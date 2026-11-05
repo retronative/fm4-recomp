@@ -8,7 +8,8 @@
 #
 #   /opt/homebrew/bin/python3 -B -I tests/test_analysis.py [test_name ...]
 #
-# With names, only those tests run (the focused run per change); without, all of them.
+# With names, only those tests run (the focused run per change); without, all of them. A passing
+# run removes its work folder build/tests/analysis (KEEP_WORK=1 keeps it).
 import os
 import re
 import shutil
@@ -72,8 +73,14 @@ def recompile(case, sections, entry, extra_config="", export_table_address=0, fi
             f.write(text)
     with open(os.path.join(d, "case.toml"), "w") as f:
         f.write('[main]\nfile_path = "case.xex"\nout_directory_path = "ppc"\n' + extra_config)
-    p = subprocess.run([RECOMP, os.path.join(d, "case.toml"), CONTEXT_H], cwd=d, capture_output=True,
-                       text=True, timeout=120)
+    # A synthetic case recompiles in milliseconds: a recompiler that has not finished in 5 s hangs
+    # (e.g. an analysis that never advances). Fail fast and by name, so a whole-suite run (mutation
+    # gate --full) cannot time out on a hang and the hang is reported as this case's failure.
+    try:
+        p = subprocess.run([RECOMP, os.path.join(d, "case.toml"), CONTEXT_H], cwd=d, capture_output=True,
+                           text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("XenonRecomp did not finish within 5 s on case %s (hang)" % case)
     with open(os.path.join(d, "recomp.log"), "w") as f:
         f.write(p.stdout + p.stderr)
     return Result(p.returncode, p.stdout + p.stderr, os.path.join(d, "ppc"))
@@ -526,13 +533,14 @@ class Analysis(unittest.TestCase):
 
     def test_fatal_reported_once_for_reemitted_body(self):
         """Patch 0026: a FATAL inside a body that a secondary entry re-emits is reported once.
-        O @T (pdata, 2): frsqrte f1,f2; blr; C @T+8 (pdata, 2): bl O+4; blr (O+4 is an entry)."""
+        O @T (pdata, 2): mtfsb1 30; blr; C @T+8 (pdata, 2): bl O+4; blr (O+4 is an entry). mtfsb1 has no
+        translation (frsqrte, used here before, is translated since patch 0034)."""
         O, C = T, T + 8
         r = recompile("fatal_reported_once_for_reemitted_body",
-                      [(".text", 0x1000, X.words(X.frsqrte(1, 2), X.BLR, X.bl(C, O + 4), X.BLR), X.CODE),
+                      [(".text", 0x1000, X.words(X.mtfsb1(30), X.BLR, X.bl(C, O + 4), X.BLR), X.CODE),
                        (".pdata", P, X.pdata((O, 2), (C, 2)), X.DATA)], O)
         self.assertNotEqual(r.code, 0)
-        self.assertEqual(r.fatal, ["unrecognized instruction at 0x82001000: frsqrte"])
+        self.assertEqual(r.fatal, ["unrecognized instruction at 0x82001000: mtfsb1"])
 
     def test_switch_table_unaligned_is_fatal(self):
         """Patch 0027: an in-code switch table that is not word-aligned is fatal."""
@@ -593,6 +601,10 @@ def main(argv):
     else:
         suite = loader.loadTestsFromTestCase(Analysis)
     result = unittest.TextTestRunner(verbosity=2).run(suite)
+    # A passing run leaves nothing behind; a failing one keeps build/tests/analysis for diagnosis.
+    # KEEP_WORK=1 keeps it either way.
+    if result.wasSuccessful() and not os.environ.get("KEEP_WORK") and os.path.isdir(WORK):
+        shutil.rmtree(WORK)
     return 0 if result.wasSuccessful() else 1
 
 

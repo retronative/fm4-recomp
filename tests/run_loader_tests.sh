@@ -67,4 +67,7 @@ for test in "$ROOT"/tests/loader/*_test.cpp; do
     echo "NEGATIVE CONTROL FAILED: $name: expected '$want' from the unpatched loader, see $log"; status=1
   fi
 done
+# A passing run leaves nothing behind; a failing one keeps its binaries and logs for diagnosis.
+# KEEP_WORK=1 keeps them either way.
+if [ "$status" = 0 ] && [ -z "${KEEP_WORK:-}" ]; then rm -r "$OUT"; fi
 exit $status

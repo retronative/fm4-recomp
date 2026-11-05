@@ -1,0 +1,44 @@
+From 262ea3da667ec99e0783757d51c00805881b418f Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:35:45 +0700
+Subject: [PATCH] Translate frsqrte as a double-precision reciprocal square
+ root
+
+Accepted project policy (FM4 Recomp), the approach of ShiftGlue: frD =
+frB < 0.0 ? quiet NaN : 1.0 / sqrt(frB), computed in double precision and never rounded through
+float. This is not the Xbox 360's hardware reciprocal square root estimate and is not guaranteed
+bit-exact with it; FPSCR flags are not updated. Applies at FM4's nine frsqrte sites (all the plain
+form); the record form frsqrte. stays rejected by the record-form check (patch 0004). Our own code:
+no ShiftGlue code is copied.
+
+FM4 Recomp patch (not from ForzaRecomp). Tests: tests/translator/frsqrte_policy.s (12 IEEE edge
+cases, hand-computed), tests/translator/reject/frsqrte_record_form.s.
+---
+ XenonRecomp/recompiler.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 2934162..ae2e7c5 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1517,6 +1517,17 @@ bool Recompiler::Recompile(
+         println("\t{}.f64 = sqrt({}.f64);", f(insn.operands[0]), f(insn.operands[1]));
+         break;
+ 
++    case PPC_INST_FRSQRTE:
++        // Accepted project policy (FM4 Recomp; ShiftGlue's approach): a negative
++        // input gives a quiet NaN, otherwise 1.0 / sqrt(x) in double precision, never rounded
++        // through float. This is NOT the Xbox 360's hardware estimate and is not guaranteed
++        // bit-exact with it; FPSCR flags are not updated. -0.0 < 0.0 is false: 1 / sqrt(-0) = -inf.
++        // The record form (frsqrte.) writes no CR field here, so 0003's record-form check rejects it.
++        printSetFlushMode(false);
++        println("\t{}.f64 = {}.f64 < 0.0 ? __builtin_nan(\"\") : 1.0 / sqrt({}.f64);",
++            f(insn.operands[0]), f(insn.operands[1]), f(insn.operands[1]));
++        break;
++
+     case PPC_INST_FSQRTS:
+         printSetFlushMode(false);
+         println("\t{}.f64 = double(float(sqrt({}.f64)));", f(insn.operands[0]), f(insn.operands[1]));
+-- 
+2.54.0 (Apple Git-157)
+

@@ -34,11 +34,20 @@
 #                               before printing anything.
 # tests/translator/reject/*.s   must fail to translate with the FATAL message named on its
 #                               "#! FATAL <text>" line.
+#
+# Compiled harnesses are cached under build/tests/translator_cache/ by a key over everything they
+# are built from (tests/translator_lib.sh); a cached harness is still run. TRANSLATOR_CACHE=0
+# compiles every harness; the cache is capped at 200 MiB, oldest entries evicted first. A passing
+# run removes its work folder (KEEP_WORK=1 keeps it); a failing run keeps it. Each step is bounded (translate 30 s, compile 120 s, run 10 s); a step
+# past its deadline exits 124, which never counts as a trap.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 "$ROOT/scripts/preflight.sh" >/dev/null
 XR="$ROOT/tools/XenonRecomp"
 WORK="$ROOT/build/tests/translator"
+CACHE="$ROOT/build/tests/translator_cache"
+CACHE_MAX_KIB=204800   # 200 MiB, size-based eviction (a harness is ~180 KiB)
+source "$ROOT/tests/translator_lib.sh"
 if [ -z "${LLVM:-}" ]; then
   if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then LLVM=/opt/homebrew/opt/llvm/bin
   else LLVM="$(dirname "$(command -v clang)")"; fi
@@ -48,12 +57,31 @@ for tool in "$LLVM/llvm-mc" "$LLVM/llvm-objdump" "$LLVM/clang++" "$LLD" "$XR/bui
   [ -x "$tool" ] || { echo "missing $tool"; exit 1; }
 done
 rm -rf "$WORK" && mkdir -p "$WORK"
+CXXFLAGS=(-std=c++20 -O1 -fwrapv -fno-strict-aliasing -Wno-unused-label -Wno-unused-variable -Werror=asm-operand-widths
+  -include cstdlib -include "$ROOT/tests/translator/harness_doubles.h" -I"$XR/XenonUtils" -I"$XR/thirdparty/simde"
+  -I"$XR/thirdparty/fmt/include")
+TOOLKEY=""
+if [ "${TRANSLATOR_CACHE:-1}" != 0 ]; then
+  TOOLKEY="$(cache_tool_key "$XR" "$ROOT/tests/translator/harness_doubles.h" "$LLVM/clang++" "$0" -- "${CXXFLAGS[@]}")"
+fi
 FOCUS=" $* "
 selected() { [ "$FOCUS" = "  " ] || [[ "$FOCUS" == *" $(basename "$1" .s) "* ]]; }
 for n in "$@"; do
   compgen -G "$ROOT/tests/translator/$n.s" >/dev/null || compgen -G "$ROOT/tests/translator/*/$n.s" >/dev/null \
     || { echo "FAIL $n: no such fixture"; exit 1; }
 done
+
+# TIMING_LOG=<file>: append "<phase> <start> <end>" (seconds) for each step: a profiling aid only,
+# off by default (no change to what runs).
+now() { perl -MTime::HiRes=time -e 'printf "%.4f", time'; }
+timed() {
+  local phase="$1"; shift
+  if [ -z "${TIMING_LOG:-}" ]; then "$@"; return; fi
+  local t0 t1 rc=0
+  t0="$(now)"; "$@" || rc=$?; t1="$(now)"
+  echo "$phase $t0 $t1" >> "$TIMING_LOG"
+  return $rc
+}
 
 # Assemble <src>.s into <dir>/bin/<name>.o and .dis, as XenonRecomp's test mode expects
 # (<dir>/<name>.s next to <dir>/bin/). Register names gain llvm-mc's % prefix.
@@ -63,24 +91,41 @@ assemble() {
   mkdir -p "$dir/bin"
   grep -v '^[[:space:]]*#[^_!]' "$src" | grep -v '^[[:space:]]*#$' > "$dir/$name.s"
   perl -pe 'next if /^\s*#/; s/\b(r|v|f|cr)(\d+)\b/%$1$2/g unless /:\s*$/' "$src" > "$dir/bin/$name.llvm.s"
-  "$LLVM/llvm-mc" -triple=powerpc-unknown-unknown -mcpu=pwr7 -mattr=+altivec -filetype=obj \
+  timed assemble "$LLVM/llvm-mc" -triple=powerpc-unknown-unknown -mcpu=pwr7 -mattr=+altivec -filetype=obj \
     -o "$dir/bin/$name.obj" "$dir/bin/$name.llvm.s"
-  "$LLD" -o "$dir/bin/$name.o" -e 0 --image-base=0 -Ttext=0x10000 "$dir/bin/$name.obj"
-  "$LLVM/llvm-objdump" -d "$dir/bin/$name.o" > "$dir/bin/$name.dis"
+  timed assemble "$LLD" -o "$dir/bin/$name.o" -e 0 --image-base=0 -Ttext=0x10000 "$dir/bin/$name.obj"
+  timed assemble "$LLVM/llvm-objdump" -d "$dir/bin/$name.o" > "$dir/bin/$name.dis"
   rm "$dir/bin/$name.obj" "$dir/bin/$name.llvm.s"
 }
 
-# Translate <dir>/bin into <dir>/out, compile the harness, run it; prints its output.
+# Translate <dir>/bin into <dir>/out, compile the harness (or take it from the cache), run it;
+# prints its output.
 build_and_run() {
-  local dir="$1"
+  local dir="$1" harness="$1/harness" key tmp
   mkdir -p "$dir/out"
-  "$XR/build/XenonRecomp/XenonRecomp" "$dir/bin" "$dir/out" > "$dir/recomp.log" 2>&1 || {
+  timed translate bounded 30 "$XR/build/XenonRecomp/XenonRecomp" "$dir/bin" "$dir/out" > "$dir/recomp.log" 2>&1 || {
     cat "$dir/recomp.log"; echo "translation failed: $dir"; return 1; }
-  "$LLVM/clang++" -std=c++20 -O1 -fwrapv -fno-strict-aliasing -Wno-unused-label -Wno-unused-variable \
-    -Werror=asm-operand-widths \
-    -include cstdlib -include "$ROOT/tests/translator/harness_doubles.h" -I"$XR/XenonUtils" -I"$XR/thirdparty/simde" -I"$XR/thirdparty/fmt/include" \
-    "$dir"/out/*.cpp "$XR/build/thirdparty/fmt/libfmt.a" -o "$dir/harness"
-  "$dir/harness"
+  if [ -n "$TOOLKEY" ]; then
+    key="$(cache_harness_key "$TOOLKEY" "$dir/out")"
+    harness="$CACHE/$key/harness"
+  fi
+  if [ -x "$harness" ]; then
+    if [ -n "$TOOLKEY" ]; then touch "$CACHE/$key"; fi   # recently used: evicted last
+  else
+    tmp="$dir/harness.build"
+    mkdir -p "$tmp"
+    timed compile bounded 120 "$LLVM/clang++" "${CXXFLAGS[@]}" "$dir"/out/*.cpp "$XR/build/thirdparty/fmt/libfmt.a" \
+      -o "$tmp/harness" || { rm -r "$tmp"; return 1; }
+    if [ -n "$TOOLKEY" ]; then
+      # Publish atomically: rename(2) of the whole directory, which fails if the key already exists
+      # (a concurrent writer built the same binary, so losing the race is harmless).
+      mkdir -p "$CACHE"
+      perl -e 'rename $ARGV[0], $ARGV[1] or exit 1' "$tmp" "$CACHE/$key" || rm -r "$tmp"
+    else
+      mv "$tmp/harness" "$harness"
+    fi
+  fi
+  timed run bounded 10 "$harness"
 }
 
 status=0
@@ -161,8 +206,10 @@ for src in "$ROOT"/tests/translator/reject/*.s; do
   [ -n "$want" ] || { echo "FAIL $name: no '#! FATAL <text>' line"; status=1; continue; }
   assemble "$src" "$dir"
   mkdir -p "$dir/out"
-  if "$XR/build/XenonRecomp/XenonRecomp" "$dir/bin" "$dir/out" > "$dir/recomp.log" 2>&1; then
+  if bounded 30 "$XR/build/XenonRecomp/XenonRecomp" "$dir/bin" "$dir/out" > "$dir/recomp.log" 2>&1; then
     echo "FAIL $name: translated without a fatal problem"; status=1
+  elif grep -q '^TIMEOUT after' "$dir/recomp.log"; then
+    echo "FAIL $name: translation did not finish"; status=1
   elif grep -q "^FATAL: .*$want" "$dir/recomp.log"; then
     echo "pass $name: rejected ($want)"; rejected=$((rejected + 1))
   else
@@ -170,5 +217,9 @@ for src in "$ROOT"/tests/translator/reject/*.s; do
   fi
 done
 
+[ -z "$TOOLKEY" ] || cache_prune "$CACHE" "$CACHE_MAX_KIB"
+# A passing run leaves nothing behind but the cache; a failing one keeps its work folder for
+# diagnosis. KEEP_WORK=1 keeps it either way.
+if [ "$status" = 0 ] && [ -z "${KEEP_WORK:-}" ]; then rm -r "$WORK"; fi
 echo "translator tests: $positive positive tests, $trapped traps, $rejected rejections, status $status"
 exit $status

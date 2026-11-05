@@ -80,8 +80,8 @@ def addi(rd, ra, value):  # addi rD, rA, SIMM
     return 0x38000000 | (rd << 21) | (ra << 16) | (value & 0xFFFF)
 
 
-def frsqrte(frd, frb):    # opcode 63, XO 26 (A-form)
-    return 0xFC000034 | (frd << 21) | (frb << 11)
+def mtfsb1(bt):           # X-form, opcode 63, XO 38, Rc 0: 0xFC000000 | BT << 21 | 38 << 1
+    return 0xFC00004C | (bt << 21)
 
 
 def words(*ws):

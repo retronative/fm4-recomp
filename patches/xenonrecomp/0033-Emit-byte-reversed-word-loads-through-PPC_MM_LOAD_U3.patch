@@ -1,0 +1,28 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 18:48:04 +0700
+Subject: [PATCH] Emit byte-reversed word loads through PPC_MM_LOAD_U32
+
+---
+ XenonRecomp/recompiler.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 4db76d6..47f1d11 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1763,7 +1763,10 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWBRX:
+-        print("\t{}.u64 = __builtin_bswap32(PPC_LOAD_U32(", r(insn.operands[0]));
++        // Byte-reversed word loads are how titles read little-endian device registers (with no
++        // eieio to mark them, unlike MMIO stores): they go through PPC_MM_LOAD_U32, which the
++        // runtime may override; the default is the plain load.
++        print("\t{}.u64 = __builtin_bswap32(PPC_MM_LOAD_U32(", r(insn.operands[0]));
+         if (insn.operands[1] != 0)
+             print("{}.u32 + ", r(insn.operands[1]));
+         println("{}.u32));", r(insn.operands[2]));
+-- 
+2.54.0 (Apple Git-157)
+
