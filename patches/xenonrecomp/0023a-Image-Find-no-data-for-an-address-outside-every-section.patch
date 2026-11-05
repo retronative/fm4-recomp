@@ -1,0 +1,42 @@
+From ad53df7dcafe57cf8b7f1d26662159fb36fba047 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:05:49 +0700
+Subject: [PATCH] Image::Find: no data for an address outside every section
+
+Image::Find(address) took std::prev(sections.upper_bound(address)): for an address below the
+first section that is std::prev(begin()), undefined behaviour, and an address past a section's
+end got a pointer past that section's data. Patch 0023 checks Find's result for null before the
+exception-handler word of a .pdata function, but Find never returned null, so a flagged function
+at the start of .text read an arbitrary word (seen: 0xFD430091 in one run, a function address in
+another). Find now returns null outside every section and for sections without data.
+
+FM4 Recomp patch (not from ForzaRecomp). Tests: tests/analysis/image_find_test.cpp (ASan);
+tests/test_analysis.py test_exception_handler_word_outside_image.
+---
+ XenonUtils/image.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/XenonUtils/image.cpp b/XenonUtils/image.cpp
+index 39afe92..ed47a4e 100644
+--- a/XenonUtils/image.cpp
++++ b/XenonUtils/image.cpp
+@@ -12,7 +12,15 @@ void Image::Map(const std::string_view& name, size_t base, uint32_t size, uint8_
+ 
+ const void* Image::Find(size_t address) const
+ {
+-    const auto section = std::prev(sections.upper_bound(address));
++    // An address outside every section has no data: null. Taking the section before the first one
++    // (std::prev of begin()) is undefined behaviour, and an address past a section's end would
++    // point past its data.
++    const auto next = sections.upper_bound(address);
++    if (next == sections.begin())
++        return nullptr;
++    const auto section = std::prev(next);
++    if (address >= section->base + section->size || section->data == nullptr)
++        return nullptr;
+     return section->data + (address - section->base);
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

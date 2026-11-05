@@ -38,6 +38,7 @@ GATE = "tests/mutate.py"
 RECOMP = "tools/XenonRecomp/XenonRecomp/recompiler.cpp"
 ANALYZE = "tools/XenonRecomp/XenonAnalyse/function.cpp"
 TEST_RECOMP = "tools/XenonRecomp/XenonRecomp/test_recompiler.cpp"
+IMAGE_CPP = "tools/XenonRecomp/XenonUtils/image.cpp"
 PPC_CONTEXT = "tools/XenonRecomp/XenonUtils/ppc_context.h"
 DISASM = "tools/XenonRecomp/thirdparty/disasm/ppc-dis.c"
 
@@ -151,6 +152,110 @@ MUTANTS = [
     dict(id='N1', milestone="M1", file=RECOMP, test='analysis', fault='pdata FunctionLength read as 4-byte words twice over (size x2)',
          old='f.size = fn.FunctionLength * 4;',
          new='f.size = fn.FunctionLength * 8;', expect='test_baseline_discovery'),
+
+    # ---- M1: patches/xenonrecomp/0028 (ForzaRecomp 0028: switch address tables are data, not pointer-reached entries) ----
+    dict(id='S28a', milestone="M1", file=RECOMP, test='analysis', fault='table start entered as code',
+         old='switchTargets.insert(table.table);',
+         new=';', expect='test_switch_table_pointer_is_not_entry'),
+    dict(id='S28b', milestone="M1", file=RECOMP, test='analysis', fault='case labels taken by pointer become extra entries',
+         old='switchTargets.insert(table.labels.begin(), table.labels.end());',
+         new=';', expect='test_switch_case_pointer_is_not_entry'),
+    dict(id='S28c', milestone="M1", file=RECOMP, test='analysis', fault='both exclusions lost',
+         old='|| switchTargets.count(address))',
+         new=')', expect='test_switch_table_pointer_is_not_entry'),
+
+    # ---- M1: patches/xenonrecomp/0027 (ForzaRecomp 0027: harden switch tables and setjmp) ----
+    dict(id='S27a', milestone="M1", file=RECOMP, test='analysis', fault='unaligned in-code table accepted',
+         old='if (table.tableSize != 0 && inCode && (table.table & 3))',
+         new='if (false)', expect='test_switch_table_unaligned_is_fatal'),
+    dict(id='S27b', milestone="M1", file=RECOMP, test='analysis', fault='two setjmp calls share one snapshot',
+         old='if (++setJmpCalls > 1)',
+         new='if (++setJmpCalls > 2)', expect='test_second_setjmp_call_is_fatal'),
+    dict(id='S27c', milestone="M1", file=RECOMP, test='analysis', fault='setjmp count leaks across functions',
+         old='    setJmpCalls = 0;\n',
+         new='', expect='test_setjmp_once_in_each_of_two_functions'),
+    dict(id='S27d', milestone="M1", file=RECOMP, test='analysis', fault='a table overrunning by one word not detected',
+         old='range != dataRanges.end() && base + range->second > end)',
+         new='range != dataRanges.end() && base + range->second > end + 4)', expect='test_switch_table_overrun_is_fatal'),
+
+    # ---- M1: patches/xenonrecomp/0026 (ForzaRecomp 0026: enter code reached through pointers) ----
+    dict(id='S26a', milestone="M1", file=RECOMP, test='analysis', fault='pieces after a terminator not entered',
+         old='if (previous != 0 && !IsUnconditionalTerminator(previous))',
+         new='if (previous != 0)', expect='test_pointer_reached_piece_is_entry'),
+    dict(id='S26b', milestone="M1", file=RECOMP, test='analysis', fault='addi low half not sign-extended',
+         old='high + uint32_t(int32_t(int16_t(next & 0xFFFF)))',
+         new='high + (next & 0xFFFF)', expect='test_pointer_reached_piece_is_entry'),
+    dict(id='S26c', milestone="M1", file=RECOMP, test='analysis', fault='data-section pointers ignored',
+         old='if (const uint32_t value = ByteSwap(words[i]); (value & 3) == 0 && inCode(value))',
+         new='if (const uint32_t value = ByteSwap(words[i]); false)', expect='test_data_pointer_reached_piece_is_entry'),
+    dict(id='S26d', milestone="M1", file=RECOMP, test='analysis', fault='a FATAL counted per re-emitted copy',
+         old='if (!reported.insert(message).second)',
+         new='if (false)', expect='test_fatal_reported_once_for_reemitted_body'),
+    dict(id='S26e', milestone="M1", file=RECOMP, test='analysis', fault='lis and addi more than one word apart missed',
+         old='k < std::min<size_t>(i + 12, section.size / 4)',
+         new='k < std::min<size_t>(i + 2, section.size / 4)', expect='test_pointer_reached_piece_is_entry'),
+
+    # ---- M1: patches/xenonrecomp/0025 (ForzaRecomp 0025: translate switch tables safely) ----
+    dict(id='S25a', milestone="M1", file=RECOMP, test='analysis', fault='switch index uses the whole 64-bit register',
+         old='println("\\tswitch ({}.u32) {{", r(switchTable->second.r));',
+         new='println("\\tswitch ({}.u64) {{", r(switchTable->second.r));', expect='test_switch_proven'),
+    dict(id='S25b', milestone="M1", file=RECOMP, test='analysis', fault='out-of-bound index returns silently (fail-open)',
+         old='println("\\tdefault:");',
+         new='println("\\tdefault: return;");', expect='test_switch_proven'),
+    dict(id='S25c', milestone="M1", file=RECOMP, test='analysis', fault='unproven switch emitted as an empty switch',
+         old='if (switchTable->second.labels.empty())',
+         new='if (false)', expect='test_switch_without_bound_is_fatal'),
+    dict(id='S25d', milestone="M1", file=RECOMP, test='analysis', fault='inline table decoded as instructions',
+         old='dataRanges.emplace(table.table, (table.tableSize + 3) & ~3u);',
+         new='(void)0;', expect='test_switch_proven'),
+    dict(id='S25e', milestone="M1", file=RECOMP, test='analysis', fault='out-of-function cases not entered',
+         old='if (switchOwner && label >= switchOwner->base && label < switchOwner->base + switchOwner->size)',
+         new='if (switchOwner)', expect='test_switch_case_in_another_function_is_entry'),
+
+    # ---- M1: patches/xenonrecomp/0024 (ForzaRecomp 0024: hand context routines to the runtime) ----
+    dict(id='S24a', milestone="M1", file=RECOMP, test='analysis', fault='noreturn routine falls off its end',
+         old='if (runtime->second.noReturn)',
+         new='if (false)', expect='test_runtime_routine_body'),
+    dict(id='S24b', milestone="M1", file=RECOMP, test='analysis', fault='entry into a runtime routine only noted',
+         old='Fatal(fmt::format("secondary entry {:X} enters runtime-handled routine {:X}", entry, fn.base));',
+         new='fmt::println("NOTE: secondary entry {:X} enters runtime-handled routine {:X}", entry, fn.base);', expect='test_runtime_routine_entry_is_fatal'),
+    dict(id='S24c', milestone="M1", file=RECOMP, test='analysis', fault='setjmp on the wrong guest buffer (r4)',
+         old='println("\\t{}.s64 = setjmp(PpcJumpBuffer({}.u32));", temp(), r(3));',
+         new='println("\\t{}.s64 = setjmp(PpcJumpBuffer({}.u32));", temp(), r(4));', expect='test_setjmp_call'),
+    dict(id='S24d', milestone="M1", file=RECOMP, test='analysis', fault='branch (not a call) to setjmp accepted',
+         old='if (!PPC_BL(insn.instruction))',
+         new='if (false)', expect='test_branch_to_setjmp_is_fatal'),
+    dict(id='S24e', milestone="M1", file=RECOMP, test='analysis', fault='registers restored on the first return',
+         old='println("\\tif ({}.s64 != 0) ctx = {};", temp(), env());',
+         new='println("\\tif ({}.s64 == 0) ctx = {};", temp(), env());', expect='test_setjmp_call'),
+    dict(id='S24f', milestone="M1", file=RECOMP, test='analysis', fault='longjmp returns r3 instead of r4',
+         old='println("\\tlongjmp(PpcJumpBuffer({}.u32), {}.s32);", r(3), r(4));',
+         new='println("\\tlongjmp(PpcJumpBuffer({}.u32), {}.s32);", r(3), r(3));', expect='test_longjmp_call'),
+
+    # ---- M1: patches/xenonrecomp/0023a (ours: Image::Find is null outside every section) ----
+    dict(id='S23f', milestone="M1", file=IMAGE_CPP, test='analysis', fault='address before the first section takes std::prev(begin()) (upstream UB)',
+         old='    if (next == sections.begin())\n        return nullptr;\n',
+         new='', expect='test_image_find_bounds'),
+    dict(id='S23g', milestone="M1", file=IMAGE_CPP, test='analysis', fault="address past a section's end points past its data",
+         old='if (address >= section->base + section->size || section->data == nullptr)',
+         new='if (section->data == nullptr)', expect='test_image_find_bounds'),
+
+    # ---- M1: patches/xenonrecomp/0023 (ForzaRecomp 0023: exception handlers and local-register options after analysis) ----
+    dict(id='S23a', milestone="M1", file=RECOMP, test='analysis', fault='non-function handler accepted',
+         old='Fatal(fmt::format("exception handler {:X} before function {:X} is not a function", handler, function));',
+         new='(void)handler;', expect='test_exception_handler_must_be_function'),
+    dict(id='S23b', milestone="M1", file=RECOMP, test='analysis', fault='ctr-as-local allowed with secondary entries',
+         old='if (!secondaryEntries.empty() && (config.ctrAsLocalVariable || config.xerAsLocalVariable ||',
+         new='if (!secondaryEntries.empty() && (config.xerAsLocalVariable ||', expect='test_secondary_entry_rejects_ctr_as_local'),
+    dict(id='S23c', milestone="M1", file=RECOMP, test='analysis', fault='non-volatile-as-local allowed with secondary entries',
+         old='config.nonArgumentRegistersAsLocalVariables || config.nonVolatileRegistersAsLocalVariables))',
+         new='config.nonArgumentRegistersAsLocalVariables))', expect='test_secondary_entry_rejects_non_volatile_as_local'),
+    dict(id='S23d', milestone="M1", file=RECOMP, test='analysis', fault='handlers not recorded for the post-analysis check',
+         old='exceptionHandlers.emplace_back(fn.BeginAddress, handler);',
+         new='(void)handler;', expect='test_exception_handler_must_be_function'),
+    dict(id='S23e', milestone="M1", file=RECOMP, test='analysis', fault='missing handler word not checked (null dereference)',
+         old='if (handlerWord == nullptr)',
+         new='if (false)', expect='test_exception_handler_word_outside_image'),
 
     # ---- M1: patches/xenonrecomp/0022 (ForzaRecomp 0022: merge analysed functions split from one routine) and 0022a (ours: keep exports) ----
     dict(id='S22a', milestone="M1", file=RECOMP, test='analysis', fault='backward-loop pieces not merged',

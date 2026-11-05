@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:50:23 +0700
+Subject: [PATCH] Check exception handlers and local-register options after
+ analysis
+
+The two words before a .pdata function with ExceptionFlag were accepted as handler and data
+when the first was any code address. After analysis, each handler must now be a function or an
+import thunk; a missing word is fatal. Secondary entries run a body from the middle, which is
+only correct with registers in the context: they are fatal when any *_as_local option is set.
+---
+ XenonRecomp/recompiler.cpp | 27 ++++++++++++++++++++++++++-
+ XenonRecomp/recompiler.h   |  2 ++
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 495a4d7..9914777 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -242,12 +242,19 @@ void Recompiler::Analyse()
+         // register save/restore helpers set the flag without them: the words before them are code.
+         if (fn.ExceptionFlag && functionSources.find(fn.BeginAddress) == functionSources.end())
+         {
+-            const uint32_t handler = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(fn.BeginAddress - 8)));
++            const auto* handlerWord = reinterpret_cast<const uint32_t*>(image.Find(fn.BeginAddress - 8));
++            if (handlerWord == nullptr)
++            {
++                Fatal(fmt::format("no exception handler word before function {:X}", fn.BeginAddress));
++                continue;
++            }
++            const uint32_t handler = ByteSwap(*handlerWord);
+             const auto section = std::find_if(image.sections.begin(), image.sections.end(),
+                 [&](const Section& s) { return handler >= s.base && handler < s.base + s.size; });
+             if (section == image.sections.end() || !(section->flags & SectionFlags_Code))
+                 Fatal(fmt::format("exception handler {:X} before function {:X} is not in code", handler, fn.BeginAddress));
+             dataRanges.emplace(fn.BeginAddress - 8, 8);
++            exceptionHandlers.emplace_back(fn.BeginAddress, handler);
+         }
+ 
+         if (image.symbols.find(fn.BeginAddress) == image.symbols.end())
+@@ -453,7 +460,25 @@ void Recompiler::Analyse()
+         functions.erase(functions.begin() + i + 1);
+     }
+ 
++    // Each exception handler must be a function (or an import thunk) once analysis is complete;
++    // a code address alone does not show that the two words are a handler and its data.
++    for (const auto& [function, handler] : exceptionHandlers)
++    {
++        const auto symbol = image.symbols.find(handler);
++        if (symbol == image.symbols.end() || symbol->type != Symbol_Function)
++            Fatal(fmt::format("exception handler {:X} before function {:X} is not a function", handler, function));
++    }
++
+     FindSecondaryEntries();
++
++    // A secondary entry runs its owner's body from the middle, so every register it reads must
++    // live in the context: the *_as_local options would start it with fresh locals.
++    if (!secondaryEntries.empty() && (config.ctrAsLocalVariable || config.xerAsLocalVariable ||
++        config.reservedRegisterAsLocalVariable || config.crRegistersAsLocalVariables ||
++        config.nonArgumentRegistersAsLocalVariables || config.nonVolatileRegistersAsLocalVariables))
++    {
++        Fatal("secondary entries need registers in the context, but a *_as_local option is set");
++    }
+ }
+ 
+ void Recompiler::FindSecondaryEntries()
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index b025676..e5e088e 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -39,6 +39,8 @@ struct Recompiler
+     std::unordered_map<uint32_t, std::string_view> functionSources;
+     // Data inside code sections (start, size): exception-handler metadata and the export table.
+     std::map<uint32_t, uint32_t> dataRanges;
++    // Exception handler named before each .pdata function with ExceptionFlag (function, handler).
++    std::vector<std::pair<uint32_t, uint32_t>> exceptionHandlers;
+     // Secondary entry points: direct branch targets inside another function, by entry address,
+     // with the base of the function that contains them.
+     std::map<uint32_t, uint32_t> secondaryEntries;
+-- 
+2.54.0 (Apple Git-157)
+

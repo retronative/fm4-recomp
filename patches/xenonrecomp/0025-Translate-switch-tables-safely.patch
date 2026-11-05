@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:07:56 +0700
+Subject: [PATCH] Translate switch tables safely
+
+Upstream switches on the index register's 64-bit value, though the bound is a 32-bit cmplwi;
+its default case is __builtin_unreachable, so an index past the bound is undefined behaviour;
+a case outside the function is fatal; and a table placed in the code (Forza Motorsport 4 puts
+address tables right after the bctr) is decoded as instructions. Now the switch uses the low
+word, the default traps, a case outside the function is a tail call to it (a function start
+or a secondary entry), a table entry without labels (an unproven bound) is fatal, and the
+optional table and table_size keys make the table a data range that is neither swept nor
+emitted. Switch cases count as branches when analysed functions are merged.
+---
+ XenonRecomp/recompiler.cpp        | 56 +++++++++++++++++++++++++++++--
+ XenonRecomp/recompiler_config.cpp |  2 ++
+ XenonRecomp/recompiler_config.h   |  3 ++
+ 3 files changed, 58 insertions(+), 3 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index ad237a4..1c8fc8b 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -283,6 +283,16 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    // A switch table inside a code section is data (FM4 places address tables right after the
++    // bctr that uses them).
++    for (const auto& [bctr, table] : config.switchTables)
++    {
++        const bool inCode = std::any_of(image.sections.begin(), image.sections.end(), [&](const Section& s)
++            { return (s.flags & SectionFlags_Code) && table.table >= s.base && table.table + table.tableSize <= s.base + s.size; });
++        if (table.tableSize != 0 && inCode)
++            dataRanges.emplace(table.table, (table.tableSize + 3) & ~3u);
++    }
++
+     // The XEX export table (security header) is data inside a code section. Layout, as Xenia's
+     // xex2_export_table: 0x48000000, 0x00485645 ("HVE"), 0x48000000, two module-number words,
+     // three version words, the image base >> 16, the export count, the ordinal base, then one
+@@ -443,8 +453,19 @@ void Recompiler::Analyse()
+         };
+     const auto branchesInto = [&](const Function& from, const Function& to)
+         {
++            for (const auto& [bctr, table] : config.switchTables)
++            {
++                if (bctr >= from.base && bctr < from.base + from.size &&
++                    std::any_of(table.labels.begin(), table.labels.end(), [&](uint32_t l) { return l >= to.base && l < to.base + to.size; }))
++                    return true;
++            }
+             for (size_t address = from.base; address < from.base + from.size; address += 4)
+             {
++                if (dataRanges.count(uint32_t(address)))
++                {
++                    address += dataRanges.at(uint32_t(address)) - 4;
++                    continue;
++                }
+                 const uint32_t insn = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(address)));
+                 const uint32_t op = PPC_OP(insn);
+                 if ((op != PPC_OP_B && op != PPC_OP_BC) || PPC_BL(insn))
+@@ -532,6 +553,20 @@ void Recompiler::FindSecondaryEntries()
+                 secondaryEntries.emplace(target, uint32_t(owner->base));
+         }
+     }
++    // Switch cases outside the function of their bctr are entered the same way.
++    for (const auto& [bctr, table] : config.switchTables)
++    {
++        const auto* switchOwner = containing(bctr);
++        for (uint32_t label : table.labels)
++        {
++            if (switchOwner && label >= switchOwner->base && label < switchOwner->base + switchOwner->size)
++                continue;
++            if (image.symbols.find(label) != image.symbols.end())
++                continue;
++            if (const auto* owner = containing(label))
++                secondaryEntries.emplace(label, uint32_t(owner->base));
++        }
++    }
+     for (const auto& [entry, owner] : secondaryEntries)
+     {
+         const auto* fn = containing(entry);
+@@ -963,7 +998,12 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTR:
+         if (switchTable != config.switchTables.end())
+         {
+-            println("\tswitch ({}.u64) {{", r(switchTable->second.r));
++            // The bound is a 32-bit cmplwi, so the index is the register's low word. A case outside
++            // this function is a tail call into it (a function start or secondary entry). An index
++            // past the proven bound cannot occur; if it did, stop rather than run on.
++            if (switchTable->second.labels.empty())
++                Fatal(fmt::format("switch table at {:X} has no proven bound", base));
++            println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+ 
+             for (size_t i = 0; i < switchTable->second.labels.size(); i++)
+             {
+@@ -971,7 +1011,8 @@ bool Recompiler::Recompile(
+                 auto label = switchTable->second.labels[i];
+                 if (label < fn.base || label >= fn.base + fn.size)
+                 {
+-                    Fatal(fmt::format("switch case at {:X} jumps outside its function: {:X}", base, label));
++                    print("\t");
++                    printFunctionCall(label);
+                     println("\t\treturn;");
+                 }
+                 else
+@@ -981,7 +1022,7 @@ bool Recompiler::Recompile(
+             }
+ 
+             println("\tdefault:");
+-            println("\t\t__builtin_unreachable();");
++            println("\t\t__builtin_trap();");
+             println("\t}}");
+ 
+             switchTable = config.switchTables.end();
+@@ -3124,6 +3165,15 @@ bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+         if (switchTable == config.switchTables.end())
+             switchTable = config.switchTables.find(base);
+ 
++        // Data inside the function (a switch table): not instructions.
++        if (const auto range = dataRanges.find(uint32_t(base)); range != dataRanges.end() && base + range->second <= end)
++        {
++            println("\t// data: {} bytes", range->second);
++            base += range->second;
++            data += range->second / 4;
++            continue;
++        }
++
+         ppc::Disassemble(data, 4, base, insn);
+ 
+         if (insn.opcode == nullptr)
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index d11a481..4538959 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -95,6 +95,8 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+                     auto& table = *entry.as_table();
+                     RecompilerSwitchTable switchTable;
+                     switchTable.r = *table["r"].value<uint32_t>();
++                    switchTable.table = table["table"].value_or(0u);
++                    switchTable.tableSize = table["table_size"].value_or(0u);
+                     for (auto& label : *table["labels"].as_array())
+                     {
+                         switchTable.labels.push_back(*label.value<uint32_t>());
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index d818a1c..2b8176c 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -6,6 +6,9 @@ struct RecompilerSwitchTable
+ {
+     uint32_t r;
+     std::vector<uint32_t> labels;
++    // The table itself (optional): data, possibly inside a function's code.
++    uint32_t table = 0;
++    uint32_t tableSize = 0;
+ };
+ 
+ struct RecompilerMidAsmHook
+-- 
+2.54.0 (Apple Git-157)
+

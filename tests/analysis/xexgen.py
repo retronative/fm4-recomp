@@ -68,6 +68,22 @@ def cmpwi(ra, value):      # cmpi cr0, L=0, rA, SIMM
     return 0x2C000000 | (ra << 16) | (value & 0xFFFF)
 
 
+MTCTR_R4 = 0x7C8903A6       # mtspr CTR (SPR 9), r4
+BCTR = 0x4E800420           # bcctr 20, 0
+
+
+def lis(rd, high):        # addis rD, 0, SIMM
+    return 0x3C000000 | (rd << 21) | (high & 0xFFFF)
+
+
+def addi(rd, ra, value):  # addi rD, rA, SIMM
+    return 0x38000000 | (rd << 21) | (ra << 16) | (value & 0xFFFF)
+
+
+def frsqrte(frd, frb):    # opcode 63, XO 26 (A-form)
+    return 0xFC000034 | (frd << 21) | (frb << 11)
+
+
 def words(*ws):
     return b"".join(struct.pack(">I", w) for w in ws)
 

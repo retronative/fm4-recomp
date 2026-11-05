@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:31:44 +0700
+Subject: [PATCH 26/27] Enter code that is reached through pointers
+
+Merging analysed pieces (0022) erased the starts of pieces reached only through pointers:
+in Forza Motorsport 4, three this-adjusting vtable thunks and a stored callback, which a
+virtual or indirect call then could not find. Code whose address is stored in a data section
+or built with lis and addi/ori, and that follows an unconditional terminator or padding, is
+now a secondary entry of the function containing it (FM4: 58, including two older ones inside
+.pdata functions). Addresses in the middle of code (such as exception-handling state tables)
+and switch cases are not entries. A fatal problem repeated by a secondary entry's copy of its
+owner's body is reported and counted once; every copy still has its #error.
+---
+ XenonRecomp/recompiler.cpp | 64 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 1c8fc8b..17fb5d7 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -553,6 +553,63 @@ void Recompiler::FindSecondaryEntries()
+                 secondaryEntries.emplace(target, uint32_t(owner->base));
+         }
+     }
++    // Code whose address is taken (a word in a data section, or built with lis and addi/ori) can
++    // be called through a pointer: vtable thunks, callbacks. Inside a function, it is an entry.
++    const auto inCode = [&](uint32_t address)
++        {
++            return std::any_of(image.sections.begin(), image.sections.end(), [&](const Section& s)
++                { return (s.flags & SectionFlags_Code) && address >= s.base && address < s.base + s.size; });
++        };
++    std::set<uint32_t> addressTaken;
++    for (const auto& section : image.sections)
++    {
++        const auto* words = reinterpret_cast<const uint32_t*>(section.data);
++        if (words == nullptr)
++            continue;
++        if (!(section.flags & SectionFlags_Code))
++        {
++            for (size_t i = 0; i < section.size / 4; i++)
++                if (const uint32_t value = ByteSwap(words[i]); (value & 3) == 0 && inCode(value))
++                    addressTaken.insert(value);
++            continue;
++        }
++        for (size_t i = 0; i < section.size / 4; i++)
++        {
++            const uint32_t insn = ByteSwap(words[i]);
++            if (PPC_OP(insn) != 15 || ((insn >> 16) & 31) != 0)  // lis rD, hi
++                continue;
++            const uint32_t rd = (insn >> 21) & 31, high = insn << 16;
++            for (size_t k = i + 1; k < std::min<size_t>(i + 12, section.size / 4); k++)
++            {
++                const uint32_t next = ByteSwap(words[k]);
++                const uint32_t op = PPC_OP(next);
++                if ((op == 14 || op == 24) && ((next >> 16) & 31) == rd)  // addi/ori rX, rD, lo
++                {
++                    const uint32_t value = op == 14 ? high + uint32_t(int32_t(int16_t(next & 0xFFFF))) : high | (next & 0xFFFF);
++                    if ((value & 3) == 0 && inCode(value))
++                        addressTaken.insert(value);
++                    break;
++                }
++            }
++        }
++    }
++    // An entry starts after an unconditional terminator or padding (thunks, merged pieces); an
++    // address taken in the middle of straight-line code (e.g. exception-handling state tables)
++    // is not one, and neither is a switch case, which its switch reaches.
++    std::set<uint32_t> switchCases;
++    for (const auto& [bctr, table] : config.switchTables)
++        switchCases.insert(table.labels.begin(), table.labels.end());
++    for (uint32_t address : addressTaken)
++    {
++        if (dataRanges.count(address) || image.symbols.find(address) != image.symbols.end() || switchCases.count(address))
++            continue;
++        const uint32_t previous = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(address - 4)));
++        if (previous != 0 && !IsUnconditionalTerminator(previous))
++            continue;
++        if (const auto* owner = containing(address))
++            secondaryEntries.emplace(address, uint32_t(owner->base));
++    }
++
+     // Switch cases outside the function of their bctr are entered the same way.
+     for (const auto& [bctr, table] : config.switchTables)
+     {
+@@ -3456,8 +3513,13 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+ 
+ void Recompiler::Fatal(const std::string& message)
+ {
+-    fmt::println("FATAL: {}", message);
++    // Every occurrence stops the build; a problem is reported and counted once (a secondary
++    // entry emits its owner's body again).
+     println("#error \"XenonRecomp: {}\"", message);
++    static std::set<std::string> reported;
++    if (!reported.insert(message).second)
++        return;
++    fmt::println("FATAL: {}", message);
+     ++fatalProblems;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

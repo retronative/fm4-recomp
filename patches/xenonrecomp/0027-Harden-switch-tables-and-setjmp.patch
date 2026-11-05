@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:32:16 +0700
+Subject: [PATCH 27/27] Harden switch tables and setjmp
+
+An unaligned switch table in code, or a table that runs past the end of its function, was
+decoded as instructions without an error; both are now fatal. Two setjmp calls in one function
+would share the function's single context snapshot, so a longjmp to the first would restore the
+second's registers; a second call is now fatal.
+---
+ XenonRecomp/recompiler.cpp | 10 +++++++++-
+ XenonRecomp/recompiler.h   |  2 ++
+ 2 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 17fb5d7..b6dcc23 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -289,7 +289,9 @@ void Recompiler::Analyse()
+     {
+         const bool inCode = std::any_of(image.sections.begin(), image.sections.end(), [&](const Section& s)
+             { return (s.flags & SectionFlags_Code) && table.table >= s.base && table.table + table.tableSize <= s.base + s.size; });
+-        if (table.tableSize != 0 && inCode)
++        if (table.tableSize != 0 && inCode && (table.table & 3))
++            Fatal(fmt::format("switch table {:X} of the bctr at {:X} is in code but not word-aligned", table.table, bctr));
++        else if (table.tableSize != 0 && inCode)
+             dataRanges.emplace(table.table, (table.tableSize + 3) & ~3u);
+     }
+ 
+@@ -759,6 +761,9 @@ bool Recompiler::Recompile(
+             {
+                 if (!PPC_BL(insn.instruction))
+                     Fatal(fmt::format("branch (not a call) to setjmp at {:X}: setjmp must return into a caller", base));
++                // One snapshot per function: a second setjmp would overwrite the first's.
++                if (++setJmpCalls > 1)
++                    Fatal(fmt::format("second setjmp call in function {:X} at {:X}", fn.base, base));
+                 println("\t{} = ctx;", env());
+                 println("\t{}.s64 = setjmp(PpcJumpBuffer({}.u32));", temp(), r(3));
+                 println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
+@@ -3194,6 +3199,7 @@ bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+     println("PPC_FUNC_IMPL(__imp__{}) {{", name);
+     println("\tPPC_FUNC_PROLOGUE();");
+ 
++    setJmpCalls = 0;
+     auto switchTable = config.switchTables.end();
+     bool allRecompiled = true;
+     CSRState csrState = CSRState::Unknown;
+@@ -3223,6 +3229,8 @@ bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+             switchTable = config.switchTables.find(base);
+ 
+         // Data inside the function (a switch table): not instructions.
++        if (const auto range = dataRanges.find(uint32_t(base)); range != dataRanges.end() && base + range->second > end)
++            Fatal(fmt::format("data at {:X} runs past the end of function {:X}", base, fn.base));
+         if (const auto range = dataRanges.find(uint32_t(base)); range != dataRanges.end() && base + range->second <= end)
+         {
+             println("\t// data: {} bytes", range->second);
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index e5e088e..d489630 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -44,6 +44,8 @@ struct Recompiler
+     // Secondary entry points: direct branch targets inside another function, by entry address,
+     // with the base of the function that contains them.
+     std::map<uint32_t, uint32_t> secondaryEntries;
++    // setjmp calls in the function being emitted (its context snapshot is one local).
++    uint32_t setJmpCalls = 0;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+-- 
+2.54.0 (Apple Git-157)
+

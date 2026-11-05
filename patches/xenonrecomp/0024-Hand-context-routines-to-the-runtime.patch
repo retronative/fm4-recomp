@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:01:33 +0700
+Subject: [PATCH] Hand context routines to the runtime
+
+Forza Motorsport 4's context routines (setjmp, longjmp, the fiber switch and a context
+restore) save or restore registers and the stack pointer, which translated code cannot do. A
+new config key, runtime_routines, names routines whose body becomes a call to PpcRuntime_<name>,
+declared and left to the runtime (followed by a trap when it does not return); nothing is
+analysed into them and a secondary entry into one is fatal. setjmp and longjmp run on the host
+at their calls as before, but with the host jump buffer the runtime keeps for the guest buffer
+(PpcJumpBuffer) instead of writing a host jmp_buf into guest memory; a branch to setjmp that
+is not a call is fatal. The setjmp body traps (it is reached only through calls); the longjmp
+body runs longjmp (it is also reached through pointers).
+---
+ XenonRecomp/recompiler.cpp        | 71 ++++++++++++++++++++++++++++++-
+ XenonRecomp/recompiler_config.cpp | 12 ++++++
+ XenonRecomp/recompiler_config.h   | 11 +++++
+ XenonUtils/ppc_context.h          |  4 ++
+ 4 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 9914777..ad237a4 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -221,6 +221,21 @@ void Recompiler::Analyse()
+     for (const auto& fn : functions)
+         functionSources.emplace(fn.base, "helper");
+ 
++    // Runtime-handled routines are functions before the scans, so that nothing analyses into them.
++    for (const auto& [address, routine] : config.runtimeRoutines)
++    {
++        const auto section = std::find_if(image.sections.begin(), image.sections.end(),
++            [&](const Section& s) { return address >= s.base && address < s.base + s.size && (s.flags & SectionFlags_Code); });
++        if (section == image.sections.end())
++        {
++            Fatal(fmt::format("runtime routine {} at {:X} is not in code", routine.name, address));
++            continue;
++        }
++        auto& fn = functions.emplace_back(Function::Analyze(image.Find(address), section->base + section->size - address, address));
++        functionSources.emplace(fn.base, "runtime");
++        image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++    }
++
+     for (auto& [address, size] : config.functions)
+     {
+         functions.emplace_back(address, size);
+@@ -641,14 +656,19 @@ bool Recompiler::Recompile(
+ 
+     auto printFunctionCall = [&](uint32_t address)
+         {
++            // setjmp and longjmp run on the host: setjmp inline at the call, so that it can return
++            // twice into this function, with the host jump buffer the runtime keeps for the guest
++            // buffer's address (PpcJumpBuffer); guest memory is not written.
+             if (address == config.longJmpAddress)
+             {
+-                println("\tlongjmp(*reinterpret_cast<jmp_buf*>(base + {}.u32), {}.s32);", r(3), r(4));
++                println("\tlongjmp(PpcJumpBuffer({}.u32), {}.s32);", r(3), r(4));
+             }
+             else if (address == config.setJmpAddress)
+             {
++                if (!PPC_BL(insn.instruction))
++                    Fatal(fmt::format("branch (not a call) to setjmp at {:X}: setjmp must return into a caller", base));
+                 println("\t{} = ctx;", env());
+-                println("\t{}.s64 = setjmp(*reinterpret_cast<jmp_buf*>(base + {}.u32));", temp(), r(3));
++                println("\t{}.s64 = setjmp(PpcJumpBuffer({}.u32));", temp(), r(3));
+                 println("\tif ({}.s64 != 0) ctx = {};", temp(), env());
+                 println("\t{} = {};", r(3), temp());
+             }
+@@ -3022,6 +3042,53 @@ bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+         name = fmt::format("sub_{}", fn.base);
+     }
+ 
++    const auto runtime = config.runtimeRoutines.find(fn.base);
++    const bool isSetJmp = config.setJmpAddress != 0 && fn.base == config.setJmpAddress;
++    const bool isLongJmp = config.longJmpAddress != 0 && fn.base == config.longJmpAddress;
++    if (runtime != config.runtimeRoutines.end() || isSetJmp || isLongJmp)
++    {
++        // Context routines are not translated: their effect on the stack and registers is the
++        // runtime's (or the host's setjmp/longjmp, at the calls).
++        if (entry != 0)
++        {
++            Fatal(fmt::format("secondary entry {:X} enters runtime-handled routine {:X}", entry, fn.base));
++            return false;
++        }
++        if (runtime != config.runtimeRoutines.end())
++            println("PPC_EXTERN_FUNC(PpcRuntime_{});\n", runtime->second.name);
++#ifdef XENON_RECOMP_USE_ALIAS
++        println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
++#endif
++        println("PPC_FUNC_IMPL(__imp__{}) {{", name);
++        println("\tPPC_FUNC_PROLOGUE();");
++        if (runtime != config.runtimeRoutines.end())
++        {
++            println("\tPpcRuntime_{}(ctx, base);", runtime->second.name);
++            if (runtime->second.noReturn)
++                println("\t__builtin_trap();");
++            fmt::println("NOTE: function {:X} is handled by the runtime (PpcRuntime_{})", fn.base, runtime->second.name);
++        }
++        else if (isLongJmp)
++        {
++            // Reached through a pointer (calls are handled where they are made).
++            println("\tlongjmp(PpcJumpBuffer(ctx.r3.u32), ctx.r4.s32);");
++            fmt::println("NOTE: function {:X} is longjmp, run on the host", fn.base);
++        }
++        else
++        {
++            // Every call to setjmp is handled where it is made; this body is not reachable.
++            println("\t__builtin_trap();");
++            fmt::println("NOTE: function {:X} is setjmp, handled at its calls", fn.base);
++        }
++        println("}}\n");
++#ifndef XENON_RECOMP_USE_ALIAS
++        println("PPC_WEAK_FUNC({}) {{", name);
++        println("\t__imp__{}(ctx, base);", name);
++        println("}}\n");
++#endif
++        return true;
++    }
++
+ #ifdef XENON_RECOMP_USE_ALIAS
+     println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
+ #endif
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..d11a481 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -38,6 +38,18 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+         longJmpAddress = main["longjmp_address"].value_or(0u);
+         setJmpAddress = main["setjmp_address"].value_or(0u);
+ 
++        if (auto routines = main["runtime_routines"].as_array())
++        {
++            for (auto& entry : *routines)
++            {
++                auto& table = *entry.as_table();
++                RecompilerRuntimeRoutine routine;
++                routine.name = *table["name"].value<std::string>();
++                routine.noReturn = table["noreturn"].value_or(false);
++                runtimeRoutines.emplace(*table["address"].value<uint32_t>(), std::move(routine));
++            }
++        }
++
+         if (restGpr14Address == 0) fmt::println("ERROR: __restgprlr_14 address is unspecified");
+         if (saveGpr14Address == 0) fmt::println("ERROR: __savegprlr_14 address is unspecified");
+         if (restFpr14Address == 0) fmt::println("ERROR: __restfpr_14 address is unspecified");
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..d818a1c 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <map>
++#include <string>
+ 
+ struct RecompilerSwitchTable
+ {
+@@ -22,6 +24,14 @@ struct RecompilerMidAsmHook
+     bool afterInstruction = false;
+ };
+ 
++// A routine the runtime implements instead of its translation (context switching and restore):
++// its body calls PpcRuntime_<name>, which the runtime defines.
++struct RecompilerRuntimeRoutine
++{
++    std::string name;
++    bool noReturn = false;
++};
++
+ struct RecompilerConfig
+ {
+     std::string directoryPath;
+@@ -49,6 +59,7 @@ struct RecompilerConfig
+     uint32_t saveVmx64Address = 0;
+     uint32_t longJmpAddress = 0;
+     uint32_t setJmpAddress = 0;
++    std::map<uint32_t, RecompilerRuntimeRoutine> runtimeRoutines;
+     std::unordered_map<uint32_t, uint32_t> functions;
+     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 2dfbc08..f2a3ebc 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -688,6 +688,10 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+ // defined by the runtime: a build without it fails to link instead of running on a host counter.
+ uint64_t PpcQueryTimebase();
+ 
++// setjmp/longjmp run on the host. The host jump buffer for a guest jmp_buf address is the
++// runtime's: it is declared here and defined by the runtime, and guest memory is not written.
++jmp_buf& PpcJumpBuffer(uint32_t guestAddress);
++
+ // IEEE 754 binary16 to binary32 bits: exact for every finite half (subnormals are normalized);
+ // exponent 31 gives infinity or a NaN with the payload kept.
+ inline uint32_t ppc_half_to_float_bits(uint16_t half)
+-- 
+2.54.0 (Apple Git-157)
+

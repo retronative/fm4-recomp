@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 22:11:49 +0700
+Subject: [PATCH] Treat switch address tables as data, not pointer-reached
+ entries
+
+---
+ XenonRecomp/recompiler.cpp | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index b6dcc23..a91b99c 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -597,13 +597,17 @@ void Recompiler::FindSecondaryEntries()
+     }
+     // An entry starts after an unconditional terminator or padding (thunks, merged pieces); an
+     // address taken in the middle of straight-line code (e.g. exception-handling state tables)
+-    // is not one, and neither is a switch case, which its switch reaches.
+-    std::set<uint32_t> switchCases;
++    // is not one, and neither is a switch case, which its switch reaches, nor a switch's address
++    // table (its dispatch loads the table address; an unproven table has no data range).
++    std::set<uint32_t> switchTargets;
+     for (const auto& [bctr, table] : config.switchTables)
+-        switchCases.insert(table.labels.begin(), table.labels.end());
++    {
++        switchTargets.insert(table.labels.begin(), table.labels.end());
++        switchTargets.insert(table.table);
++    }
+     for (uint32_t address : addressTaken)
+     {
+-        if (dataRanges.count(address) || image.symbols.find(address) != image.symbols.end() || switchCases.count(address))
++        if (dataRanges.count(address) || image.symbols.find(address) != image.symbols.end() || switchTargets.count(address))
+             continue;
+         const uint32_t previous = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(address - 4)));
+         if (previous != 0 && !IsUnconditionalTerminator(previous))
+-- 
+2.54.0 (Apple Git-157)
+

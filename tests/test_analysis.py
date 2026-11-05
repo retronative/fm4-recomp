@@ -61,12 +61,15 @@ class Result:
         return text
 
 
-def recompile(case, sections, entry, extra_config="", export_table_address=0):
+def recompile(case, sections, entry, extra_config="", export_table_address=0, files=None, image_size=0x4000):
     d = os.path.join(WORK, case)
     shutil.rmtree(d, ignore_errors=True)
     os.makedirs(os.path.join(d, "ppc"))
     with open(os.path.join(d, "case.xex"), "wb") as f:
-        f.write(X.build(sections, entry, export_table_address=export_table_address))
+        f.write(X.build(sections, entry, image_size=image_size, export_table_address=export_table_address))
+    for name, text in (files or {}).items():
+        with open(os.path.join(d, name), "w") as f:
+            f.write(text)
     with open(os.path.join(d, "case.toml"), "w") as f:
         f.write('[main]\nfile_path = "case.xex"\nout_directory_path = "ppc"\n' + extra_config)
     p = subprocess.run([RECOMP, os.path.join(d, "case.toml"), CONTEXT_H], cwd=d, capture_output=True,
@@ -241,6 +244,28 @@ class Analysis(unittest.TestCase):
         self.assertNotEqual(r.code, 0)
         self.assertIn("function 82001000 falls through past its end at 82001008", r.fatal)
 
+    def build_unit(self, name, libs):
+        out = os.path.join(WORK, name)
+        os.makedirs(out, exist_ok=True)
+        exe = os.path.join(out, name)
+        b = os.path.join(XR, "build")
+        cmd = ["/opt/homebrew/opt/llvm/bin/clang++", "-std=c++20", "-O1", "-g", "-include", "cstdlib",
+               "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+               "-I" + os.path.join(XR, "XenonAnalyse"), "-I" + os.path.join(XR, "XenonUtils"),
+               "-I" + os.path.join(XR, "thirdparty"), "-I" + os.path.join(XR, "thirdparty", "disasm"),
+               "-I" + os.path.join(XR, "thirdparty", "fmt", "include"),
+               os.path.join(HERE, "analysis", name + ".cpp")] + [os.path.join(b, l) for l in libs] + ["-o", exe]
+        c = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        self.assertEqual(c.returncode, 0, c.stderr[-3000:])
+        p = subprocess.run([exe], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, (p.stdout + p.stderr)[-3000:])
+
+    def test_image_find_bounds(self):
+        """Patch 0023a: Image::Find is null outside every section (tests/analysis/image_find_test.cpp
+        under AddressSanitizer)."""
+        self.build_unit("image_find_test", [os.path.join("XenonUtils", "libXenonUtils.a"),
+                                            os.path.join("thirdparty", "fmt", "libfmt.a")])
+
     def test_analyze_stops_at_size_limit(self):
         """Patch 0020: Function::Analyze reads no word past the size it is given
         (tests/analysis/function_analyze_test.cpp under AddressSanitizer)."""
@@ -332,6 +357,232 @@ class Analysis(unittest.TestCase):
                       [(".text", 0x1000, text, X.CODE), (".pdata", P, X.pdata(), X.DATA)], A,
                       export_table_address=TBL)
         self.assertIn(E, r.functions, r.log[-1500:])
+
+    def test_exception_handler_must_be_function(self):
+        """Patch 0023: a handler word that points into code but not at a function is fatal.
+        H @T: li r3,9; blr (pdata); metadata @T+8: H+4 (inside H), 0x12345678;
+        E @T+0x10: li r3,1; blr (pdata, ExceptionFlag)."""
+        H, E = T, T + 0x10
+        text = X.words(X.li(3, 9), X.BLR, H + 4, 0x12345678, X.li(3, 1), X.BLR)
+        r = recompile("exception_handler_must_be_function",
+                      [(".text", 0x1000, text, X.CODE), (".pdata", P, X.pdata((H, 2), (E, 2, 0, 1)), X.DATA)], H)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("exception handler 82001004 before function 82001010 is not a function", r.fatal)
+
+    def test_exception_handler_word_outside_image(self):
+        """Patch 0023: a flagged function at the start of .text has no handler word in any section
+        (T-8 is header space): fatal, not a null dereference. E @T: li r3,1; blr (pdata, flag)."""
+        E = T
+        r = recompile("exception_handler_word_outside_image",
+                      [(".text", 0x1000, X.words(X.li(3, 1), X.BLR), X.CODE), (".pdata", P, X.pdata((E, 2, 0, 1)), X.DATA)], E)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("no exception handler word before function 82001000", r.fatal)
+
+    def entry_with_option(self, name, option):
+        """C @T: bl O+4; blr (pdata); O @T+8: li r3,1; li r3,2; blr (pdata): O+4 is a secondary
+        entry. With a *_as_local option set it must be fatal (patch 0023)."""
+        C, O = T, T + 8
+        text = X.words(X.bl(C, O + 4), X.BLR, X.li(3, 1), X.li(3, 2), X.BLR)
+        return recompile(name, [(".text", 0x1000, text, X.CODE), (".pdata", P, X.pdata((C, 2), (O, 3)), X.DATA)], C,
+                         "%s = true\n" % option)
+
+    def test_secondary_entry_rejects_ctr_as_local(self):
+        r = self.entry_with_option("secondary_entry_rejects_ctr_as_local", "ctr_as_local")
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("secondary entries need registers in the context, but a *_as_local option is set", r.fatal)
+
+    def test_secondary_entry_rejects_non_volatile_as_local(self):
+        r = self.entry_with_option("secondary_entry_rejects_non_volatile_as_local", "non_volatile_as_local")
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("secondary entries need registers in the context, but a *_as_local option is set", r.fatal)
+
+    def runtime_case(self, name, text, pdata, config):
+        return recompile(name, [(".text", 0x1000, text, X.CODE), (".pdata", P, X.pdata(*pdata), X.DATA)], T, config)
+
+    def test_runtime_routine_body(self):
+        """Patch 0024: a runtime routine's body is a call to PpcRuntime_<name>, followed by a stop
+        when it does not return. C @T: bl R; blr (pdata); R @T+8: li r3,7; blr (routine)."""
+        C, R = T, T + 8
+        r = self.runtime_case("runtime_routine_body", X.words(X.bl(C, R), X.BLR, X.li(3, 7), X.BLR), [(C, 2)],
+                              'runtime_routines = [ { address = 0x%X, name = "restore_context", noreturn = true } ]\n' % R)
+        body = self.function_body(r, R)
+        self.assertIn("PpcRuntime_restore_context(ctx, base);", body)
+        self.assertIn("__builtin_trap();", body)
+        self.assertNotIn("ctx.r3.s64 = 7;", body)  # the guest body is not translated
+
+    def test_runtime_routine_entry_is_fatal(self):
+        """Patch 0024: entering a runtime routine in its middle is fatal. C @T: bl R; blr (pdata);
+        R @T+8: li r3,7; blr (routine); D @T+0x10: b R+4 (pdata)."""
+        C, R, D = T, T + 8, T + 0x10
+        r = self.runtime_case("runtime_routine_entry_is_fatal",
+                              X.words(X.bl(C, R), X.BLR, X.li(3, 7), X.BLR, X.b(D, R + 4)), [(C, 2), (D, 1)],
+                              'runtime_routines = [ { address = 0x%X, name = "switch_fiber" } ]\n' % R)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("secondary entry 8200100C enters runtime-handled routine 82001008", r.fatal)
+
+    def test_setjmp_call(self):
+        """Patch 0024: a call to setjmp snapshots ctx, calls host setjmp on the guest buffer in r3
+        (PpcJumpBuffer), and restores ctx only on the second (non-zero) return.
+        C @T: bl S; blr (pdata); S @T+8: li r3,0; blr (setjmp)."""
+        C, S = T, T + 8
+        r = self.runtime_case("setjmp_call", X.words(X.bl(C, S), X.BLR, X.li(3, 0), X.BLR), [(C, 2)],
+                              "setjmp_address = 0x%X\n" % S)
+        body = self.function_body(r, C)
+        self.assertRegex(body, r"\t(\w+) = ctx;\n\t(\w+)\.s64 = setjmp\(PpcJumpBuffer\(ctx\.r3\.u32\)\);\n\tif \(\2\.s64 != 0\) ctx = \1;")
+
+    def test_branch_to_setjmp_is_fatal(self):
+        """Patch 0024: setjmp must return into a caller, so a branch (not a call) to it is fatal.
+        C @T: b S (pdata, 1); S @T+4: li r3,0; blr (setjmp)."""
+        C, S = T, T + 4
+        r = self.runtime_case("branch_to_setjmp_is_fatal", X.words(X.b(C, S), X.li(3, 0), X.BLR), [(C, 1)],
+                              "setjmp_address = 0x%X\n" % S)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("branch (not a call) to setjmp at 82001000: setjmp must return into a caller", r.fatal)
+
+    def test_longjmp_call(self):
+        """Patch 0024: a call to longjmp is host longjmp on the guest buffer in r3 with the value in r4.
+        C @T: bl L; blr (pdata); L @T+8: li r3,0; blr (longjmp)."""
+        C, L = T, T + 8
+        r = self.runtime_case("longjmp_call", X.words(X.bl(C, L), X.BLR, X.li(3, 0), X.BLR), [(C, 2)],
+                              "longjmp_address = 0x%X\n" % L)
+        self.assertIn("longjmp(PpcJumpBuffer(ctx.r3.u32), ctx.r4.s32);", self.function_body(r, C))
+
+    def switch_case(self, name, labels, extra_words=(), pdata_extra=(), table=None, table_size=8, rdata=None):
+        """F @T (pdata, 8 words): mtctr r4; bctr; table (T+0x10, T+0x18); case 0 @T+0x10: li r3,1;
+        blr; case 1 @T+0x18: li r3,2; blr; then extra words. Switch at the bctr (T+4) on r3."""
+        F = T
+        text = X.words(X.MTCTR_R4, X.BCTR, T + 0x10, T + 0x18, X.li(3, 1), X.BLR, X.li(3, 2), X.BLR, *extra_words)
+        table = "[[switch]]\nbase = 0x%X\nr = 3\nlabels = [ %s ]\ntable = 0x%X\ntable_size = %d\n" % (
+            T + 4, ", ".join("0x%X" % l for l in labels), T + 8 if table is None else table, table_size)
+        sections = [(".text", 0x1000, text, X.CODE), (".pdata", P, X.pdata((F, 8), *pdata_extra), X.DATA)]
+        if rdata is not None:
+            sections.append((".rdata", 0x3000, rdata, X.DATA))
+        return recompile(name, sections, F,
+                         'switch_table_file_path = "switch.toml"\n', files={"switch.toml": table})
+
+    def test_switch_proven(self):
+        """Patch 0025: a proven switch dispatches on the index register's low word, jumps to each
+        case, traps on any other index, and its inline table is data, not instructions."""
+        r = self.switch_case("switch_proven", [T + 0x10, T + 0x18])
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        body = self.function_body(r, T)
+        self.assertIn("switch (ctx.r3.u32) {", body)
+        self.assertIn("\tcase 0:\n\t\tgoto loc_82001010;\n\tcase 1:\n\t\tgoto loc_82001018;\n\tdefault:\n\t\t__builtin_trap();", body)
+        self.assertIn("// data: 8 bytes", body)
+
+    def test_switch_without_bound_is_fatal(self):
+        """Patch 0025: a switch entry with no labels (no proven bound) is fatal."""
+        r = self.switch_case("switch_without_bound_is_fatal", [])
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("switch table at 82001004 has no proven bound", r.fatal)
+
+    def test_switch_case_in_another_function_is_entry(self):
+        """Patch 0025: a case label inside another function becomes a secondary entry of it, and
+        the switch tail-calls it. G @T+0x20 (pdata, 2): li r3,3; blr; case 1 = G+4 (G's blr)."""
+        G = T + 0x20
+        r = self.switch_case("switch_case_in_another_function_is_entry", [T + 0x10, G + 4],
+                             extra_words=(X.li(3, 3), X.BLR), pdata_extra=((G, 2),))
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertIn(G + 4, r.functions)
+        self.assertIn("sub_82001024(ctx, base);", self.function_body(r, T))
+
+    T8 = 0x82008000  # .text at RVA 0x8000: addresses whose low half is >= 0x8000
+
+    def pointer_case(self, name, load_address, rdata=None):
+        """C @T8 (pdata, 7): lis r4,0x8201; li r5,0; li r6,0; li r7,0; addi r4,r4,-0x7FDC (= H when
+        load_address, else li r4,0); bl X; blr. X @T8+0x1C: li r3,1; b H+4 (bl target).
+        H @T8+0x24: li r3,5; blr. X branches into H's piece, so 0022 merges H away; H follows X's
+        unconditional b, so a pointer to H makes it an entry again (patch 0026)."""
+        C, Xf, H = self.T8, self.T8 + 0x1C, self.T8 + 0x24
+        load = (X.lis(4, 0x8201), X.li(5, 0), X.li(6, 0), X.li(7, 0), X.addi(4, 4, H - 0x82010000)) if load_address \
+            else (X.li(4, 0), X.li(5, 0), X.li(6, 0), X.li(7, 0), X.li(4, 0))
+        text = X.words(*load, X.bl(C + 0x14, Xf), X.BLR, X.li(3, 1), X.b(Xf + 4, H + 4), X.li(3, 5), X.BLR)
+        sections = [(".text", 0x8000, text, X.CODE), (".pdata", P, X.pdata((C, 7)), X.DATA)]
+        if rdata is not None:
+            sections.append((".rdata", 0x9000, rdata, X.DATA))
+        return recompile(name, sections, C, image_size=0x10000), H
+
+    def test_pointer_reached_piece_is_entry(self):
+        """Patch 0026: lis/addi (3 instructions apart, low half >= 0x8000) reaching a merged piece's
+        start after an unconditional terminator make it an entry."""
+        r, H = self.pointer_case("pointer_reached_piece_is_entry", True)
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertEqual(r.listed.get(H), (0, "secondary@8200801C"))  # merged into X, back as X's entry
+        self.assertIn(H, r.functions)
+
+    def test_data_pointer_reached_piece_is_entry(self):
+        """Patch 0026: a code address stored in a data section (a vtable slot) makes an entry."""
+        r, H = self.pointer_case("data_pointer_reached_piece_is_entry", False, rdata=X.words(self.T8 + 0x24))
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertEqual(r.listed.get(H), (0, "secondary@8200801C"))
+        self.assertIn(H, r.functions)
+
+    def test_unreached_merged_piece_is_not_entry(self):
+        """Control: without any pointer the merged piece is not an entry."""
+        r, H = self.pointer_case("unreached_merged_piece_is_not_entry", False)
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertNotIn(H, r.functions)
+        self.assertNotIn(H, r.listed)
+
+    def test_fatal_reported_once_for_reemitted_body(self):
+        """Patch 0026: a FATAL inside a body that a secondary entry re-emits is reported once.
+        O @T (pdata, 2): frsqrte f1,f2; blr; C @T+8 (pdata, 2): bl O+4; blr (O+4 is an entry)."""
+        O, C = T, T + 8
+        r = recompile("fatal_reported_once_for_reemitted_body",
+                      [(".text", 0x1000, X.words(X.frsqrte(1, 2), X.BLR, X.bl(C, O + 4), X.BLR), X.CODE),
+                       (".pdata", P, X.pdata((O, 2), (C, 2)), X.DATA)], O)
+        self.assertNotEqual(r.code, 0)
+        self.assertEqual(r.fatal, ["unrecognized instruction at 0x82001000: frsqrte"])
+
+    def test_switch_table_unaligned_is_fatal(self):
+        """Patch 0027: an in-code switch table that is not word-aligned is fatal."""
+        r = self.switch_case("switch_table_unaligned_is_fatal", [T + 0x10, T + 0x18], table=T + 0xA)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("switch table 8200100A of the bctr at 82001004 is in code but not word-aligned", r.fatal)
+
+    def test_switch_table_overrun_is_fatal(self):
+        """Patch 0027: a data range running past its function's end is fatal: the table at T+0x1C
+        (8 bytes) ends 4 bytes past the 0x20-byte function; two nops after it keep the table inside
+        .text (a table not wholly in code is no data range)."""
+        r = self.switch_case("switch_table_overrun_is_fatal", [T + 0x10, T + 0x18], table=T + 0x1C,
+                             extra_words=(X.NOP, X.NOP))
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("data at 8200101C runs past the end of function 82001000", r.fatal)
+
+    def test_second_setjmp_call_is_fatal(self):
+        """Patch 0027: one setjmp snapshot per function: a second call in it is fatal.
+        C @T: bl S; bl S; blr (pdata, 3); S @T+0xC: li r3,0; blr (setjmp)."""
+        C, S = T, T + 0xC
+        r = self.runtime_case("second_setjmp_call_is_fatal", X.words(X.bl(C, S), X.bl(C + 4, S), X.BLR, X.li(3, 0), X.BLR),
+                              [(C, 3)], "setjmp_address = 0x%X\n" % S)
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("second setjmp call in function 82001000 at 82001004", r.fatal)
+
+    def test_setjmp_once_in_each_of_two_functions(self):
+        """Patch 0027: the per-function count restarts in each function.
+        C1 @T: bl S; blr (pdata); C2 @T+8: bl S; blr (pdata); S @T+0x10: li r3,0; blr (setjmp)."""
+        C1, C2, S = T, T + 8, T + 0x10
+        r = self.runtime_case("setjmp_once_in_each_of_two_functions",
+                              X.words(X.bl(C1, S), X.BLR, X.bl(C2, S), X.BLR, X.li(3, 0), X.BLR),
+                              [(C1, 2), (C2, 2)], "setjmp_address = 0x%X\n" % S)
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertEqual(r.fatal, [])
+
+    def test_switch_table_pointer_is_not_entry(self):
+        """Patch 0028: a pointer to a switch's table (a data word holding T+8, the table right after
+        the bctr, an unconditional terminator) does not make the table an entry. table_size 0: the
+        table is no data range (the case 0028 is for: an unproven table's extent is unknown)."""
+        r = self.switch_case("switch_table_pointer_is_not_entry", [T + 0x10, T + 0x18], rdata=X.words(T + 8),
+                             table_size=0)
+        self.assertNotIn(T + 8, r.listed)
+        self.assertNotIn(T + 8, r.functions)
+
+    def test_switch_case_pointer_is_not_entry(self):
+        """Patch 0028: a pointer to a case label (T+0x18, right after case 0's blr) does not make it
+        an extra entry: its switch reaches it."""
+        r = self.switch_case("switch_case_pointer_is_not_entry", [T + 0x10, T + 0x18], rdata=X.words(T + 0x18))
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertNotIn(T + 0x18, r.listed)
 
 
 def main(argv):
