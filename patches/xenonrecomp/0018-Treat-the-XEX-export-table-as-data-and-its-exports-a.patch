@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:17:17 +0700
+Subject: [PATCH] Treat the XEX export table as data and its exports as entries
+
+The XEX security header points to the image's export table, which Forza Motorsport 4 places at
+the end of .text. The sweep analysed its 56 bytes as code: seven words failed to decode and two
+were functions falling through into it. The loader now records the table's address; the
+analysis checks its layout (as Xenia's xex2_export_table: magic, image base, a bounded count)
+and treats it as data, and adds each export that is not yet a function as an entry. Another
+layout, or an export inside a function, is fatal.
+---
+ XenonRecomp/recompiler.cpp | 60 ++++++++++++++++++++++++++++++++++----
+ XenonRecomp/recompiler.h   |  5 ++--
+ XenonUtils/image.h         |  1 +
+ XenonUtils/xex.cpp         |  1 +
+ 4 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index a4d30e3..03b85ee 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -247,7 +247,7 @@ void Recompiler::Analyse()
+                 [&](const Section& s) { return handler >= s.base && handler < s.base + s.size; });
+             if (section == image.sections.end() || !(section->flags & SectionFlags_Code))
+                 Fatal(fmt::format("exception handler {:X} before function {:X} is not in code", handler, fn.BeginAddress));
+-            exceptionMetadata.insert(fn.BeginAddress - 8);
++            dataRanges.emplace(fn.BeginAddress - 8, 8);
+         }
+ 
+         if (image.symbols.find(fn.BeginAddress) == image.symbols.end())
+@@ -261,6 +261,54 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    // The XEX export table (security header) is data inside a code section. Layout, as Xenia's
++    // xex2_export_table: 0x48000000, 0x00485645 ("HVE"), 0x48000000, two module-number words,
++    // three version words, the image base >> 16, the export count, the ordinal base, then one
++    // offset per export, relative to the image base. Any other layout is fatal. Each export is a
++    // function entry.
++    if (image.export_table != 0)
++    {
++        const auto section = std::find_if(image.sections.begin(), image.sections.end(),
++            [&](const Section& s) { return image.export_table >= s.base && image.export_table < s.base + s.size; });
++        const auto* table = reinterpret_cast<const uint32_t*>(image.Find(image.export_table));
++        const size_t sectionEnd = section != image.sections.end() ? section->base + section->size : 0;
++        uint32_t count = 0;
++        bool valid = section != image.sections.end() && (section->flags & SectionFlags_Code) && image.export_table + 44 <= sectionEnd &&
++            ByteSwap(table[0]) == 0x48000000 && ByteSwap(table[1]) == 0x00485645 && ByteSwap(table[2]) == 0x48000000 &&
++            (size_t(ByteSwap(table[8])) << 16) == image.base;
++        if (valid)
++        {
++            count = ByteSwap(table[9]);
++            valid = count <= 0x10000 && image.export_table + 44 + 4 * size_t(count) <= sectionEnd;
++        }
++        if (!valid)
++        {
++            Fatal(fmt::format("export table at {:X} has an unsupported layout", image.export_table));
++        }
++        else
++        {
++            dataRanges.emplace(image.export_table, 44 + 4 * count);
++            for (uint32_t i = 0; i < count; i++)
++            {
++                const uint32_t address = uint32_t(image.base + ByteSwap(table[11 + i]));
++                if (image.symbols.find(address) != image.symbols.end())
++                    continue;
++                const auto owner = std::find_if(functions.begin(), functions.end(),
++                    [&](const Function& fn) { return address > fn.base && address < fn.base + fn.size; });
++                const auto code = std::find_if(image.sections.begin(), image.sections.end(),
++                    [&](const Section& s) { return address >= s.base && address < s.base + s.size && (s.flags & SectionFlags_Code); });
++                if (owner != functions.end() || code == image.sections.end())
++                {
++                    Fatal(fmt::format("export {:X} is not a function entry", address));
++                    continue;
++                }
++                auto& fn = functions.emplace_back(Function::Analyze(image.Find(address), code->base + code->size - address, address));
++                functionSources.emplace(fn.base, "export");
++                image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
++            }
++        }
++    }
++
+     for (const auto& section : image.sections)
+     {
+         if (!(section.flags & SectionFlags_Code))
+@@ -273,9 +321,9 @@ void Recompiler::Analyse()
+ 
+         while (data < dataEnd)
+         {
+-            if (exceptionMetadata.count(uint32_t(base + (data - section.data))))
++            if (auto range = dataRanges.find(uint32_t(base + (data - section.data))); range != dataRanges.end())
+             {
+-                data += 8;
++                data += range->second;
+                 continue;
+             }
+             uint32_t insn = ByteSwap(*(uint32_t*)data);
+@@ -298,10 +346,10 @@ void Recompiler::Analyse()
+ 
+         while (data < dataEnd)
+         {
+-            if (exceptionMetadata.count(uint32_t(base)))
++            if (auto range = dataRanges.find(uint32_t(base)); range != dataRanges.end())
+             {
+-                base += 8;
+-                data += 8;
++                base += range->second;
++                data += range->second;
+                 continue;
+             }
+             auto invalidInstr = config.invalidInstructions.find(ByteSwap(*(uint32_t*)data));
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 51ac18a..7096cec 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <map>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <string_view>
+@@ -36,8 +37,8 @@ struct Recompiler
+     std::vector<Function> functions;
+     // How each function was found (helper, config, pdata, bl_target, sweep), for ppc_functions.txt.
+     std::unordered_map<uint32_t, std::string_view> functionSources;
+-    // First words of the exception-handler metadata (handler, data) before .pdata functions.
+-    std::unordered_set<uint32_t> exceptionMetadata;
++    // Data inside code sections (start, size): exception-handler metadata and the export table.
++    std::map<uint32_t, uint32_t> dataRanges;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+diff --git a/XenonUtils/image.h b/XenonUtils/image.h
+index be61119..3ba3e5f 100644
+--- a/XenonUtils/image.h
++++ b/XenonUtils/image.h
+@@ -12,6 +12,7 @@ struct Image
+     uint32_t size{};
+ 
+     size_t entry_point{};
++    uint32_t export_table{}; // XEX security header: address of the image's export table, or 0
+     std::set<Section, SectionComparer> sections{};
+     SymbolTable symbols{};
+ 
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index 48aa7e2..36df8c0 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -279,6 +279,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+         return {};
+     image.data = std::move(result);
+     image.size = security->imageSize;
++    image.export_table = security->exportTable;
+ 
+     // Map image
+     const auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(image.data.get());
+-- 
+2.54.0 (Apple Git-157)
+

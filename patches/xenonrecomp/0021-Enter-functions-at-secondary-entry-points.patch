@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:29:29 +0700
+Subject: [PATCH 21/21] Enter functions at secondary entry points
+
+A direct branch or call to an address inside another function has no translation target, and a
+call target inside a function was analysed again as an overlapping function. Forza Motorsport 4
+has 85 such targets: tails shared between functions and code without .pdata that the sweep
+splits. Each is now a secondary entry, sub_<address>, emitted as the containing function's
+body entered with a goto after the declarations, with a NOTE line. Calls into known functions
+no longer create functions; functions found by analysis end at the next function, and the sweep
+never runs over it. A branch to a zero word of a code section outside any function is an
+illegal instruction and traps. In test mode, functions are declared before use and secondary
+entries are emitted.
+---
+ XenonRecomp/recompiler.cpp      | 104 ++++++++++++++++++++++++++++++--
+ XenonRecomp/recompiler.h        |   8 ++-
+ XenonRecomp/test_recompiler.cpp |  10 +++
+ 3 files changed, 117 insertions(+), 5 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index c0e1419..764ff6f 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -309,6 +309,13 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    // Functions known before the scans (helpers, config, .pdata, exports), sorted, as (start, end):
++    // a call into one of them enters its body and is a secondary entry, not a new function.
++    std::vector<std::pair<size_t, size_t>> known;
++    for (const auto& fn : functions)
++        known.emplace_back(fn.base, fn.base + fn.size);
++    std::sort(known.begin(), known.end());
++
+     for (const auto& section : image.sections)
+     {
+         if (!(section.flags & SectionFlags_Code))
+@@ -331,7 +338,9 @@ void Recompiler::Analyse()
+             {
+                 size_t address = base + (data - section.data) + PPC_BI(insn);
+ 
+-                if (address >= section.base && address < section.base + section.size && image.symbols.find(address) == image.symbols.end())
++                const auto after = std::upper_bound(known.begin(), known.end(), std::pair<size_t, size_t>(address, SIZE_MAX));
++                const bool inside = after != known.begin() && address > std::prev(after)->first && address < std::prev(after)->second;
++                if (address >= section.base && address < section.base + section.size && image.symbols.find(address) == image.symbols.end() && !inside)
+                 {
+                     auto data = section.data + address - section.base;
+                     auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
+@@ -370,7 +379,12 @@ void Recompiler::Analyse()
+             }
+             else
+             {
+-                auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base));
++                // Never run over the next known function: what follows is its code, not this one's.
++                auto next = image.symbols.lower_bound(base + 1);
++                while (next != image.symbols.end() && next->type != Symbol_Function)
++                    ++next;
++                const size_t limit = next != image.symbols.end() ? std::min<size_t>(dataEnd - data, next->address - base) : dataEnd - data;
++                auto& fn = functions.emplace_back(Function::Analyze(data, limit, base));
+                 functionSources.emplace(fn.base, "sweep");
+                 image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+ 
+@@ -381,6 +395,64 @@ void Recompiler::Analyse()
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++
++    // A function found by analysis (not declared by .pdata, the config or the helpers) ends where
++    // the next function starts: analysis follows branches, and a tail branch into the next
++    // function must not absorb it. Branches past the cut become tail calls or secondary entries.
++    for (size_t i = 0; i + 1 < functions.size(); i++)
++    {
++        auto& fn = functions[i];
++        const auto source = functionSources.find(fn.base);
++        const bool analysed = source != functionSources.end() &&
++            (source->second == "bl_target" || source->second == "sweep" || source->second == "export");
++        if (analysed && fn.base + fn.size > functions[i + 1].base && functions[i + 1].base > fn.base)
++            fn.size = functions[i + 1].base - fn.base;
++    }
++
++    FindSecondaryEntries();
++}
++
++void Recompiler::FindSecondaryEntries()
++{
++    // A direct branch or call to an address inside another function enters that function's body
++    // there: MSVC shares tails between functions (and calls some of them), and code without .pdata
++    // is split into several functions that branch into each other. Each such target becomes a secondary entry,
++    // emitted as the containing function's body entered at the target.
++    const auto containing = [&](uint32_t address) -> const Function*
++        {
++            auto it = std::upper_bound(functions.begin(), functions.end(), address, [](uint32_t a, const Function& f) { return a < f.base; });
++            for (int back = 0; it != functions.begin() && back < 64; back++)
++            {
++                --it;
++                if (address > it->base && address < it->base + it->size)
++                    return &*it;
++            }
++            return nullptr;
++        };
++    for (const auto& fn : functions)
++    {
++        for (uint32_t address = uint32_t(fn.base); address < fn.base + fn.size; address += 4)
++        {
++            const auto* word = reinterpret_cast<const uint32_t*>(image.Find(address));
++            const uint32_t insn = word ? ByteSwap(*word) : 0;
++            const uint32_t op = PPC_OP(insn);
++            if ((op != PPC_OP_B && op != PPC_OP_BC) || dataRanges.count(address))
++                continue;
++            const uint32_t displacement = op == PPC_OP_B ? PPC_BI(insn) : PPC_BD(insn);
++            const uint32_t target = (insn & 2) ? displacement : address + displacement;
++            if (target >= fn.base && target < fn.base + fn.size)
++                continue;
++            if (image.symbols.find(target) != image.symbols.end())
++                continue;
++            if (const auto* owner = containing(target))
++                secondaryEntries.emplace(target, uint32_t(owner->base));
++        }
++    }
++    for (const auto& [entry, owner] : secondaryEntries)
++    {
++        const auto* fn = containing(entry);
++        image.symbols.emplace(fmt::format("sub_{:X}", entry), entry, uint32_t(fn->base + fn->size - entry), Symbol_Function);
++    }
+ }
+ 
+ bool Recompiler::Recompile(
+@@ -526,6 +598,15 @@ bool Recompiler::Recompile(
+                         println("\t{}(ctx, base);", targetSymbol->name);
+                     }
+                 }
++                else if (std::any_of(image.sections.begin(), image.sections.end(), [&](const Section& s)
++                    { return (s.flags & SectionFlags_Code) && address >= s.base && address + 4 <= s.base + s.size; }) &&
++                    *reinterpret_cast<const uint32_t*>(image.Find(address)) == 0)
++                {
++                    // The target is a zero word of a code section outside any function: an
++                    // illegal instruction.
++                    println("\t__builtin_trap();");
++                    fmt::println("NOTE: branch target {:X} from {:X} is a zero word", address, base);
++                }
+                 else
+                 {
+                     Fatal(fmt::format("branch target {:X} from {:X} is not a function", address, base));
+@@ -2771,7 +2852,7 @@ bool Recompiler::Recompile(
+     return true;
+ }
+ 
+-bool Recompiler::Recompile(const Function& fn)
++bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+ {
+     auto base = fn.base;
+     auto end = base + fn.size;
+@@ -2779,6 +2860,8 @@ bool Recompiler::Recompile(const Function& fn)
+ 
+     static std::unordered_set<size_t> labels;
+     labels.clear();
++    if (entry != 0)
++        labels.emplace(entry);
+ 
+     for (size_t addr = base; addr < end; addr += 4)
+     {
+@@ -2859,7 +2942,7 @@ bool Recompiler::Recompile(const Function& fn)
+         }
+     }
+ 
+-    auto symbol = image.symbols.find(fn.base);
++    auto symbol = image.symbols.find(entry != 0 ? entry : fn.base);
+     std::string name;
+     if (symbol != image.symbols.end())
+     {
+@@ -3038,6 +3121,10 @@ bool Recompiler::Recompile(const Function& fn)
+     if (localVariables.ea)
+         println("\tuint32_t ea{{}};");
+ 
++    // A secondary entry starts at its label, after the declarations (C++ cannot jump past them).
++    if (entry != 0)
++        println("\tgoto loc_{:X};", entry);
++
+     out += tempString;
+ 
+     return allRecompiled;
+@@ -3152,6 +3239,8 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+             const auto source = functionSources.find(fn.base);
+             println("{:08X} {:X} {}", fn.base, fn.size, source != functionSources.end() ? source->second : "unknown");
+         }
++        for (const auto& [entry, owner] : secondaryEntries)
++            println("{:08X} 0 secondary@{:08X}", entry, owner);
+         SaveCurrentOutData("ppc_functions.txt");
+     }
+ 
+@@ -3169,6 +3258,13 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+         Recompile(functions[i]);
+     }
+ 
++    for (const auto& [entry, owner] : secondaryEntries)
++    {
++        const auto fn = std::find_if(functions.begin(), functions.end(), [&](const Function& f) { return f.base == owner; });
++        fmt::println("NOTE: secondary entry {:X} in function {:X}", entry, owner);
++        Recompile(*fn, entry);
++    }
++
+     SaveCurrentOutData();
+ }
+ 
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 7096cec..b025676 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -39,6 +39,9 @@ struct Recompiler
+     std::unordered_map<uint32_t, std::string_view> functionSources;
+     // Data inside code sections (start, size): exception-handler metadata and the export table.
+     std::map<uint32_t, uint32_t> dataRanges;
++    // Secondary entry points: direct branch targets inside another function, by entry address,
++    // with the base of the function that contains them.
++    std::map<uint32_t, uint32_t> secondaryEntries;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+@@ -70,7 +73,10 @@ struct Recompiler
+         RecompilerLocalVariables& localVariables,
+         CSRState& csrState);
+ 
+-    bool Recompile(const Function& fn);
++    // entry != 0: emit sub_<entry>, the body of fn entered at entry (a secondary entry point).
++    bool Recompile(const Function& fn, uint32_t entry = 0);
++    // Records direct branch targets inside other functions as secondary entries (after analysis).
++    void FindSecondaryEntries();
+ 
+     void Recompile(const std::filesystem::path& headerFilePath);
+ 
+diff --git a/XenonRecomp/test_recompiler.cpp b/XenonRecomp/test_recompiler.cpp
+index fa8053a..a03df5e 100644
+--- a/XenonRecomp/test_recompiler.cpp
++++ b/XenonRecomp/test_recompiler.cpp
+@@ -30,6 +30,7 @@ void TestRecompiler::Analyse(const std::string_view& testName)
+     }
+ 
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
++    FindSecondaryEntries();
+ }
+ 
+ size_t TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* dstDirectoryPath)
+@@ -59,6 +60,9 @@ size_t TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char*
+             recompiler.println("#define PPC_CONFIG_H_INCLUDED");
+             recompiler.println("#include <ppc_context.h>\n");
+             recompiler.println("#define __builtin_debugtrap()\n");
++            for (const auto& symbol : recompiler.image.symbols)
++                if (symbol.type == Symbol_Function)
++                    recompiler.println("PPC_EXTERN_FUNC({});", symbol.name);
+ 
+             for (auto& fn : recompiler.functions)
+             {
+@@ -71,6 +75,12 @@ size_t TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char*
+                     fmt::println("Function {:X} in {} has unimplemented instructions", fn.base, stem);
+                 }
+             }
++            for (const auto& [entry, owner] : recompiler.secondaryEntries)
++            {
++                const auto fn = std::find_if(recompiler.functions.begin(), recompiler.functions.end(), [&](const Function& f) { return f.base == owner; });
++                fmt::println("NOTE: secondary entry {:X} in function {:X}", entry, owner);
++                recompiler.Recompile(*fn, entry);
++            }
+             fatalProblems += recompiler.fatalProblems;
+             stem += ".cpp";
+             recompiler.SaveCurrentOutData(stem);
+-- 
+2.54.0 (Apple Git-157)
+

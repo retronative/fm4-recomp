@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:20:35 +0700
+Subject: [PATCH] Stop after a final call that should not return
+
+A function whose last instruction is a call falls through past its end if the callee returns.
+Forza Motorsport 4 has 108 such functions, calling error and exception routines. When the next
+word is zero, returning would execute an illegal instruction; when the function's .pdata extent
+ends after the call and data follows, the compiler declares that the call does not return. In
+both cases the call is followed by a trap and a NOTE line instead of a fatal problem. Other
+fallthrough past a function end stays fatal.
+---
+ XenonRecomp/recompiler.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 03b85ee..c0e1419 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -2955,12 +2955,30 @@ bool Recompiler::Recompile(const Function& fn)
+         if (last > fn.base && !IsUnconditionalTerminator(ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(last - 4)))))
+         {
+             auto next = image.symbols.find(last);
++            const uint32_t lastInsn = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(last - 4)));
++            const bool endsInCall = (lastInsn >> 26) == 18 && (lastInsn & 1);
++            const auto* nextWord = reinterpret_cast<const uint32_t*>(image.Find(last));
++            const auto fnSource = functionSources.find(fn.base);
+             if (last == fn.base + fn.size && next != image.symbols.end() && next->address == last && next->type == Symbol_Function)
+             {
+                 println("\t// falls through into the next function");
+                 println("\t{}(ctx, base);", next->name);
+                 println("\treturn;");
+             }
++            else if (endsInCall && nextWord != nullptr && *nextWord == 0)
++            {
++                // If the call returned, the next word, zero, is an illegal instruction: trap.
++                println("\t__builtin_trap();");
++                fmt::println("NOTE: function {:X} ends in a call followed by padding at {:X}", fn.base, last);
++            }
++            else if (endsInCall && last == fn.base + fn.size && fnSource != functionSources.end() && fnSource->second == "pdata" &&
++                dataRanges.count(last))
++            {
++                // The compiler's .pdata extent ends after the call and data follows: the call does
++                // not return here. Stop if it does.
++                println("\t__builtin_trap();");
++                fmt::println("NOTE: function {:X} ends in a call followed by data at {:X} (.pdata extent)", fn.base, last);
++            }
+             else
+             {
+                 Fatal(fmt::format("function {:X} falls through past its end at {:X}", fn.base, last));
+-- 
+2.54.0 (Apple Git-157)
+

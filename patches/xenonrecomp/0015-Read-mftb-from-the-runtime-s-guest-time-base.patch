@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:43:27 +0700
+Subject: [PATCH] Read mftb from the runtime's guest time base
+
+mftb was translated as the raw host counter (__rdtsc), whose rate is not the console's (24 MHz
+on Apple silicon), and it returned all 64 bits even for mftbu (TBR 269), which the decoder also
+names mftb. Forza Motorsport 4 reads the time base 48 times. TBR 268 now returns
+PpcQueryTimebase() and TBR 269 its upper word; other TBRs are fatal. PpcQueryTimebase is
+declared in ppc_context.h and defined by the runtime, which owns the guest rate and must keep it
+consistent with the kernel's performance-counter frequency; a build without it fails to link.
+---
+ XenonRecomp/recompiler.cpp | 14 +++++++++++++-
+ XenonUtils/ppc_context.h   |  5 +++++
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 933ac5a..4ff6da0 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1502,8 +1502,20 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_MFTB:
+-        println("\t{}.u64 = __rdtsc();", r(insn.operands[0]));
++    {
++        // TBR 268 reads the time base (all 64 bits in 64-bit mode), 269 its upper word. The TBR
++        // is read from the instruction word (its two 5-bit halves are swapped there), since the
++        // decoder reports 268 as 0. The guest time base runs at the console's rate, which the
++        // runtime provides (PpcQueryTimebase).
++        const uint32_t tbr = ((insn.instruction >> 16) & 0x1F) | ((insn.instruction >> 6) & 0x3E0);
++        if (tbr == 268)
++            println("\t{}.u64 = PpcQueryTimebase();", r(insn.operands[0]));
++        else if (tbr == 269)
++            println("\t{}.u64 = PpcQueryTimebase() >> 32;", r(insn.operands[0]));
++        else
++            Fatal(fmt::format("mftb from TBR {} at {:X} is not supported", tbr, base));
+         break;
++    }
+ 
+     case PPC_INST_MR:
+         println("\t{}.u64 = {}.u64;", r(insn.operands[0]), r(insn.operands[1]));
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 760c1b2..2dfbc08 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -683,6 +683,11 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+     return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+ }
+ 
++// The guest time base (mftb). Its rate is the console's, which only the runtime can supply
++// consistently with the kernel's performance-counter frequency, so it is declared here and
++// defined by the runtime: a build without it fails to link instead of running on a host counter.
++uint64_t PpcQueryTimebase();
++
+ // IEEE 754 binary16 to binary32 bits: exact for every finite half (subnormals are normalized);
+ // exponent 31 gives infinity or a NaN with the payload kept.
+ inline uint32_t ppc_half_to_float_bits(uint16_t half)
+-- 
+2.54.0 (Apple Git-157)
+

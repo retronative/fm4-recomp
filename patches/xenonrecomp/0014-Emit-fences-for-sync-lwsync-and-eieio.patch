@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:40:06 +0700
+Subject: [PATCH] Emit fences for sync, lwsync and eieio
+
+The recompiler drops the memory barriers, which is only safe on strongly ordered hosts (x86).
+Forza Motorsport 4 has 64 sync, 120 lwsync and 20 eieio; on ARM64 the hardware and the compiler
+may reorder accesses across them. sync becomes a sequentially consistent fence, lwsync (all
+orderings but store-load) an acquire-release fence, and eieio (store ordering) a release fence.
+---
+ XenonRecomp/recompiler.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 1688fb1..933ac5a 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1004,7 +1004,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_EIEIO:
+-        // no op
++        // Orders stores to cacheable memory (store-store); a release fence also orders earlier loads.
++        println("\t__atomic_thread_fence(__ATOMIC_RELEASE);");
+         break;
+ 
+     case PPC_INST_EXTSB:
+@@ -1374,7 +1375,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_LWSYNC:
+-        // no op
++        // Orders load-load, load-store and store-store, not store-load: an acquire-release fence.
++        println("\t__atomic_thread_fence(__ATOMIC_ACQ_REL);");
+         break;
+ 
+     case PPC_INST_LWZ:
+@@ -1952,7 +1954,8 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_SYNC:
+-        // no op
++        // Orders every earlier storage access before every later one.
++        println("\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");
+         break;
+ 
+     case PPC_INST_TDLGEI:
+-- 
+2.54.0 (Apple Git-157)
+

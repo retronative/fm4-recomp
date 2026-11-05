@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:29:29 +0700
+Subject: [PATCH 20/21] Function analysis: stop at the size limit
+
+Function::Analyze looped while data <= dataEnd, so it read and included one word past the size
+it was given. With a size that ends at the next known function, that word is the next
+function's first instruction. In Forza Motorsport 4 a two-entry stack-probe routine became two
+overlapping functions.
+---
+ XenonAnalyse/function.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/XenonAnalyse/function.cpp b/XenonAnalyse/function.cpp
+index 34add40..4831c85 100644
+--- a/XenonAnalyse/function.cpp
++++ b/XenonAnalyse/function.cpp
+@@ -62,7 +62,7 @@ Function Function::Analyze(const void* code, size_t size, size_t base)
+     #define RESTORE_DATA() if (!blockStack.empty()) data = (dataStart + ((blocks[blockStack.back()].base + blocks[blockStack.back()].size) / sizeof(*data))) - 1; // continue adds one
+ 
+     // TODO: Branch fallthrough
+-    for (; data <= dataEnd ; ++data)
++    for (; data < dataEnd ; ++data)
+     {
+         const size_t addr = base + ((data - dataStart) * sizeof(*data));
+         if (blockStack.empty())
+-- 
+2.54.0 (Apple Git-157)
+

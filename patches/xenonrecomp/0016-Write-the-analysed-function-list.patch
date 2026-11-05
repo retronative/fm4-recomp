@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:10:35 +0700
+Subject: [PATCH] Write the analysed function list
+
+The function boundaries the analysis chooses decide what is translated, but they are not
+visible in the output. ppc_functions.txt lists every function's base, size and source (helper,
+config, pdata, bl_target or sweep), sorted, so they can be validated independently against the
+image.
+---
+ XenonRecomp/recompiler.cpp | 17 +++++++++++++++++
+ XenonRecomp/recompiler.h   |  4 ++++
+ 2 files changed, 21 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 4ff6da0..63aaf09 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -218,9 +218,13 @@ void Recompiler::Analyse()
+         }
+     }
+ 
++    for (const auto& fn : functions)
++        functionSources.emplace(fn.base, "helper");
++
+     for (auto& [address, size] : config.functions)
+     {
+         functions.emplace_back(address, size);
++        functionSources.emplace(address, "config");
+         image.symbols.emplace(fmt::format("sub_{:X}", address), address, size, Symbol_Function);
+     }
+ 
+@@ -238,6 +242,7 @@ void Recompiler::Analyse()
+             auto& f = functions.emplace_back();
+             f.base = fn.BeginAddress;
+             f.size = fn.FunctionLength * 4;
++            functionSources.emplace(f.base, "pdata");
+ 
+             image.symbols.emplace(fmt::format("sub_{:X}", f.base), f.base, f.size, Symbol_Function);
+         }
+@@ -264,6 +269,7 @@ void Recompiler::Analyse()
+                 {
+                     auto data = section.data + address - section.base;
+                     auto& fn = functions.emplace_back(Function::Analyze(data, section.base + section.size - address, address));
++                    functionSources.emplace(fn.base, "bl_target");
+                     image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+                 }
+             }
+@@ -293,6 +299,7 @@ void Recompiler::Analyse()
+             else
+             {
+                 auto& fn = functions.emplace_back(Function::Analyze(data, dataEnd - data, base));
++                functionSources.emplace(fn.base, "sweep");
+                 image.symbols.emplace(fmt::format("sub_{:X}", fn.base), fn.base, fn.size, Symbol_Function);
+ 
+                 base += fn.size;
+@@ -3048,6 +3055,16 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+         SaveCurrentOutData("ppc_func_mapping.cpp");
+     }
+ 
++    {
++        // The analysed functions, for structural validation: base, size and how each was found.
++        for (const auto& fn : functions)
++        {
++            const auto source = functionSources.find(fn.base);
++            println("{:08X} {:X} {}", fn.base, fn.size, source != functionSources.end() ? source->second : "unknown");
++        }
++        SaveCurrentOutData("ppc_functions.txt");
++    }
++
+     for (size_t i = 0; i < functions.size(); i++)
+     {
+         if ((i % 256) == 0)
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 7bc0cc5..24ba129 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -1,4 +1,6 @@
+ #pragma once
++#include <unordered_map>
++#include <string_view>
+ 
+ #include "pch.h"
+ #include "recompiler_config.h"
+@@ -31,6 +33,8 @@ struct Recompiler
+     static constexpr uint32_t c_eieio = 0xAC06007C;
+     Image image;
+     std::vector<Function> functions;
++    // How each function was found (helper, config, pdata, bl_target, sweep), for ppc_functions.txt.
++    std::unordered_map<uint32_t, std::string_view> functionSources;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+-- 
+2.54.0 (Apple Git-157)
+

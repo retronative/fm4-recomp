@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:14:58 +0700
+Subject: [PATCH] Treat exception-handler metadata before functions as data
+
+A .pdata entry with ExceptionFlag is preceded by two data words, the handler's address and its
+data. The analysis swept them as code: in Forza Motorsport 4, 350 such pairs became functions
+that swallowed the .pdata function after them (nested duplicates), whose interior branches then
+looked like branches into non-functions. The two words are now skipped by the bl-target scan and
+the sweep; a handler outside the code sections is fatal. The compiler's register save/restore
+helpers set the flag without the words and are excluded.
+---
+ XenonRecomp/recompiler.cpp | 24 ++++++++++++++++++++++++
+ XenonRecomp/recompiler.h   |  3 +++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 63aaf09..a4d30e3 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -237,6 +237,19 @@ void Recompiler::Analyse()
+         fn.BeginAddress = ByteSwap(fn.BeginAddress);
+         fn.Data = ByteSwap(fn.Data);
+ 
++        // A function with an exception handler (ExceptionFlag) is preceded by two data words, the
++        // handler's address and its data (FM4: 353 entries), which are not code. The compiler's
++        // register save/restore helpers set the flag without them: the words before them are code.
++        if (fn.ExceptionFlag && functionSources.find(fn.BeginAddress) == functionSources.end())
++        {
++            const uint32_t handler = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(fn.BeginAddress - 8)));
++            const auto section = std::find_if(image.sections.begin(), image.sections.end(),
++                [&](const Section& s) { return handler >= s.base && handler < s.base + s.size; });
++            if (section == image.sections.end() || !(section->flags & SectionFlags_Code))
++                Fatal(fmt::format("exception handler {:X} before function {:X} is not in code", handler, fn.BeginAddress));
++            exceptionMetadata.insert(fn.BeginAddress - 8);
++        }
++
+         if (image.symbols.find(fn.BeginAddress) == image.symbols.end())
+         {
+             auto& f = functions.emplace_back();
+@@ -260,6 +273,11 @@ void Recompiler::Analyse()
+ 
+         while (data < dataEnd)
+         {
++            if (exceptionMetadata.count(uint32_t(base + (data - section.data))))
++            {
++                data += 8;
++                continue;
++            }
+             uint32_t insn = ByteSwap(*(uint32_t*)data);
+             if (PPC_OP(insn) == PPC_OP_B && PPC_BL(insn))
+             {
+@@ -280,6 +298,12 @@ void Recompiler::Analyse()
+ 
+         while (data < dataEnd)
+         {
++            if (exceptionMetadata.count(uint32_t(base)))
++            {
++                base += 8;
++                data += 8;
++                continue;
++            }
+             auto invalidInstr = config.invalidInstructions.find(ByteSwap(*(uint32_t*)data));
+             if (invalidInstr != config.invalidInstructions.end())
+             {
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 24ba129..51ac18a 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include <unordered_map>
++#include <unordered_set>
+ #include <string_view>
+ 
+ #include "pch.h"
+@@ -35,6 +36,8 @@ struct Recompiler
+     std::vector<Function> functions;
+     // How each function was found (helper, config, pdata, bl_target, sweep), for ppc_functions.txt.
+     std::unordered_map<uint32_t, std::string_view> functionSources;
++    // First words of the exception-handler metadata (handler, data) before .pdata functions.
++    std::unordered_set<uint32_t> exceptionMetadata;
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,18 @@
+# Forza Motorsport 4 (USA, title 4D530910, default.xex SHA-256 3618e85a...3e09): XenonRecomp config.
+# Addresses and evidence only; no game bytes. Paths are relative to this file.
+#
+# Hand-written keys.
+[main]
+file_path = "../game/files/default.xex"
+out_directory_path = "../ppc"
+
+# Compiler register save/restore helpers: one byte-pattern hit each in FM4's decrypted image
+# (tools/survey/xexsurvey, VERIFIED); equal to ForzaRecomp's config/fm4.toml.
+restgprlr_14_address = 0x827604A0
+savegprlr_14_address = 0x82760450
+restfpr_14_address = 0x82760C6C
+savefpr_14_address = 0x82760C20
+restvmx_14_address = 0x8275F958
+savevmx_14_address = 0x8275F6C0
+restvmx_64_address = 0x8275F9EC
+savevmx_64_address = 0x8275F754

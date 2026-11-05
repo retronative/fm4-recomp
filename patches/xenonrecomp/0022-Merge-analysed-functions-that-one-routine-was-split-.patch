@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:48:06 +0700
+Subject: [PATCH] Merge analysed functions that one routine was split into
+
+The sweep cuts code without .pdata at every terminator, and secondary entries then join the
+pieces with C calls: a guest loop across two pieces recursed in C, one frame per iteration
+(Forza Motorsport 4: a string-compare loop at 0x82514860 and a loop at 0x827E3920). Contiguous
+analysed functions joined by a fall-through or a branch between them are now one function;
+a start called from elsewhere becomes a secondary entry. FM4: 197 pieces merged, secondary
+entries 85 -> 45.
+---
+ XenonRecomp/recompiler.cpp | 44 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 764ff6f..495a4d7 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -409,6 +409,50 @@ void Recompiler::Analyse()
+             fn.size = functions[i + 1].base - fn.base;
+     }
+ 
++    // Contiguous analysed functions joined by a fall-through or a branch (not a call) between
++    // them are one routine split by the analysis, e.g. a loop in code without .pdata. They are
++    // merged so that the loop is local control flow, not tail calls that recurse in C; a start
++    // that is called from elsewhere becomes a secondary entry of the merged function.
++    const auto isAnalysed = [&](const Function& fn)
++        {
++            const auto source = functionSources.find(fn.base);
++            return source != functionSources.end() &&
++                (source->second == "bl_target" || source->second == "sweep" || source->second == "export");
++        };
++    const auto branchesInto = [&](const Function& from, const Function& to)
++        {
++            for (size_t address = from.base; address < from.base + from.size; address += 4)
++            {
++                const uint32_t insn = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(address)));
++                const uint32_t op = PPC_OP(insn);
++                if ((op != PPC_OP_B && op != PPC_OP_BC) || PPC_BL(insn))
++                    continue;
++                const uint32_t displacement = op == PPC_OP_B ? PPC_BI(insn) : PPC_BD(insn);
++                const uint32_t target = (insn & 2) ? displacement : uint32_t(address) + displacement;
++                if (target >= to.base && target < to.base + to.size)
++                    return true;
++            }
++            return false;
++        };
++    for (size_t i = 0; i + 1 < functions.size();)
++    {
++        auto& fn = functions[i];
++        const auto& next = functions[i + 1];
++        const uint32_t last = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(fn.base + fn.size - 4)));
++        const bool joined = fn.base + fn.size == next.base && isAnalysed(fn) && isAnalysed(next) && fn.size != 0 &&
++            (!IsUnconditionalTerminator(last) || branchesInto(fn, next) || branchesInto(next, fn));
++        if (!joined)
++        {
++            i++;
++            continue;
++        }
++        fn.size += next.size;
++        if (const auto symbol = image.symbols.find(next.base); symbol != image.symbols.end())
++            image.symbols.erase(symbol);
++        functionSources.erase(next.base);
++        functions.erase(functions.begin() + i + 1);
++    }
++
+     FindSecondaryEntries();
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

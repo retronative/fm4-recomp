@@ -1,0 +1,39 @@
+From d74635e52af840b8f56aaf5add2280e5d166c974 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:02:20 +0700
+Subject: [PATCH] Keep export entries out of merged functions
+
+Patch 0022 merges contiguous analysed pieces and erases the second piece's symbol. The function
+table (ppc_func_mapping.cpp) is generated from the symbols, so an export merged as a second piece
+lost its table entry: FM4's export 3 (0x82AEE4E0, from the XEX export table at 0x82D40FE4) was
+missing after 0022. An export is resolved by address at run time, so a piece whose source is
+"export" is never merged away; the piece before it may still fall through into it (a call to
+the next function).
+
+FM4 Recomp patch (not from ForzaRecomp). Test: tests/test_analysis.py
+test_export_piece_keeps_its_entry.
+---
+ XenonRecomp/recompiler.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 495a4d7..f048084 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -439,7 +439,12 @@ void Recompiler::Analyse()
+         auto& fn = functions[i];
+         const auto& next = functions[i + 1];
+         const uint32_t last = ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(fn.base + fn.size - 4)));
+-        const bool joined = fn.base + fn.size == next.base && isAnalysed(fn) && isAnalysed(next) && fn.size != 0 &&
++        // An export is an entry the runtime resolves by address: it keeps its own symbol and is
++        // never merged into the piece before it (merging dropped FM4's export 0x82AEE4E0 from the
++        // function table). A piece before it may still fall through into it, as a call.
++        const auto nextSource = functionSources.find(next.base);
++        const bool nextIsExport = nextSource != functionSources.end() && nextSource->second == "export";
++        const bool joined = fn.base + fn.size == next.base && isAnalysed(fn) && isAnalysed(next) && !nextIsExport && fn.size != 0 &&
+             (!IsUnconditionalTerminator(last) || branchesInto(fn, next) || branchesInto(next, fn));
+         if (!joined)
+         {
+-- 
+2.54.0 (Apple Git-157)
+

@@ -26,6 +26,8 @@ TESTS = {
                    focus=True),
     "translator": dict(cmd=["bash", "tests/run_translator_tests.sh"], timeout=1200, build=True,
                        ran=r"^translator tests: ", focus=True),
+    "analysis": dict(cmd=PY + ["tests/test_analysis.py"], timeout=600, build=True, ran=r"^Ran \d+ tests?",
+                     focus=True),
     "mutate": dict(cmd=PY + ["tests/test_mutate.py"], timeout=300, build=False, ran=r"^Ran \d+ tests?"),
 }
 
@@ -34,6 +36,8 @@ STFSINFO = "survey/stfsinfo.py"
 XEX_CPP = "tools/XenonRecomp/XenonUtils/xex.cpp"
 GATE = "tests/mutate.py"
 RECOMP = "tools/XenonRecomp/XenonRecomp/recompiler.cpp"
+ANALYZE = "tools/XenonRecomp/XenonAnalyse/function.cpp"
+TEST_RECOMP = "tools/XenonRecomp/XenonRecomp/test_recompiler.cpp"
 PPC_CONTEXT = "tools/XenonRecomp/XenonUtils/ppc_context.h"
 DISASM = "tools/XenonRecomp/thirdparty/disasm/ppc-dis.c"
 
@@ -142,6 +146,178 @@ MUTANTS = [
     dict(id="S15", milestone="M0", file=STFSINFO, test="stfsinfo", fault="level-0 hash table number for blocks < 28900 falls through",
          old="            if index < PER_LEVEL[1]:\n                return block\n", new="",
          expect="test_read_only_hash_tables"),
+
+    # ---- M1: function-analysis tests (tests/test_analysis.py) on upstream Analyse ----
+    dict(id='N1', milestone="M1", file=RECOMP, test='analysis', fault='pdata FunctionLength read as 4-byte words twice over (size x2)',
+         old='f.size = fn.FunctionLength * 4;',
+         new='f.size = fn.FunctionLength * 8;', expect='test_baseline_discovery'),
+
+    # ---- M1: patches/xenonrecomp/0022 (ForzaRecomp 0022: merge analysed functions split from one routine) and 0022a (ours: keep exports) ----
+    dict(id='S22a', milestone="M1", file=RECOMP, test='analysis', fault='backward-loop pieces not merged',
+         old='(!IsUnconditionalTerminator(last) || branchesInto(fn, next) || branchesInto(next, fn));',
+         new='(!IsUnconditionalTerminator(last) || branchesInto(fn, next));', expect='test_loop_pieces_merged'),
+    dict(id='S22b', milestone="M1", file=RECOMP, test='analysis', fault='.pdata functions merged into analysed ones',
+         old='isAnalysed(fn) && isAnalysed(next) && !nextIsExport',
+         new='isAnalysed(fn) && !nextIsExport', expect='test_sweep_stops_at_next_function'),
+    dict(id='S22c', milestone="M1", file=RECOMP, test='analysis', fault='stale symbol left for a merged piece',
+         old='image.symbols.erase(symbol);',
+         new='(void)symbol;', expect='test_loop_pieces_merged'),
+    dict(id='S22d', milestone="M1", file=RECOMP, test='analysis', fault='a branch to the exact start not counted',
+         old='if (target >= to.base && target < to.base + to.size)',
+         new='if (target > to.base && target < to.base + to.size)', expect='test_loop_pieces_merged'),
+    dict(id='S22e', milestone="M1", file=RECOMP, test='analysis', fault='calls join pieces',
+         old='if ((op != PPC_OP_B && op != PPC_OP_BC) || PPC_BL(insn))',
+         new='if (op != PPC_OP_B && op != PPC_OP_BC)', expect='test_call_does_not_join_pieces'),
+    dict(id='S22x', milestone="M1", file=RECOMP, test='analysis', fault="exports merged away (0022a removed): FM4's export 0x82AEE4E0 lost",
+         old='&& !nextIsExport && fn.size != 0',
+         new='&& fn.size != 0', expect='test_export_piece_keeps_its_entry'),
+
+    # ---- M1: patches/xenonrecomp/0021, test mode declarations ----
+    dict(id='S21g', milestone="M1", file=TEST_RECOMP, test='translator', fault='test-mode entries undeclared before use',
+         old='recompiler.println("PPC_EXTERN_FUNC({});", symbol.name);',
+         new='(void)symbol;', expect='secondary_entries'),
+
+    # ---- M1: patches/xenonrecomp/0021, analysis bounds ----
+    dict(id='S21e', milestone="M1", file=RECOMP, test='analysis', fault='sweep runs over the next function',
+         old='std::min<size_t>(dataEnd - data, next->address - base)',
+         new='(dataEnd - data)', expect='test_sweep_limit_keeps_later_gap_function'),
+    dict(id='S21f', milestone="M1", file=RECOMP, test='analysis', fault='analysed functions absorb the next one',
+         old='if (analysed && fn.base + fn.size > functions[i + 1].base && functions[i + 1].base > fn.base)',
+         new='if (false)', expect='test_analysed_function_cut_at_next'),
+
+    # ---- M1: patches/xenonrecomp/0021 (ForzaRecomp 0021: enter functions at secondary entry points) ----
+    dict(id='S21a', milestone="M1", file=RECOMP, test='translator', fault="entry runs from the owner's start (no goto)",
+         old='    if (entry != 0)\n        println("\\tgoto loc_{:X};", entry);',
+         new='    if (false)\n        println("\\tgoto loc_{:X};", entry);', expect='secondary_entries'),
+    dict(id='S21b', milestone="M1", file=RECOMP, test='translator', fault='no label at the entry',
+         old='    if (entry != 0)\n        labels.emplace(entry);',
+         new='    if (false)\n        labels.emplace(entry);', expect='secondary_entries'),
+    dict(id='S21c', milestone="M1", file=RECOMP, test='translator', fault='entry recorded one word late',
+         old='const uint32_t target = (insn & 2) ? displacement : address + displacement;',
+         new='const uint32_t target = (insn & 2) ? displacement : address + displacement + 4;', expect='secondary_entries'),
+    dict(id='S21d', milestone="M1", file=RECOMP, test='translator', fault='zero-word target treated as non-zero (killed only by our backward fixture)',
+         old='*reinterpret_cast<const uint32_t*>(image.Find(address)) == 0)',
+         new='*reinterpret_cast<const uint32_t*>(image.Find(address)) != 0)', expect='branch_back_to_zero_word'),
+
+    # ---- M1: patches/xenonrecomp/0020 (ForzaRecomp 0020: function analysis stops at the size limit) ----
+    dict(id='M20a', milestone="M1", file=ANALYZE, test='analysis', fault='reads one word past the size limit (upstream)',
+         old='for (; data < dataEnd ; ++data)',
+         new='for (; data <= dataEnd ; ++data)', expect='test_analyze_stops_at_size_limit'),
+    dict(id='M20b', milestone="M1", file=ANALYZE, test='analysis', fault='last word of the range dropped',
+         old='for (; data < dataEnd ; ++data)',
+         new='for (; data + 1 < dataEnd ; ++data)', expect='test_analyze_stops_at_size_limit'),
+
+    # ---- M1: patches/xenonrecomp/0019, padding branch ----
+    dict(id='O6', milestone="M1", file=RECOMP, test='analysis', fault='padding case removed (back to the fallthrough FATAL)',
+         old='else if (endsInCall && nextWord != nullptr && *nextWord == 0)',
+         new='else if (false)', expect='test_final_call_then_padding_in_extent_stops'),
+
+    # ---- M1: patches/xenonrecomp/0019, data case ----
+    dict(id='O4', milestone="M1", file=RECOMP, test='analysis', fault='data case accepted without a data range following',
+         old='fnSource->second == "pdata" &&\n                dataRanges.count(last))',
+         new='fnSource->second == "pdata")', expect='test_final_call_before_unknown_words_is_fatal'),
+    dict(id='O5', milestone="M1", file=RECOMP, test='analysis', fault='data case: NOTE without the stop',
+         old='                println("\\t__builtin_trap();");\n                fmt::println("NOTE: function {:X} ends in a call followed by data',
+         new='                fmt::println("NOTE: function {:X} ends in a call followed by data', expect='test_final_call_before_data_stops'),
+
+    # ---- M1: patches/xenonrecomp/0019 (ForzaRecomp 0019: stop after a final call that should not return) ----
+    dict(id='O1', milestone="M1", file=RECOMP, test='translator', fault='any odd word counts as a call',
+         old='const bool endsInCall = (lastInsn >> 26) == 18 && (lastInsn & 1);',
+         new='const bool endsInCall = (lastInsn & 1);', expect='falls_into_padding'),
+    dict(id='O2', milestone="M1", file=RECOMP, test='translator', fault='any instruction before padding accepted (fail-open)',
+         old='else if (endsInCall && nextWord != nullptr && *nextWord == 0)',
+         new='else if (nextWord != nullptr && *nextWord == 0)', expect='falls_into_padding'),
+    dict(id='O3', milestone="M1", file=RECOMP, test='translator', fault='padding case: NOTE without the stop',
+         old='                println("\\t__builtin_trap();");\n                fmt::println("NOTE: function {:X} ends in a call followed by padding',
+         new='                fmt::println("NOTE: function {:X} ends in a call followed by padding', expect='call_then_padding',
+         equivalent="the padding word inside the function's extent is translated first and traps (patch 0004's zero-word rule), so 0019's trap after it is unreachable; a .pdata extent ending at the call makes the sweep turn the padding into its own function instead (0003's fall-through call)"),
+
+    # ---- M1: patches/xenonrecomp/0018, loader: export table address ----
+    dict(id='J6', milestone="M1", file=XEX_CPP, test='analysis', fault='export table ignored (upstream)',
+         old='image.export_table = security->exportTable;',
+         new='image.export_table = 0;', expect='test_export_table_is_data_and_entry'),
+
+    # ---- M1: patches/xenonrecomp/0018 (ForzaRecomp 0018: export table as data, exports as entries) ----
+    dict(id='J1', milestone="M1", file=RECOMP, test='analysis', fault='layout check inverted on the second magic word',
+         old='ByteSwap(table[1]) == 0x00485645',
+         new='ByteSwap(table[1]) != 0x00485645', expect='test_export_table_is_data_and_entry'),
+    dict(id='J2', milestone="M1", file=RECOMP, test='analysis', fault='offset words swept as code (range covers the header only)',
+         old='dataRanges.emplace(image.export_table, 44 + 4 * count);',
+         new='dataRanges.emplace(image.export_table, 44);', expect='test_export_table_is_data_and_entry'),
+    dict(id='J3', milestone="M1", file=RECOMP, test='analysis', fault='export count unbounded',
+         old='valid = count <= 0x10000 && image.export_table + 44 + 4 * size_t(count) <= sectionEnd;',
+         new='valid = true;', expect='test_export_table_truncated'),
+    dict(id='J4', milestone="M1", file=RECOMP, test='analysis', fault='export inside a function accepted',
+         old='if (owner != functions.end() || code == image.sections.end())',
+         new='if (code == image.sections.end())', expect='test_export_inside_function'),
+    dict(id='J5', milestone="M1", file=RECOMP, test='analysis', fault='ordinal offsets read one word early',
+         old='ByteSwap(table[11 + i])',
+         new='ByteSwap(table[10 + i])', expect='test_export_table_is_data_and_entry'),
+    dict(id='Y4', milestone="M1", file=RECOMP, test='analysis', fault='metadata range covers only the data word (handler word swept)',
+         old='dataRanges.emplace(fn.BeginAddress - 8, 8);',
+         new='dataRanges.emplace(fn.BeginAddress - 4, 4);', expect='test_exception_metadata_is_data'),
+
+    # ---- M1: patches/xenonrecomp/0017 (ForzaRecomp 0017: exception-handler metadata before functions is data) ----
+    dict(id='Y1', milestone="M1", file=RECOMP, test='analysis', fault="helpers' preceding code treated as metadata",
+         old='if (fn.ExceptionFlag && functionSources.find(fn.BeginAddress) == functionSources.end())',
+         new='if (fn.ExceptionFlag)', expect='test_flagged_helper_keeps_preceding_code'),
+    dict(id='Y2', milestone="M1", file=RECOMP, test='analysis', fault='handler in a data section accepted',
+         old='if (section == image.sections.end() || !(section->flags & SectionFlags_Code))',
+         new='if (section == image.sections.end())', expect='test_exception_handler_not_in_code'),
+    dict(id='Y3', milestone="M1", file=RECOMP, test='analysis', fault='wrong word read as the handler',
+         old='image.Find(fn.BeginAddress - 8)',
+         new='image.Find(fn.BeginAddress - 4)', expect='test_exception_metadata_is_data'),
+
+    # ---- M1: patches/xenonrecomp/0016 (ForzaRecomp 0016: write the analysed function list) ----
+    dict(id='W1', milestone="M1", file=RECOMP, test='analysis', fault='wrong extent reported',
+         old='println("{:08X} {:X} {}", fn.base, fn.size,',
+         new='println("{:08X} {:X} {}", fn.base, fn.size + 4,', expect='test_function_sources'),
+    dict(id='W2', milestone="M1", file=RECOMP, test='analysis', fault='pdata functions tagged sweep',
+         old='functionSources.emplace(f.base, "pdata");',
+         new='functionSources.emplace(f.base, "sweep");', expect='test_function_sources'),
+    dict(id='W3', milestone="M1", file=RECOMP, test='analysis', fault='helpers untagged',
+         old='functionSources.emplace(fn.base, "helper");',
+         new='(void)fn;', expect='test_helper_sources'),
+    dict(id='W4', milestone="M1", file=RECOMP, test='analysis', fault='bl targets tagged pdata',
+         old='functionSources.emplace(fn.base, "bl_target");',
+         new='functionSources.emplace(fn.base, "pdata");', expect='test_function_sources'),
+
+    # ---- M1: patches/xenonrecomp/0015 (ForzaRecomp 0015: mftb reads the runtime's guest time base) ----
+    dict(id='T1', milestone="M1", file=RECOMP, test='translator', fault='TBR low half read from the wrong field',
+         old='((insn.instruction >> 16) & 0x1F)',
+         new='((insn.instruction >> 11) & 0x1F)', expect='timebase'),
+    dict(id='T2', milestone="M1", file=RECOMP, test='translator', fault='TBR high half misplaced',
+         old='((insn.instruction >> 6) & 0x3E0)',
+         new='((insn.instruction >> 11) & 0x3E0)', expect='timebase'),
+    dict(id='T3', milestone="M1", file=RECOMP, test='translator', fault='mftbu returns 64 bits (upstream bug)',
+         old='PpcQueryTimebase() >> 32;',
+         new='PpcQueryTimebase();', expect='timebase'),
+    dict(id='T4', milestone="M1", file=RECOMP, test='translator', fault='mftb (TBR 268) truncated to 32 bits',
+         old='println("\\t{}.u64 = PpcQueryTimebase();", r(insn.operands[0]));',
+         new='println("\\t{}.u32 = PpcQueryTimebase();", r(insn.operands[0]));', expect='timebase'),
+    dict(id='T5', milestone="M1", file=RECOMP, test='translator', fault='unknown TBR read as the time base (fail-open)',
+         old='Fatal(fmt::format("mftb from TBR {} at {:X} is not supported", tbr, base));',
+         new='println("\\t{}.u64 = PpcQueryTimebase();", r(insn.operands[0]));', expect='mftb_other_tbr'),
+    dict(id='T6', milestone="M1", file=RECOMP, test='translator', fault='wrong upper-word TBR',
+         old='else if (tbr == 269)',
+         new='else if (tbr == 270)', expect='timebase'),
+
+    # ---- M1: patches/xenonrecomp/0014 (ForzaRecomp 0014: fences for sync, lwsync, eieio) ----
+    dict(id='Q1', milestone="M1", file=RECOMP, test='translator', fault='sync weakened to acq_rel (no store-load ordering)',
+         old='println("\\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");',
+         new='println("\\t__atomic_thread_fence(__ATOMIC_ACQ_REL);");', expect='barrier_sync'),
+    dict(id='Q2', milestone="M1", file=RECOMP, test='translator', fault='lwsync weakened to release',
+         old='println("\\t__atomic_thread_fence(__ATOMIC_ACQ_REL);");',
+         new='println("\\t__atomic_thread_fence(__ATOMIC_RELEASE);");', expect='barrier_lwsync'),
+    dict(id='Q3', milestone="M1", file=RECOMP, test='translator', fault='eieio dropped (upstream behaviour: the negative control)',
+         old='println("\\t__atomic_thread_fence(__ATOMIC_RELEASE);");',
+         new='println("\\t// no op");', expect='barrier_eieio'),
+    dict(id='Q4', milestone="M1", file=RECOMP, test='translator', fault='sync as a compiler-only barrier (no dmb)',
+         old='println("\\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");',
+         new='println("\\t__atomic_signal_fence(__ATOMIC_SEQ_CST);");', expect='barrier_sync'),
+    dict(id='Q5', milestone="M1", file=RECOMP, test='translator', fault="lwsync given sync's fence (one half of a sync/lwsync swap)",
+         old='println("\\t__atomic_thread_fence(__ATOMIC_ACQ_REL);");',
+         new='println("\\t__atomic_thread_fence(__ATOMIC_SEQ_CST);");', expect='barrier_lwsync'),
 
     # ---- M1: patches/xenonrecomp/0013 (ForzaRecomp 0012: blrl as an indirect call) ----
     dict(id='I1', milestone="M1", file=RECOMP, test='translator', fault='LR written before the target is read',
