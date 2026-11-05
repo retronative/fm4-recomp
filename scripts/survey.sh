@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 FM4 Recomp contributors
+#
+# Survey and recompile FM4's default.xex: the M1 pipeline (survey/survey.py does the work).
+#
+#   scripts/survey.sh [--diagnostic] [--compare-with game/survey/<run1>.json]
+#
+# Refuses to start unless scripts/preflight.sh says the machine is free; prints the SHA-256 of
+# every tool and input before the run (a run once used a stale binary). Bounded: each step of
+# survey/survey.py has a deadline. Fail-closed: exit 1 on any recompiler problem, error marker,
+# inconsistent input or (with --compare-with) any byte difference from the earlier run.
+# Two-run reproducibility check (M1 acceptance):
+#   scripts/survey.sh && cp game/survey/reproducibility.json the local capture repro_run1 (not distributed).json
+#   scripts/survey.sh --compare-with the local capture repro_run1 (not distributed).json
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PY=/opt/homebrew/bin/python3
+cd "$ROOT"
+
+"$ROOT/scripts/preflight.sh"
+[ -x "$PY" ] || { echo "survey: $PY is missing (Python 3.11+ with tomllib)" >&2; exit 1; }
+for f in tools/survey/xexsurvey tools/XenonRecomp/build/XenonRecomp/XenonRecomp \
+         tools/XenonRecomp/XenonUtils/ppc_context.h config/fm4.toml game/files/default.xex; do
+  [ -e "$f" ] || { echo "survey: $f is missing (scripts/setup_tools.sh, scripts/extract_game.sh)" >&2; exit 1; }
+  shasum -a 256 "$f"
+done
+echo "XenonRecomp patch series: $(git -C tools/XenonRecomp log --oneline -1)"
+exec "$PY" -B -I survey/survey.py "$@"

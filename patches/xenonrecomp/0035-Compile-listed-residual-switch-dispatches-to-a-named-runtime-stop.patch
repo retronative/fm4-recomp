@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 22:08:31 +0700
+Subject: [PATCH] Compile listed residual switch dispatches to a named runtime stop
+
+FM4 Recomp: a table dispatch with no proven bound may be accepted as a
+documented residual: [main] residual_stops = [ { address = <bctr>, name = "<identifier>" } ]. Such
+a dispatch is not translated and no case is taken from its table (no bound is inferred from the
+table, the index is not clamped): its code calls PpcResidualStop(address, name, index, lr), which
+the runtime defines to report the stop and halt; it never returns. ppc_context.h declares it.
+The list is exact: naming a switch with a proven bound is fatal, a listed address with no unproven
+switch table is fatal, every unlisted unproven switch stays fatal (patch 0025), and each entry needs
+an address and a plain name. Our own code.
+---
+ XenonRecomp/recompiler.cpp        | 21 +++++++++++++++++++++
+ XenonRecomp/recompiler.h          |  1 +
+ XenonRecomp/recompiler_config.cpp | 18 ++++++++++++++++++
+ XenonRecomp/recompiler_config.h   |  3 +++
+ XenonUtils/ppc_context.h          |  5 +++++
+ 5 files changed, 48 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index ae2e7c5..2fbd976 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1072,6 +1072,20 @@ bool Recompiler::Recompile(
+             // The bound is a 32-bit cmplwi, so the index is the register's low word. A case outside
+             // this function is a tail call into it (a function start or secondary entry). An index
+             // past the proven bound cannot occur; if it did, stop rather than run on.
++            const auto stop = config.residualStops.find(base);
++            if (stop != config.residualStops.end() && !switchTable->second.labels.empty())
++                Fatal(fmt::format("residual stop {} at {:X} names a switch table with a proven bound", stop->second, base));
++            if (switchTable->second.labels.empty() && stop != config.residualStops.end())
++            {
++                // An accepted residual: the dispatch is not translated (no case is assumed from the
++                // table); executing it stops in the runtime, which names it.
++                if (residualStopsReached.insert(base).second)
++                    fmt::println("NOTE: residual stop {} at {:X} (no proven bound; config residual_stops)", stop->second, base);
++                println("\t// residual stop {}: switch table at {:X} has no proven bound (config residual_stops)", stop->second, base);
++                println("\tPpcResidualStop(0x{:X}u, \"{}\", {}.u32, uint32_t(ctx.lr));", base, stop->second, r(switchTable->second.r));
++                switchTable = config.switchTables.end();
++                break;
++            }
+             if (switchTable->second.labels.empty())
+                 Fatal(fmt::format("switch table at {:X} has no proven bound", base));
+             println("\tswitch ({}.u32) {{", r(switchTable->second.r));
+@@ -3642,6 +3656,13 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+         Recompile(*fn, entry);
+     }
+ 
++    // The list is exact: every residual stop must be an unproven switch table this image dispatches through.
++    for (const auto& [address, name] : config.residualStops)
++    {
++        if (!residualStopsReached.count(address))
++            Fatal(fmt::format("residual stop {} at {:X} was not reached: no unproven switch table there", name, address));
++    }
++
+     SaveCurrentOutData();
+ }
+ 
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index d489630..26a7260 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -89,5 +89,6 @@ struct Recompiler
+     // Code that cannot be translated faithfully is a fatal problem, never a silent omission:
+     // reported on stdout as "FATAL: ..." and emitted as an #error so the output cannot compile.
+     size_t fatalProblems = 0;
++    std::set<uint32_t> residualStopsReached;
+     void Fatal(const std::string& message);
+ };
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 4538959..aba334c 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -70,6 +70,24 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+             }
+         }
+ 
++        if (auto stops = main["residual_stops"].as_array())
++        {
++            for (auto& entry : *stops)
++            {
++                auto* table = entry.as_table();
++                auto address = table ? (*table)["address"].value<uint32_t>() : std::nullopt;
++                std::string name = table ? (*table)["name"].value_or(std::string()) : std::string();
++                // The name is written into a string literal and a log line: a plain identifier only.
++                const bool plain = !name.empty() && std::all_of(name.begin(), name.end(),
++                    [](char c) { return std::isalnum((unsigned char)c) || c == '_'; });
++                if (!address || !plain || !residualStops.emplace(*address, name).second)
++                {
++                    fmt::println("FATAL: residual_stops needs one {{ address, name }} per dispatch, name [A-Za-z0-9_]+");
++                    std::exit(EXIT_FAILURE);
++                }
++            }
++        }
++
+         if (auto invalidArray = main["invalid_instructions"].as_array())
+         {
+             for (auto& instr : *invalidArray)
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 2b8176c..29e475b 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -63,6 +63,9 @@ struct RecompilerConfig
+     uint32_t longJmpAddress = 0;
+     uint32_t setJmpAddress = 0;
+     std::map<uint32_t, RecompilerRuntimeRoutine> runtimeRoutines;
++    // Table dispatches with no proven bound accepted as documented stops (bctr
++    // address -> name): each compiles to a call to PpcResidualStop instead of a switch.
++    std::map<uint32_t, std::string> residualStops;
+     std::unordered_map<uint32_t, uint32_t> functions;
+     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index f2a3ebc..506254f 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -31,6 +31,11 @@
+ 
+ #define PPC_FUNC_PROLOGUE() __builtin_assume(((size_t)base & 0x1F) == 0)
+ 
++// A table dispatch listed in [main] residual_stops (no proven bound; patch 0035) is not translated:
++// executing it calls this. The runtime defines it: it reports the name, the dispatch address, the
++// index and the caller, and stops. It never returns.
++[[noreturn]] void PpcResidualStop(uint32_t address, const char* name, uint32_t index, uint32_t lr);
++
+ #ifndef PPC_LOAD_U8
+ #define PPC_LOAD_U8(x) *(volatile uint8_t*)(base + (x))
+ #endif
+-- 
+fm4-recomp

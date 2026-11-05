@@ -454,7 +454,7 @@ class Analysis(unittest.TestCase):
                               "longjmp_address = 0x%X\n" % L)
         self.assertIn("longjmp(PpcJumpBuffer(ctx.r3.u32), ctx.r4.s32);", self.function_body(r, C))
 
-    def switch_case(self, name, labels, extra_words=(), pdata_extra=(), table=None, table_size=8, rdata=None):
+    def switch_case(self, name, labels, extra_words=(), pdata_extra=(), table=None, table_size=8, rdata=None, extra_config=""):
         """F @T (pdata, 8 words): mtctr r4; bctr; table (T+0x10, T+0x18); case 0 @T+0x10: li r3,1;
         blr; case 1 @T+0x18: li r3,2; blr; then extra words. Switch at the bctr (T+4) on r3."""
         F = T
@@ -465,7 +465,7 @@ class Analysis(unittest.TestCase):
         if rdata is not None:
             sections.append((".rdata", 0x3000, rdata, X.DATA))
         return recompile(name, sections, F,
-                         'switch_table_file_path = "switch.toml"\n', files={"switch.toml": table})
+                         'switch_table_file_path = "switch.toml"\n' + extra_config, files={"switch.toml": table})
 
     def test_switch_proven(self):
         """Patch 0025: a proven switch dispatches on the index register's low word, jumps to each
@@ -476,6 +476,44 @@ class Analysis(unittest.TestCase):
         self.assertIn("switch (ctx.r3.u32) {", body)
         self.assertIn("\tcase 0:\n\t\tgoto loc_82001010;\n\tcase 1:\n\t\tgoto loc_82001018;\n\tdefault:\n\t\t__builtin_trap();", body)
         self.assertIn("// data: 8 bytes", body)
+
+    def test_residual_stop(self):
+        """Patch 0035: an unproven switch listed in residual_stops compiles to a named runtime stop
+        (no case is taken from the table), with a NOTE; the run succeeds. The switch is at T+4 on r3."""
+        r = self.switch_case("residual_stop", [], table_size=0,
+                             extra_config='residual_stops = [ { address = 0x82001004, name = "range_model_steps" } ]\n')
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertEqual(r.fatal, [])
+        self.assertIn("NOTE: residual stop range_model_steps at 82001004 (no proven bound; config residual_stops)", r.log)
+        body = self.function_body(r, T)
+        self.assertIn('\tPpcResidualStop(0x82001004u, "range_model_steps", ctx.r3.u32, uint32_t(ctx.lr));', body)
+        self.assertNotIn("switch (ctx.r3.u32)", body)
+        self.assertNotIn("#error", body)
+
+    def test_residual_stop_on_proven_switch_is_fatal(self):
+        """Patch 0035: the list is exact: naming a switch with a proven bound is fatal."""
+        r = self.switch_case("residual_stop_on_proven_switch_is_fatal", [T + 0x10, T + 0x18],
+                             extra_config='residual_stops = [ { address = 0x82001004, name = "s" } ]\n')
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("residual stop s at 82001004 names a switch table with a proven bound", r.fatal)
+
+    def test_residual_stop_not_reached_is_fatal(self):
+        """Patch 0035: a listed address with no unproven switch table is fatal (T+0x10 is case 0's
+        li, not a dispatch); the unlisted unproven switch at T+4 stays fatal too."""
+        r = self.switch_case("residual_stop_not_reached_is_fatal", [], table_size=0,
+                             extra_config='residual_stops = [ { address = 0x82001010, name = "elsewhere" } ]\n')
+        self.assertNotEqual(r.code, 0)
+        self.assertEqual(sorted(r.fatal), ["residual stop elsewhere at 82001010 was not reached: no unproven switch table there",
+                                           "switch table at 82001004 has no proven bound"])
+
+    def test_residual_stop_needs_a_plain_name(self):
+        """Patch 0035: each entry needs an address and a name of [A-Za-z0-9_]+ (it is written into a
+        string literal); otherwise the run stops before analysis."""
+        for bad in ('{ address = 0x82001004 }', '{ address = 0x82001004, name = "a\\"b" }', '{ name = "x" }'):
+            r = self.switch_case("residual_stop_needs_a_plain_name", [], table_size=0,
+                                 extra_config='residual_stops = [ %s ]\n' % bad)
+            self.assertNotEqual(r.code, 0, bad)
+            self.assertIn("residual_stops needs one { address, name } per dispatch, name [A-Za-z0-9_]+", r.log, bad)
 
     def test_switch_without_bound_is_fatal(self):
         """Patch 0025: a switch entry with no labels (no proven bound) is fatal."""

@@ -9,6 +9,9 @@ local and not distributed: they hold data derived from the game.
 
 | Area | Note | What it covers |
 |---|---|---|
+| Recompiler | [pipeline_map.md](recompiler/pipeline_map.md) | The survey and recompile pipeline, its checks and log markers |
+| Recompiler | [unproven_switches.md](recompiler/unproven_switches.md) | Switch dispatches without a proven bound, the first diagnostic survey |
+| Recompiler | [unproven_switch_c.md](recompiler/unproven_switch_c.md), [unproven_switch_d.md](recompiler/unproven_switch_d.md) | The two bounded analyses of the 0x82ADA478 dispatch |
 
 ## Sources FM4 copies or adapts code from
 

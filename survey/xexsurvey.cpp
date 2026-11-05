@@ -7,7 +7,12 @@
 //
 //   tools/survey/xexsurvey <file.xex> <out-dir>
 //
-// Writes <out-dir>/image.bin (proprietary-derived: <out-dir> must be under game/, git-ignored).
+// Writes <out-dir>/image.bin (proprietary-derived: <out-dir> must be under game/, git-ignored)
+// and <out-dir>/report.json (addresses only, for survey/survey.py, survey/switch_tables.py and
+// scripts/validate.py): base, size, entry, export_table, the loader's sections (what XenonRecomp
+// sees; the PE table printed below stays the independent check), the compiler-helper hits, the
+// import thunks and every import record (import_slots). Field names follow ForzaRecomp
+// survey/xex_report.cpp at 2958627 (GPL-3.0-or-later), whose consumers this report feeds.
 // Exits 1 with "FATAL:" when a check fails; prints "image check: OK" when all pass.
 //
 // Adapted from ReCarbon survey/xexsurvey.cpp (ReCarbon, GPL-3.0-or-later).
@@ -110,6 +115,35 @@ struct Pattern
     const char* key;
     std::vector<uint8_t> bytes;
 };
+
+// One import record for report.json: kind "thunk" (a function stub the loader named), "variable",
+// "function_slot" (a type-0 record whose name is a thunk's of the same library: its import-table
+// slot) or "unexpected" (a non-zero record type without a thunk; survey.py fails on it).
+struct ImportSlot
+{
+    std::string library, name, kind;
+    uint32_t ordinal = 0, address = 0;
+};
+
+// JSON string literal: names come from the loader's export tables and the XEX string table.
+static std::string JsonString(const std::string& s)
+{
+    std::string out = "\"";
+    for (unsigned char c : s)
+    {
+        if (c == '"' || c == '\\')
+            out += '\\', out += char(c);
+        else if (c < 0x20)
+        {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        }
+        else
+            out += char(c);
+    }
+    return out + "\"";
+}
 
 int main(int argc, char** argv)
 {
@@ -270,6 +304,7 @@ int main(int argc, char** argv)
     const uint8_t* importHeader = FindOptHeader(file, 0x000103FF);
     std::map<std::string, std::set<std::string>> byLibrary;
     std::map<std::string, std::set<std::string>> variablesByLibrary;
+    std::vector<ImportSlot> slots;
     if (importHeader != nullptr)
     {
         uint32_t stringTableSize = ReadBE32(importHeader + 4);
@@ -305,6 +340,7 @@ int main(int argc, char** argv)
                 if (sym != image.symbols.end() && sym->address == thunkAddr)
                 {
                     byLibrary[libName].insert(sym->name);
+                    slots.push_back({libName, sym->name, "thunk", 0, thunkAddr});
                     continue;
                 }
 
@@ -339,6 +375,7 @@ int main(int argc, char** argv)
                     variablesByLibrary[libName].insert(name);
                 else
                     byLibrary[libName].insert(name);
+                slots.push_back({libName, name, type == 0 ? "variable" : "unexpected", ordinal, thunkAddr});
             }
             lib += libSize;
         }
@@ -377,6 +414,7 @@ int main(int argc, char** argv)
     };
 
     printf("\n## Compiler helpers\n\n");
+    std::vector<std::pair<const char*, std::vector<size_t>>> helperHits;
     for (auto& p : patterns)
     {
         std::vector<size_t> hits;
@@ -395,6 +433,7 @@ int main(int argc, char** argv)
         for (size_t h : hits)
             printf(" 0x%08zX", h);
         printf("%s\n", hits.empty() ? " (not found)" : hits.size() > 1 ? "   <-- multiple hits, check by hand" : "");
+        helperHits.emplace_back(p.key, std::move(hits));
     }
 
     printf("\n## Import stubs\n\n");
@@ -403,6 +442,65 @@ int main(int argc, char** argv)
         if (sym.name.rfind("__imp__", 0) == 0)
             printf("0x%08zX %s\n", sym.address, sym.name.c_str());
     }
+
+    // A type-0 record named like a thunk of its library is that function's import-table slot.
+    for (auto& slot : slots)
+        if (slot.kind == "variable" && byLibrary[slot.library].count(slot.name))
+            slot.kind = "function_slot";
+
+    // report.json: addresses as JSON numbers (decimal), keys in a fixed order, sections in the
+    // loader's order, symbols in the symbol table's order, records in header order: the file
+    // depends only on the XEX (two runs are byte-identical).
+    const std::string reportPath = std::string(argv[2]) + "/report.json";
+    FILE* r = fopen(reportPath.c_str(), "w");
+    if (r == nullptr)
+    {
+        fprintf(stderr, "FATAL: cannot write %s\n", reportPath.c_str());
+        return 1;
+    }
+    fprintf(r, "{\n  \"base\": %zu,\n  \"size\": %zu,\n  \"entry\": %zu,\n  \"export_table\": %zu,\n  \"sections\": [",
+        size_t(image.base), size_t(image.size), size_t(image.entry_point), size_t(image.export_table));
+    bool first = true;
+    for (const auto& s : image.sections)
+    {
+        fprintf(r, "%s\n    {\"name\": %s, \"start\": %zu, \"end\": %zu, \"code\": %s}", first ? "" : ",",
+            JsonString(s.name).c_str(), size_t(s.base), size_t(s.base) + s.size, (s.flags & SectionFlags_Code) ? "true" : "false");
+        first = false;
+    }
+    fprintf(r, "\n  ],\n  \"helpers\": {");
+    first = true;
+    for (const auto& [key, hits] : helperHits)
+    {
+        fprintf(r, "%s\n    \"%s\": [", first ? "" : ",", key);
+        for (size_t i = 0; i < hits.size(); ++i)
+            fprintf(r, "%s%zu", i ? ", " : "", hits[i]);
+        fprintf(r, "]");
+        first = false;
+    }
+    fprintf(r, "\n  },\n  \"imports\": [");
+    first = true;
+    for (const auto& sym : image.symbols)
+    {
+        if (sym.type != Symbol_Function)
+            continue;
+        fprintf(r, "%s\n    {\"name\": %s, \"address\": %zu}", first ? "" : ",", JsonString(sym.name).c_str(), size_t(sym.address));
+        first = false;
+    }
+    fprintf(r, "\n  ],\n  \"import_slots\": [");
+    first = true;
+    for (const auto& slot : slots)
+    {
+        fprintf(r, "%s\n    {\"library\": %s, \"name\": %s, \"ordinal\": %u, \"address\": %u, \"kind\": \"%s\"}", first ? "" : ",",
+            JsonString(slot.library).c_str(), JsonString(slot.name).c_str(), slot.ordinal, slot.address, slot.kind.c_str());
+        first = false;
+    }
+    fprintf(r, "\n  ]\n}\n");
+    if (fclose(r) != 0)
+    {
+        fprintf(stderr, "FATAL: cannot write %s\n", reportPath.c_str());
+        return 1;
+    }
+    printf("\nwrote %s\n", reportPath.c_str());
 
     return 0;
 }
