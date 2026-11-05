@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:23:44 +0700
+Subject: [PATCH 2/3] XEX sections: bound names and extents by their fields and
+ the image
+
+IMAGE_SECTION_HEADER.Name is 8 bytes and has no terminating NUL when the
+name is 8 characters long (Forza Motorsport 4's .XBMOVIE). Mapping it as a
+C string read past the field into VirtualSize, so the section was named
+".XBMOVIE\f". Bound the name by the field size.
+
+A section's VirtualSize can also extend past the loaded image (FM4's
+discardable .reloc ends 0x2ED94 bytes after it). Map only the part inside
+the image; a code section that does not fit rejects the image (an empty
+result), since truncating code would drop it.
+---
+ XenonUtils/xex.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index 21ee0ef..a986eac 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -299,8 +299,22 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+             flags |= SectionFlags_Code;
+         }
+ 
+-        image.Map(reinterpret_cast<const char*>(section.Name), section.VirtualAddress, 
+-            section.Misc.VirtualSize, flags, image.data.get() + section.VirtualAddress);
++        // A section name fills all 8 bytes of Name when it is 8 characters long, with no
++        // terminating NUL: never read past the field.
++        const auto* name = reinterpret_cast<const char*>(section.Name);
++
++        // A section may extend past the loaded image (Forza Motorsport 4's discardable .reloc):
++        // map only the part that exists. Code is never truncated: such an image is rejected.
++        const size_t rva = section.VirtualAddress;
++        size_t size = section.Misc.VirtualSize;
++        if (rva > image.size || size > image.size - rva)
++        {
++            if (flags & SectionFlags_Code)
++                return {};
++            size = rva < image.size ? image.size - rva : 0;
++        }
++        image.Map(std::string_view(name, strnlen(name, sizeof(section.Name))), rva, uint32_t(size), flags,
++            rva < image.size ? image.data.get() + rva : nullptr);
+     }
+ 
+     auto* imports = reinterpret_cast<const Xex2ImportHeader*>(getOptHeaderPtr(data, XEX_HEADER_IMPORT_LIBRARIES));
+-- 
+2.54.0 (Apple Git-157)
+

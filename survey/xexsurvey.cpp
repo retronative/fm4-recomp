@@ -32,9 +32,10 @@
 //      vs 0xF50000) and Xenia does not check it;
 //   4. sections, read from the PE headers with names bounded to their 8-byte field: a code
 //      section past the image is FATAL; a data section past the image (FM4's discardable
-//      .reloc) is reported and never read. Upstream Xex2LoadImage reads 8-character names past
-//      the field and maps such sections with their full size (ForzaRecomp patch 0002, not
-//      imported): the loader's own section table is not used here.
+//      .reloc) is reported and never read. Upstream Xex2LoadImage read 8-character names past
+//      the field and mapped such sections with their full size; patches/xenonrecomp/0002 fixes
+//      both. This survey still reads sections from the PE headers itself, as an independent
+//      check on the loader's table.
 
 #include <xex.h>
 #include <image.h>
