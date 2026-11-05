@@ -22,12 +22,19 @@
 //      zero-fills the rest), and the blocks' data fits in the file after the header (layout:
 //      xex2_info.h xex2_opt_file_format_info / xex2_file_basic_compression_block). Upstream
 //      Xex2LoadImage allocates only the block sum but reports image_size, so a shorter sum
-//      means the loader would read past its buffer: refuse (FATAL) until the loader is fixed
-//     
-//   3. the loaded image is a PE image: "MZ", e_lfanew inside the image, "PE\0\0"
-//      (a wrong key or a bad decompression yields neither);
-//   4. PE OptionalHeader.SizeOfImage == image_size and ImageBase == the load base;
-//   5. every PE section lies inside the image.
+//      means the loader would read past its buffer: refused (FATAL) while kUpstreamLoader is set;
+//      fixed by patches/xenonrecomp/0001;
+//   3. the loaded image is an Xbox PE image, with Xenia's checks (xex_module.cc ReadPEHeaders):
+//      "MZ", "PE\0\0", Machine IMAGE_FILE_MACHINE_POWERPCBE (0x1F2), IMAGE_FILE_32BIT_MACHINE
+//      (0x100), SizeOfOptionalHeader 224, PE32 magic 0x10B, Subsystem IMAGE_SUBSYSTEM_XBOX (14)
+//      (a wrong key or a bad decompression yields none of these); plus ours: ImageBase == the
+//      load address. PE SizeOfImage is NOT compared with image_size: FM4's is larger (0x10DDA00
+//      vs 0xF50000) and Xenia does not check it;
+//   4. sections, read from the PE headers with names bounded to their 8-byte field: a code
+//      section past the image is FATAL; a data section past the image (FM4's discardable
+//      .reloc) is reported and never read. Upstream Xex2LoadImage reads 8-character names past
+//      the field and maps such sections with their full size (ForzaRecomp patch 0002, not
+//      imported): the loader's own section table is not used here.
 
 #include <xex.h>
 #include <image.h>
@@ -62,8 +69,9 @@ static uint16_t ReadLE16(const uint8_t* p)
 static int failures = 0;
 
 // True while tools/XenonRecomp has no loader fix for BASIC images whose blocks are shorter than
-// the declared image (upstream ddd128bc). Set to false in the same change that adds the fix.
-constexpr bool kUpstreamLoader = true;
+// the declared image (upstream ddd128bc). False since patches/xenonrecomp/0001 (allocates the
+// declared size, zero-filled; tests/loader/xex_basic_*_test.cpp).
+constexpr bool kUpstreamLoader = false;
 
 static void Check(bool ok, const char* what, uint64_t got, uint64_t want)
 {
@@ -168,9 +176,12 @@ int main(int argc, char** argv)
         if (total < imageSize)
             printf("  note  image tail 0x%llX bytes past the blocks is zero-filled by the console loader\n",
                 (unsigned long long)(imageSize - total));
-        Check(total == imageSize || !kUpstreamLoader,
-            "upstream Xex2LoadImage allocates only the block sum: loading would read past its buffer",
-            total, imageSize);
+        if (kUpstreamLoader)
+            Check(total == imageSize,
+                "upstream Xex2LoadImage allocates only the block sum: loading would read past its buffer",
+                total, imageSize);
+        else if (total < imageSize)
+            printf("  note  the loader allocates the declared image size, zero-filled (patches/xenonrecomp/0001)\n");
     }
     else
     {
@@ -194,19 +205,44 @@ int main(int argc, char** argv)
         return 1;
     const uint8_t* nt = img + lfanew;
     Check(memcmp(nt, "PE\0\0", 4) == 0, "PE signature", ReadLE32(nt), 0x00004550);
-    const uint8_t* opt = nt + 24;  // IMAGE_OPTIONAL_HEADER32
-    Check(ReadLE32(opt + 56) == imageSize, "PE SizeOfImage == image_size", ReadLE32(opt + 56), imageSize);
-    Check(ReadLE32(opt + 28) == loadAddress, "PE ImageBase == load address", ReadLE32(opt + 28), loadAddress);
-    const uint16_t numSections = ReadLE16(nt + 6);
+    Check(ReadLE16(nt + 4) == 0x1F2, "PE Machine == POWERPCBE", ReadLE16(nt + 4), 0x1F2);
+    Check((ReadLE16(nt + 22) & 0x100) != 0, "PE Characteristics has 32BIT_MACHINE", ReadLE16(nt + 22), 0x100);
     const uint16_t optSize = ReadLE16(nt + 20);
+    Check(optSize == 224, "PE SizeOfOptionalHeader == 224", optSize, 224);
+    if (failures)
+        return 1;
+    const uint8_t* opt = nt + 24;  // IMAGE_OPTIONAL_HEADER32
+    Check(ReadLE16(opt) == 0x10B, "PE32 optional header magic", ReadLE16(opt), 0x10B);
+    Check(ReadLE16(opt + 68) == 14, "PE Subsystem == XBOX", ReadLE16(opt + 68), 14);
+    Check(ReadLE32(opt + 28) == loadAddress, "PE ImageBase == load address", ReadLE32(opt + 28), loadAddress);
+    printf("  note  PE SizeOfImage 0x%X (not compared: see check 3)\n", ReadLE32(opt + 56));
+    const uint16_t numSections = ReadLE16(nt + 6);
+    if (lfanew + 0xF8 + uint64_t(numSections) * 40 > imageSize)
+    {
+        fprintf(stderr, "FATAL: section headers outside the image\n");
+        return 1;
+    }
+    std::string sectionTable = "| Section | Start | End | Size | Kind | Note |\n|---|---|---|---|---|---|\n";
     const uint8_t* sec = opt + optSize;
     for (uint16_t i = 0; i < numSections; i++, sec += 40)
     {
-        char name[9] = {};
-        memcpy(name, sec, 8);
-        const uint64_t end = uint64_t(ReadLE32(sec + 12)) + ReadLE32(sec + 8);
-        std::string what = std::string("section ") + name + " inside the image";
-        Check(end <= imageSize, what.c_str(), end, imageSize);
+        const std::string name(reinterpret_cast<const char*>(sec), strnlen(reinterpret_cast<const char*>(sec), 8));
+        const uint32_t size = ReadLE32(sec + 8), rva = ReadLE32(sec + 12), chars = ReadLE32(sec + 36);
+        const bool code = (chars & 0x20) != 0;  // IMAGE_SCN_CNT_CODE, as Xex2LoadImage tests
+        const uint64_t end = uint64_t(rva) + size;
+        const char* note = "";
+        if (end > imageSize)
+        {
+            std::string what = "code section " + name + " inside the image";
+            if (code)
+                Check(false, what.c_str(), end, imageSize);
+            note = "extends past the image: not read";
+        }
+        char row[160];
+        snprintf(row, sizeof(row), "| %s | 0x%08llX | 0x%08llX | 0x%X | %s%s | %s |\n", name.c_str(),
+            (unsigned long long)(loadAddress + uint64_t(rva)), (unsigned long long)(loadAddress + end), size,
+            code ? "code" : "data", (chars & 0x02000000) ? ", discardable" : "", note);
+        sectionTable += row;
     }
     if (failures)
         return 1;
@@ -214,12 +250,7 @@ int main(int argc, char** argv)
 
     printf("\n## Image\n\n");
     printf("base 0x%08zX, size 0x%08X, entry 0x%08zX\n\n", image.base, image.size, image.entry_point);
-    printf("| Section | Start | End | Size | Kind |\n|---|---|---|---|---|\n");
-    for (auto& s : image.sections)
-    {
-        printf("| %s | 0x%08zX | 0x%08zX | 0x%X | %s |\n", s.name.c_str(), s.base, s.base + s.size, s.size,
-            (s.flags & SectionFlags_Code) ? "code" : "data");
-    }
+    printf("%s", sectionTable.c_str());
 
     std::string outPath = std::string(argv[2]) + "/image.bin";
     FILE* f = fopen(outPath.c_str(), "wb");
@@ -264,6 +295,11 @@ int main(int argc, char** argv)
             for (uint16_t im = 0; im < count; im++)
             {
                 uint32_t thunkAddr = ReadBE32(lib + 0x28 + im * 4);
+                if (thunkAddr < image.base || thunkAddr + 4ull > image.base + uint64_t(image.size))
+                {
+                    fprintf(stderr, "FATAL: import record 0x%08X of %s outside the image\n", thunkAddr, libName.c_str());
+                    return 1;
+                }
                 auto sym = image.symbols.find(thunkAddr);
                 if (sym != image.symbols.end() && sym->address == thunkAddr)
                 {

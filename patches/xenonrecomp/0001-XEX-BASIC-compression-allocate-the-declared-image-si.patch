@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:19:59 +0700
+Subject: [PATCH 1/3] XEX BASIC compression: allocate the declared image size
+
+Xex2LoadImage reports image.size = security->imageSize, but for BASIC
+compression it allocated only the sum of the expanded blocks. When the blocks
+expand to less than the declared size (Forza Motorsport 4: 0xF48000 of
+0xF50000 bytes), every access to the declared tail read past the allocation.
+
+Allocate the declared size, zero-filled, so the reported extent is always
+backed. Reject the image (an empty result) when the blocks expand beyond the
+declared size or their data runs past the end of the file. Block sizes are
+summed in 64 bits so 32-bit fields cannot wrap past these checks, and a
+format header too short to hold any block is rejected.
+---
+ XenonUtils/xex.cpp | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index 4e79042..21ee0ef 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -172,15 +172,25 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+         else if (fileFormatInfo->compressionType == XEX_COMPRESSION_BASIC)
+         {
+             auto* blocks = reinterpret_cast<const Xex2FileBasicCompressionBlock*>(fileFormatInfo + 1);
++            if (fileFormatInfo->infoSize < sizeof(Xex2FileBasicCompressionInfo))
++                return {};
+             const size_t numBlocks = (fileFormatInfo->infoSize / sizeof(Xex2FileBasicCompressionInfo)) - 1;
+ 
+-            imageSize = 0;
++            // Sizes are summed in 64 bits: 32-bit block fields must not wrap past the checks below.
++            uint64_t expandedSize = 0, sourceSize = 0;
+             for (size_t i = 0; i < numBlocks; i++)
+             {
+-                imageSize += blocks[i].dataSize + blocks[i].zeroSize;
++                expandedSize += uint64_t(blocks[i].dataSize) + blocks[i].zeroSize;
++                sourceSize += blocks[i].dataSize;
+             }
+ 
+-            result = std::make_unique<uint8_t[]>(imageSize);
++            // The image is reported with the security header's size (image.size below), which
++            // can exceed the expanded blocks: allocate that whole extent, zero-filled. Reject
++            // blocks that expand beyond it, or whose data runs past the end of the file.
++            if (expandedSize > security->imageSize.get() || sourceSize > dataSize - header->headerSize)
++                return {};
++            imageSize = size_t(expandedSize);
++            result = std::make_unique<uint8_t[]>(security->imageSize.get());
+             auto* destData = result.get();
+ 
+             for (size_t i = 0; i < numBlocks; i++)
+-- 
+2.54.0 (Apple Git-157)
+
