@@ -1,0 +1,27 @@
+# Reference notes
+
+Durable technical notes behind FM4 Recomp's design. Code comments link here when a decision needs
+more than a few lines. Labels: VERIFIED (read in code or a specification), OBSERVED (seen in a run
+or trace of the game), HYPOTHESIS, FALSIFIED, UNRESOLVED. Traces, logs and other run captures are
+local and not distributed: they hold data derived from the game.
+
+## Notes
+
+| Area | Note | What it covers |
+|---|---|---|
+
+## Sources FM4 copies or adapts code from
+
+Citations of the form `file:line` refer to these revisions unless a citation names another.
+Licences and notices: [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md), [LICENSES](../LICENSES).
+
+| Project | Revision | Licence | Used for |
+|---|---|---|---|
+| [Xenia canary](https://github.com/xenia-canary/xenia-canary) | 67f16c4e315f (some citations: d119505, 838850fed838, named in place) | BSD-3-Clause | Kernel, XAM and GPU semantics; the xboxkrnl printf family is ported from it |
+| [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) | ddd128bcca99fe8bfbb99bea583c972351fa6ace | MIT | The recompiler, with the patches in `patches/xenonrecomp/` |
+| [SpeedBreaker](https://github.com/SpeedBreakerProject/speedbreaker) | 312ce69 | GPL-3.0 | The POD pipeline key (`runtime/video/draw_record.h`) |
+| ShiftGlue SDK (Xenia-derived) | 72b7dd6f | BSD-style | Semantics and techniques re-implemented here and cited in place (EDRAM pack/decode rules, depth-overwrite claim, clear absorption); no code copied |
+| TinySHA1 (as modified for Xenia, in XenonRecomp) | XenonRecomp's pin | ISC-style | The STFS hash tree (included, not copied) |
+| [FFmpeg](https://ffmpeg.org) | 7.1.1 | LGPL-2.1 | The XMA decoder (`patches/ffmpeg/`, built by `scripts/build_ffmpeg_xma.sh`) |
+
+Code taken from earlier ports keeps its attribution and licence in each file's header.

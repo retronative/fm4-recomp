@@ -1,0 +1,99 @@
+# Game data is NEVER committed. Players supply their own discs.
+/game
+/private
+*.iso
+*.xex
+*.xexp
+*.xcp
+# FM4 disc formats (Forza/extracted_data census, 2026-11-05). Not ignored globally because the
+# repository uses them too: xml, zip, bin, sh, txt, ini, dds, tga. Keep game files out of the tree.
+*.fsb
+*.fxobj
+*.carbin
+*.xpr
+*.xma
+*.fev
+*.pvs
+*.crowd
+*.seg
+*.irt
+*.geo
+*.col
+*.pit
+*.cfgp
+*.xds
+*.xzp
+*.xmplr
+*.wmv
+*.sbm
+*.lex
+*.slt
+
+# Generated recompiler output (from the player's own default.xex)
+/ppc
+ppc/
+
+# Analysis output derived from the game binary (disassembly, dumps, function lists)
+/reference/analysis/out
+*.ppm
+*.dump
+/*.bmp
+/*.png
+
+# Durable local evidence (runs, logs, reports); git-ignored, not /tmp
+/research/
+
+# Build output and packages
+build/
+out/
+.cache/
+*.tar.xz
+*.dmg
+*.dSYM/
+xcuserdata/
+*.spv
+
+# Third-party tool checkouts and builds
+/tools
+
+# Logs and traces
+*.log
+*.trace
+
+# Credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# macOS / editors
+.DS_Store
+._*
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local debugging log
+WORKLOG.local.md
+
+# Private local documents (owner decides later which become public)
+/reference/private/
+
+# Claude Code session state
+**/.claude/scheduled_tasks.*
+**/.claude/routines/.state/
+**/.claude/worktrees/
+**/.claude/checkpoints/
+**/.claude/mailbox/
+**/.claude/agent-registry.json
+**/.claude/agent-memory-local
+
+# Retention markers for local temporary data (general/data-retention-and-cleanup.md)
+.retention.json
