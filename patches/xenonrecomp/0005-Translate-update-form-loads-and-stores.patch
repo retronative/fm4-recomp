@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:07:29 +0700
+Subject: [PATCH] Translate update-form loads and stores
+
+Forza Motorsport 4 uses 16 update-form loads and stores that the recompiler does not translate
+(2,229 sites): lbzux, lhzu, lhzux, lhau, lwzux, ldux, stbux, sthu, sthux, stdux, lfsu, lfsux,
+lfdu, stfsu, stfsux and stfdu. Each computes EA = (rA) + d or (rA) + (rB), accesses memory with
+the source register's value from before the update, then sets rA = EA, as the existing lwzu and
+stwu do. The invalid forms (rA = 0, or rA = rT for a GPR load) are fatal.
+---
+ XenonRecomp/recompiler.cpp | 75 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 75 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 99091df..0c1aed4 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1300,6 +1300,81 @@ bool Recompiler::Recompile(
+         println("{});", int32_t(insn.operands[1]));
+         break;
+ 
++    // Update forms (PowerPC ISA Book I, "Load/Store with Update"): EA = (rA) + d or (rA) + (rB);
++    // the access uses (rS) before rA is updated; then rA = EA. rA = 0, and rA = rT for a GPR
++    // load, are invalid forms and are rejected. As upstream's LWZU/STWU, addresses are 32-bit
++    // and only the low word of rA is written.
++    case PPC_INST_LBZUX:
++    case PPC_INST_LHZU:
++    case PPC_INST_LHZUX:
++    case PPC_INST_LHAU:
++    case PPC_INST_LWZUX:
++    case PPC_INST_LDUX:
++    case PPC_INST_STBUX:
++    case PPC_INST_STHU:
++    case PPC_INST_STHUX:
++    case PPC_INST_STDUX:
++    case PPC_INST_LFSU:
++    case PPC_INST_LFSUX:
++    case PPC_INST_LFDU:
++    case PPC_INST_STFSU:
++    case PPC_INST_STFSUX:
++    case PPC_INST_STFDU:
++    {
++        const uint32_t id = insn.opcode->id;
++        const bool indexed = id == PPC_INST_LBZUX || id == PPC_INST_LHZUX || id == PPC_INST_LWZUX || id == PPC_INST_LDUX ||
++            id == PPC_INST_STBUX || id == PPC_INST_STHUX || id == PPC_INST_STDUX || id == PPC_INST_LFSUX || id == PPC_INST_STFSUX;
++        const bool gprLoad = id == PPC_INST_LBZUX || id == PPC_INST_LHZU || id == PPC_INST_LHZUX || id == PPC_INST_LHAU ||
++            id == PPC_INST_LWZUX || id == PPC_INST_LDUX;
++        const uint32_t rt = insn.operands[0], ra = insn.operands[indexed ? 1 : 2];
++        if (ra == 0 || (gprLoad && ra == rt))
++        {
++            Fatal(fmt::format("invalid form {} at {:X}: rA is 0 or the load target", insn.opcode->name, base));
++            break;
++        }
++        if (indexed)
++            println("\t{} = {}.u32 + {}.u32;", ea(), r(ra), r(insn.operands[2]));
++        else
++            println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(ra));
++
++        const char* store = mmioStore() ? "PPC_MM_STORE" : "PPC_STORE";
++        switch (id)
++        {
++        case PPC_INST_LBZUX: println("\t{}.u64 = PPC_LOAD_U8({});", r(rt), ea()); break;
++        case PPC_INST_LHZU:
++        case PPC_INST_LHZUX: println("\t{}.u64 = PPC_LOAD_U16({});", r(rt), ea()); break;
++        case PPC_INST_LHAU: println("\t{}.s64 = int16_t(PPC_LOAD_U16({}));", r(rt), ea()); break;
++        case PPC_INST_LWZUX: println("\t{}.u64 = PPC_LOAD_U32({});", r(rt), ea()); break;
++        case PPC_INST_LDUX: println("\t{}.u64 = PPC_LOAD_U64({});", r(rt), ea()); break;
++        case PPC_INST_STBUX: println("\t{}_U8({}, {}.u8);", store, ea(), r(rt)); break;
++        case PPC_INST_STHU:
++        case PPC_INST_STHUX: println("\t{}_U16({}, {}.u16);", store, ea(), r(rt)); break;
++        case PPC_INST_STDUX: println("\t{}_U64({}, {}.u64);", store, ea(), r(rt)); break;
++        case PPC_INST_LFSU:
++        case PPC_INST_LFSUX:
++            printSetFlushMode(false);
++            println("\t{}.u32 = PPC_LOAD_U32({});", temp(), ea());
++            println("\t{}.f64 = double({}.f32);", f(rt), temp());
++            break;
++        case PPC_INST_LFDU:
++            printSetFlushMode(false);
++            println("\t{}.u64 = PPC_LOAD_U64({});", f(rt), ea());
++            break;
++        case PPC_INST_STFSU:
++        case PPC_INST_STFSUX:
++            printSetFlushMode(false);
++            println("\t{}.f32 = float({}.f64);", temp(), f(rt));
++            println("\t{}_U32({}, {}.u32);", store, ea(), temp());
++            break;
++        case PPC_INST_STFDU:
++            printSetFlushMode(false);
++            println("\t{}_U64({}, {}.u64);", store, ea(), f(rt));
++            break;
++        }
++        println("\t{}.u32 = {};", r(ra), ea());
++        break;
++    }
++
+     case PPC_INST_LWZU:
+         println("\t{} = {} + {}.u32;", ea(), int32_t(insn.operands[1]), r(insn.operands[2]));
+         println("\t{}.u64 = PPC_LOAD_U32({});", r(insn.operands[0]), ea());
+-- 
+2.54.0 (Apple Git-157)
+

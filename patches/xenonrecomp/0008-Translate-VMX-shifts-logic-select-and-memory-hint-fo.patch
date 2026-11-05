@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:17:16 +0700
+Subject: [PATCH] Translate VMX shifts, logic, select and memory-hint forms
+
+Forza Motorsport 4 uses vsl, vslo, vslo128, vsro128, vsrb, vnor128 and vsel128, and the memory
+forms lvxl128, stvlxl128 and lvehx, which the recompiler does not translate (394 sites). Vector
+registers hold the guest value byte-reversed, so the guest 128-bit value is the host's
+little-endian one and whole-register shifts move bytes toward higher host indices for a guest
+left shift; the count comes from guest byte 15. vsel128's mask is its destination register.
+lvxl128 and stvlxl128 differ from lvx128 and stvlx128 only by a cache hint; lvehx loads the
+aligned quadword, which places the halfword in its element (the ISA leaves the others
+undefined).
+---
+ XenonRecomp/recompiler.cpp | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index ff4cf97..8a97bf3 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1279,6 +1279,8 @@ bool Recompiler::Recompile(
+     case PPC_INST_LVEWX128:
+     case PPC_INST_LVX:
+     case PPC_INST_LVX128:
++    case PPC_INST_LVXL128: // lvx128 with a least-recently-used hint
++    case PPC_INST_LVEHX: // the element's halfword lands in place; the ISA leaves the others undefined
+         // NOTE: for endian swapping, we reverse the whole vector instead of individual elements.
+         // this is accounted for in every instruction (eg. dp3 sums yzw instead of xyz)
+         print("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_shuffle_epi8(simde_mm_load_si128((simde__m128i*)(base + ((", v(insn.operands[0]));
+@@ -1826,6 +1828,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_STVLX:
+     case PPC_INST_STVLX128:
++    case PPC_INST_STVLXL128: // stvlx128 with a least-recently-used hint
+         // TODO: vectorize
+         // NOTE: accounting for the full vector reversal here
+         print("\t{} = ", ea());
+@@ -2318,9 +2321,42 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_VSEL:
++    case PPC_INST_VSEL128: // the mask operand (VS128) is the destination register
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_or_si128(simde_mm_andnot_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_and_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8))));", v(insn.operands[0]), v(insn.operands[3]), v(insn.operands[1]), v(insn.operands[3]), v(insn.operands[2]));
+         break;
+ 
++    // Whole-register shifts. Registers hold the guest vector byte-reversed (host u8[k] is guest
++    // byte 15 - k), so the guest 128-bit value is the host's little-endian one: a guest left
++    // shift moves bytes toward higher host indices. The count is in guest byte 15 (host u8[0]).
++    case PPC_INST_VSL:
++        // shift left by (vB) bits 125:127
++        println("\t{{ const unsigned shift = {}.u8[0] & 7; const PPCVRegister source = {};", v(insn.operands[2]), v(insn.operands[1]));
++        println("\tfor (size_t i = 0; i < 16; i++) {}.u8[i] = uint8_t((source.u8[i] << shift) | (i != 0 ? source.u8[i - 1] >> (8 - shift) : 0)); }}", v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSLO:
++    case PPC_INST_VSLO128:
++        // shift left by (vB) bits 121:124 octets
++        println("\t{{ const unsigned shift = ({}.u8[0] >> 3) & 0xF; const PPCVRegister source = {};", v(insn.operands[2]), v(insn.operands[1]));
++        println("\tfor (size_t i = 0; i < 16; i++) {}.u8[i] = i >= shift ? source.u8[i - shift] : 0; }}", v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSRO128:
++        // shift right by (vB) bits 121:124 octets
++        println("\t{{ const unsigned shift = ({}.u8[0] >> 3) & 0xF; const PPCVRegister source = {};", v(insn.operands[2]), v(insn.operands[1]));
++        println("\tfor (size_t i = 0; i < 16; i++) {}.u8[i] = i + shift < 16 ? source.u8[i + shift] : 0; }}", v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VSRB:
++        // each byte shifted right by the low 3 bits of the matching byte of vB
++        println("\t{{ const PPCVRegister source = {}, count = {};", v(insn.operands[1]), v(insn.operands[2]));
++        println("\tfor (size_t i = 0; i < 16; i++) {}.u8[i] = source.u8[i] >> (count.u8[i] & 7); }}", v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VNOR128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_xor_si128(simde_mm_or_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_set1_epi32(-1)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
+     case PPC_INST_VSLB:
+         // TODO: vectorize
+         for (size_t i = 0; i < 16; i++)
+-- 
+2.54.0 (Apple Git-157)
+

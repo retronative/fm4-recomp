@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:09:59 +0700
+Subject: [PATCH] Translate bdzf, bdnzt, bso and bns
+
+Forza Motorsport 4 uses four conditional branches the recompiler does not translate (732 sites):
+bdzf, bdnzt, bso and bns. The counter forms share one lowering with bdnzf: CTR is decremented
+once and tested on its low word as in bdz and bdnz, then CR bit BI is tested; targets outside
+the function are tail calls. bso and bns test bit 3 of the CR field, which holds SO after an
+integer compare and the unordered result after a floating-point compare.
+---
+ XenonRecomp/recompiler.cpp | 53 ++++++++++++++++++++++++++++----------
+ 1 file changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 0c1aed4..a288254 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -470,6 +470,27 @@ bool Recompiler::Recompile(
+             }
+         };
+ 
++    // bdzf, bdnzf, bdnzt: CTR is decremented once; the branch is taken when CTR is (or is not)
++    // zero and CR bit BI has the given value. CTR is tested on its low word, as in bdz and bdnz.
++    auto printCounterCrBranch = [&](bool ctrZero, bool bitSet)
++        {
++            println("\t--{}.u64;", ctr());
++            const auto condition = fmt::format("{}.u32 {} 0 && {}{}.{}", ctr(), ctrZero ? "==" : "!=", bitSet ? "" : "!",
++                cr(insn.operands[0] / 4), CrBit(insn.operands[0]));
++            if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
++            {
++                println("\tif ({}) {{", condition);
++                print("\t");
++                printFunctionCall(insn.operands[1]);
++                println("\t\treturn;");
++                println("\t}}");
++            }
++            else
++            {
++                println("\tif ({}) goto loc_{:X};", condition, insn.operands[1]);
++            }
++        };
++
+     auto printSetFlushMode = [&](bool enable)
+         {
+             auto newState = enable ? CSRState::VMX : CSRState::FPU;
+@@ -734,19 +755,25 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BDNZF:
+-        println("\t--{}.u64;", ctr());
+-        if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
+-        {
+-            println("\tif ({}.u32 != 0 && !{}.{}) {{", ctr(), cr(insn.operands[0] / 4), CrBit(insn.operands[0]));
+-            print("\t");
+-            printFunctionCall(insn.operands[1]);
+-            println("\t\treturn;");
+-            println("\t}}");
+-        }
+-        else
+-        {
+-            println("\tif ({}.u32 != 0 && !{}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), CrBit(insn.operands[0]), insn.operands[1]);
+-        }
++        printCounterCrBranch(false, false);
++        break;
++
++    case PPC_INST_BDZF:
++        printCounterCrBranch(true, false);
++        break;
++
++    case PPC_INST_BDNZT:
++        printCounterCrBranch(false, true);
++        break;
++
++    // bso/bns test CR bit 3 of the field: SO (a copy of XER[SO]) after an integer compare,
++    // unordered after a floating-point compare.
++    case PPC_INST_BSO:
++        printConditionalBranch(false, "so");
++        break;
++
++    case PPC_INST_BNS:
++        printConditionalBranch(true, "so");
+         break;
+ 
+     case PPC_INST_BEQ:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:25:31 +0700
+Subject: [PATCH] Translate lhbrx and dcbst
+
+Forza Motorsport 4 uses lhbrx and dcbst once each; the recompiler translates neither. lhbrx
+loads a byte-reversed halfword, zero-extended, as lwbrx does for words. dcbst only writes a cache
+block back to memory, which the host keeps coherent, so like dcbf it emits nothing.
+---
+ XenonRecomp/recompiler.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 35d6db0..a976752 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -946,6 +946,10 @@ bool Recompiler::Recompile(
+         // no op
+         break;
+ 
++    case PPC_INST_DCBST:
++        // no op: like dcbf it only writes the block back to memory, which the host keeps coherent
++        break;
++
+     case PPC_INST_DCBT:
+         // no op
+         break;
+@@ -1345,6 +1349,14 @@ bool Recompiler::Recompile(
+         println("{}.u32));", r(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_LHBRX:
++        // the halfword at (rA|0) + (rB), byte-reversed, zero-extended
++        print("\t{}.u64 = __builtin_bswap16(PPC_LOAD_U16(", r(insn.operands[0]));
++        if (insn.operands[1] != 0)
++            print("{}.u32 + ", r(insn.operands[1]));
++        println("{}.u32));", r(insn.operands[2]));
++        break;
++
+     case PPC_INST_LWBRX:
+         print("\t{}.u64 = __builtin_bswap32(PPC_LOAD_U32(", r(insn.operands[0]));
+         if (insn.operands[1] != 0)
+-- 
+2.54.0 (Apple Git-157)
+

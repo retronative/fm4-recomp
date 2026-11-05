@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:23:38 +0700
+Subject: [PATCH] Decode VMX128 before PowerPC 405 instructions for Cell
+
+The decoder's default dialect, which the cell option leaves in place, includes the PowerPC
+403/405 instructions. Their encodings overlap VMX128: in Forza Motorsport 4, one vsldoi128 word
+decodes as the 405 multiply-accumulate mullhwu. and is not translated. Cell and Xenon have no
+403/405 instructions, so the cell dialect no longer enables them. Across all of FM4's code
+words, that word is the only decode that changes.
+---
+ thirdparty/disasm/ppc-dis.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/thirdparty/disasm/ppc-dis.c b/thirdparty/disasm/ppc-dis.c
+index 3e224b4..0ec6204 100644
+--- a/thirdparty/disasm/ppc-dis.c
++++ b/thirdparty/disasm/ppc-dis.c
+@@ -5336,6 +5336,12 @@ powerpc_dialect(struct disassemble_info* info)
+         && strstr(info->disassembler_options, "440") != NULL)
+         dialect |= PPC_OPCODE_BOOKE | PPC_OPCODE_32
+         | PPC_OPCODE_440 | PPC_OPCODE_ISEL | PPC_OPCODE_RFMCI;
++    else if (info->disassembler_options
++        && strstr(info->disassembler_options, "cell") != NULL)
++        /* Cell and Xenon lack the PowerPC 403/405 instructions, whose encodings (e.g. 405
++           mullhwu.) would otherwise shadow VMX128 ones (vsldoi128).  */
++        dialect |= (PPC_OPCODE_601 | PPC_OPCODE_CLASSIC
++            | PPC_OPCODE_COMMON | PPC_OPCODE_ALTIVEC);
+     else
+         dialect |= (PPC_OPCODE_403 | PPC_OPCODE_601 | PPC_OPCODE_CLASSIC
+             | PPC_OPCODE_COMMON | PPC_OPCODE_ALTIVEC);
+-- 
+2.54.0 (Apple Git-157)
+

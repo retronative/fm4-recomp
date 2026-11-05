@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:37:59 +0700
+Subject: [PATCH] ARM64: write FPCR from a 64-bit register
+
+setcsr passed a uint32_t to msr fpcr, which takes a 64-bit register; clang warns
+(-Wasm-operand-widths) and the upper half, FPCR's reserved bits, is unspecified. Every
+recompiled function that changes the rounding or flush mode on ARM64 runs this code.
+---
+ XenonUtils/ppc_context.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 1a67022..760c1b2 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -251,7 +251,8 @@ struct PPCFPSCRRegister
+ 
+     inline void setcsr(uint32_t csr) noexcept
+     {
+-        __asm__ __volatile__("msr fpcr, %0" : : "r"(csr));
++        // FPCR is a 64-bit register: a 32-bit operand would leave its upper half unspecified.
++        __asm__ __volatile__("msr fpcr, %0" : : "r"(uint64_t(csr)));
+     }
+ #else
+ #   error "Missing implementation for FPSCR."
+-- 
+2.54.0 (Apple Git-157)
+

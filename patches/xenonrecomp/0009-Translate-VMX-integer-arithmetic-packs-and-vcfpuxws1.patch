@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:20:51 +0700
+Subject: [PATCH] Translate VMX integer arithmetic, packs and vcfpuxws128
+
+Forza Motorsport 4 uses vaddsbs, vaddsws, vsubuwm, vmaxuh, vminuh, vcmpequh, vspltish, the
+VMX128 packs vpkswss128, vpkuwum128, vpkuwus128 and vpkuhus128, and vcfpuxws128, which the
+recompiler does not translate (277 sites). Element-wise operations map directly onto the
+byte-reversed register layout; packs take vB into the host's low lanes. Unsigned saturating
+packs clamp before packing, since the host pack instructions read signed input. vcfpuxws128
+scales by 2^UIMM and saturates NaN and non-positive values to 0 and values of 2^32 and above to
+0xFFFFFFFF. The record form vcmpequh. remains unsupported.
+---
+ XenonRecomp/recompiler.cpp | 69 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 69 insertions(+)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 8a97bf3..35d6db0 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -2357,6 +2357,75 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_xor_si128(simde_mm_or_si128(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)), simde_mm_set1_epi32(-1)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+ 
++    // VMX integer arithmetic. Element-wise operations are unaffected by the byte-reversed
++    // register layout: guest element i is host lane (n - 1 - i) of every operand alike.
++    case PPC_INST_VADDSBS:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s8, simde_mm_adds_epi8(simde_mm_load_si128((simde__m128i*){}.s8), simde_mm_load_si128((simde__m128i*){}.s8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VADDSWS:
++        // signed saturating add per word, as upstream's vsubsws
++        for (size_t i = 0; i < 4; i++)
++        {
++            println("\t{}.s64 = int64_t({}.s32[{}]) + int64_t({}.s32[{}]);", temp(), v(insn.operands[1]), i, v(insn.operands[2]), i);
++            println("\t{}.s32[{}] = {}.s64 > INT_MAX ? INT_MAX : {}.s64 < INT_MIN ? INT_MIN : {}.s64;", v(insn.operands[0]), i, temp(), temp(), temp());
++        }
++        break;
++
++    case PPC_INST_VSUBUWM:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u32, simde_mm_sub_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMAXUH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_max_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VMINUH:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VCMPEQUH:
++        // the record form (vcmpequh.) is not translated: 0003's CR check rejects it
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_cmpeq_epi16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        break;
++
++    case PPC_INST_VSPLTISH:
++        // the 5-bit SIMM is sign-extended by the decoder
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_set1_epi16(int16_t(0x{:X})));", v(insn.operands[0]), insn.operands[1] & 0xFFFF);
++        break;
++
++    // VMX128 packs: guest vD is (vA's elements, then vB's), so in the reversed layout the host's
++    // low lanes come from vB and the high lanes from vA.
++    case PPC_INST_VPKSWSS128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.s16, simde_mm_packs_epi32(simde_mm_load_si128((simde__m128i*){}.s32), simde_mm_load_si128((simde__m128i*){}.s32)));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKUWUM128:
++        // modulo: the low halfword of each word
++        println("\t{{ const PPCVRegister high = {}, low = {};", v(insn.operands[1]), v(insn.operands[2]));
++        println("\tfor (size_t i = 0; i < 4; i++) {{ {}.u16[i] = uint16_t(low.u32[i]); {}.u16[4 + i] = uint16_t(high.u32[i]); }} }}", v(insn.operands[0]), v(insn.operands[0]));
++        break;
++
++    case PPC_INST_VPKUWUS128:
++        // unsigned saturation: clamp to 0xFFFF first, since packus reads its input as signed
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u16, simde_mm_packus_epi32(simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(0xFFFF)), simde_mm_min_epu32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(0xFFFF))));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VPKUHUS128:
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_packus_epi16(simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF)), simde_mm_min_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_set1_epi16(0xFF))));", v(insn.operands[0]), v(insn.operands[2]), v(insn.operands[1]));
++        break;
++
++    case PPC_INST_VCFPUXWS128:
++    {
++        // each float times 2^UIMM, to an unsigned word: NaN and values <= 0 give 0, values at or
++        // above 2^32 give 0xFFFFFFFF, others truncate toward zero
++        printSetFlushMode(true);
++        println("\t{{ const PPCVRegister source = {};", v(insn.operands[1]));
++        println("\tfor (size_t i = 0; i < 4; i++) {{ const float value = source.f32[i] * {}.0f;", 1u << insn.operands[2]);
++        println("\t{}.u32[i] = __builtin_isnan(value) || value <= 0.0f ? 0u : value >= 4294967296.0f ? 0xFFFFFFFFu : uint32_t(value); }} }}", v(insn.operands[0]));
++        break;
++    }
++
+     case PPC_INST_VSLB:
+         // TODO: vectorize
+         for (size_t i = 0; i < 16; i++)
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 13:46:15 +0700
+Subject: [PATCH] Fail closed on untranslatable code
+
+Every instruction or control-flow construct the recompiler cannot translate is reported as
+FATAL, emitted as #error into the output, and makes XenonRecomp exit non-zero (normal and test
+mode): unrecognized and undecodable instructions, branch targets that are not functions, switch
+cases outside the function, record forms that write no CR field, unsupported pack/unpack types,
+undefined labels, fallthrough past a function end and fallthrough into a zero word. Counter
+branches with targets outside the function become conditional tail calls; bdnzf tests the CR bit
+it names. Trap instructions evaluate their TO condition and stop when it holds, and zero words
+(illegal instructions) stop when reached, instead of being dropped. Unsupported or truncated XEX
+input loads as an empty image, which both tools reject.
+---
+ XenonAnalyse/main.cpp           |   5 +
+ XenonRecomp/main.cpp            |  10 +-
+ XenonRecomp/recompiler.cpp      | 215 +++++++++++++++++++++++++-------
+ XenonRecomp/recompiler.h        |   5 +
+ XenonRecomp/test_recompiler.cpp |  12 +-
+ XenonRecomp/test_recompiler.h   |   3 +-
+ XenonUtils/xex.cpp              |  10 ++
+ 7 files changed, 213 insertions(+), 47 deletions(-)
+
+diff --git a/XenonAnalyse/main.cpp b/XenonAnalyse/main.cpp
+index d08371e..fc79c44 100644
+--- a/XenonAnalyse/main.cpp
++++ b/XenonAnalyse/main.cpp
+@@ -191,6 +191,11 @@ int main(int argc, char** argv)
+ 
+     const auto file = LoadFile(argv[1]);
+     auto image = Image::ParseImage(file.data(), file.size());
++    if (!image.data)
++    {
++        fmt::println("FATAL: unable to load {}", argv[1]);
++        return EXIT_FAILURE;
++    }
+ 
+     auto printTable = [&](const SwitchTable& table)
+         {
+diff --git a/XenonRecomp/main.cpp b/XenonRecomp/main.cpp
+index 12c6d8c..e2143d8 100644
+--- a/XenonRecomp/main.cpp
++++ b/XenonRecomp/main.cpp
+@@ -42,10 +42,16 @@ int main(int argc, char* argv[])
+             ;
+ 
+         recompiler.Recompile(headerFilePath);
++        if (recompiler.fatalProblems != 0)
++        {
++            fmt::println("XenonRecomp: {} fatal problem(s), listed above as FATAL; the output has an #error for each", recompiler.fatalProblems);
++            return EXIT_FAILURE;
++        }
+     }
+-    else
++    else if (size_t problems = TestRecompiler::RecompileTests(path, argv[2]); problems != 0)
+     {
+-        TestRecompiler::RecompileTests(path, argv[2]);
++        fmt::println("XenonRecomp: {} fatal problem(s) in the tests, listed above as FATAL", problems);
++        return EXIT_FAILURE;
+     }
+ 
+     return EXIT_SUCCESS;
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index fa91527..99091df 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1,7 +1,52 @@
+ #include "pch.h"
+ #include "recompiler.h"
++#include <cctype>
++#include <set>
+ #include <xex_patcher.h>
+ 
++// True when execution never continues at the next word (b, blr, bctr, an always-taken bc, or an
++// always-trapping tw/twi).
++static bool IsUnconditionalTerminator(uint32_t insn)
++{
++    const uint32_t op = insn >> 26, bo = (insn >> 21) & 31, xop = (insn >> 1) & 0x3FF;
++    const bool link = insn & 1, always = (bo & 0x14) == 0x14;
++    if (op == 18) return !link;
++    if (op == 16) return !link && always;
++    if (op == 19 && (xop == 16 || xop == 528)) return !link && always;
++    if (op == 31 && xop == 4) return ((insn >> 21) & 31) == 31;
++    if (op == 2 || op == 3) return ((insn >> 21) & 31) == 31;
++    return false;
++}
++
++// Name of the PPCCRRegister field for condition-register bit `bi` (0-31).
++static const char* CrBit(uint32_t bi)
++{
++    static const char* const names[] = { "lt", "gt", "eq", "so" };
++    return names[bi % 4];
++}
++
++// Targets of "goto loc_X;" in a function body that the body never defines as "loc_X:".
++static std::vector<uint32_t> UndefinedLabels(std::string_view body)
++{
++    std::set<uint32_t> defined, used;
++    for (size_t at = body.find("loc_"); at != std::string_view::npos; at = body.find("loc_", at))
++    {
++        const bool isGoto = at >= 5 && body.substr(at - 5, 5) == "goto ";
++        at += 4;
++        size_t end = at;
++        while (end < body.size() && std::isxdigit(static_cast<unsigned char>(body[end]))) ++end;
++        if (end == at) continue;
++        const uint32_t label = uint32_t(std::stoul(std::string(body.substr(at, end - at)), nullptr, 16));
++        if (isGoto) used.insert(label);
++        else if (end < body.size() && body[end] == ':') defined.insert(label);
++        at = end;
++    }
++    std::vector<uint32_t> missing;
++    for (uint32_t label : used)
++        if (!defined.count(label)) missing.push_back(label);
++    return missing;
++}
++
+ static uint64_t ComputeMask(uint32_t mstart, uint32_t mstop)
+ {
+     mstart &= 0x3F;
+@@ -90,6 +135,11 @@ bool Recompiler::LoadConfig(const std::string_view& configFilePath)
+     }
+ 
+     image = Image::ParseImage(file.data(), file.size());
++    if (!image.data)
++    {
++        fmt::println("FATAL: unable to load the input image");
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -399,7 +449,7 @@ bool Recompiler::Recompile(
+                 }
+                 else
+                 {
+-                    println("\t// ERROR {:X}", address);
++                    Fatal(fmt::format("branch target {:X} from {:X} is not a function", address, base));
+                 }
+             }
+         };
+@@ -617,8 +667,7 @@ bool Recompiler::Recompile(
+                 auto label = switchTable->second.labels[i];
+                 if (label < fn.base || label >= fn.base + fn.size)
+                 {
+-                    println("\t\t// ERROR: 0x{:X}", label);
+-                    fmt::println("ERROR: Switch case at {:X} is trying to jump outside function: {:X}", base, label);
++                    Fatal(fmt::format("switch case at {:X} jumps outside its function: {:X}", base, label));
+                     println("\t\treturn;");
+                 }
+                 else
+@@ -649,7 +698,18 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        if (insn.operands[0] < fn.base || insn.operands[0] >= fn.base + fn.size)
++        {
++            println("\tif ({}.u32 == 0) {{", ctr());
++            print("\t");
++            printFunctionCall(insn.operands[0]);
++            println("\t\treturn;");
++            println("\t}}");
++        }
++        else
++        {
++            println("\tif ({}.u32 == 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        }
+         break;
+ 
+     case PPC_INST_BDZLR:
+@@ -659,13 +719,34 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BDNZ:
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        if (insn.operands[0] < fn.base || insn.operands[0] >= fn.base + fn.size)
++        {
++            println("\tif ({}.u32 != 0) {{", ctr());
++            print("\t");
++            printFunctionCall(insn.operands[0]);
++            println("\t\treturn;");
++            println("\t}}");
++        }
++        else
++        {
++            println("\tif ({}.u32 != 0) goto loc_{:X};", ctr(), insn.operands[0]);
++        }
+         break;
+ 
+     case PPC_INST_BDNZF:
+-        // NOTE: assuming eq here as a shortcut because all the instructions in the game do that
+         println("\t--{}.u64;", ctr());
+-        println("\tif ({}.u32 != 0 && !{}.eq) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), insn.operands[1]);
++        if (insn.operands[1] < fn.base || insn.operands[1] >= fn.base + fn.size)
++        {
++            println("\tif ({}.u32 != 0 && !{}.{}) {{", ctr(), cr(insn.operands[0] / 4), CrBit(insn.operands[0]));
++            print("\t");
++            printFunctionCall(insn.operands[1]);
++            println("\t\treturn;");
++            println("\t}}");
++        }
++        else
++        {
++            println("\tif ({}.u32 != 0 && !{}.{}) goto loc_{:X};", ctr(), cr(insn.operands[0] / 4), CrBit(insn.operands[0]), insn.operands[1]);
++        }
+         break;
+ 
+     case PPC_INST_BEQ:
+@@ -712,7 +793,7 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BLRL:
+-        println("__builtin_debugtrap();");
++        Fatal(fmt::format("blrl at {:X} is not supported", base));
+         break;
+ 
+     case PPC_INST_BLT:
+@@ -1715,24 +1796,37 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_TDLGEI:
+-        // no op
+-        break;
+-
+     case PPC_INST_TDLLEI:
+-        // no op
+-        break;
+-
+     case PPC_INST_TWI:
+-        // no op
+-        break;
+-
+     case PPC_INST_TWLGEI:
+-        // no op
+-        break;
+-
+     case PPC_INST_TWLLEI:
+-        // no op
++    {
++        // twi/tdi: trap when rA compared with SIMM meets any condition in TO (16 lt, 8 gt, 4 eq,
++        // 2 unsigned lt, 1 unsigned gt); tw compares the low 32 bits, td all 64. A taken trap
++        // never continues: it stops the program instead of being dropped.
++        const uint32_t to = (insn.instruction >> 21) & 31, ra = (insn.instruction >> 16) & 31;
++        const int64_t simm = int16_t(insn.instruction & 0xFFFF);
++        const bool doubleword = (insn.instruction >> 26) == 2;
++        const auto value = [&](bool isSigned) { return fmt::format("{}.{}{}", r(ra), isSigned ? 's' : 'u', doubleword ? "64" : "32"); };
++        const auto immediate = [&](bool isSigned)
++            {
++                if (isSigned)
++                    return doubleword ? fmt::format("int64_t({})", simm) : fmt::format("int32_t({})", int32_t(simm));
++                return doubleword ? fmt::format("0x{:X}ull", uint64_t(simm)) : fmt::format("0x{:X}u", uint32_t(simm));
++            };
++        std::string condition;
++        const auto add = [&](uint32_t bit, bool isSigned, const char* op)
++            {
++                if (to & bit)
++                    condition += fmt::format("{}{} {} {}", condition.empty() ? "" : " || ", value(isSigned), op, immediate(isSigned));
++            };
++        add(16, true, "<"); add(8, true, ">"); add(4, true, "=="); add(2, false, "<"); add(1, false, ">");
++        if (to == 31)
++            println("\t__builtin_trap();");
++        else if (!condition.empty())
++            println("\tif ({}) __builtin_trap();", condition);
+         break;
++    }
+ 
+     case PPC_INST_VADDFP:
+     case PPC_INST_VADDFP128:
+@@ -1831,7 +1925,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_VCMPBFP:
+     case PPC_INST_VCMPBFP128:
+-        println("\t__builtin_debugtrap();");
++        Fatal(fmt::format("{} at {:X} is not supported", insn.opcode->name, base));
+         break;
+ 
+     case PPC_INST_VCMPEQFP:
+@@ -2002,7 +2096,7 @@ bool Recompiler::Recompile(
+         {
+         case 0: // D3D color
+             if (insn.operands[3] != 1)
+-                fmt::println("Unexpected D3D color pack instruction at {:X}", base);
++                Fatal(fmt::format("unsupported D3D color pack variant at {:X}", base));
+ 
+             for (size_t i = 0; i < 4; i++)
+             {
+@@ -2016,7 +2110,7 @@ bool Recompiler::Recompile(
+ 
+         case 5: // float16_4
+             if (insn.operands[3] != 2 || insn.operands[4] > 2)
+-                fmt::println("Unexpected float16_4 pack instruction at {:X}", base);
++                Fatal(fmt::format("unsupported float16_4 pack variant at {:X}", base));
+ 
+             for (size_t i = 0; i < 4; i++)
+             {
+@@ -2037,7 +2131,7 @@ bool Recompiler::Recompile(
+             break;
+ 
+         default:
+-            println("\t__builtin_debugtrap();");
++            Fatal(fmt::format("{} type {} at {:X} is not supported", insn.opcode->name, insn.operands[2], base));
+             break;
+         }
+         break;
+@@ -2213,7 +2307,7 @@ bool Recompiler::Recompile(
+             break;
+ 
+         default:
+-            println("\t__builtin_debugtrap();");
++            Fatal(fmt::format("{} type {} at {:X} is not supported", insn.opcode->name, insn.operands[2], base));
+             break;
+         }
+         break;
+@@ -2267,14 +2361,6 @@ bool Recompiler::Recompile(
+         return false;
+     }
+ 
+-#if 1
+-    if (strchr(insn.opcode->name, '.'))
+-    {
+-        int lastLine = out.find_last_of('\n', out.size() - 2);
+-        if (out.find("cr0", lastLine + 1) == std::string::npos && out.find("cr6", lastLine + 1) == std::string::npos)
+-            fmt::println("{} at {:X} has RC bit enabled but no comparison was generated", insn.opcode->name, base);
+-    }
+-#endif
+ 
+     if (midAsmHook != config.midAsmHooks.end() && midAsmHook->second.afterInstruction)
+         printMidAsmHook();
+@@ -2398,6 +2484,10 @@ bool Recompiler::Recompile(const Function& fn)
+     tempString.clear();
+     std::swap(out, tempString);
+ 
++    // End of the function's code: trailing zero words are padding.
++    uint32_t lastCode = uint32_t(fn.base + fn.size);
++    while (lastCode > fn.base && *reinterpret_cast<const uint32_t*>(image.Find(lastCode - 4)) == 0) lastCode -= 4;
++
+     ppc_insn insn;
+     while (base < end)
+     {
+@@ -2417,31 +2507,63 @@ bool Recompiler::Recompile(const Function& fn)
+         if (insn.opcode == nullptr)
+         {
+             println("\t// {}", insn.op_str);
+-#if 1
+             if (*data != 0)
+-                fmt::println("Unable to decode instruction {:X} at {:X}", *data, base);
+-#endif
++                Fatal(fmt::format("unable to decode instruction {:X} at {:X}", ByteSwap(*data), base));
++            // A zero word is an illegal instruction: reaching it (by a branch into padding) stops.
++            // Falling into one from code before the function's last instruction is fatal; a
++            // fallthrough into trailing padding is reported once by the end-of-function check.
++            println("\t__builtin_trap();");
++            if (*data == 0 && base > fn.base && base < lastCode && *(data - 1) != 0 && !IsUnconditionalTerminator(ByteSwap(*(data - 1))))
++                Fatal(fmt::format("function {:X} falls into a zero word at {:X}", fn.base, base));
+         }
+         else
+         {
+             if (insn.opcode->id == PPC_INST_BCTR && (*(data - 1) == 0x07008038 || *(data - 1) == 0x00000060) && switchTable == config.switchTables.end())
+-                fmt::println("Found a switch jump table at {:X} with no switch table entry present", base);
++                Fatal(fmt::format("switch jump table at {:X} has no switch table entry", base));
+ 
++            const size_t emittedBefore = out.size();
+             if (!Recompile(fn, base, insn, data, switchTable, localVariables, csrState))
+             {
+-                fmt::println("Unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name);
++                Fatal(fmt::format("unrecognized instruction at 0x{:X}: {}", base, insn.opcode->name));
+                 allRecompiled = false;
+             }
++            else if (const size_t len = strlen(insn.opcode->name); len > 1 && insn.opcode->name[len - 1] == '.')
++            {
++                // A record form ('.' shares the plain form's opcode id) must write a CR field.
++                const std::string_view emitted(out.data() + emittedBefore, out.size() - emittedBefore);
++                bool writesCr = false;
++                for (size_t at = emitted.find("cr"); at != std::string_view::npos && !writesCr; at = emitted.find("cr", at + 2))
++                    writesCr = at + 2 < emitted.size() && emitted[at + 2] >= '0' && emitted[at + 2] <= '7';
++                if (!writesCr)
++                    Fatal(fmt::format("record form {} at {:X} writes no CR field", insn.opcode->name, base));
++            }
+         }
+ 
+         base += 4;
+         ++data;
+     }
+ 
+-#if 0
+-    if (insn.opcode == nullptr || (insn.opcode->id != PPC_INST_B && insn.opcode->id != PPC_INST_BCTR && insn.opcode->id != PPC_INST_BLR))
+-        fmt::println("Function at {:X} ends prematurely with instruction {} at {:X}", fn.base, insn.opcode != nullptr ? insn.opcode->name : "INVALID", base - 4);
+-#endif
++    for (uint32_t label : UndefinedLabels(out))
++        Fatal(fmt::format("goto to undefined label loc_{:X} in function {:X}", label, fn.base));
++    {
++        // Falling off the end continues at the next word: legal only into the next function,
++        // which is then called explicitly.
++        const uint32_t last = lastCode;
++        if (last > fn.base && !IsUnconditionalTerminator(ByteSwap(*reinterpret_cast<const uint32_t*>(image.Find(last - 4)))))
++        {
++            auto next = image.symbols.find(last);
++            if (last == fn.base + fn.size && next != image.symbols.end() && next->address == last && next->type == Symbol_Function)
++            {
++                println("\t// falls through into the next function");
++                println("\t{}(ctx, base);", next->name);
++                println("\treturn;");
++            }
++            else
++            {
++                Fatal(fmt::format("function {:X} falls through past its end at {:X}", fn.base, last));
++            }
++        }
++    }
+ 
+     println("}}\n");
+ 
+@@ -2619,6 +2741,13 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+     SaveCurrentOutData();
+ }
+ 
++void Recompiler::Fatal(const std::string& message)
++{
++    fmt::println("FATAL: {}", message);
++    println("#error \"XenonRecomp: {}\"", message);
++    ++fatalProblems;
++}
++
+ void Recompiler::SaveCurrentOutData(const std::string_view& name)
+ {
+     if (!out.empty())
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..7bc0cc5 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -67,4 +67,9 @@ struct Recompiler
+     void Recompile(const std::filesystem::path& headerFilePath);
+ 
+     void SaveCurrentOutData(const std::string_view& name = std::string_view());
++
++    // Code that cannot be translated faithfully is a fatal problem, never a silent omission:
++    // reported on stdout as "FATAL: ..." and emitted as an #error so the output cannot compile.
++    size_t fatalProblems = 0;
++    void Fatal(const std::string& message);
+ };
+diff --git a/XenonRecomp/test_recompiler.cpp b/XenonRecomp/test_recompiler.cpp
+index f4fcdfe..fa8053a 100644
+--- a/XenonRecomp/test_recompiler.cpp
++++ b/XenonRecomp/test_recompiler.cpp
+@@ -32,8 +32,9 @@ void TestRecompiler::Analyse(const std::string_view& testName)
+     std::sort(functions.begin(), functions.end(), [](auto& lhs, auto& rhs) { return lhs.base < rhs.base; });
+ }
+ 
+-void TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* dstDirectoryPath)
++size_t TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* dstDirectoryPath)
+ {
++    size_t fatalProblems = 0;
+     std::map<std::string, std::unordered_set<size_t>> functions;
+ 
+     for (auto& file : std::filesystem::directory_iterator(srcDirectoryPath))
+@@ -45,6 +46,12 @@ void TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* ds
+             TestRecompiler recompiler;
+             recompiler.config.outDirectoryPath = dstDirectoryPath;
+             recompiler.image = Image::ParseImage(exeFile.data(), exeFile.size());
++            if (!recompiler.image.data)
++            {
++                fmt::println("FATAL: unable to load {}", file.path().string());
++                ++fatalProblems;
++                continue;
++            }
+ 
+             auto stem = file.path().stem().string();
+             recompiler.Analyse(stem);
+@@ -64,6 +71,7 @@ void TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* ds
+                     fmt::println("Function {:X} in {} has unimplemented instructions", fn.base, stem);
+                 }
+             }
++            fatalProblems += recompiler.fatalProblems;
+             stem += ".cpp";
+             recompiler.SaveCurrentOutData(stem);
+         }
+@@ -288,4 +296,6 @@ void TestRecompiler::RecompileTests(const char* srcDirectoryPath, const char* ds
+     fmt::println(file, "}}");
+ 
+     fclose(file);
++
++    return fatalProblems;
+ }
+diff --git a/XenonRecomp/test_recompiler.h b/XenonRecomp/test_recompiler.h
+index 2ef368c..375b0b1 100644
+--- a/XenonRecomp/test_recompiler.h
++++ b/XenonRecomp/test_recompiler.h
+@@ -6,5 +6,6 @@ struct TestRecompiler : Recompiler
+     void Analyse(const std::string_view& testName);
+     void Reset();
+     
+-    static void RecompileTests(const char* srcDirectoryPath, const char* dstDirectoryPath);
++    // Returns the number of fatal problems across all tests.
++    static size_t RecompileTests(const char* srcDirectoryPath, const char* dstDirectoryPath);
+ };
+diff --git a/XenonUtils/xex.cpp b/XenonUtils/xex.cpp
+index a986eac..48aa7e2 100644
+--- a/XenonUtils/xex.cpp
++++ b/XenonUtils/xex.cpp
+@@ -127,8 +127,14 @@ std::unordered_map<size_t, const char*> XboxKernelExports =
+ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+ {
+     auto* header = reinterpret_cast<const Xex2Header*>(data);
++    // Unsupported or truncated input loads as an empty image, which callers reject.
++    if (dataSize < sizeof(Xex2Header) || header->headerSize > dataSize ||
++        header->securityOffset > dataSize || dataSize - header->securityOffset < sizeof(Xex2SecurityInfo))
++        return {};
+     auto* security = reinterpret_cast<const Xex2SecurityInfo*>(data + header->securityOffset);
+     const auto* fileFormatInfo = reinterpret_cast<const Xex2OptFileFormatInfo*>(getOptHeaderPtr(data, XEX_HEADER_FILE_FORMAT_INFO));
++    if (fileFormatInfo == nullptr || fileFormatInfo->compressionType > XEX_COMPRESSION_NORMAL)
++        return {};
+ 
+     Image image{};
+     std::unique_ptr<uint8_t[]> result{};
+@@ -166,6 +172,8 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+ 
+         if (fileFormatInfo->compressionType == XEX_COMPRESSION_NONE)
+         {
++            if (imageSize > dataSize - header->headerSize)
++                return {};
+             result = std::make_unique<uint8_t[]>(imageSize);
+             memcpy(result.get(), srcData, imageSize);
+         }
+@@ -267,6 +275,8 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize)
+         }
+     }
+ 
++    if (!result || security->imageSize < sizeof(IMAGE_DOS_HEADER))
++        return {};
+     image.data = std::move(result);
+     image.size = security->imageSize;
+ 
+-- 
+2.54.0 (Apple Git-157)
+
