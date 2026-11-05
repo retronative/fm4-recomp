@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:36:46 +0700
+Subject: [PATCH] Translate blrl as an indirect call
+
+Forza Motorsport 4 calls a function pointer once with mtlr and blrl, which the recompiler
+rejects. blrl branches to LR and sets LR to the following address: the target is read before LR
+is written, then called indirectly as bctrl does. With skip_lr, LR is not available and blrl
+stays fatal.
+---
+ XenonRecomp/recompiler.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index cf01d30..1688fb1 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -854,7 +854,16 @@ bool Recompiler::Recompile(
+         break;
+ 
+     case PPC_INST_BLRL:
+-        Fatal(fmt::format("blrl at {:X} is not supported", base));
++        // Indirect call through LR: the target is LR before it is set to the return address.
++        if (config.skipLr)
++        {
++            Fatal(fmt::format("blrl at {:X} needs LR, which skip_lr removes", base));
++            break;
++        }
++        println("\t{}.u64 = ctx.lr;", temp());
++        println("\tctx.lr = 0x{:X};", base + 4);
++        println("\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());
++        csrState = CSRState::Unknown; // the call could change it
+         break;
+ 
+     case PPC_INST_BLT:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -4,7 +4,9 @@
 #
 # XEX loader regression tests. Needs scripts/setup_tools.sh first.
 #
-#   tests/run_loader_tests.sh
+#   tests/run_loader_tests.sh [name ...]
+#
+# With names (test basenames without .cpp), only those tests run (focused); without, all of them.
 #
 # Builds tests/loader/*_test.cpp with AddressSanitizer against the toolchain's patched XenonUtils
 # and runs them. Negative control: each test, built with the loader source from the pinned upstream
@@ -39,8 +41,11 @@ POSITIVE=()
 export ASAN_OPTIONS="max_malloc_fill_size=1048576${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 git -C "$XR" show "$BASE:XenonUtils/xex.cpp" > "$OUT/xex_base.cpp"
 status=0
+FOCUS=" $* "
+for n in "$@"; do [ -e "$ROOT/tests/loader/$n.cpp" ] || { echo "FAIL: $n: no such test"; exit 1; }; done
 for test in "$ROOT"/tests/loader/*_test.cpp; do
   name="$(basename "$test" .cpp)"
+  [ "$FOCUS" = "  " ] || [[ "$FOCUS" == *" $name "* ]] || continue
   "$LLVM/clang++" "${FLAGS[@]}" "${INCLUDES[@]}" "$test" ${POSITIVE[@]+"${POSITIVE[@]}"} "${LIBS[@]}" -o "$OUT/$name"
   if "$OUT/$name" > "$OUT/$name.log" 2>&1; then
     echo "pass: $name ($(tail -1 "$OUT/$name.log"))"

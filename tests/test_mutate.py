@@ -52,7 +52,10 @@ RUNNER_TEST = '''import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "survey"))
 import toy
 bad = 0
+only = sys.argv[1:]
 for name, ok in (("adds two numbers", toy.add(2, 3) == 5), ("signs a negative", toy.sign(-4) == -1)):
+    if only and name.split()[0] not in only:
+        continue
     if not ok:
         print("  FAIL " + name); bad += 1
 print("checked: 2 checks, %d failures" % bad)
@@ -64,6 +67,7 @@ TESTS = {
     "runner": dict(cmd=PY + ["tests/runner_toy.py"], timeout=20, build=False, ran=r"^checked: "),
     "silent": dict(cmd=PY + ["tests/test_toy.py"], timeout=20, build=False, ran=r"^never printed"),
     "short": dict(cmd=PY + ["tests/test_toy.py"], timeout=3, build=False, ran=r"^Ran \d+ tests?"),
+    "focused": dict(cmd=PY + ["tests/runner_toy.py"], timeout=20, build=False, ran=r"^checked: ", focus=True),
 }
 
 
@@ -141,6 +145,16 @@ class Gate(unittest.TestCase):
         for base in (self.tree.scratch, self.root):
             with open(os.path.join(base, "survey", "toy.py")) as f:
                 self.assertEqual(f.read(), TOY)
+
+    def test_focus_runs_only_the_named_check(self):
+        # focused on "signs": an add fault is not exercised, so it survives; the sign fault is killed
+        self.assertEqual(self.result(M("f", "return a + b", "return a - b", "adds", test="focused", focus=["signs"])),
+                         "SURVIVED")
+        self.assertEqual(self.result(M("g", "return -1", "return 1", "signs a negative", test="focused", focus=["signs"])),
+                         "KILLED")
+        self.assertEqual(mutate.focus_of(M("h", "a", "b", "update_forms:", test="focused"), TESTS), ("update_forms",))
+        self.assertEqual(mutate.focus_of(M("h", "a", "b", "x", test="focused"), TESTS, full=True), ())
+        self.assertEqual(mutate.focus_of(M("h", "a", "b", "x", test="toy"), TESTS), ())
 
     def test_stale_bytecode_purged(self):
         # Two equal-size mutants written within a second: without the purge, Python may reuse the

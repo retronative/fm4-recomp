@@ -16,13 +16,16 @@ Design after reFrozen tests/mutants.py (dict entries, TESTS map).
 PY = ["/opt/homebrew/bin/python3", "-B", "-I"]
 
 # key -> command run from the scratch tree's root, its timeout (s), whether it needs the scratch
-# XenonRecomp build, and a regex that shows the test ran (absent => INVALID, never a kill).
+# XenonRecomp build, a regex that shows the test ran (absent => INVALID, never a kill), and whether
+# the command takes fixture names (focus): then a mutant runs only its `focus` list (default: its
+# expected check) unless tests/mutate.py --full.
 TESTS = {
     "xexinfo": dict(cmd=PY + ["tests/test_xexinfo.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?"),
     "stfsinfo": dict(cmd=PY + ["tests/test_stfsinfo.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?"),
-    "loader": dict(cmd=["bash", "tests/run_loader_tests.sh"], timeout=900, build=True, ran=r"^(pass|FAIL): xex_"),
+    "loader": dict(cmd=["bash", "tests/run_loader_tests.sh"], timeout=900, build=True, ran=r"^(pass|FAIL): xex_",
+                   focus=True),
     "translator": dict(cmd=["bash", "tests/run_translator_tests.sh"], timeout=1200, build=True,
-                       ran=r"^translator tests: "),
+                       ran=r"^translator tests: ", focus=True),
     "mutate": dict(cmd=PY + ["tests/test_mutate.py"], timeout=300, build=False, ran=r"^Ran \d+ tests?"),
 }
 
@@ -54,6 +57,9 @@ MUTANTS = [
     dict(id="G6", milestone="M1", file=GATE, test="mutate", fault="ERROR lines not counted as failures",
          old='if l.strip().startswith(("FAIL", "ERROR"))]', new='if l.strip().startswith("FAIL")]',
          expect="test_classify_shapes"),
+    dict(id="G8", milestone="M1", file=GATE, test="mutate", fault="focus ignored: whole test always runs",
+         old='    if full or not tests[m["test"]].get("focus"):', new="    if True:",
+         expect="test_focus_runs_only_the_named_check"),
     dict(id="G7", milestone="M1", file=GATE, test="mutate", fault="survivor of a documented-equivalent reported as SURVIVED",
          old='return ("EQUIVALENT", m["equivalent"]) if m.get("equivalent") else ("SURVIVED", "the test passed")',
          new='return ("SURVIVED", "the test passed")', expect="test_equivalent_and_wrong_equivalent"),
@@ -136,6 +142,42 @@ MUTANTS = [
     dict(id="S15", milestone="M0", file=STFSINFO, test="stfsinfo", fault="level-0 hash table number for blocks < 28900 falls through",
          old="            if index < PER_LEVEL[1]:\n                return block\n", new="",
          expect="test_read_only_hash_tables"),
+
+    # ---- M1: patches/xenonrecomp/0013 (ForzaRecomp 0012: blrl as an indirect call) ----
+    dict(id='I1', milestone="M1", file=RECOMP, test='translator', fault='LR written before the target is read',
+         old='        println("\\t{}.u64 = ctx.lr;", temp());\n        println("\\tctx.lr = 0x{:X};", base + 4);',
+         new='        println("\\tctx.lr = 0x{:X};", base + 4);\n        println("\\t{}.u64 = ctx.lr;", temp());', expect='indirect_calls'),
+    dict(id='I2', milestone="M1", file=RECOMP, test='translator', fault='wrong return address',
+         old='        println("\\tctx.lr = 0x{:X};", base + 4);\n        println("\\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());',
+         new='        println("\\tctx.lr = 0x{:X};", base + 8);\n        println("\\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());', expect='indirect_calls'),
+
+    # ---- M1: patches/xenonrecomp/0012, ppc_context.h half-to-float ----
+    dict(id='H2', milestone="M1", file=PPC_CONTEXT, test='translator', fault='half-to-float exponent bias off by one',
+         old='return sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);',
+         new='return sign | ((exponent + 127 - 16) << 23) | (mantissa << 13);', expect='vmx_d3d_float16'),
+    dict(id='H3', milestone="M1", file=PPC_CONTEXT, test='translator', fault='subnormal halves flushed to zero',
+         old='    if (mantissa == 0)\n        return sign;',
+         new='    if (true)\n        return sign;', expect='vmx_d3d_float16'),
+
+    # ---- M1: patches/xenonrecomp/0012 (ForzaRecomp 0011: D3D float16 unpack, float16_2 pack) ----
+    dict(id='H1', milestone="M1", file=RECOMP, test='translator', fault='float16_4 unpack half order',
+         old='ppc_half_to_float_bits({}.u16[{}]);", vTemp(), 3 - i, v(insn.operands[1]), 3 - i);',
+         new='ppc_half_to_float_bits({}.u16[{}]);", vTemp(), 3 - i, v(insn.operands[1]), i);', expect='vmx_d3d_float16'),
+    dict(id='H4', milestone="M1", file=RECOMP, test='translator', fault='float16_2 unpack w = 0',
+         old='ppc_half_to_float_bits({}.u16[0]);", vTemp(), v(insn.operands[1]));\n            println("\\t{}.f32[1] = 0.0f;", vTemp());\n            println("\\t{}.f32[0] = 1.0f;", vTemp());',
+         new='ppc_half_to_float_bits({}.u16[0]);", vTemp(), v(insn.operands[1]));\n            println("\\t{}.f32[1] = 0.0f;", vTemp());\n            println("\\t{}.f32[0] = 0.0f;", vTemp());', expect='vmx_d3d_float16'),
+    dict(id='H5', milestone="M1", file=RECOMP, test='translator', fault='float16_2 pack lanes swapped',
+         old='            printFloatToHalf(3, 2 * insn.operands[4] + 1);\n            printFloatToHalf(2, 2 * insn.operands[4]);',
+         new='            printFloatToHalf(2, 2 * insn.operands[4] + 1);\n            printFloatToHalf(3, 2 * insn.operands[4]);', expect='vmx_d3d_float16'),
+    dict(id='H6', milestone="M1", file=RECOMP, test='translator', fault='UIMM low-bit guard removed (killed only by our reject fixture)',
+         old='        if (insn.operands[2] & 3)\n        {',
+         new='        if (false)\n        {', expect='vupkd3d128_immediate_low_bits'),
+    dict(id='H7', milestone="M1", file=RECOMP, test='translator', fault='sign not stripped before the range test',
+         old='println("\\t{}.u32 = (source.u32[{}]&0x7FFFFFFF);", temp(), lane);',
+         new='println("\\t{}.u32 = (source.u32[{}]&0xFFFFFFFF);", temp(), lane);', expect='vmx_d3d_float16'),
+    dict(id='H8', milestone="M1", file=RECOMP, test='translator', fault='float16_2 pack reads vB in place, not a copy (killed only by our aliasing fixture)',
+         old='println("\\t{{ const PPCVRegister source = {};", v(insn.operands[1]));\n            printFloatToHalf(3, 2 * insn.operands[4] + 1);',
+         new='println("\\t{{ PPCVRegister& source = {};", v(insn.operands[1]));\n            printFloatToHalf(3, 2 * insn.operands[4] + 1);', expect='vmx_d3d_float16_alias'),
 
     # ---- M1: patches/xenonrecomp/0011 (ForzaRecomp 0010: lhbrx, dcbst) ----
     dict(id='R1', milestone="M1", file=RECOMP, test='translator', fault='lhbrx without the byte swap',

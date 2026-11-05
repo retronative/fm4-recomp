@@ -4,7 +4,12 @@
 """Mutation gate: plant each fault of tests/mutants.py in a scratch copy of the sources and check
 that its test catches it.
 
-  /opt/homebrew/bin/python3 -I tests/mutate.py [--only ID,...] [--milestone M1] [--tsv OUT]
+  /opt/homebrew/bin/python3 -I tests/mutate.py [--only ID,...] [--milestone M1] [--tsv OUT] [--full]
+
+Focused by default: a mutant of a test marked `focus` in tests/mutants.py runs only the fixtures
+named by its `focus` list (default: its expected check, without a trailing ':'), and the baseline
+runs each distinct focus once. --full runs every test whole, for milestone close and large steps
+(per change, focused tests only).
 
 The real tree is never modified. build/mutate/ holds a copy of survey/, tests/, scripts/,
 patches/ and tools/XenonRecomp (sources and .git; tests read the pinned upstream from it), plus
@@ -103,10 +108,10 @@ class Tree:
                     shutil.rmtree(os.path.join(dirpath, d))
                     dirnames.remove(d)
 
-    def test(self, key):
+    def test(self, key, args=()):
         t = self.tests[key]
         self.purge_bytecode()
-        return run(t["cmd"], self.scratch, t["timeout"])
+        return run(t["cmd"] + list(args), self.scratch, t["timeout"])
 
 
 def classify(m, test, code, out):
@@ -125,7 +130,14 @@ def classify(m, test, code, out):
     return "KILLED-OTHER", (fails[0] if fails else "exit %d without a FAIL line" % code)
 
 
-def mutate_one(tree, m):
+def focus_of(m, tests, full=False):
+    """The fixture names a mutant's test runs with, or () for the whole test."""
+    if full or not tests[m["test"]].get("focus"):
+        return ()
+    return tuple(m.get("focus") or [m["expect"].rstrip(":")])
+
+
+def mutate_one(tree, m, full=False):
     test = tree.tests[m["test"]]
     path = os.path.join(tree.scratch, m["file"])
     with open(path) as f:
@@ -142,7 +154,7 @@ def mutate_one(tree, m):
             ok, out = tree.build()
             if not ok:
                 return "INVALID", "build failed: " + out.strip().splitlines()[-1][:200]
-        code, out = tree.test(m["test"])
+        code, out = tree.test(m["test"], focus_of(m, tree.tests, full))
         return classify(m, test, code, out)
     finally:
         with open(path, "w") as f:
@@ -161,6 +173,7 @@ def main(argv=None):
     ap.add_argument("--milestone")
     ap.add_argument("--tsv")
     ap.add_argument("--scratch", default=os.path.join(ROOT, "build", "mutate"))
+    ap.add_argument("--full", action="store_true", help="run every test whole (milestone close)")
     a = ap.parse_args(argv)
     sel = MUTANTS
     if a.only:
@@ -188,18 +201,18 @@ def main(argv=None):
         if not ok:
             print("mutate: BASELINE build failed; nothing was mutated\n" + out[-2000:], file=sys.stderr)
             return 1
-    for k in needed:
-        code, out = tree.test(k)
+    for k, focus in sorted({(m["test"], focus_of(m, TESTS, a.full)) for m in sel}):
+        code, out = tree.test(k, focus)
         if code != 0 or not re.search(TESTS[k]["ran"], out, re.M):
-            print("mutate: BASELINE failed for test %s (exit %s); nothing was mutated\n%s" % (k, code, out[-3000:]),
+            print("mutate: BASELINE failed for test %s %s (exit %s); nothing was mutated\n%s" % (k, " ".join(focus), code, out[-3000:]),
                   file=sys.stderr)
             return 1
-        print("baseline ok: %s" % k, flush=True)
+        print("baseline ok: %s %s" % (k, " ".join(focus) or "(whole)"), flush=True)
 
     rows, bad = [], 0
     for m in sel:
         t0 = time.time()
-        status, detail = mutate_one(tree, m)
+        status, detail = mutate_one(tree, m, a.full)
         if status not in ("KILLED", "EQUIVALENT"):
             bad += 1
         rows.append((m["id"], m["milestone"], m["test"], status, detail))

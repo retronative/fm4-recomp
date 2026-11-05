@@ -10,7 +10,10 @@
 # Translator tests (T0). Needs scripts/setup_tools.sh first, plus LLVM's llvm-mc and llvm-objdump
 # and lld (LLVM=<bin dir>, LLD=<ld.lld>).
 #
-#   tests/run_translator_tests.sh
+#   tests/run_translator_tests.sh [name ...]
+#
+# With names (fixture basenames without .s), only those fixtures run: the focused run used per
+# change. Without names, every fixture runs: the full suite, for milestone close and large steps.
 #
 # tests/translator/*.s          must translate with no fatal problem; XenonRecomp's test mode then
 #                               generates a harness from the "#_ REGISTER_IN/OUT" directives, which
@@ -45,6 +48,12 @@ for tool in "$LLVM/llvm-mc" "$LLVM/llvm-objdump" "$LLVM/clang++" "$LLD" "$XR/bui
   [ -x "$tool" ] || { echo "missing $tool"; exit 1; }
 done
 rm -rf "$WORK" && mkdir -p "$WORK"
+FOCUS=" $* "
+selected() { [ "$FOCUS" = "  " ] || [[ "$FOCUS" == *" $(basename "$1" .s) "* ]]; }
+for n in "$@"; do
+  compgen -G "$ROOT/tests/translator/$n.s" >/dev/null || compgen -G "$ROOT/tests/translator/*/$n.s" >/dev/null \
+    || { echo "FAIL $n: no such fixture"; exit 1; }
+done
 
 # Assemble <src>.s into <dir>/bin/<name>.o and .dis, as XenonRecomp's test mode expects
 # (<dir>/<name>.s next to <dir>/bin/). Register names gain llvm-mc's % prefix.
@@ -78,6 +87,7 @@ status=0
 positive=0
 for src in "$ROOT"/tests/translator/*.s "$ROOT"/tests/translator/trap/*.s; do
   [ -e "$src" ] || continue
+  selected "$src" || continue
   if grep -q '^[[:space:]]*#_ REGISTER_OUT c' "$src"; then
     echo "FAIL $(basename "$src"): REGISTER_OUT on cr or ctr is not checked by the harness"; status=1; continue
   fi
@@ -88,6 +98,7 @@ done
 
 for src in "$ROOT"/tests/translator/*.s; do
   [ -e "$src" ] || continue
+  selected "$src" || continue
   name="$(basename "$src" .s)"
   dir="$WORK/$name"
   assemble "$src" "$dir"
@@ -128,6 +139,7 @@ done
 trapped=0
 for src in "$ROOT"/tests/translator/trap/*.s; do
   [ -e "$src" ] || continue
+  selected "$src" || continue
   name="$(basename "$src" .s)"
   dir="$WORK/trap/$name"
   assemble "$src" "$dir"
@@ -142,6 +154,7 @@ done
 rejected=0
 for src in "$ROOT"/tests/translator/reject/*.s; do
   [ -e "$src" ] || continue
+  selected "$src" || continue
   name="$(basename "$src" .s)"
   dir="$WORK/reject/$name"
   want="$(sed -n 's/^#! FATAL //p' "$src")"

@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:34:49 +0700
+Subject: [PATCH] Unpack D3D float16 types and pack float16_2
+
+Forza Motorsport 4 unpacks FLOAT16_4 (vupkd3d128 type 5, 171 sites) and FLOAT16_2 (type 3, 4
+sites) and packs FLOAT16_2 (vpkd3d128 type 3, 1 site), which the recompiler rejects. Unpacking
+converts IEEE binary16 halves exactly (ppc_half_to_float_bits); FLOAT16_2 gives (x, y, 0, 1)
+from guest word 3 and FLOAT16_4 (x, y, z, w) from guest words 2 and 3, the mapping Xenia uses.
+Packing FLOAT16_2 reuses the existing float16_4 conversion (truncation; NaN and magnitudes above
+65504 give 0x7FFF), now shared and reading a copy of the source so that vD may alias vB. An
+unpack immediate with nonzero low bits is fatal.
+---
+ XenonRecomp/recompiler.cpp | 79 ++++++++++++++++++++++++++++++--------
+ XenonUtils/ppc_context.h   | 17 ++++++++
+ 2 files changed, 80 insertions(+), 16 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index a976752..cf01d30 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -2240,9 +2240,27 @@ bool Recompiler::Recompile(
+     }
+ 
+     case PPC_INST_VPKD3D128:
++    {
+         // TODO: vectorize somehow?
+         // NOTE: handling vector reversal here too
+         printSetFlushMode(true);
++        // Host lane `lane` of `source` to half `half` of vD.
++        auto printFloatToHalf = [&](size_t lane, size_t half)
++            {
++                // Strip sign from source
++                println("\t{}.u32 = (source.u32[{}]&0x7FFFFFFF);", temp(), lane);
++                // If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits
++                println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : ((source.u32[{2}]&0x7f800000)>>23);", vTemp(), temp(), lane);
++                // If 8 exponent bits were saved, it can only be 0x8E at most
++                // If saved, save first 10 bits of mantissa
++                println("\t{}.u16 = {}.u8[0] != 0xFF ? ((source.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), lane);
++                // If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
++                // If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
++                // If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
++                println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), half, vTemp(), temp());
++                // Add back original sign
++                println("\t{}.u16[{}] |= ((source.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), half, lane);
++            };
+         switch (insn.operands[2])
+         {
+         case 0: // D3D color
+@@ -2259,26 +2277,31 @@ bool Recompiler::Recompile(
+             println("\t{}.u32[{}] = {}.u32;", v(insn.operands[0]), insn.operands[4], temp());
+             break;
+ 
++        // Float16 types: each float to a half as below (from upstream's float16_4: NaN and
++        // magnitudes above 65504 give 0x7FFF, mantissas are truncated). The source is copied
++        // first, since vD may be vB.
++        case 3: // float16_2: (x, y) to one word, written to host word operands[4] (pack kind 1)
++            if (insn.operands[3] != 1)
++            {
++                Fatal(fmt::format("unsupported float16_2 pack variant at {:X}", base));
++                break;
++            }
++            println("\t{{ const PPCVRegister source = {};", v(insn.operands[1]));
++            printFloatToHalf(3, 2 * insn.operands[4] + 1);
++            printFloatToHalf(2, 2 * insn.operands[4]);
++            println("\t}}");
++            break;
++
+         case 5: // float16_4
+             if (insn.operands[3] != 2 || insn.operands[4] > 2)
+-                Fatal(fmt::format("unsupported float16_4 pack variant at {:X}", base));
+-
+-            for (size_t i = 0; i < 4; i++)
+             {
+-        		// Strip sign from source
+-        		println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", temp(), v(insn.operands[1]), i);
+-        		// If |source| is > 65504, clamp output to 0x7FFF, else save 8 exponent bits 
+-        		println("\t{0}.u8[0] = ({1}.f32 != {1}.f32) || ({1}.f32 > 65504.0f) ? 0xFF : (({2}.u32[{3}]&0x7f800000)>>23);", vTemp(), temp(), v(insn.operands[1]), i);
+-        		// If 8 exponent bits were saved, it can only be 0x8E at most
+-        		// If saved, save first 10 bits of mantissa
+-        		println("\t{}.u16 = {}.u8[0] != 0xFF ? (({}.u32[{}]&0x7FE000)>>13) : 0x0;", temp(), vTemp(), v(insn.operands[1]), i);
+-        		// If saved and > 127-15, exponent is converted from 8 to 5-bit by subtracting 0x70
+-        		// If saved but not > 127-15, clamp exponent at 0, add 0x400 to mantissa and shift right by (0x71-exponent)
+-        		// If right shift is greater than 31 bits, manually clamp mantissa to 0 or else the output of the shift will be wrong
+-        		println("\t{0}.u16[{1}] = {2}.u8[0] != 0xFF ? ({2}.u8[0] > 0x70 ? ((({2}.u8[0]-0x70)<<10)+{3}.u16) : (0x71-{2}.u8[0] > 31 ? 0x0 : ((0x400+{3}.u16)>>(0x71-{2}.u8[0])))) : 0x7FFF;", v(insn.operands[0]), i+(2*insn.operands[4]), vTemp(), temp());
+-        		// Add back original sign
+-        		println("\t{}.u16[{}] |= (({}.u32[{}]&0x80000000)>>16);", v(insn.operands[0]), i+(2*insn.operands[4]), v(insn.operands[1]), i);
++                Fatal(fmt::format("unsupported float16_4 pack variant at {:X}", base));
++                break;
+             }
++            println("\t{{ const PPCVRegister source = {};", v(insn.operands[1]));
++            for (size_t i = 0; i < 4; i++)
++                printFloatToHalf(i, i + 2 * insn.operands[4]);
++            println("\t}}");
+             break;
+ 
+         default:
+@@ -2286,6 +2309,7 @@ bool Recompiler::Recompile(
+             break;
+         }
+         break;
++    }
+ 
+     case PPC_INST_VPKSHUS:
+     case PPC_INST_VPKSHUS128:
+@@ -2536,6 +2560,11 @@ bool Recompiler::Recompile(
+     case PPC_INST_VUPKD3D128:
+         // TODO: vectorize somehow?
+         // NOTE: handling vector reversal here too
++        if (insn.operands[2] & 3)
++        {
++            Fatal(fmt::format("{} immediate {} at {:X} is not supported", insn.opcode->name, insn.operands[2], base));
++            break;
++        }
+         switch (insn.operands[2] >> 2)
+         {
+         case 0: // D3D color
+@@ -2559,6 +2588,24 @@ bool Recompiler::Recompile(
+             println("\t{} = {};", v(insn.operands[0]), vTemp());
+             break;
+ 
++        // Float16 types (format mapping from Xenia, as in ReCarbon): FLOAT16_2 unpacks guest word 3
++        // (x in its high half, y in its low half) to (x, y, 0, 1); FLOAT16_4 unpacks guest words 2
++        // and 3 to (x, y, z, w). Guest word k is host u32[3 - k]; the high half of host u32[n] is
++        // u16[2n + 1].
++        case 3: // float16_2
++            println("\t{}.u32[3] = ppc_half_to_float_bits({}.u16[1]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.u32[2] = ppc_half_to_float_bits({}.u16[0]);", vTemp(), v(insn.operands[1]));
++            println("\t{}.f32[1] = 0.0f;", vTemp());
++            println("\t{}.f32[0] = 1.0f;", vTemp());
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
++        case 5: // float16_4
++            for (size_t i = 0; i < 4; i++)
++                println("\t{}.u32[{}] = ppc_half_to_float_bits({}.u16[{}]);", vTemp(), 3 - i, v(insn.operands[1]), 3 - i);
++            println("\t{} = {};", v(insn.operands[0]), vTemp());
++            break;
++
+         default:
+             Fatal(fmt::format("{} type {} at {:X} is not supported", insn.opcode->name, insn.operands[2], base));
+             break;
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 31a86cd..1a67022 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -682,6 +682,23 @@ inline simde__m128i simde_mm_vctsxs(simde__m128 src1)
+     return simde_mm_andnot_si128(simde_mm_castps_si128(xmm2), simde_mm_castps_si128(dest));
+ }
+ 
++// IEEE 754 binary16 to binary32 bits: exact for every finite half (subnormals are normalized);
++// exponent 31 gives infinity or a NaN with the payload kept.
++inline uint32_t ppc_half_to_float_bits(uint16_t half)
++{
++    const uint32_t sign = uint32_t(half & 0x8000) << 16, exponent = (half >> 10) & 0x1F, mantissa = half & 0x3FF;
++    if (exponent == 0x1F)
++        return sign | 0x7F800000 | (mantissa << 13);
++    if (exponent != 0)
++        return sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
++    if (mantissa == 0)
++        return sign;
++    uint32_t shift = 0;
++    while ((mantissa << shift & 0x400) == 0)
++        shift++;
++    return sign | ((127 - 15 + 1 - shift) << 23) | ((mantissa << shift & 0x3FF) << 13);
++}
++
+ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b)
+ {
+     b = simde_mm_srli_epi64(simde_mm_slli_epi64(b, 61), 61);
+-- 
+2.54.0 (Apple Git-157)
+
