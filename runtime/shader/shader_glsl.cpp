@@ -2227,13 +2227,26 @@ std::string Translator::Assemble(uint32_t interpolators) const
     g += "    xe_position_out = vec4(0.0);\n";
     g += "    for (int i = 0; i < " + n + "; i++)\n        xe_interp_out[i] = vec4(0.0);\n";
     g += temps + body_ + "}\n";
-    g += "void xe_emit(vec4 p, vec4 interp[" + n + "])\n{\n";
-    g += "    gl_Position = vec4(p.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * p.w, p.w);\n";
+    // The W-format fix-up (FM4 Recomp; shader_glsl.h): Xenia 67f16c4 spirv_shader_translator.cc:1482-1554
+    // CompleteVertexOrTessEvalShaderInMain, every operation NoContraction (precise). xe_flags bits: 1 XY divided
+    // by W (PA_CL_VTE_CNTL vtx_xy_fmt), 2 Z divided by W (vtx_z_fmt), 4 W not reciprocal (vtx_w0_fmt).
+    g += R"(vec4 xe_fixup(vec4 p)
+{
+    precise float w = (xe_flags & 4u) != 0u ? p.w : 1.0 / p.w;
+    precise vec2 xy = (xe_flags & 1u) != 0u ? p.xy * w : p.xy;
+    precise float z = (xe_flags & 2u) != 0u ? p.z * w : p.z;
+    return vec4(xy, z, w);
+}
+)";
+    g += "void xe_emit(vec4 q, vec4 interp[" + n + "])\n{\n";
+    // The viewport fold (:1556-1575, NoContraction): q is the fixed-up position, q.w the real W.
+    g += "    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n";
+    g += "    gl_Position = vec4(xe_ndc, q.w);\n";
     for (uint32_t i = 0; i < interpolators; i++)
         g += "    xe_interp_" + Num(i) + " = interp[" + Num(i) + "];\n";
     g += "}\n";
     g += "#ifndef XE_RECT_LIST\nvoid main()\n{\n    vec4 p;\n    vec4 interp[" + n +
-         "];\n    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(p, interp);\n}\n#else\n";
+         "];\n    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n}\n#else\n";
     // Rect list: ForzaRecomp runtime/video/renderer.cpp ExpandRectList and Xenia's rectangle-list
     // geometry shader (vulkan_pipeline_cache.cc), on the exported (pre-fold) positions.
     g += R"(float xe_len2(vec4 a, vec4 b)
@@ -2257,6 +2270,11 @@ void main()
     g += R"(    xe_vertex(xe_indices[3u * rect + 0u], p0, i0);
     xe_vertex(xe_indices[3u * rect + 1u], p1, i1);
     xe_vertex(xe_indices[3u * rect + 2u], p2, i2);
+    // The W-format fix-up first (Xenia expands rectangles after its vertex shader's epilogue); the
+    // fold is linear in the 4-vector, so folding before or after the mirror is the same.
+    p0 = xe_fixup(p0);
+    p1 = xe_fixup(p1);
+    p2 = xe_fixup(p2);
     // Squared edge lengths: [0] edge 12, [1] edge 20, [2] edge 01; v0 is opposite the longest.
     float len0 = xe_len2(p1, p2), len1 = xe_len2(p2, p0), len2 = xe_len2(p0, p1);
     uint first = (len0 > len1 && len0 > len2) ? 0u : (len1 > len2 ? 1u : 2u);

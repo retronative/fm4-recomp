@@ -779,8 +779,10 @@ void TestClearVs()
     // 3: 0x33441122, which the two steps below produce.
     CHECK(Has(g, "if (e == 1u || e == 2u)\n        v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);"));
     CHECK(Has(g, "if (e == 2u || e == 3u)\n        v = (v << 16) | (v >> 16);"));
-    // Viewport fold (host contract): homogeneous, so it holds for w != 1.
-    CHECK(Has(g, "gl_Position = vec4(p.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * p.w, p.w);"));
+    // Viewport fold (host contract) of the fixed-up position q: homogeneous, so it holds for w != 1
+    // (the fix-up itself: TestPositionFormatFlags).
+    CHECK(Has(g, "    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n    gl_Position = vec4(xe_ndc, q.w);\n"));
+    CHECK(Has(g, "    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n"));
     CHECK(Has(g, "layout(location = 0) out vec4 xe_interp_0;"));
     CHECK(Has(g, "layout(std140, set = 0, binding = 2) uniform XeVsConstants"));
     CHECK(Compiles(g, false));
@@ -1095,6 +1097,41 @@ void TestTexturedPs()
     // Negative control: the abs bit cleared.
     CHECK(Translate(TexturedPs({}, false), true, t));
     CONTROL(Has(t.glsl, "sqrt(abs(r0).x)"));
+}
+
+// The W-format fix-up before the viewport fold (FM4 Recomp): Xenia 67f16c4
+// spirv_shader_translator.cc:1482-1554, the flags as vulkan_command_processor.cc:3547-3555 sets them
+// from PA_CL_VTE_CNTL (xe_flags bits: 1 vtx_xy_fmt, 2 vtx_z_fmt, 4 vtx_w0_fmt; shader_glsl.h). The
+// expected text is written from Xenia's operation order: w first (p.w, or 1 / p.w when the guest
+// exported 1/W), then xy and z each multiplied back by w where the guest had divided them, then
+// the fold on the fixed-up vector; every step NoContraction (`precise`). FM4 sets 0x300 (xy and z
+// divided, w reciprocal) for its clears and 0x43F / 0x400 (w not reciprocal) for its UI draws
+// (the local capture trace10 (not distributed)).
+void TestPositionFormatFlags()
+{
+    CHECK(kFlagXyDividedByW == 1u && kFlagZDividedByW == 2u && kFlagWNotReciprocal == 4u);  // the literals the GLSL spells
+    ShaderTranslation t;
+    CHECK(Translate(ClearVs(ClearFull(), ClearMini()), false, t));
+    const std::string& g = t.glsl;
+    const std::string fixup =
+        "vec4 xe_fixup(vec4 p)\n{\n"
+        "    precise float w = (xe_flags & 4u) != 0u ? p.w : 1.0 / p.w;\n"
+        "    precise vec2 xy = (xe_flags & 1u) != 0u ? p.xy * w : p.xy;\n"
+        "    precise float z = (xe_flags & 2u) != 0u ? p.z * w : p.z;\n"
+        "    return vec4(xy, z, w);\n}\n";
+    CHECK(Has(g, fixup));
+    CHECK(Has(g, "    uint xe_flags;\n};\n"));  // read from XeSystem, not a define: one pipeline serves every PA_CL_VTE_CNTL
+    // The fix-up precedes the fold in the plain path and the mirror in the rect-list path.
+    CHECK(Has(g, "    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n"));
+    CHECK(Has(g, "    xe_vertex(xe_indices[3u * rect + 2u], p2, i2);\n") && Has(g, "    p0 = xe_fixup(p0);\n    p1 = xe_fixup(p1);\n    p2 = xe_fixup(p2);\n"));
+    CHECK(g.find("p2 = xe_fixup(p2);") < g.find("float len0 = xe_len2(p1, p2)"));
+    CHECK(Has(g, "void xe_emit(vec4 q, vec4 interp[1])\n{\n    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n"
+                 "    gl_Position = vec4(xe_ndc, q.w);\n"));
+    CONTROL(Has(g, "gl_Position = vec4(p.xyz * xe_viewport_scale.xyz"));  // the old fold on the raw export is gone
+    CONTROL(Has(g, "xe_emit(p, interp);\n}\n#else"));                     // and so is the unfixed plain path
+    CHECK(Compiles(g, false));
+    // A vertex shader with no interpolators (the resolve) gets the same fix-up.
+    CHECK(Translate(ResolveVs(), false, t) && Has(t.glsl, fixup) && Has(t.glsl, "void xe_emit(vec4 q, vec4 interp[1])\n"));
 }
 
 void TestResolveAndPointsVs()
@@ -3140,6 +3177,7 @@ int main(int argc, char** argv)
     TestQuadsVs();
     TestTexturedPs();
     TestResolveAndPointsVs();
+    TestPositionFormatFlags();
     TestVideoPs();
     TestPwlGamma();
     TestBranchesVs();

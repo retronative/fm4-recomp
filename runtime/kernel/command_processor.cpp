@@ -198,12 +198,22 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             }
             break;
         }
-        case kDrawIndx: case kDrawIndx2:
-            TraceDraw(base, state.draws, opcode);
+        case kDrawIndx: case kDrawIndx2:  // (:985-1125): the packet's words go to the registers Xenia writes (:1003, :1025, :1034)
+        {
+            const uint32_t vizQueryToken = opcode == kDrawIndx ? next() : 0;  // (:1112; DRAW_INDX_2 has no token, :1123)
+            const uint32_t initiator = next();
+            CpWriteRegister(base, reg::kVgtDrawInitiator, initiator);
+            if (((initiator >> 6) & 3) == 0)  // source select kDMA: VGT_DMA_BASE and VGT_DMA_SIZE follow (:1011-1047)
+            {
+                CpWriteRegister(base, reg::kVgtDmaBase, next());
+                CpWriteRegister(base, reg::kVgtDmaSize, next());
+            }
+            TraceDraw(base, state.draws, opcode, vizQueryToken);
             state.draws++;  // counted; drawn only with a renderer (M4 unit 8)
             if (renderer)
-                renderer->draw(base, opcode);
+                renderer->draw(base, opcode, vizQueryToken);
             break;
+        }
         case kInterrupt:  // per CPU bit, interrupt source 1 (:630-641)
         {
             const uint32_t mask = next();

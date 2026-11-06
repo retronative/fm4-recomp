@@ -9,12 +9,31 @@
 // through GpuGuard (ForzaRecomp's presenter waited with UINT64_MAX, unbounded); the staging buffer is
 // a per-frame resource held by the slot's lifetime and destroyed only after a confirmed completion;
 // captures go through the capped ring.
+//
+// The draw path (unit 8, Draw below) records every draw since the previous swap into the slot the swap
+// then submits (one submission per frame in unit 4's single slot; unit 5 adds slots and submissions
+// within a frame). Per draw, in this order and before anything is recorded: the gate's in-memory
+// state; DecodeDrawState (draw_state.h, fail closed); a resolve to the EDRAM hooks, a NoWrite draw to
+// the one policy switch (draw_record.h kNoWriteDraws); the host indices; GpuGuard::DrawLoopWork; the
+// shader variants and the pipeline key (draw_record.h); PipelineCache::Get, whose first step is the
+// shader-class allow-list (a never-seen class runs first in its own approved run); the
+// render target from the EDRAM hooks; the uploads into the slot's ring; the descriptor set from the
+// slot's pool; then one render pass with one draw. The ring and the pool are reset exactly in
+// OpenSlot, after the slot's previous submission was confirmed complete (RetireSlot) and before the
+// next one records anything; the xe_error dwords of the slot's draws are read in RetireSlot, after the
+// confirmed completion and before that reset.
 #include "renderer.h"
 #include "capture_store.h"
+#include "draw_record.h"
+#include "draw_state.h"
 #include "front_buffer.h"
 #include "gpu_guard.h"
+#include "pipeline_cache.h"
 #include "png.h"
+#include "shader_cache.h"
+#include "shader_class.h"
 #include "vulkan_device.h"
+#include "kernel/graphics.h"
 #include "kernel/virtual_memory.h"
 #include <chrono>
 #include <cstdio>
@@ -22,6 +41,7 @@
 #include <cstring>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // Added to stops.h / stops.cpp by the stop drain.
@@ -34,6 +54,9 @@ constexpr uint32_t kDisplayWidth = 1280, kDisplayHeight = 720;  // the accepted 
 constexpr uint32_t kSlots = 1;                                     // unit 4; D-b's 12 slots come with unit 5
 constexpr size_t kCaptureRecords = 16;
 constexpr uint64_t kCaptureBytes = 64ull << 20;                    // 16 stored-deflate 1280x720 PNGs are ~44 MB
+constexpr uint64_t kRingBytes = 16ull << 20;                       // per slot (D-b): ~9.7 KB of blocks per draw plus its vertex windows
+constexpr uint32_t kDrawsPerSlot = 4096;                           // descriptor sets per slot pool (a race frame is ~3,000 draws, L §3.4); a set
+                                                                   // costs every binding of the layout (32 samplers), written or not
 
 // A buffer the recorded commands use and that is destroyed only after their completion is confirmed.
 struct Transient
@@ -51,12 +74,47 @@ struct Slot
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    // Unit 8: the slot's persistent upload ring (uniform, storage and index data of its draws), its
+    // descriptor pool, and the xe_error dword of each draw recorded into the open submission.
+    Transient ring;
+    std::optional<UploadRing> allocator;
+    VkDescriptorPool descriptors = VK_NULL_HANDLE;
+    bool open = false;  // recording (OpenSlot) and not yet submitted
+    std::vector<std::pair<uint64_t, uint64_t>> errorDwords;  // (ring offset, draw number)
 } slots[kSlots];
 VkImage display = VK_NULL_HANDLE;
 VkDeviceMemory displayMemory = VK_NULL_HANDLE;
 Transient readback;  // persistent: read on the CPU only after the slot's completion is confirmed
 uint64_t transientsDestroyed = 0, drawsSinceSwap = 0, shadersSinceSwap = 0;
+uint64_t noWriteSinceSwap = 0, resolvesSinceSwap = 0, drawNumber = 0;
 gpu::SubmissionGate gate;
+
+// Unit 8.
+std::optional<GlslangCompiler> compiler;
+std::optional<ShaderCache> shaders;
+std::optional<PipelineCache> pipelines;
+ShaderClass allowedClasses = kClassStraight;
+const EdramHooks* edram = nullptr;
+const TextureHooks* textures = nullptr;
+struct FramebufferKey
+{
+    VkRenderPass pass;
+    VkImageView color, depth;
+    uint32_t width, height;
+    bool operator==(const FramebufferKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
+    struct Hasher
+    {
+        size_t operator()(const FramebufferKey& k) const
+        {
+            const auto* b = reinterpret_cast<const unsigned char*>(&k);
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (size_t i = 0; i < sizeof k; i++)
+                h = (h ^ b[i]) * 0x100000001b3ull;
+            return size_t(h);
+        }
+    };
+};
+std::unordered_map<FramebufferKey, VkFramebuffer, FramebufferKey::Hasher> framebuffers;
 
 void Check(VkResult result, const char* what)
 {
@@ -99,6 +157,18 @@ void Require(const Verdict& v)
 {
     if (!v.ok)
         Stop(v.stranded ? StopCode::GpuStranded : StopCode::Setup, "renderer: %s", v.reason.c_str());
+}
+
+// A refused draw-time result: the host cannot render this draw faithfully (unimplemented), named by its number.
+void RequireDraw(uint64_t draw, const KeyResult& r)
+{
+    if (!r.ok)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, r.reason.c_str());
+}
+void RequireDraw(uint64_t draw, const Verdict& v)
+{
+    if (!v.ok)
+        Stop(v.stranded ? StopCode::GpuStranded : StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, v.reason.c_str());
 }
 
 Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
@@ -148,6 +218,42 @@ VkCommandBuffer BeginSlot(uint32_t s)
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     Check(vkBeginCommandBuffer(slots[s].commands, &begin), "vkBeginCommandBuffer");
     return slots[s].commands;
+}
+
+// The slot's open command buffer (draws and the swap record into the same submission). The first call
+// after the slot's previous submission was retired opens it: this is the one reset point of the slot's
+// upload ring and descriptor pool (pipeline_key.h UploadRing: never while the slot is in flight; the
+// idle check is BeginSlot's).
+VkCommandBuffer OpenSlot(uint32_t s)
+{
+    Slot& slot = slots[s];
+    if (slot.open)
+        return slot.commands;
+    const VkCommandBuffer c = BeginSlot(s);
+    slot.allocator->Reset();
+    Check(vkResetDescriptorPool(dev.device, slot.descriptors, 0), "vkResetDescriptorPool");
+    slot.errorDwords.clear();
+    slot.open = true;
+    return c;
+}
+
+// The slot's submission, confirmed complete (bounded wait), then the xe_error dword of each of its draws
+// (shader_glsl.h binding 5: bit 0 a vertex fetch outside its slot's data, bit 1 a half float with
+// exponent 31): a set bit stops naming the draw. Read before the next OpenSlot resets the ring.
+void RetireSlot(uint32_t s)
+{
+    Require(guard->Retire(s));
+    Slot& slot = slots[s];
+    slot.open = false;
+    for (const auto& [offset, draw] : slot.errorDwords)
+    {
+        uint32_t error = 0;
+        std::memcpy(&error, static_cast<const uint8_t*>(slot.ring.mapped) + offset, 4);
+        if (error != 0)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: the vertex shader flagged xe_error %u (bit 0: a vertex fetch outside its slot's data; "
+                                          "bit 1: a 16-bit float with exponent 31)", (unsigned long long)draw, error);
+    }
+    slot.errorDwords.clear();
 }
 
 // The display image (already in TRANSFER_DST_OPTIMAL after `written`) -> the readback buffer, made
@@ -225,6 +331,13 @@ void CreateResources()
     Check(vkAllocateMemory(dev.device, &allocate, nullptr, &displayMemory), "vkAllocateMemory");
     Check(vkBindImageMemory(dev.device, display, displayMemory, 0), "vkBindImageMemory");
     readback = MakeBuffer(VkDeviceSize(kDisplayWidth) * kDisplayHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    // The ring alignments are the device's (never assumed; MoltenVK reports Metal's).
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(dev.gpu, &properties);
+    const uint64_t uniformAlign = properties.limits.minUniformBufferOffsetAlignment, storageAlign = properties.limits.minStorageBufferOffsetAlignment;
+    if (uniformAlign == 0 || (uniformAlign & (uniformAlign - 1)) || storageAlign == 0 || (storageAlign & (storageAlign - 1)))
+        Stop(StopCode::Setup, "renderer: buffer offset alignments %llu / %llu are not powers of two", (unsigned long long)uniformAlign,
+             (unsigned long long)storageAlign);
     for (Slot& s : slots)
     {
         VkCommandPoolCreateInfo poolInfo{};
@@ -241,6 +354,20 @@ void CreateResources()
         VkFenceCreateInfo fence{};
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         Check(vkCreateFence(dev.device, &fence, nullptr, &s.fence), "vkCreateFence");
+        // Unit 8: the ring (uniform, storage and index data) and the descriptor pool, persistent per slot.
+        s.ring = MakeBuffer(kRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        s.allocator.emplace(kRingBytes, uniformAlign, storageAlign);
+        const VkDescriptorPoolSize sizes[] = {
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kDrawsPerSlot},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTextureBindings * kDrawsPerSlot},  // the layout's 16 sampler bindings per set
+        };
+        VkDescriptorPoolCreateInfo dp{};
+        dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dp.maxSets = kDrawsPerSlot;
+        dp.poolSizeCount = uint32_t(std::size(sizes));
+        dp.pPoolSizes = sizes;
+        Check(vkCreateDescriptorPool(dev.device, &dp, nullptr, &s.descriptors), "vkCreateDescriptorPool");
     }
 }
 
@@ -250,11 +377,22 @@ void Shutdown()
 {
     if (const size_t kept = guard->Shutdown(); kept != 0)
         Stop(StopCode::GpuStranded, "renderer: %zu resource(s) kept at shutdown (completion unknown); the device is not destroyed", kept);
+    for (auto& [key, fb] : framebuffers)  // before the render passes and the EDRAM unit's views they reference
+        vkDestroyFramebuffer(dev.device, fb, nullptr);
+    framebuffers.clear();
+    pipelines.reset();  // pipelines, render passes, modules, layouts
+    shaders.reset();
+    compiler.reset();
     for (Slot& s : slots)
     {
+        vkDestroyDescriptorPool(dev.device, s.descriptors, nullptr);
+        backend.Destroy(s.ring);
         vkDestroyFence(dev.device, s.fence, nullptr);
         vkDestroyCommandPool(dev.device, s.pool, nullptr);  // frees its command buffer
-        s = Slot{};
+        s.allocator.reset();
+        s.descriptors = VK_NULL_HANDLE, s.fence = VK_NULL_HANDLE, s.commands = VK_NULL_HANDLE, s.pool = VK_NULL_HANDLE;
+        s.open = false;
+        s.errorDwords.clear();
     }
     backend.Destroy(readback);
     vkDestroyImage(dev.device, display, nullptr);
@@ -275,10 +413,75 @@ void Expect(bool ok, const char* what)
         Stop(StopCode::Setup, "renderer: self-check failed: %s", what);
 }
 
+// ---- Unit 8 helpers -------------------------------------------------------------------------------
+
+uint32_t ReadRegisterHook(const void* context, uint32_t index) { return runtime::gpu::ReadRegister(static_cast<const uint8_t*>(context), index); }
+
+// A guest index buffer element as the GPU loads it (little-endian, before the DMA endian swap in
+// draw_record.cpp SwapIndex). The buffer's range was checked against physical memory by DrawState; the
+// view that holds it is found per element (PhysicalToGuest).
+struct IndexSource
+{
+    const uint8_t* base;
+    const IndexBuffer* indices;
+    uint64_t draw;
+};
+uint32_t ReadGuestIndex(const void* context, uint32_t i)
+{
+    const IndexSource& s = *static_cast<const IndexSource*>(context);
+    const uint32_t size = s.indices->is32Bit ? 4 : 2, physical = s.indices->physical + i * size;
+    uint32_t guest = 0;
+    if (!runtime::PhysicalToGuest(physical, guest))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: index %u at physical %08X is in no view", (unsigned long long)s.draw, i, physical);
+    uint32_t raw = 0;
+    std::memcpy(&raw, s.base + guest, size);  // the GPU's little-endian element load
+    return raw;
+}
+
+// The framebuffer of a render pass over the EDRAM unit's views (one per distinct set for the run; the
+// views live for the run, render_hooks.h).
+VkFramebuffer Framebuffer(VkRenderPass pass, const HostTargets& t, bool color, bool depth)
+{
+    const FramebufferKey key{pass, color ? t.color : VK_NULL_HANDLE, depth ? t.depth : VK_NULL_HANDLE, t.width, t.height};
+    if (const auto it = framebuffers.find(key); it != framebuffers.end())
+        return it->second;
+    VkImageView views[2];
+    uint32_t count = 0;
+    if (color)
+        views[count++] = t.color;
+    if (depth)
+        views[count++] = t.depth;
+    VkFramebufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    info.renderPass = pass;
+    info.attachmentCount = count;
+    info.pAttachments = views;
+    info.width = t.width;
+    info.height = t.height;
+    info.layers = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    Check(vkCreateFramebuffer(dev.device, &info, nullptr, &fb), "vkCreateFramebuffer");
+    framebuffers[key] = fb;
+    return fb;
+}
+
+// One block of the draw in the slot's ring; exhaustion stops (fail closed: no wrap, no silent drop).
+uint64_t Allocate(Slot& s, uint64_t draw, uint64_t bytes, bool uniform, const char* what)
+{
+    uint64_t offset = 0;
+    if (!s.allocator->Allocate(bytes, uniform, offset))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the slot's upload ring (%llu bytes) cannot hold %llu more bytes for %s after %llu allocations "
+                                      "(unit 5 submits within a frame)", (unsigned long long)draw, (unsigned long long)kRingBytes, (unsigned long long)bytes,
+             what, (unsigned long long)s.allocator->Allocations());
+    return offset;
+}
+
 }  // namespace
 
 gpu::SubmissionGate& Submissions() { return gate; }
 bool Enabled() { return enabled; }
+void SetEdramHooks(const EdramHooks* hooks) { edram = hooks; }
+void SetTextureHooks(const TextureHooks* hooks) { textures = hooks; }
 
 bool Initialize(const Options& o)
 {
@@ -287,6 +490,9 @@ bool Initialize(const Options& o)
         return false;
     if (o.gpuStopPath == nullptr || o.captureDir == nullptr)
         Stop(StopCode::Setup, "renderer: --gpu-stop and --gpu-capture are required with a GPU renderer mode");
+    std::string classError;
+    if (!ParseShaderClassAllowList(o.shaderClasses, allowedClasses, classError))  // required, no silent default (shader_class.h)
+        Stop(StopCode::Setup, "renderer: %s", classError.c_str());
     const gpu::FenceTimeout timeout = gpu::FenceTimeoutFromEnv(o.fenceTimeoutEnv);
     if (timeout.malformed)  // fail closed: a mistyped limit is not silently replaced
         Stop(StopCode::Setup, "renderer: FM4_GPU_FENCE_TIMEOUT_MS=%s is not a decimal number of milliseconds", o.fenceTimeoutEnv);
@@ -294,11 +500,26 @@ bool Initialize(const Options& o)
     Require(guard->Begin("renderer initialize"));  // GPU_STOP before any Vulkan call
     captures.emplace(o.captureDir, "frame_", kCaptureBytes);
     SetStopQuiesce(QuiesceForStop, ReportForSignalStop);
-    std::fprintf(stderr, "[gpu] renderer %s: fence timeout %u ms, captures %s (at most %zu files, %llu MB), GPU_STOP %s\n",
-                 o.mode == Mode::SelfCheck ? "self-check" : "present (draws not rendered)", timeout.ms, o.captureDir, kCaptureRecords,
-                 (unsigned long long)(kCaptureBytes >> 20), o.gpuStopPath);
+    std::fprintf(stderr, "[gpu] renderer %s: fence timeout %u ms, captures %s (at most %zu files, %llu MB), GPU_STOP %s, shader classes allowed: %s\n",
+                 o.mode == Mode::SelfCheck ? "self-check" : "present", timeout.ms, o.captureDir, kCaptureRecords,
+                 (unsigned long long)(kCaptureBytes >> 20), o.gpuStopPath, allowedClasses == kClassStraight ? "none (straight-line only)" : ShaderClassName(allowedClasses).c_str());
     dev = CreateVulkanDevice(o.validation);
     CreateResources();
+    // Unit 8: the shader and pipeline caches. The portability-subset features are not exposed by
+    // vulkan_device.cpp yet: constant-alpha colour blend factors stay refused (conservative; FM4's first
+    // screens blend with src alpha / inv src alpha only).
+    compiler.emplace();
+    shaders.emplace(*compiler, o.shaderDumpDir);
+    VkPhysicalDeviceFeatures deviceFeatures;
+    vkGetPhysicalDeviceFeatures(dev.gpu, &deviceFeatures);
+    PipelineDeviceFeatures features;
+    features.depthClamp = deviceFeatures.depthClamp == VK_TRUE;
+    features.constantAlphaColorBlendFactors = false;
+    features.independentBlend = deviceFeatures.independentBlend == VK_TRUE;
+    KeyResult created;
+    pipelines.emplace(dev.device, features, allowedClasses, created);
+    if (!created)
+        Stop(StopCode::Setup, "renderer: %s", created.reason.c_str());
     enabled = true;
     return true;
 }
@@ -317,6 +538,15 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     uint32_t guest = 0;
     if (!runtime::PhysicalToGuest(f.physical, guest))
         Stop(StopCode::Unimplemented, "renderer: swap %llu: front buffer %08X is in no view", (unsigned long long)swap, f.physical);
+    // The frame's recorded work (draws, and the resolves that write guest memory, render_hooks.h) must
+    // complete before the front buffer is read: submit and retire the open slot first. Two bounded waits
+    // per swap in unit 4's one slot; unit 7's GPU-guarded page read makes this ordering automatic.
+    if (slots[0].open)
+    {
+        Check(vkEndCommandBuffer(slots[0].commands), "vkEndCommandBuffer");
+        Require(guard->Submit(0));
+        RetireSlot(0);  // confirmed completion, then the draws' xe_error dwords
+    }
     // A plain CPU read while the title may still write the buffer: the guarded read
     // (write watch, external host memory) is unit 7.
     Transient staging = MakeBuffer(VkDeviceSize(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -326,7 +556,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     if (f.swapRedBlue)
         for (size_t i = 0; i < size_t(width) * height; i++)
             linear[i] = SwapRedBlue1010102(linear[i]);
-    const VkCommandBuffer c = BeginSlot(0);
+    const VkCommandBuffer c = OpenSlot(0);  // a fresh recording: the frame's draws completed above
     if (!guard->Hold(0, staging))
         Stop(StopCode::Setup, "renderer: the staging buffer cannot be held (slot not idle)");
     ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
@@ -337,37 +567,249 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     vkCmdCopyBufferToImage(c, staging.buffer, display, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     EndWithReadback(c);
     Require(guard->Submit(0));
-    Require(guard->Retire(0));  // one bounded wait per swap: the one-frame throttle (execution model §2)
+    RetireSlot(0);  // one bounded wait per swap: the one-frame throttle (execution model §2); then the draws' xe_error dwords
     Capture(swap, "front buffer");
-    std::fprintf(stderr, "[gpu] swap %llu presented offscreen; %llu draw(s) and %llu shader load(s) since the last swap NOT rendered (unit 8)\n",
-                 (unsigned long long)swap, (unsigned long long)drawsSinceSwap, (unsigned long long)shadersSinceSwap);
-    drawsSinceSwap = shadersSinceSwap = 0;
+    std::fprintf(stderr, "[gpu] swap %llu presented offscreen; since the last swap: %llu draw(s) rendered, %llu no-write draw(s) %s, %llu resolve(s), "
+                         "%llu shader load(s); %llu bytes of the slot's ring used\n",
+                 (unsigned long long)swap, (unsigned long long)drawsSinceSwap, (unsigned long long)noWriteSinceSwap,
+                 kNoWriteDraws == NoWriteDraws::Skip ? "recorded as nothing (draw_record.h kNoWriteDraws)" : "(none allowed)",
+                 (unsigned long long)resolvesSinceSwap, (unsigned long long)shadersSinceSwap, (unsigned long long)slots[0].allocator->Used());
+    drawsSinceSwap = shadersSinceSwap = noWriteSinceSwap = resolvesSinceSwap = 0;
 }
 
-void Draw(const uint8_t* base, uint32_t opcode)
+void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
 {
-    (void)base, (void)opcode;
     if (!enabled)
         return;
-    // Unit 8 inserts here, in this order, before anything of the draw is recorded:
-    //   1. the gate's in-memory state (no file access per draw; GPU_STOP is checked at every Submit,
-    //      the single choke point to the queue, execution model §4);
-    //   2. GpuGuard::DrawLoopWork(vs loop constants, index count, ps loop constants,
-    //      gpu::PixelInvocations(PA_SC_WINDOW_SCISSOR_TL, _BR, RB_SURFACE_INFO)): a refusal stops;
-    //   3. a shader class never run before (loops, jumps, calls) stops unless the run approves it
-    //      (the isolation rule, D-h);
-    //   4. recording into the open slot, resources held by the slot's lifetime.
+    const uint64_t draw = drawNumber++;
+    // 1. The gate's in-memory state (no file access per draw; GPU_STOP is checked at every Submit, the
+    //    single choke point to the queue, execution model §4).
     const gpu::SubmissionGate::View v = gate.Load();
     if (v.stopping || v.stranded)
-        Stop(v.stranded ? StopCode::GpuStranded : StopCode::Setup, "renderer: draw after the GPU stopped");
+        Stop(v.stranded ? StopCode::GpuStranded : StopCode::Setup, "renderer: draw %llu after the GPU stopped", (unsigned long long)draw);
+    // 2. The draw state from the register file and the current shaders (fail closed).
+    const CachedShader* vs = shaders->Current(false);
+    const CachedShader* ps = shaders->Current(true);
+    if (vs == nullptr || ps == nullptr)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: no %s shader was loaded (IM_LOAD) before it", (unsigned long long)draw, vs ? "pixel" : "vertex");
+    DrawInputs in;
+    in.read = ReadRegisterHook;
+    in.context = base;
+    in.opcode = opcode;
+    in.vizQueryToken = vizQueryToken;
+    in.physicalBytes = runtime::kPhysicalSize;
+    in.vs = &vs->t;
+    in.ps = &ps->t;
+    const DrawState d = DecodeDrawState(in);
+    std::string error;
+    switch (d.kind)
+    {
+    case DrawKind::Refused:
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, d.error.c_str());
+    case DrawKind::Resolve:  // RB_MODECONTROL 6: the EDRAM unit's (render_hooks.h)
+        if (edram == nullptr)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: a resolve (RB_MODECONTROL 6) without an EDRAM unit", (unsigned long long)draw);
+        if (!edram->resolve(OpenSlot(0), base, d, draw, error))
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: resolve: %s", (unsigned long long)draw, error.c_str());
+        resolvesSinceSwap++;
+        return;
+    case DrawKind::NoWrite:  // the one policy switch (draw_record.h kNoWriteDraws; decision pending)
+        if (kNoWriteDraws == NoWriteDraws::Stop)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: %s of %u indices writes neither colour nor depth nor stencil (kNoWriteDraws = Stop)",
+                 (unsigned long long)draw, PrimitiveTypeName(d.primitiveType), d.indices.count);
+        noWriteSinceSwap++;
+        return;
+    case DrawKind::Draw: case DrawKind::DepthOnly:
+        break;
+    }
+    // 3. The host indices, then the loop-work cap (vertex invocations = what the host draws, pixel
+    //    invocations = the scissor's area), before anything is recorded.
+    HostIndices indices;
+    const IndexSource source{base, &d.indices, draw};
+    RequireDraw(draw, BuildHostIndices(d, d.indices.indexed ? ReadGuestIndex : nullptr, &source, indices));
+    RequireDraw(draw, GpuGuard<Transient, kSlots>::DrawLoopWork(d.vsLoopRegisters, indices.vertexCount, d.psLoopRegisters, d.pixelInvocations));
+    // 4. The shader variants, the pipeline key and the descriptor plan (CPU).
+    ShaderVariantDefines vsDefines, psDefines;
+    RequireDraw(draw, VariantsFromDrawState(d, *vs, *ps, vsDefines, psDefines));
+    ShaderVariant* vsVariant = shaders->Variant(*vs, vsDefines, error);
+    if (vsVariant == nullptr)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, error.c_str());
+    ShaderVariant* psVariant = shaders->Variant(*ps, psDefines, error);
+    if (psVariant == nullptr)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, error.c_str());
+    PipelineKey key;
+    RequireDraw(draw, KeyFromDrawState(d, *vs, *ps, vsVariant->id, psVariant->id, key));
+    DescriptorPlan plan;
+    RequireDraw(draw, PlanDescriptors(*vs, *ps, plan));
+    // 5. The pipeline: the shader-class allow-list is PipelineCache::Get's first step, before any Vulkan call.
+    PipelineCache::Entry pipeline;
+    RequireDraw(draw, pipelines->Get(key, *vs, *vsVariant, *ps, *psVariant, pipeline));
+    // 6. The render target (the EDRAM unit's images) and its framebuffer.
+    if (edram == nullptr)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: a draw into a render target without an EDRAM unit", (unsigned long long)draw);
+    Slot& slot = slots[0];
+    const VkCommandBuffer c = OpenSlot(0);
+    HostTargets targets;
+    if (!edram->acquireTargets(c, d.target, key.colorUsed != 0, key.depthUsed != 0, targets, error))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: render target: %s", (unsigned long long)draw, error.c_str());
+    if (targets.samples != key.samples)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the EDRAM unit returned %u-sample images for a %u-sample target", (unsigned long long)draw,
+             targets.samples, key.samples);
+    if (key.colorUsed && (targets.color == VK_NULL_HANDLE || targets.format != HostColorFormat(key.color[0].format)))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the EDRAM unit's colour view is missing or of format %d (expected %d)", (unsigned long long)draw,
+             int(targets.format), int(HostColorFormat(key.color[0].format)));
+    if (key.depthUsed && (targets.depth == VK_NULL_HANDLE || targets.depthFormat != HostDepthFormat(key.depthFormat)))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the EDRAM unit's depth view is missing or of format %d (expected %d)", (unsigned long long)draw,
+             int(targets.depthFormat), int(HostDepthFormat(key.depthFormat)));
+    if (targets.width < d.scissor.x + d.scissor.width || targets.height < d.scissor.y + d.scissor.height || targets.width == 0 || targets.height == 0)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the %ux%u host target does not cover the scissor (%u, %u, %ux%u)", (unsigned long long)draw,
+             targets.width, targets.height, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height);
+    const VkFramebuffer framebuffer = Framebuffer(pipeline.renderPass, targets, key.colorUsed != 0, key.depthUsed != 0);
+    // 7. The uploads into the slot's ring (pipeline_key.h D9).
+    std::vector<VertexWindow> windows;
+    uint32_t vertexDwords = 0;
+    PlanVertexWindows(d, indices.highIndex, windows, vertexDwords);
+    const uint64_t systemAt = Allocate(slot, draw, kSystemBytes, true, "XeSystem");
+    const uint64_t vsConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XeVsConstants");
+    const uint64_t psConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XePsConstants");
+    const uint64_t vertexBytes = std::max<uint64_t>(uint64_t(vertexDwords) * 4, 4);
+    const uint64_t vertexAt = Allocate(slot, draw, vertexBytes, false, "vertex data");
+    const uint64_t indexBytes = std::max<uint64_t>(indices.indices.size() * 4, 4);
+    const uint64_t indexAt = Allocate(slot, draw, indexBytes, false, "indices");
+    const uint64_t errorAt = Allocate(slot, draw, kErrorsBytes, false, "XeErrors");
+    uint8_t* ring = static_cast<uint8_t*>(slot.ring.mapped);
+    FillXeSystem(windows, FoldViewport(d.viewport, targets.width, targets.height), d.systemFlags, ring + systemAt);
+    FillConstants(d, false, ring + vsConstantsAt);
+    FillConstants(d, true, ring + psConstantsAt);
+    for (const VertexWindow& w : windows)
+    {
+        if (w.dwords == 0)
+            continue;
+        // A plain CPU read of guest memory, as the present path (the guarded read is unit 7). Both ends
+        // of the window must sit in one view.
+        uint32_t guest = 0, guestEnd = 0;
+        if (!runtime::PhysicalToGuest(w.physical, guest) || !runtime::PhysicalToGuest(w.physical + w.dwords * 4 - 1, guestEnd) || guestEnd - guest != w.dwords * 4 - 1)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: vertex fetch slot %u (%08X, %u dwords) is not in one view", (unsigned long long)draw, w.slot,
+                 w.physical, w.dwords);
+        std::memcpy(ring + vertexAt + uint64_t(w.baseDword) * 4, base + guest, size_t(w.dwords) * 4);
+    }
+    if (!indices.indices.empty())
+        std::memcpy(ring + indexAt, indices.indices.data(), indices.indices.size() * 4);
+    std::memset(ring + errorAt, 0, kErrorsBytes);
+    slot.errorDwords.emplace_back(errorAt, draw);
+    // 8. The descriptor set: the six buffer bindings and the textures the pair samples.
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    const VkDescriptorSetLayout layout = pipelines->SetLayout();
+    VkDescriptorSetAllocateInfo setInfo{};
+    setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    setInfo.descriptorPool = slot.descriptors;
+    setInfo.descriptorSetCount = 1;
+    setInfo.pSetLayouts = &layout;
+    if (const VkResult r = vkAllocateDescriptorSets(dev.device, &setInfo, &set); r != VK_SUCCESS)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: vkAllocateDescriptorSets failed (VkResult %d): the slot's pool (%u sets of %u bindings) is exhausted",
+             (unsigned long long)draw, int(r), kDrawsPerSlot, 6 + kTextureBindings);
+    const VkDescriptorBufferInfo buffers[6] = {
+        {slot.ring.buffer, vertexAt, vertexBytes},         // 0 XeVertexData
+        {slot.ring.buffer, systemAt, kSystemBytes},        // 1 XeSystem
+        {slot.ring.buffer, vsConstantsAt, kConstantsBytes}, // 2 XeVsConstants
+        {slot.ring.buffer, psConstantsAt, kConstantsBytes}, // 3 XePsConstants
+        {slot.ring.buffer, indexAt, indexBytes},           // 4 XeIndices (read by the XE_RECT_LIST variant only)
+        {slot.ring.buffer, errorAt, kErrorsBytes},         // 5 XeErrors
+    };
+    const VkDescriptorType bufferTypes[6] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    std::vector<VkWriteDescriptorSet> writes;
+    std::vector<VkDescriptorImageInfo> images;
+    images.reserve(kTextureBindings);
+    for (uint32_t b = 0; b < 6; b++)
+    {
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = b;
+        w.descriptorCount = 1;
+        w.descriptorType = bufferTypes[b];
+        w.pBufferInfo = &buffers[b];
+        writes.push_back(w);
+    }
+    for (uint32_t s = 0; s < kTextureBindings; s++)
+    {
+        if (plan.dimension[s] == 0)
+            continue;
+        if (textures == nullptr)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: the shaders sample texture slot %u but no texture unit is registered", (unsigned long long)draw, s);
+        const TextureSlot* t = nullptr;
+        for (const TextureSlot& candidate : d.textureSlots)
+            if (candidate.slot == s)
+                t = &candidate;
+        if (t == nullptr)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u is sampled but was not decoded", (unsigned long long)draw, s);
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        if (!textures->bind(c, *t, view, sampler, error) || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u: %s", (unsigned long long)draw, s, error.empty() ? "no view or sampler" : error.c_str());
+        images.push_back({sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = set;
+        w.dstBinding = kBindingTexture0 + s;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w.pImageInfo = &images.back();
+        writes.push_back(w);
+    }
+    vkUpdateDescriptorSets(dev.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    // 9. One render pass, one draw. The render area is the whole target (every attachment loads and
+    //    stores); the scissor is the guest's. Dynamic state in the pipeline's declared set.
+    VkRenderPassBeginInfo pass{};
+    pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    pass.renderPass = pipeline.renderPass;
+    pass.framebuffer = framebuffer;
+    pass.renderArea = {{0, 0}, {targets.width, targets.height}};
+    vkCmdBeginRenderPass(c, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines->Layout(), 0, 1, &set, 0, nullptr);
+    const HostViewport hv = FoldViewport(d.viewport, targets.width, targets.height);
+    const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.height), hv.zMin, hv.zMax};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    const VkRect2D scissor{{int32_t(d.scissor.x), int32_t(d.scissor.y)}, {d.scissor.width, d.scissor.height}};
+    vkCmdSetScissor(c, 0, 1, &scissor);
+    vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.ref);
+    vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, d.depthStencil.back.ref);
+    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.compareMask);
+    vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_BACK_BIT, d.depthStencil.back.compareMask);
+    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.writeMask);
+    vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_BACK_BIT, d.depthStencil.back.writeMask);
+    vkCmdSetBlendConstants(c, d.blend.constant);
+    vkCmdSetDepthBias(c, 0.0f, 0.0f, 0.0f);  // the poly offset enables are refused by DrawState; the state is declared dynamic
+    switch (indices.kind)
+    {
+    case HostIndices::Kind::Direct: case HostIndices::Kind::RectList:
+        vkCmdDraw(c, indices.vertexCount, 1, 0, 0);
+        break;
+    case HostIndices::Kind::Indexed:
+        vkCmdBindIndexBuffer(c, slot.ring.buffer, indexAt, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(c, indices.vertexCount, 1, 0, 0, 0);
+        break;
+    }
+    vkCmdEndRenderPass(c);
     drawsSinceSwap++;
 }
 
 void LoadShader(uint32_t type, const uint32_t* words, uint32_t count)
 {
-    (void)type, (void)words, (void)count;
-    if (enabled)
-        shadersSinceSwap++;  // unit 8: runtime/shader TranslateShader, refused shaders stop with their hash
+    if (!enabled)
+        return;
+    shadersSinceSwap++;
+    const uint64_t before = shaders->Stats().translations;
+    std::string reason;
+    const CachedShader* shader = shaders->Load(type, words, count, reason);
+    if (shader == nullptr)
+        Stop(StopCode::Unimplemented, "renderer: %s", reason.c_str());  // the hash is in the reason (shader_cache.cpp)
+    if (shaders->Stats().translations != before)  // the first load of this hash: name its class for the allow-list decision
+        std::fprintf(stderr, "[shader] %s_%016llx: %u words, class %s, %zu vertex fetch slot(s), %zu texture slot(s), %zu bool(s), %zu loop(s)\n",
+                     shader->pixel ? "ps" : "vs", (unsigned long long)shader->hash, shader->words, ShaderClassName(shader->cls).c_str(),
+                     shader->t.vertexFetchSlots.size(), shader->t.textureSlots.size(), shader->t.boolConstants.size(), shader->t.loopConstants.size());
 }
 
 void QuiesceForStop()

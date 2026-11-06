@@ -68,9 +68,18 @@
 // `#define XE_COLOR0_SCALE <float>` (pixel shader) multiplies colour 0 by it after the alpha test
 // and the conversions (ForzaRecomp: 2^(bias - 5) for a 16_16_16_16 target held as SNORM).
 // Without them the shader neither converts, clamps, scales nor tests.
-// gl_Position = vec4(p.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * p.w, p.w) for the
-// exported position p (equal to scale * p + offset when p.w == 1). Interpolator i is
-// `layout(location = i) vec4 xe_interp_<i>` on both sides; the pixel shader's colour 0 is
+// The exported position p goes through the W-format fix-up and the viewport fold (FM4 Recomp;
+// Xenia 67f16c4e315f spirv_shader_translator.cc:1474-1575
+// CompleteVertexOrTessEvalShaderInMain, the flags from PA_CL_VTE_CNTL bits 8-10 as
+// vulkan_command_processor.cc:3539-3555 sets them): xe_fixup(p) = (xy, z, w) with
+//   w  = (xe_flags & kFlagWNotReciprocal) ? p.w : 1.0 / p.w   (the guest exports 1/W unless vtx_w0_fmt)
+//   xy = (xe_flags & kFlagXyDividedByW) ? p.xy * w : p.xy      (vtx_xy_fmt: XY were already divided by W)
+//   z  = (xe_flags & kFlagZDividedByW) ? p.z * w : p.z         (vtx_z_fmt)
+// then gl_Position = vec4(q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w, q.w) for
+// q = xe_fixup(p) (equal to scale * p + offset when q.w == 1). The rect-list expansion mirrors the
+// fixed-up corners (Xenia expands rectangles after its vertex shader's epilogue). The host writes
+// xe_flags from the draw state (runtime/video/draw_state.h DrawState::systemFlags). Interpolator i
+// is `layout(location = i) vec4 xe_interp_<i>` on both sides; the pixel shader's colour 0 is
 // `layout(location = 0) out vec4 xe_color0`.
 #pragma once
 #include <cstddef>
@@ -79,6 +88,13 @@
 #include <vector>
 
 namespace runtime::shader {
+
+// XeSystem.xe_flags bits (the GLSL spells them as literals: 1u, 2u, 4u). Named after Xenia's
+// kSysFlag_XYDividedByW / kSysFlag_ZDividedByW / kSysFlag_WNotReciprocal (spirv_shader_translator.h:94-96;
+// Xenia's own bit positions differ and do not matter here). Any other bit must be 0.
+constexpr uint32_t kFlagXyDividedByW = 1u << 0;   // PA_CL_VTE_CNTL bit 8 vtx_xy_fmt
+constexpr uint32_t kFlagZDividedByW = 1u << 1;    // bit 9 vtx_z_fmt
+constexpr uint32_t kFlagWNotReciprocal = 1u << 2;  // bit 10 vtx_w0_fmt
 
 struct ShaderTranslation
 {

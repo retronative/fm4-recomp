@@ -39,7 +39,9 @@ struct RendererHooks
 {
     // XE_SWAP, after the slot's type-0 write of the front buffer's fetch constant (registers 4800-4805, host order).
     void (*present)(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap);
-    void (*draw)(const uint8_t* base, uint32_t opcode);                         // DRAW_INDX, DRAW_INDX_2
+    // DRAW_INDX, DRAW_INDX_2, after the packet's words are in VGT_DRAW_INITIATOR, VGT_DMA_BASE and VGT_DMA_SIZE (as Xenia
+    // writes them, pm4_command_processor_implement.h:1003-1034); `vizQueryToken` is DRAW_INDX's first word, 0 for DRAW_INDX_2.
+    void (*draw)(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken);
     void (*loadShader)(uint32_t type, const uint32_t* words, uint32_t count);  // IM_LOAD(_IMMEDIATE), host order
 };
 void SetRendererHooks(const RendererHooks* hooks);

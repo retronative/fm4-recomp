@@ -2,6 +2,7 @@
 // Copyright (C) 2026 ForzaRecomp contributors
 // Copyright (C) 2026 FM4 Recomp contributors
 //
+#define VK_ENABLE_BETA_EXTENSIONS  // VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h)
 #include "vulkan_device.h"
 #include "stops.h"
 #include <atomic>
@@ -113,8 +114,11 @@ VulkanDevice CreateVulkanDevice(bool validation)
         properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
         properties.pNext = &driver;
         vkGetPhysicalDeviceProperties2(candidate, &properties);
-        std::fprintf(stderr, "[gpu] device %s, driver %s %s, Vulkan %u.%u\n", properties.properties.deviceName, driver.driverName, driver.driverInfo,
-                     VK_API_VERSION_MAJOR(properties.properties.apiVersion), VK_API_VERSION_MINOR(properties.properties.apiVersion));
+        std::fprintf(stderr, "[gpu] device %s, driver %s %s, Vulkan %u.%u, per-stage samplers %u, sampled images %u, uniform buffers %u, storage buffers %u\n",
+                     properties.properties.deviceName, driver.driverName, driver.driverInfo, VK_API_VERSION_MAJOR(properties.properties.apiVersion),
+                     VK_API_VERSION_MINOR(properties.properties.apiVersion), properties.properties.limits.maxPerStageDescriptorSamplers,
+                     properties.properties.limits.maxPerStageDescriptorSampledImages, properties.properties.limits.maxPerStageDescriptorUniformBuffers,
+                     properties.properties.limits.maxPerStageDescriptorStorageBuffers);
         if (driver.driverID != VK_DRIVER_ID_MOLTENVK)
             continue;  // only the pinned MoltenVK is used (no other driver is approved)
         if (std::strcmp(driver.driverInfo, kMoltenVkVersion) != 0)
@@ -137,9 +141,26 @@ VulkanDevice CreateVulkanDevice(bool validation)
     std::vector<VkExtensionProperties> offered(available);
     Check(vkEnumerateDeviceExtensionProperties(d.gpu, nullptr, &available, offered.data()), "vkEnumerateDeviceExtensionProperties");
     std::vector<const char*> enabled;
+    bool portabilityOffered = false;
     for (const VkExtensionProperties& e : offered)
         if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset"))  // required when offered
-            enabled.push_back("VK_KHR_portability_subset");
+            enabled.push_back("VK_KHR_portability_subset"), portabilityOffered = true;
+    // Features the texture unit needs, enabled only when offered (Vulkan: enabling an unsupported feature is invalid):
+    // textureCompressionBC (MoltenVK sets it from MTLDevice.supportsBCTextureCompression) and the portability subset's
+    // imageViewFormatSwizzle (component mappings in image views; MoltenVK hard-codes it on Apple GPUs). Both logged.
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability{};
+    portability.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR;
+    VkPhysicalDeviceFeatures2 features{};
+    features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    features.pNext = portabilityOffered ? &portability : nullptr;
+    vkGetPhysicalDeviceFeatures2(d.gpu, &features);
+    d.textureCompressionBC = features.features.textureCompressionBC == VK_TRUE;
+    d.imageViewFormatSwizzle = portabilityOffered && portability.imageViewFormatSwizzle == VK_TRUE;
+    VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.textureCompressionBC = d.textureCompressionBC ? VK_TRUE : VK_FALSE;
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR enabledPortability{};
+    enabledPortability.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR;
+    enabledPortability.imageViewFormatSwizzle = d.imageViewFormatSwizzle ? VK_TRUE : VK_FALSE;
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo queueInfo{};
     queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -152,8 +173,27 @@ VulkanDevice CreateVulkanDevice(bool validation)
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.enabledExtensionCount = uint32_t(enabled.size());
     deviceInfo.ppEnabledExtensionNames = enabled.data();
+    deviceInfo.pEnabledFeatures = &enabledFeatures;
+    deviceInfo.pNext = portabilityOffered ? &enabledPortability : nullptr;
     Check(vkCreateDevice(d.gpu, &deviceInfo, nullptr, &d.device), "vkCreateDevice");
     vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
+    // The formats the first screens need, as the device reports them:
+    // S sampled, C colour attachment, D depth/stencil attachment, B blit destination, T transfer destination (optimal tiling).
+    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, imageViewFormatSwizzle %s (portability subset %s)\n",
+                 d.textureCompressionBC ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
+    static constexpr struct { VkFormat format; const char* name; } kFormats[] = {
+        {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1_RGBA_UNORM (Xenos DXT1)"}, {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM (k_8_8_8_8)"},
+        {VK_FORMAT_R8_UNORM, "R8_UNORM (k_8)"}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, "A2B10G10R10_UNORM (2_10_10_10 targets, format 54 front buffer)"},
+        {VK_FORMAT_D32_SFLOAT_S8_UINT, "D32_SFLOAT_S8_UINT (D24FS8 stand-in)"}, {VK_FORMAT_D24_UNORM_S8_UINT, "D24_UNORM_S8_UINT"}};
+    for (const auto& f : kFormats)
+    {
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(d.gpu, f.format, &props);
+        const VkFormatFeatureFlags o = props.optimalTilingFeatures;
+        std::fprintf(stderr, "[gpu] format %s: %s%s%s%s%s(optimal %08X)\n", f.name, o & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? "S " : "",
+                     o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? "C " : "", o & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "D " : "",
+                     o & VK_FORMAT_FEATURE_BLIT_DST_BIT ? "B " : "", o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? "T " : "", o);
+    }
     std::fprintf(stderr, "[gpu] MoltenVK %s, queue family %u, validation %s\n", kMoltenVkVersion, d.queueFamily,
                  validation ? "on (VK_LAYER_KHRONOS_validation 1.4.363, messenger stops at the first warning)" : "OFF");
     return d;

@@ -21,6 +21,7 @@ constexpr uint32_t RegisterAddress(uint32_t index) { return kRegisterBase + 4 * 
 // Register indices (Xenia register_table.inc).
 namespace reg { constexpr uint32_t kCpRbWptr = 0x1C5, kScratchUmsk = 0x1DC, kScratchAddr = 0x1DD, kScratchReg0 = 0x578,
                                    kWritebackBase = 0xA04, kCoherStatusHost = 0xA31, kVgtEventInitiator = 0x21F9,
+                                   kVgtDmaBase = 0x21FA, kVgtDmaSize = 0x21FB, kVgtDrawInitiator = 0x21FC,
                                    kShaderConstantFetch00 = 0x4800; }
 
 // Commits the register page and seeds the registers Xenia reads as constants (graphics_system.cc:209-224):

@@ -8,14 +8,14 @@
 // little-endian from the guest's big-endian bytes; prime 100000001b3). Capped at 64 MB (an uncapped dump once filled ~50 GB): past the
 // cap one final line, then nothing. Not part of any stop line or result.
 #pragma once
+#include "shader_hash.h"
 #include <cstdint>
 
 namespace runtime::gpu {
 
-// `words`: the microcode as the guest's 32-bit values (big-endian in memory).
-uint64_t ShaderHash(uint32_t type, const uint32_t* words, uint32_t count);
+// ShaderHash: kernel/shader_hash.h (shared with runtime/video/shader_cache.h).
 bool TraceEnabled();
-void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode);
+void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t vizQueryToken);
 // FM4_SHADER_DUMP=<dir> also writes each distinct shader once (<vs|ps>_<hash>.bin, big-endian words; capped at 4096).
 void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate);
 

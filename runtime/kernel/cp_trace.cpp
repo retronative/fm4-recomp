@@ -49,29 +49,54 @@ void Line(const char* text, int length)
 
 }  // namespace
 
-uint64_t ShaderHash(uint32_t type, const uint32_t* words, uint32_t count)
-{
-    uint64_t hash = 0xcbf29ce484222325ull ^ type;
-    for (uint32_t i = 0; i < count; i++)
-        hash = (hash ^ __builtin_bswap32(words[i])) * 0x100000001b3ull;  // a little-endian load of big-endian bytes
-    return hash;
-}
-
 bool TraceEnabled()
 {
     std::lock_guard guard(traceLock);
     return Open() != nullptr;
 }
 
-void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode)
+void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t vizQueryToken)
 {
     std::lock_guard guard(traceLock);
     if (Open() == nullptr)
         return;
-    char text[256];
-    Line(text, std::snprintf(text, sizeof text, "draw %llu op %02X surface %08X color %08X depth %08X color1 %08X mode %08X scissor_br %08X\n",
+    char text[384];
+    // The draw packet (VGT_DRAW_INITIATOR 21FC, after the CP wrote it) and the state the draw decoder reads (runtime/video/
+    // draw_state.h): RB_COLOR_MASK 2104, RB_DEPTHCONTROL 2200, RB_BLENDCONTROL0 2201, RB_COLORCONTROL 2202, PA_CL_CLIP_CNTL
+    // 2204, PA_SU_SC_MODE_CNTL 2205, PA_CL_VTE_CNTL 2206, SQ_PROGRAM_CNTL 2180 (Xenia register_table.inc).
+    Line(text, std::snprintf(text, sizeof text,
+                             "draw %llu op %02X surface %08X color %08X depth %08X color1 %08X mode %08X scissor_br %08X initiator %08X "
+                             "colormask %08X depthctl %08X blend0 %08X colorctl %08X clip %08X sumode %08X vte %08X program %08X\n",
                              (unsigned long long)draw, opcode, ReadRegister(base, 0x2000), ReadRegister(base, 0x2001), ReadRegister(base, 0x2002),
-                             ReadRegister(base, 0x2003), ReadRegister(base, 0x2208), ReadRegister(base, 0x2082)));
+                             ReadRegister(base, 0x2003), ReadRegister(base, 0x2208), ReadRegister(base, 0x2082), ReadRegister(base, 0x21FC),
+                             ReadRegister(base, 0x2104), ReadRegister(base, 0x2200), ReadRegister(base, 0x2201), ReadRegister(base, 0x2202),
+                             ReadRegister(base, 0x2204), ReadRegister(base, 0x2205), ReadRegister(base, 0x2206), ReadRegister(base, 0x2180)));
+    // The rest of the decoder's inputs (runtime/video/draw_state.h): DRAW_INDX's viz-query token, PA_SC_VIZ_QUERY 2293,
+    // VGT_OUTPUT_PATH_CNTL 2284, SQ_INTERPOLATOR_CNTL 2182, SQ_VS_CONST 2307, SQ_PS_CONST 2308, PA_SC_WINDOW_OFFSET 2080,
+    // PA_SC_WINDOW_SCISSOR_TL 2081, PA_SU_VTX_CNTL 2302, RB_STENCILREFMASK 210D, PA_CL_VPORT_XSCALE..ZOFFSET 210F-2114.
+    Line(text, std::snprintf(text, sizeof text,
+                             "state viz %08X %08X outpath %08X interp %08X vsconst %08X psconst %08X window %08X %08X vtxcntl %08X stencilref %08X "
+                             "vport %08X %08X %08X %08X %08X %08X\n",
+                             vizQueryToken, ReadRegister(base, 0x2293), ReadRegister(base, 0x2284), ReadRegister(base, 0x2182), ReadRegister(base, 0x2307),
+                             ReadRegister(base, 0x2308), ReadRegister(base, 0x2080), ReadRegister(base, 0x2081), ReadRegister(base, 0x2302),
+                             ReadRegister(base, 0x210D), ReadRegister(base, 0x210F), ReadRegister(base, 0x2110), ReadRegister(base, 0x2111),
+                             ReadRegister(base, 0x2112), ReadRegister(base, 0x2113), ReadRegister(base, 0x2114)));
+    // DRAW_INDX (the textured draws so far): texture fetch constants of slots 0-2 (6 dwords each at 4800 + 6 * slot, Xenia
+    // FETCH_00_0; the pixel shaders FM4's first screens load use slots 0-2 at most, reference/gpu/texture.md).
+    // Resolves (RB_MODECONTROL 2208 = 6): RB_COPY_CONTROL 2318, RB_COPY_DEST_BASE 2319, RB_COPY_DEST_PITCH 231A, RB_COPY_DEST_INFO
+    // 231B, RB_COPY_DEST_OFFSET 231D..231F, PA_SC_WINDOW_OFFSET 2080 / WINDOW_SCISSOR_TL 2081, and fetch constant 0 (the
+    // resolve's destination texture; reference/gpu/edram.md: these were in no trace before).
+    if ((ReadRegister(base, 0x2208) & 7) == 6)
+        Line(text, std::snprintf(text, sizeof text, "resolve copy %08X %08X %08X %08X offset %08X %08X %08X window %08X %08X fetch0 %08X %08X %08X %08X %08X %08X\n",
+                                 ReadRegister(base, 0x2318), ReadRegister(base, 0x2319), ReadRegister(base, 0x231A), ReadRegister(base, 0x231B),
+                                 ReadRegister(base, 0x231D), ReadRegister(base, 0x231E), ReadRegister(base, 0x231F), ReadRegister(base, 0x2080),
+                                 ReadRegister(base, 0x2081), ReadRegister(base, 0x4800), ReadRegister(base, 0x4801), ReadRegister(base, 0x4802),
+                                 ReadRegister(base, 0x4803), ReadRegister(base, 0x4804), ReadRegister(base, 0x4805)));
+    if (opcode == 0x22)
+        for (uint32_t slot = 0; slot < 3; slot++)
+            Line(text, std::snprintf(text, sizeof text, "tex %u %08X %08X %08X %08X %08X %08X\n", slot, ReadRegister(base, 0x4800 + 6 * slot),
+                                     ReadRegister(base, 0x4801 + 6 * slot), ReadRegister(base, 0x4802 + 6 * slot), ReadRegister(base, 0x4803 + 6 * slot),
+                                     ReadRegister(base, 0x4804 + 6 * slot), ReadRegister(base, 0x4805 + 6 * slot)));
 }
 
 void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate)

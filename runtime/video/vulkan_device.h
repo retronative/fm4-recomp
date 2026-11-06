@@ -32,6 +32,11 @@ struct VulkanDevice
     VkQueue queue = VK_NULL_HANDLE;
     uint32_t queueFamily = 0;
     bool validation = false;
+    // Features enabled at vkCreateDevice when the device offers them (logged at creation; the texture unit refuses
+    // what is absent): BC1-3 sampling (MoltenVK: MTLDevice.supportsBCTextureCompression) and image-view component
+    // swizzles (VK_KHR_portability_subset imageViewFormatSwizzle).
+    bool textureCompressionBC = false;
+    bool imageViewFormatSwizzle = false;
 };
 
 // Creates the instance (validation as asked), picks the MoltenVK device with a graphics queue,

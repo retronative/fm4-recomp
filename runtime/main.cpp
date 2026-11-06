@@ -120,6 +120,7 @@ int main(int argc, char** argv)
     const char* rendererMode = nullptr;
     const char* gpuCaptureDir = nullptr;
     const char* vkValidation = nullptr;
+    const char* shaderClasses = nullptr;
     int stopAtSwap = 0;
     int deadline = 0;
     for (int i = 1; i < argc; i += 2)
@@ -137,6 +138,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--renderer")) rendererMode = argv[i + 1];
         else if (!std::strcmp(argv[i], "--gpu-capture")) gpuCaptureDir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--vk-validation")) vkValidation = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--shader-classes")) shaderClasses = argv[i + 1];
         else if (!std::strcmp(argv[i], "--stop-at-swap")) stopAtSwap = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--deadline")) deadline = std::atoi(argv[i + 1]);
         else Stop(StopCode::Setup, "unknown option %s", argv[i]);
@@ -144,7 +146,7 @@ int main(int argc, char** argv)
     if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || rendererMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
         Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --disc-map <disc1_gdfx.tsv> "
              "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present> --stop-at-swap <n> --deadline <seconds> (all required; "
-             "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off>)");
+             "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off> --shader-classes <none|branch,predicate,loop>)");
     // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
     // the same 48 kHz pacing, frame conversion and callbacks (kernel/audio.h).
     if (!std::strcmp(audioMode, "audible"))
@@ -178,6 +180,12 @@ int main(int argc, char** argv)
         if (gpuCaptureDir == nullptr || vkValidation == nullptr || (std::strcmp(vkValidation, "on") && std::strcmp(vkValidation, "off")))
             Stop(StopCode::Setup, "--renderer %s requires --gpu-capture <dir> and --vk-validation <on|off>", rendererMode);
         video.validation = !std::strcmp(vkValidation, "on");
+        // The shader-class allow-list (video/shader_class.h): required, no silent default; parsed and refused by the renderer.
+        if (shaderClasses == nullptr)
+            Stop(StopCode::Setup, "--renderer %s requires --shader-classes <none|branch,predicate,loop> (a never-seen shader class runs first in its own approved run)",
+                 rendererMode);
+        video.shaderClasses = shaderClasses;
+        video.shaderDumpDir = std::getenv("FM4_SHADER_DUMP");  // the translated GLSL beside the CP's .bin dumps (video/shader_cache.h)
     }
     runtime::SetModuleImages(fm4::kModules, std::size(fm4::kModules), modulesPath);  // XexLoadImage (kernel/loader.h)
     runtime::MountDisc(discPath, discMapPath);

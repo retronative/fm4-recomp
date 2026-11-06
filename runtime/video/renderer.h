@@ -14,12 +14,16 @@
 //               ring; then each safety path exercised in-process; stops with
 //               StopCode::GpuSelfCheck (12) before the title runs any code.
 //   present     the guest front buffer is detiled and presented (offscreen, captured) at every
-//               XE_SWAP. Draws are NOT rendered yet: each swap logs how many were skipped, and the
-//               mode is diagnostic only, never a default (no draw skipping by default).
+//               XE_SWAP, and every draw since the previous swap is recorded into the same submission
+//               (unit 8, Draw below): the shader cache, the pipeline cache, the per-slot upload ring and
+//               descriptor pool, the EDRAM and texture hooks (render_hooks.h). A draw the host cannot
+//               render faithfully stops the run naming the draw; a NoWrite draw follows the one policy
+//               switch draw_record.h kNoWriteDraws (decision pending) and is counted in the swap line.
 // All GPU work goes through GpuGuard (gpu_guard.h): GPU_STOP, submission gate, per-slot lifetime,
 // bounded fence waits, loop-work cap, GPU_STOP written on a stranding.
 #pragma once
 #include "gpu/submission_gate.h"
+#include "render_hooks.h"
 #include "stops.h"
 #include <cstdint>
 
@@ -39,7 +43,16 @@ struct Options
     const char* captureDir = nullptr;   // --gpu-capture <dir> (required unless headless): the run's evidence dir
     bool validation = true;             // --vk-validation on|off (required unless headless; gpu_run.sh passes on)
     const char* fenceTimeoutEnv = nullptr;  // getenv("FM4_GPU_FENCE_TIMEOUT_MS") (fence_wait.h FenceTimeoutFromEnv)
+    // --shader-classes none|<branch,predicate,loop> (required unless headless; shader_class.h): the classes of
+    // shaders this run may create pipelines for. A never-seen class runs first in its own approved run.
+    const char* shaderClasses = nullptr;
+    const char* shaderDumpDir = nullptr;  // getenv("FM4_SHADER_DUMP"): the translated GLSL beside the CP's .bin dumps (shader_cache.h)
 };
+
+// The EDRAM unit's and the texture unit's hooks (render_hooks.h), registered before the title runs. Without
+// them a draw that needs a render target, a resolve or a texture stops (fail closed).
+void SetEdramHooks(const EdramHooks* hooks);
+void SetTextureHooks(const TextureHooks* hooks);
 
 // The process-wide submission gate (stops.cpp drains it before _exit).
 gpu::SubmissionGate& Submissions();
@@ -54,9 +67,13 @@ bool Enabled();
 // Command processor hook points (kernel/command_processor.cpp). Each checks GPU_STOP first.
 // XE_SWAP, after the type-0 write of the fetch constant: `fetch` = registers 4800-4805 (host order).
 void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap);
-// DRAW_INDX / DRAW_INDX_2: unit 8 records the draw here; until then it is counted (Mode::Present).
-void Draw(const uint8_t* base, uint32_t opcode);
-// IM_LOAD / IM_LOAD_IMMEDIATE: unit 8 translates (runtime/shader) and caches here; nothing yet.
+// DRAW_INDX / DRAW_INDX_2 (unit 8): decodes the draw state (draw_state.h), checks the loop-work cap and the
+// shader-class allow-list, builds or finds the pipeline, uploads the draw's blocks into the slot's ring and
+// records the draw into the open submission; a resolve goes to the EDRAM hooks. Every refusal stops, naming
+// the draw number.
+void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken);
+// IM_LOAD / IM_LOAD_IMMEDIATE: ShaderCache::Load (translation at a hash miss, class tag); a refused shader
+// stops naming its hash.
 void LoadShader(uint32_t type, const uint32_t* words, uint32_t count);
 
 // For stops.cpp (normal thread context, not a signal handler): begins the stop, waits (bounded) for
