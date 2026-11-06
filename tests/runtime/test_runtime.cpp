@@ -2826,6 +2826,17 @@ int main(int, char** argv)
         Expect(ReadRegister(base, 0x4005) == 0x3F800000 && ReadRegister(base, 0x4006) == 0x40000000 && ReadRegister(base, 0x4802) == 0x12345678 &&
                    ExitCodeOf([&] { CpState c; Execute(base, page + 0x4A0, 4, 0, 4, c); }) == int(StopCode::Unimplemented),
                "PM4 LOAD_ALU_CONSTANT: ALU and fetch constants from memory (big-endian) at their register bases; type 5 stops (7)");
+        // EVENT_WRITE_EXT (opcode 5A; Xenia :915-949): initiator 3 -> VGT_EVENT_INITIATOR; extents at +0x600 (endian 1,
+        // 8in16): 0000 0400 0000 0400 0000 0001 (8192 >> 3 = 0x400); endian 2 stops (7). Header C0015A00: 2 words.
+        put(0x5C0, {0xC0015A00, 3, (phys + 0x600) | 1});
+        put(0x5D0, {0xC0015A00, 3, (phys + 0x600) | 2});
+        CpState ext;
+        if (mapped)
+            Execute(base, page + 0x5C0, 3, 0, 3, ext);
+        Expect(ReadRegister(base, reg::kVgtEventInitiator) == 3 && be32(page + 0x600) == 0x00000400 && be32(page + 0x604) == 0x00000400 &&
+                   be32(page + 0x608) == 0x00000001 &&
+                   ExitCodeOf([&] { CpState c; Execute(base, page + 0x5D0, 3, 0, 3, c); }) == int(StopCode::Unimplemented),
+               "PM4 EVENT_WRITE_EXT: whole-surface extents (Xenia's conservative answer), big-endian 16-bit; another endian stops (7)");
         // A ring of 4 words read from word 3 with wraparound: a type-0 header at word 3, its values at words 0 and 1.
         put(0x300, {0x22, 0x33, 0, 0x00012004});
         CpState ring;

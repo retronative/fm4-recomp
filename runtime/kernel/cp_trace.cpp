@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <set>
+#include <string>
 
 namespace runtime::gpu {
 namespace {
@@ -72,11 +74,28 @@ void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode)
                              ReadRegister(base, 0x2003), ReadRegister(base, 0x2208), ReadRegister(base, 0x2082)));
 }
 
-void TraceShader(uint32_t type, uint32_t words, uint64_t hash, bool immediate)
+void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate)
 {
     std::lock_guard guard(traceLock);
     if (Open() == nullptr)
         return;
+    // FM4_SHADER_DUMP=<dir> (with the trace on): each distinct shader once, as survey/shader_export.py writes the
+    // disc's (<vs|ps>_<hash>.bin, big-endian words), for the offline census. Capped at 4096 files. Game data: local only.
+    static std::set<uint64_t> dumped;
+    if (const char* dir = std::getenv("FM4_SHADER_DUMP"); dir && dumped.size() < 4096 && dumped.insert(hash ^ type).second)
+    {
+        char name[64];
+        std::snprintf(name, sizeof name, "/%s_%016llx.bin", type == 0 ? "vs" : "ps", (unsigned long long)hash);
+        if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb"))
+        {
+            for (uint32_t i = 0; i < words; i++)
+            {
+                const uint8_t be[4] = {uint8_t(code[i] >> 24), uint8_t(code[i] >> 16), uint8_t(code[i] >> 8), uint8_t(code[i])};
+                std::fwrite(be, 1, 4, f);
+            }
+            std::fclose(f);
+        }
+    }
     char text[160];
     Line(text, std::snprintf(text, sizeof text, "shader %s type %u words %u hash %016llx\n", immediate ? "immediate" : "pointer", type, words,
                              (unsigned long long)hash));

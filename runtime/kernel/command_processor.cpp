@@ -26,7 +26,7 @@ enum : uint32_t {
     kNop = 0x10, kRegRmw = 0x21, kDrawIndx = 0x22, kVizQuery = 0x23, kWaitForIdle = 0x26, kImLoad = 0x27, kImLoadImmediate = 0x2B,
     kSetConstant = 0x2D, kLoadAluConstant = 0x2F, kDrawIndx2 = 0x36, kIndirectBufferPfd = 0x37, kInvalidateState = 0x3B, kWaitRegMem = 0x3C,
     kMemWrite = 0x3D, kRegToMem = 0x3E, kIndirectBuffer = 0x3F, kCondWrite = 0x45, kEventWrite = 0x46, kMeInit = 0x48,
-    kSetBinMask = 0x50, kSetBinSelect = 0x51, kInterrupt = 0x54, kSetConstant2 = 0x55, kEventWriteShd = 0x58,
+    kSetBinMask = 0x50, kSetBinSelect = 0x51, kInterrupt = 0x54, kSetConstant2 = 0x55, kEventWriteShd = 0x58, kEventWriteExt = 0x5A,
     kContextUpdate = 0x5E, kSetBinMaskLo = 0x60, kSetBinMaskHi = 0x61, kSetBinSelectLo = 0x62, kSetBinSelectHi = 0x63,
     kXeSwap = 0x64,
 };
@@ -67,6 +67,7 @@ struct Reader
 };
 
 std::atomic<uint32_t> ringStart{0}, ringWords{0}, readIndex{0}, writeBack{0}, stopAtSwap{1};
+const RendererHooks* renderer = nullptr;  // set once by main before the ring starts
 std::mutex stateLock;
 CpState ringState;
 
@@ -169,31 +170,39 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             const uint32_t type = next(), sizeWords = next() & 0xFFFF;
             if (sizeWords > remaining)
                 Stop(StopCode::Unimplemented, "GPU: IM_LOAD_IMMEDIATE of %u words in a %u-word packet", sizeWords, count);
-            if (TraceEnabled())
+            if (TraceEnabled() || renderer)
             {
                 std::vector<uint32_t> code(sizeWords);
                 for (uint32_t i = 0; i < sizeWords; i++)
                     code[i] = next();
-                TraceShader(type, sizeWords, ShaderHash(type, code.data(), sizeWords), true);
+                if (TraceEnabled())
+                    TraceShader(type, code.data(), sizeWords, ShaderHash(type, code.data(), sizeWords), true);
+                if (renderer)
+                    renderer->loadShader(type, code.data(), sizeWords);
             }
             break;  // the shader upload itself is not used headless
         }
         case kImLoad:  // {address | type, start << 16 | size in words} (:1244-1272)
         {
             const uint32_t addressType = next(), sizeWords = next() & 0xFFFF;
-            if (TraceEnabled())
+            if (TraceEnabled() || renderer)
             {
                 std::vector<uint32_t> code(sizeWords);
                 const uint32_t at = PhysicalToGuest(addressType & ~3u);
                 for (uint32_t i = 0; i < sizeWords; i++)
                     code[i] = Load32(base, at + 4 * i);
-                TraceShader(addressType & 3, sizeWords, ShaderHash(addressType & 3, code.data(), sizeWords), false);
+                if (TraceEnabled())
+                    TraceShader(addressType & 3, code.data(), sizeWords, ShaderHash(addressType & 3, code.data(), sizeWords), false);
+                if (renderer)
+                    renderer->loadShader(addressType & 3, code.data(), sizeWords);
             }
             break;
         }
         case kDrawIndx: case kDrawIndx2:
             TraceDraw(base, state.draws, opcode);
-            state.draws++;  // counted, not drawn
+            state.draws++;  // counted; drawn only with a renderer (M4 unit 8)
+            if (renderer)
+                renderer->draw(base, opcode);
             break;
         case kInterrupt:  // per CPU bit, interrupt source 1 (:630-641)
         {
@@ -209,6 +218,13 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             if (magic != kSwapSignature)
                 Stop(StopCode::Unimplemented, "GPU: a swap packet without its signature (%08X)", magic);
             state.swaps++;
+            if (renderer)  // presented before the stop at swap n, so swap n is captured
+            {
+                uint32_t fetch[6];
+                for (uint32_t i = 0; i < 6; i++)
+                    fetch[i] = Register(base, reg::kShaderConstantFetch00 + i);
+                renderer->present(base, fetch, frontBuffer, width, height, state.swaps);
+            }
             if (state.swaps == 1 && stopAtSwap.load() == 1)
                 Stop(StopCode::FirstSwap, "first swap: front buffer %08X, %ux%u", frontBuffer, width, height);
             if (state.swaps >= stopAtSwap.load())
@@ -319,6 +335,21 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 CpWriteRegister(base, bases[type] + (offsetType & 0x7FF) + i, Load32(base, PhysicalToGuest(address + 4 * i)));
             break;
         }
+        case kEventWriteExt:  // {initiator, address | endian}: the screen extents of earlier draws (:915-949)
+        {
+            // Nothing is drawn here, so the extents are Xenia's conservative answer: the whole surface (x and y
+            // 0-8192 in units of 8, z 0-1), six 16-bit values stored big-endian as its byte_swap leaves them. Xenia
+            // asserts the 8in16 swap; another one stops (7).
+            const uint32_t initiator = next(), address = next();
+            WriteRegister(base, reg::kVgtEventInitiator, initiator & 0x3F);
+            if ((address & 3) != 1)
+                Stop(StopCode::Unimplemented, "GPU: EVENT_WRITE_EXT with endian %u is not modelled", address & 3);
+            const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+            const uint32_t at = PhysicalToGuest(address & ~3u);
+            for (uint32_t i = 0; i < 6; i++)
+                base[at + 2 * i] = uint8_t(extents[i] >> 8), base[at + 2 * i + 1] = uint8_t(extents[i]);
+            break;
+        }
         case kSetConstant2:  // (:1170-1179)
         {
             for (uint32_t index = next() & 0xFFFF; remaining; index++)
@@ -340,6 +371,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
 }
 
 void SetStopAtSwap(uint32_t n) { stopAtSwap = n; }
+void SetRendererHooks(const RendererHooks* hooks) { renderer = hooks; }
 
 void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
 {

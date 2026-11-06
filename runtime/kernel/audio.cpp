@@ -10,7 +10,9 @@
 #include "loader.h"
 #include "threads.h"
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +30,10 @@ bool registered = false;
 uint32_t callback = 0, wrappedArgument = 0, permits = 0;
 std::deque<std::vector<uint8_t>> frames;  // submitted, guest layout
 Counters counters;
+// Signal level of the frames played since the last report (the guest's own float samples; 1.0 = full scale).
+double levelSumSquares = 0;
+float levelPeak = 0;
+uint64_t levelSamples = 0, levelAudibleFrames = 0;
 bool clockStarted = false;
 std::chrono::steady_clock::time_point firstPull;
 uint64_t firstVblank = 0;
@@ -176,6 +182,13 @@ bool ConsumeFrame(float* out)
     {
         Interleave(frame.data(), out);
         permitWake.notify_one();
+        double sumSquares = 0;
+        float peak = 0;
+        for (uint32_t i = 0; i < kFrameFloats; i++)
+            sumSquares += double(out[i]) * out[i], peak = std::max(peak, std::fabs(out[i]));
+        std::lock_guard guard(lock);
+        levelSumSquares += sumSquares, levelPeak = std::max(levelPeak, peak), levelSamples += kFrameFloats;
+        levelAudibleFrames += peak > 1e-4f;  // about -80 dBFS
     }
     if (report)
         Report(report);
@@ -206,10 +219,15 @@ void Report(const char* when)
     char device[48] = "mute";
     if (outputQueuedMs)
         std::snprintf(device, sizeof device, "device queue %.1f ms", outputQueuedMs());
+    const double rms = levelSamples ? std::sqrt(levelSumSquares / double(levelSamples)) : 0.0;
+    auto dbfs = [](double v) { return v > 0 ? 20.0 * std::log10(v) : -999.0; };
     std::fprintf(stderr, "[audio] %s: callbacks %llu, submitted %llu, consumed %llu, silent %llu, permits %u, queued %u; "
-                 "output %.3f s, wall %.3f s, vblanks/60 %.3f s since the first pull; %s\n", when,
+                 "output %.3f s, wall %.3f s, vblanks/60 %.3f s since the first pull; %s; level since last report: peak %.1f dBFS, "
+                 "RMS %.1f dBFS, %llu audible frames\n", when,
                  (unsigned long long)c.callbacks, (unsigned long long)c.submitted, (unsigned long long)c.consumed,
-                 (unsigned long long)c.silent, c.permits, c.queued, outputSeconds, wall, video, device);
+                 (unsigned long long)c.silent, c.permits, c.queued, outputSeconds, wall, video, device, dbfs(levelPeak), dbfs(rms),
+                 (unsigned long long)levelAudibleFrames);
+    levelSumSquares = 0, levelPeak = 0, levelSamples = 0, levelAudibleFrames = 0;
 }
 
 bool WaitForCallbacks(uint64_t target, int ms)

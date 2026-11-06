@@ -16,17 +16,60 @@
 #include <cstdio>
 #include <unistd.h>
 
-void Stop(StopCode code, const char* format, ...)
+namespace {
+std::atomic<void (*)()> stopQuiesce{nullptr}, stopSignalReport{nullptr};
+std::atomic<int> firstStop{0};
+// Longer than the renderer's drain (the 2 s fence limit + 1 s, runtime/video/renderer.cpp QuiesceForStop).
+constexpr int kConcurrentStopWaitMs = 65000;  // covers the largest fence limit (60 s) + 1 s + margin
+
+void WriteStopLine(StopCode code, const char* format, va_list args)
 {
     char message[512];
-    va_list args;
-    va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
-    va_end(args);
     char line[600];
     const int length = snprintf(line, sizeof(line), "[stop %d] %s\n", int(code), message);
     // write(2) and _exit(2): also reached from the fault handler and the watchdog thread.
     (void)!write(STDERR_FILENO, line, size_t(length) < sizeof(line) ? size_t(length) : sizeof(line) - 1);
+}
+}  // namespace
+
+void SetStopQuiesce(void (*quiesce)(), void (*signalReport)())
+{
+    stopQuiesce = quiesce;
+    stopSignalReport = signalReport;
+}
+
+void Stop(StopCode code, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteStopLine(code, format, args);
+    va_end(args);
+    if (void (*quiesce)() = stopQuiesce.load())
+    {
+        // M4: no GPU submission is cut short by _exit. The first stop drains (bounded, reporting what it
+        // could not wait for); a concurrent one waits for it to end the process, bounded too
+        // (ForzaRecomp stops.cpp:99-128).
+        int first = 0;
+        if (!firstStop.compare_exchange_strong(first, int(code)))
+        {
+            for (int i = 0; i < kConcurrentStopWaitMs / 10; i++)
+                usleep(10000);
+            _exit(first);
+        }
+        quiesce();
+    }
+    _exit(int(code));
+}
+
+void StopFromSignal(StopCode code, const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    WriteStopLine(code, format, args);
+    va_end(args);
+    if (void (*report)() = stopSignalReport.load())
+        report();
     _exit(int(code));
 }
 

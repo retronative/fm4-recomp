@@ -30,14 +30,14 @@ void OnFault(int signal, siginfo_t* info, void*)
     }
     const auto guest = uint32_t(address - start);
     const char* what = describeAddress ? describeAddress(guest) : nullptr;
-    Stop(StopCode::GuestFault, "guest access to unmapped or read-only %08X%s%s", guest, what ? ": " : "", what ? what : "");
+    StopFromSignal(StopCode::GuestFault, "guest access to unmapped or read-only %08X%s%s", guest, what ? ": " : "", what ? what : "");
 }
 
 void OnTrap(int signal, siginfo_t* info, void*)
 {
     // __builtin_trap() in the translation: a path the guest would also stop on (an illegal
     // instruction, or an index past a proven switch bound).
-    Stop(StopCode::Trap, "translated trap (signal %d at host %p)", signal, info->si_addr);
+    StopFromSignal(StopCode::Trap, "translated trap (signal %d at host %p)", signal, info->si_addr);
 }
 
 }  // namespace

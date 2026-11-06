@@ -16,6 +16,7 @@ namespace runtime::gpu {
 uint64_t ShaderHash(uint32_t type, const uint32_t* words, uint32_t count);
 bool TraceEnabled();
 void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode);
-void TraceShader(uint32_t type, uint32_t words, uint64_t hash, bool immediate);
+// FM4_SHADER_DUMP=<dir> also writes each distinct shader once (<vs|ps>_<hash>.bin, big-endian words; capped at 4096).
+void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate);
 
 }  // namespace runtime::gpu

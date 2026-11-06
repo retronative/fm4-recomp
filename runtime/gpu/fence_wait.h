@@ -5,10 +5,12 @@
 // The fence-wait policy: what a bounded wait for a submission established, and how long it waits.
 // WaitOutcome is taken from ForzaRecomp (forzarecomp-recarbon) runtime/video/submission_lifetime.h
 // (GPL-3.0-or-later, same owner), reviewed and re-tested here; its use is
-// runtime/video/renderer.cpp:979-980 (vkWaitForFences, then vkGetFenceStatus). The 5 s
-// default is renderer.cpp:388-390 (kCompletionTimeoutNs; FM4's longest observed wait
-// there was 6.7 ms). FM4 Recomp changes: the result is named Stranded (ForzaRecomp: Unknown); the
-// timeout comes from an environment value, clamped to 100..60000 ms (new).
+// runtime/video/renderer.cpp:979-980 (vkWaitForFences, then vkGetFenceStatus). ForzaRecomp's
+// default was 5 s (renderer.cpp:388-390, kCompletionTimeoutNs; FM4's longest observed wait
+// there was 6.7 ms); ours is 2 s (forzarecomp-recarbon
+// incidents used 2000 ms without false trips). FM4 Recomp changes: the result
+// is named Stranded (ForzaRecomp: Unknown); the timeout comes from an environment value, clamped to
+// 100..60000 ms (new); the 2 s default.
 //
 // A bounded fence wait's result and the fence's status afterwards are VkResult values (0 is
 // VK_SUCCESS): confirmed only when both succeeded. A timeout (VK_TIMEOUT 2), a status not yet
@@ -31,7 +33,7 @@ inline Completion WaitOutcome(int waitResult, int fenceStatus)
     return waitResult == 0 && fenceStatus == 0 ? Completion::Confirmed : Completion::Stranded;
 }
 
-constexpr uint32_t kFenceTimeoutDefaultMs = 5000, kFenceTimeoutMinMs = 100, kFenceTimeoutMaxMs = 60000;
+constexpr uint32_t kFenceTimeoutDefaultMs = 2000, kFenceTimeoutMinMs = 100, kFenceTimeoutMaxMs = 60000;
 
 struct FenceTimeout
 {

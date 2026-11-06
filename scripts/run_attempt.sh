@@ -51,7 +51,7 @@ for i in $(seq 1 "$RUNS"); do
     $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[launcher] deadline: process group killed\n"; exit 124 };
     alarm $deadline + 30; waitpid $pid, 0; alarm 0;
     my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-    "$DEADLINE" "$BIN" --image "$IMAGE" --xex "$XEX" --disc "$DISC" --disc-map "$ROOT/game/survey/disc1_gdfx.tsv" --modules "$MODULES" --gpu-stop "$GPU_STOP_FLAG" --user-data "$ROOT/game/user-data" --audio "$AUDIO" --stop-at-swap "$STOP_AT_SWAP" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
+    "$DEADLINE" "$BIN" --image "$IMAGE" --xex "$XEX" --disc "$DISC" --disc-map "$ROOT/game/survey/disc1_gdfx.tsv" --modules "$MODULES" --gpu-stop "$GPU_STOP_FLAG" --user-data "$ROOT/game/user-data" --audio "$AUDIO" --renderer headless --stop-at-swap "$STOP_AT_SWAP" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
   echo "$status" > "$OUT/run$i.exit"
   echo "run $i: exit $status, $(grep -m1 '^\[stop ' "$OUT/run$i.err" || echo 'no stop line')"
 done

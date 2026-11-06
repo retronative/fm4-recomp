@@ -23,10 +23,19 @@ enum class StopCode : int
     Setup = 9,          // the runtime could not start (wrong image, no memory, bad arguments)
     Trap = 10,          // a translated trap: a proven switch's impossible default, padding reached
     FirstSwap = 11,     // M3's goal: the command processor executed the first swap packet (VdSwap)
+    GpuSelfCheck = 12,  // M4: fm4recomp --renderer self-check passed (runtime/video/renderer.h)
+    GpuStranded = 13,   // M4: a GPU submission's completion is unknown: GPU_STOP written, resources kept
     Deadline = 124,     // no stop within the deadline (a hang)
 };
 
 [[noreturn]] void Stop(StopCode code, const char* format, ...) __attribute__((format(printf, 2, 3)));
+// From a signal handler (the guest fault and trap handlers): the same report, but the GPU is only
+// told to stop and its in-flight count reported (no bounded wait: sleeping is not signal-safe).
+[[noreturn]] void StopFromSignal(StopCode code, const char* format, ...) __attribute__((format(printf, 2, 3)));
+// The renderer's hooks (runtime/video/renderer.cpp; M4): `quiesce` begins the GPU stop and waits,
+// bounded, for submissions in flight; `signalReport` only begins it and reports (signal-safe). Null
+// (headless, the runtime tests) does nothing. After ForzaRecomp runtime/stops.cpp:97-152.
+void SetStopQuiesce(void (*quiesce)(), void (*signalReport)());
 
 // Called by every generated import stub (fm4_imports.cpp).
 [[noreturn]] void PpcImportStop(const char* name, PPCContext& ctx);

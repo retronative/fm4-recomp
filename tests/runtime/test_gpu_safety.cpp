@@ -307,7 +307,7 @@ void TestFenceWait()
 
     const auto ms = [](const char* v) { return FenceTimeoutFromEnv(v).ms; };
     const auto bad = [](const char* v) { return FenceTimeoutFromEnv(v).malformed; };
-    Expect(ms(nullptr) == 5000 && !bad(nullptr), "fence timeout: unset is 5000 ms");
+    Expect(ms(nullptr) == 2000 && !bad(nullptr), "fence timeout: unset is 2000 ms (D-g)");
     Expect(ms("2500") == 2500 && !bad("2500"), "fence timeout: 2500 is 2500 ms");
     Expect(ms("100") == 100, "fence timeout: 100 (the minimum) is kept");
     Expect(ms("99") == 100, "fence timeout: 99 is clamped up to 100");
@@ -315,10 +315,10 @@ void TestFenceWait()
     Expect(ms("60000") == 60000, "fence timeout: 60000 (the maximum) is kept");
     Expect(ms("60001") == 60000, "fence timeout: 60001 is clamped down to 60000");
     Expect(ms("99999999999999999999999") == 60000 && !bad("99999999999999999999999"), "fence timeout: a 23-digit value saturates to 60000, never wraps");
-    Expect(ms("") == 5000 && bad(""), "fence timeout: empty is malformed, default 5000");
-    Expect(ms("5s") == 5000 && bad("5s"), "fence timeout: trailing text is malformed, default 5000");
-    Expect(ms("-1") == 5000 && bad("-1"), "fence timeout: a sign is malformed, default 5000");
-    Expect(ms(" 200") == 5000 && bad(" 200"), "fence timeout: a leading space is malformed, default 5000");
+    Expect(ms("") == 2000 && bad(""), "fence timeout: empty is malformed, default 2000");
+    Expect(ms("5s") == 2000 && bad("5s"), "fence timeout: trailing text is malformed, default 2000");
+    Expect(ms("-1") == 2000 && bad("-1"), "fence timeout: a sign is malformed, default 2000");
+    Expect(ms(" 200") == 2000 && bad(" 200"), "fence timeout: a leading space is malformed, default 2000");
     Expect(FenceTimeoutNs(5000) == 5000000000ull, "fence timeout: 5000 ms is 5e9 ns");
     Expect(FenceTimeoutNs(60000) == 60000000000ull, "fence timeout: 60000 ms is 6e10 ns (no 32-bit overflow)");
 }

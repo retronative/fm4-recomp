@@ -28,6 +28,7 @@
 #include "kernel/xma.h"
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
+#include "video/renderer.h"
 #include "kernel/imports.h"
 #include "kernel/loader.h"
 #include "kernel/module.h"
@@ -116,6 +117,9 @@ int main(int argc, char** argv)
     const char* userDataPath = nullptr;
     const char* audioMode = nullptr;
     const char* modulesPath = nullptr;
+    const char* rendererMode = nullptr;
+    const char* gpuCaptureDir = nullptr;
+    const char* vkValidation = nullptr;
     int stopAtSwap = 0;
     int deadline = 0;
     for (int i = 1; i < argc; i += 2)
@@ -130,13 +134,17 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--user-data")) userDataPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--audio")) audioMode = argv[i + 1];
         else if (!std::strcmp(argv[i], "--modules")) modulesPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--renderer")) rendererMode = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--gpu-capture")) gpuCaptureDir = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--vk-validation")) vkValidation = argv[i + 1];
         else if (!std::strcmp(argv[i], "--stop-at-swap")) stopAtSwap = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--deadline")) deadline = std::atoi(argv[i + 1]);
         else Stop(StopCode::Setup, "unknown option %s", argv[i]);
     }
-    if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
+    if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || rendererMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
         Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --disc-map <disc1_gdfx.tsv> "
-             "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --stop-at-swap <n> --deadline <seconds> (all required)");
+             "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present> --stop-at-swap <n> --deadline <seconds> (all required; "
+             "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off>)");
     // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
     // the same 48 kHz pacing, frame conversion and callbacks (kernel/audio.h).
     if (!std::strcmp(audioMode, "audible"))
@@ -152,6 +160,21 @@ int main(int argc, char** argv)
     runtime::ldi::SetFactory(runtime::ldi::MspackDecoderFactory());  // LZX decompression (kernel/ldi.h)
     runtime::gpu::SetStopAtSwap(uint32_t(stopAtSwap));
     runtime::gpu::SetGpuStopPath(gpuStopPath);
+    // The renderer (M4; runtime/video/renderer.h). Only scripts/gpu_run.sh passes a mode other than headless.
+    runtime::video::Options video;
+    video.gpuStopPath = gpuStopPath;
+    video.captureDir = gpuCaptureDir;
+    video.fenceTimeoutEnv = std::getenv("FM4_GPU_FENCE_TIMEOUT_MS");
+    if (!std::strcmp(rendererMode, "headless")) video.mode = runtime::video::Mode::Headless;
+    else if (!std::strcmp(rendererMode, "self-check")) video.mode = runtime::video::Mode::SelfCheck;
+    else if (!std::strcmp(rendererMode, "present")) video.mode = runtime::video::Mode::Present;
+    else Stop(StopCode::Setup, "--renderer must be headless, self-check or present, not %s", rendererMode);
+    if (video.mode != runtime::video::Mode::Headless)
+    {
+        if (gpuCaptureDir == nullptr || vkValidation == nullptr || (std::strcmp(vkValidation, "on") && std::strcmp(vkValidation, "off")))
+            Stop(StopCode::Setup, "--renderer %s requires --gpu-capture <dir> and --vk-validation <on|off>", rendererMode);
+        video.validation = !std::strcmp(vkValidation, "on");
+    }
     runtime::SetModuleImages(fm4::kModules, std::size(fm4::kModules), modulesPath);  // XexLoadImage (kernel/loader.h)
     runtime::MountDisc(discPath, discMapPath);
     runtime::MountUserData(userDataPath);  // saved content, writable and isolated (kernel/content.h)  // read-only: game:\ and d:\ (kernel/file_system.h)
@@ -234,6 +257,16 @@ int main(int argc, char** argv)
         runtime::xma::Report("deadline");
         Stop(StopCode::Deadline, "no stop within %d s", deadline);
     }).detach();
+
+    // The renderer starts under the deadline (a hang in device creation is bounded in-process too), before
+    // the title can start the ring.
+    static const runtime::gpu::RendererHooks hooks{runtime::video::Present, runtime::video::Draw, runtime::video::LoadShader};
+    if (runtime::video::Initialize(video))
+    {
+        if (video.mode == runtime::video::Mode::SelfCheck)
+            runtime::video::RunSelfCheck();  // never returns: stops 12 when every check passed
+        runtime::gpu::SetRendererHooks(&hooks);
+    }
 
     // The translated code nests host calls deeply: run it on a large host stack.
     pthread_attr_t attributes;

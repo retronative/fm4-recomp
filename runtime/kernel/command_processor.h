@@ -31,6 +31,19 @@ struct CpState
     uint32_t waitingOn = 0;                        // the address or register a WAIT_REG_MEM polls (0: none)
 };
 
+// The renderer's hook points (M4; runtime/video/renderer.h), called from the command processor's thread. Null
+// (the default: headless, and the runtime tests, which build kernel/ without Vulkan) changes nothing: the
+// renderer never changes the command processor's control flow, so headless and GPU runs execute the same
+// packets, draws, swaps and fences (execution model §3).
+struct RendererHooks
+{
+    // XE_SWAP, after the slot's type-0 write of the front buffer's fetch constant (registers 4800-4805, host order).
+    void (*present)(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap);
+    void (*draw)(const uint8_t* base, uint32_t opcode);                         // DRAW_INDX, DRAW_INDX_2
+    void (*loadShader)(uint32_t type, const uint32_t* words, uint32_t count);  // IM_LOAD(_IMMEDIATE), host order
+};
+void SetRendererHooks(const RendererHooks* hooks);
+
 // The run stops (11) at swap number `n` (fm4recomp --stop-at-swap n, required; M3's evidence is n = 1).
 void SetStopAtSwap(uint32_t n);
 

@@ -6,7 +6,7 @@
 # first GPU run). After ForzaRecomp's gpu_run.sh (zsh), re-written in bash: a zsh
 # `status` variable once disabled a watchdog silently.
 #
-#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute>
+#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present>
 #   scripts/gpu_run.sh --self-test        # checks the refusal and lock-up detection on planted files; runs nothing
 #
 # Before: refuses if research/GPU_STOP exists (only the owner clears it), runs scripts/preflight.sh (the machine must
@@ -14,6 +14,11 @@
 # After each run: a new gpuEvent-*.ips report in the diagnostic reports, or a GPU restart / timeout message in the
 # system log since the run started, is a lock-up: research/GPU_STOP is written with the evidence and the launcher
 # fails. The runtime's own GPU entry points honour GPU_STOP too (M4 renderer work).
+# A renderer other than headless (M4): the pinned Khronos validation layer (1.4.363) is inserted and the pinned
+# MoltenVK ICD is the only driver; Metal API validation is on (MTL_DEBUG_LAYER=1). Before the runs the negative
+# control (build/native/tests/fm4_validation_control: an invalid VkFormat in a physical-device query, no device or
+# resource) must make the layer report VUID-vkGetPhysicalDeviceFormatProperties-format-parameter, else nothing runs.
+# After each run its log must show the layer inserted and no validation message; captures go to run<i>.captures/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STOP_FLAG="$ROOT/research/GPU_STOP"
@@ -132,9 +137,10 @@ if [ "${1:-}" = "--self-test" ]; then
   exit 0
 fi
 
-[ $# -eq 5 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> | --self-test" >&2; exit 2; }
-OUT="$1"; RUNS="$2"; DEADLINE="$3"; STOP_AT_SWAP="$4"; AUDIO="$5"
+[ $# -eq 6 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present> | --self-test" >&2; exit 2; }
+OUT="$1"; RUNS="$2"; DEADLINE="$3"; STOP_AT_SWAP="$4"; AUDIO="$5"; RENDERER="$6"
 [[ "$AUDIO" == audible || "$AUDIO" == mute ]] || { echo "audio must be audible or mute" >&2; exit 2; }
+[[ "$RENDERER" == headless || "$RENDERER" == self-check || "$RENDERER" == present ]] || { echo "renderer must be headless, self-check or present" >&2; exit 2; }
 [[ "$STOP_AT_SWAP" =~ ^[1-9][0-9]*$ ]] || { echo "the swap to stop at must be a positive integer" >&2; exit 2; }
 [[ "$RUNS" =~ ^[1-9][0-9]*$ && "$DEADLINE" =~ ^[1-9][0-9]*$ ]] || { echo "runs and deadline must be positive integers" >&2; exit 2; }
 refuse_if_stopped "$STOP_FLAG"
@@ -146,12 +152,42 @@ OUT="$(cd "$OUT" && pwd)"
 BIN="$ROOT/build/native/runtime/fm4recomp"
 shasum -a 256 "$BIN" "$ROOT/game/survey/image.bin" | sed "s|$ROOT/||" | tee "$OUT/binary.sha256"
 echo "audio: $AUDIO (fm4recomp --audio $AUDIO; the run's \"[audio]\" line names the device or says none was opened)" | tee "$OUT/audio.txt"
+GPU_ARGS=(--renderer "$RENDERER")
+if [ "$RENDERER" != headless ]; then
+  LAYERS=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d
+  ICD=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
+  grep -q '"api_version": "1.4.363"' "$LAYERS/VkLayer_khronos_validation.json" || { echo "gpu_run: the validation layer is not the pinned 1.4.363" >&2; exit 1; }
+  [ -f "$ICD" ] || { echo "gpu_run: the MoltenVK ICD $ICD is missing" >&2; exit 1; }
+  # The layer manifest names its library without a path ("libVkLayer_khronos_validation.dylib"), which the loader
+  # resolves through dyld's search path; DYLD_* variables do not survive the /usr/bin/perl launcher below (SIP strips
+  # them). So the run uses a copy of the manifest whose library_path is absolute.
+  mkdir -p "$OUT/vulkan"
+  sed 's|"library_path": "libVkLayer_khronos_validation.dylib"|"library_path": "/opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib"|' \
+    "$LAYERS/VkLayer_khronos_validation.json" > "$OUT/vulkan/VkLayer_khronos_validation.json"
+  grep -q '"library_path": "/opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib"' "$OUT/vulkan/VkLayer_khronos_validation.json" ||
+    { echo "gpu_run: the layer manifest's library_path was not rewritten" >&2; exit 1; }
+  # The ICD's library_path (../../../lib/libMoltenVK.dylib) is relative to its manifest: the loader resolves it.
+  export VK_LAYER_PATH="$OUT/vulkan" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer MTL_DEBUG_LAYER=1
+  shasum -a 256 "$ICD" "$LAYERS/VkLayer_khronos_validation.json" "$OUT/vulkan/VkLayer_khronos_validation.json" \
+    /opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib | tee -a "$OUT/binary.sha256"
+  # Negative control first: a deliberate, query-only misuse the layer must report (no device, no GPU work).
+  CONTROL="$ROOT/build/native/tests/fm4_validation_control"
+  perl -e 'alarm 30; exec @ARGV' "$CONTROL" > "$OUT/validation_control.log" 2>&1 || true
+  grep -q 'VUID-vkGetPhysicalDeviceFormatProperties-format-parameter' "$OUT/validation_control.log" ||
+    { echo "gpu_run: negative control: the layer did not report the deliberate misuse; nothing runs" >&2; exit 1; }
+  echo "validation: negative control reported (VUID-vkGetPhysicalDeviceFormatProperties-format-parameter)" | tee "$OUT/validation.txt"
+fi
 export HOME="$ROOT/game/home"
 mkdir -p "$ROOT/game/user-data"  # saved content (kernel/content.h), isolated from the read-only disc
 mkdir -p "$HOME"
 for i in $(seq 1 "$RUNS"); do
   since=$(date +%s)
   touch "$OUT/run$i.start"
+  RUN_GPU_ARGS=("${GPU_ARGS[@]}")
+  if [ "$RENDERER" != headless ]; then
+    mkdir "$OUT/run$i.captures"  # fails if it exists: evidence is never overwritten
+    RUN_GPU_ARGS+=(--gpu-capture "$OUT/run$i.captures" --vk-validation on)
+  fi
   status=0
   perl -e '
     my ($deadline, @cmd) = @ARGV;
@@ -161,7 +197,7 @@ for i in $(seq 1 "$RUNS"); do
     alarm $deadline + 30; waitpid $pid, 0; alarm 0;
     my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
     "$DEADLINE" "$BIN" --image "$ROOT/game/survey/image.bin" --xex "$ROOT/game/files/default.xex" --disc "$ROOT/game/files" --disc-map "$ROOT/game/survey/disc1_gdfx.tsv" \
-    --modules "$ROOT/game/modules" --gpu-stop "$STOP_FLAG" --user-data "$ROOT/game/user-data" --audio "$AUDIO" --stop-at-swap "$STOP_AT_SWAP" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
+    --modules "$ROOT/game/modules" --gpu-stop "$STOP_FLAG" --user-data "$ROOT/game/user-data" --audio "$AUDIO" "${RUN_GPU_ARGS[@]}" --stop-at-swap "$STOP_AT_SWAP" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
   echo "$status" > "$OUT/run$i.exit"
   echo "run $i: exit $status, $(grep -m1 '^\[stop ' "$OUT/run$i.err" || echo 'no stop line')"
   sleep 2  # let reports and log lines land
@@ -170,5 +206,13 @@ for i in $(seq 1 "$RUNS"); do
   # The log must name the audio mode given (audible: driver and device; mute: no device opened).
   if [ "$AUDIO" = mute ]; then audio_line='[audio] mute: no audio device opened'; else audio_line='[audio] audible: '; fi
   grep -F -m1 "$audio_line" "$OUT/run$i.err" >> "$OUT/audio.txt" || { echo "run $i: no \"$audio_line\" line in its log" >&2; exit 1; }
+  if [ "$RENDERER" != headless ]; then
+    grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$OUT/run$i.err" || { echo "run $i: the validation layer was not inserted" >&2; exit 1; }
+    if grep -E 'Validation (Error|Warning)|Validation Performance Warning|\[vulkan validation\]|failed to load|failed assertion' "$OUT/run$i.err" | head -20; then
+      echo "run $i: validation messages (above)" >&2; exit 1
+    fi
+    echo "run $i: layer inserted, no validation message" | tee -a "$OUT/validation.txt"
+    if [ "$RENDERER" = self-check ] && [ "$status" != 12 ]; then echo "run $i: the self-check did not pass (exit $status, expected 12)" >&2; exit 1; fi
+  fi
 done
 echo "gpu_run: $RUNS run(s), no lock-up evidence"
