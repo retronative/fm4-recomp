@@ -47,12 +47,8 @@ void PpcCallIndirect(PPCContext& ctx, uint8_t* base, uint32_t target)
     function(ctx, base);
 }
 
-// Runtime interfaces the translation declares; each is M3 work and stops until then.
-uint64_t PpcQueryTimebase()
-{
-    Stop(StopCode::Unimplemented, "mftb: the guest time base is not implemented (M3)");
-}
-
+// Runtime interfaces the translation declares; each is M3 work and stops until then. (PpcQueryTimebase,
+// mftb, is defined in kernel/clock.cpp.)
 jmp_buf& PpcJumpBuffer(uint32_t guestAddress)
 {
     Stop(StopCode::Unimplemented, "setjmp/longjmp on the guest jmp_buf at %08X is not implemented (M3)", guestAddress);

@@ -92,6 +92,8 @@ K_THREADS = 'runtime/kernel/threads.cpp'
 K_IMPOBJ = 'runtime/kernel/imports_object.cpp'
 K_IMPTIME = 'runtime/kernel/imports_time.cpp'
 K_IMPXAM = 'runtime/kernel/imports_xam.cpp'
+K_CLOCK = 'runtime/kernel/clock.cpp'
+K_XCONFIG = 'runtime/kernel/imports_xconfig.cpp'
 SURVEY = 'survey/survey.py'
 VALIDATE = 'scripts/validate.py'
 SWITCH_TABLES = 'survey/switch_tables.py'
@@ -653,9 +655,36 @@ MUTANTS = [
     dict(id='RT5', milestone="M2", file=STOPS_CPP, test='runtime', fault='a missing indirect target is called',
          old='    if (function == nullptr)\n        Stop(StopCode::IndirectCall,',
          new='    if (false)\n        Stop(StopCode::IndirectCall,', expect='indirect call to a code word with no function stops'),
-    dict(id='RT6', milestone="M2", file=STOPS_CPP, test='runtime', fault='mftb returns instead of stopping',
-         old='    Stop(StopCode::Unimplemented, "mftb: the guest time base is not implemented (M3)");',
-         new='    return 0;', expect='mftb stops until M3'),
+    dict(id='RT6', milestone="M3", file=K_CLOCK, test='runtime', fault='mftb returns a stopped clock',
+         old='uint64_t PpcQueryTimebase() { return runtime::GuestTimebase(); }',
+         new='uint64_t PpcQueryTimebase() { return 0 * runtime::GuestTimebase(); }', expect='mftb: the time base advances'),
+    dict(id='KD2', milestone="M3", file=K_CLOCK, test='runtime', fault='the time base counts nanoseconds',
+         old='    return uint64_t((unsigned __int128)ns * kTimebaseHz / 1000000000u);',
+         new='    return ns;', expect='mftb: the time base advances'),
+    dict(id='KD3', milestone="M3", file=K_CLOCK, test='runtime', fault='the time base counts at 1/1000 of its rate',
+         old='    return uint64_t((unsigned __int128)ns * kTimebaseHz / 1000000000u);',
+         new='    return uint64_t((unsigned __int128)ns * kTimebaseHz / 1000000000000u);', expect='mftb: the time base advances'),
+    dict(id='KD4', milestone="M3", file=K_XCONFIG, test='runtime', fault='the language is Japanese',
+         old='    {3, 0x09, 4, 1, "XCONFIG_USER_LANGUAGE',
+         new='    {3, 0x09, 4, 2, "XCONFIG_USER_LANGUAGE', expect='ExGetXConfigSetting(3, 9): language 1'),
+    dict(id='KD5', milestone="M3", file=K_XCONFIG, test='runtime', fault='the country is written as 4 bytes',
+         old='    {3, 0x0E, 1, 103,',
+         new='    {3, 0x0E, 4, 103,', expect='ExGetXConfigSetting(3, 0x0E): country 103'),
+    dict(id='KD6', milestone="M3", file=K_XCONFIG, test='runtime', fault='a too-small buffer is accepted',
+         old='        if (bufferSize < found->size)',
+         new='        if (bufferSize < 1)', expect='BUFFER_TOO_SMALL'),
+    dict(id='KD7', milestone="M3", file=K_XCONFIG, test='runtime', fault='no buffer with a size succeeds',
+         old='    else if (bufferSize != 0)\n        status = kInvalidParameter3;',
+         new='    else if (bufferSize != 0)\n        status = 0;', expect='INVALID_PARAMETER_3'),
+    dict(id='KD8', milestone="M3", file=K_XCONFIG, test='runtime', fault='the required size is written on failure too',
+         old='        const uint16_t required = status == kBufferTooSmall || status == kInvalidParameter3 ? 0 : found->size;',
+         new='        const uint16_t required = status == kInvalidParameter3 ? 0 : found->size;', expect='BUFFER_TOO_SMALL'),
+    dict(id='KD9', milestone="M3", file=K_XCONFIG, test='runtime', fault='the required size is little-endian',
+         old='        base[requiredOut] = uint8_t(required >> 8), base[requiredOut + 1] = uint8_t(required);',
+         new='        base[requiredOut] = uint8_t(required), base[requiredOut + 1] = uint8_t(required >> 8);', expect='ExGetXConfigSetting(3, 1): time-zone bias 0'),
+    dict(id='KD10', milestone="M3", file=K_XCONFIG, test='runtime', fault='the AV region is 0',
+         old='    {2, 0x02, 4, 0x00001000,',
+         new='    {2, 0x02, 4, 0,', expect='ExGetXConfigSetting(2, 2)'),
 
     # ---- M2: runtime/guest_memory.cpp (tests/run_runtime_tests.sh) ----
     dict(id='RT7', milestone="M2", file=GUEST_MEMORY, test='runtime', fault='SIGBUS not handled (macOS reports PROT_NONE accesses as SIGBUS)',
@@ -804,6 +833,24 @@ MUTANTS = [
     dict(id='KC21', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexCheckExecutablePrivilege always 1',
          old='    ctx.r3.u64 = (flags >> privilege) & 1;',
          new='    ctx.r3.u64 = ((flags >> privilege) & 1) | 1;', expect='XexCheckExecutablePrivilege: privilege 10 set'),
+    dict(id='KC22', milestone="M3", file=K_IMPMOD, test='runtime', fault='a null module name is not the executable',
+         old='    uint32_t ldr = runtime::ExecutableModule().ldr;',
+         new='    uint32_t ldr = 0;', expect='XexGetModuleHandle: a null or empty name'),
+    dict(id='KC23', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexGetModuleSection accepts a 9-character name',
+         old='        if (strnlen(wanted, 9) > 8 || strncmp(',
+         new='        if (strncmp(', expect='XexGetModuleSection: a 9-character name'),
+    dict(id='KC24', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexGetModuleSection accepts any title handle',
+         old='    if (module == 0 || module != runtime::ExecutableModule().ldr)',
+         new='    if (module == 0)', expect='XexGetModuleSection: a handle that is no loaded module'),
+    dict(id='KC25', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexGetModuleSection writes the size as the data address',
+         old='        runtime::Store32(base, dataOut, runtime::Load32(base, entry + 8));',
+         new='        runtime::Store32(base, dataOut, runtime::Load32(base, entry + 12));', expect='XexGetModuleSection: dbgstr at'),
+    dict(id='KC26', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexGetModuleSection skips no size word',
+         old='        const uint32_t entry = info + 4 + 16 * i;',
+         new='        const uint32_t entry = info + 16 * i;', expect='XexGetModuleSection: dbgstr at'),
+    dict(id='KC27', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexGetModuleSection reports success when not found',
+         old='    ctx.r3.u64 = 0xC0000225;  // STATUS_NOT_FOUND',
+         new='    ctx.r3.u64 = 0;  // STATUS_NOT_FOUND', expect='XexGetModuleSection: a 9-character name'),
 
     # ---- M3 unit C: runtime/kernel/imports_object.cpp (tests/run_runtime_tests.sh) ----
     dict(id='KC13', milestone="M3", file=K_IMPOBJ, test='runtime', fault='object types not checked',

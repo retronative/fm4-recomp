@@ -3,7 +3,7 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // Taken from ForzaRecomp runtime/kernel/clock.cpp (GPL-3.0-or-later, same owner), reviewed and
-// re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: PpcQueryTimebase (mftb) is not defined here: it stays a strict stop (stops.cpp) until a run reaches it.
+// re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: none.
 #include "clock.h"
 #include "imports.h"
 #include "thread_state.h"
@@ -68,3 +68,5 @@ void StartTimeStampBundle(uint8_t* base, uint32_t bundle)
 
 }  // namespace runtime
 
+// mftb (patch 0015: the translation reads the guest time base here): time base ticks since boot.
+uint64_t PpcQueryTimebase() { return runtime::GuestTimebase(); }

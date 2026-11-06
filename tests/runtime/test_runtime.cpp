@@ -221,7 +221,13 @@ int main()
     Expect(StderrOf([&] { PpcImportStop("KeTest", regs); }) ==
                "[stop 3] import KeTest called from 40001010 (r3=00000003 r4=00000004 r5=00000005 r6=00000006 r7=00000007 r8=00000008)\n",
            "an import stop names the import, the caller and six argument registers");
-    Expect(ExitCodeOf([] { (void)PpcQueryTimebase(); }) == int(StopCode::Unimplemented), "mftb stops until M3 (7)");
+    // mftb: the guest time base, 49,875,000 Hz since boot (kernel/clock.h). Over a 20 ms sleep it advances by
+    // about 20e-3 x 49,875,000 = 997,500 ticks; the bounds (1x .. 5x, the sleep may overrun) reject a
+    // stopped clock, nanoseconds (20,000,000) and a kHz scale.
+    const uint64_t tb0 = PpcQueryTimebase(), tb1 = PpcQueryTimebase();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const uint64_t tbDelta = PpcQueryTimebase() - tb1;
+    Expect(tb1 >= tb0 && tbDelta >= 997500 && tbDelta < 5 * 997500, "mftb: the time base advances at 49,875,000 Hz (about 997,500 ticks in 20 ms)");
     Expect(ExitCodeOf([] { (void)PpcJumpBuffer(0x40002000); }) == int(StopCode::Unimplemented), "setjmp/longjmp stops until M3 (7)");
     Expect(ExitCodeOf([&] { PpcRuntime_switch_fiber(ctx, base); }) == int(StopCode::Unimplemented), "a fiber switch stops until M3 (7)");
     Expect(ExitCodeOf([&] { PpcRuntime_restore_context(ctx, base); }) == int(StopCode::Unimplemented), "a context restore stops until M3 (7)");
@@ -324,6 +330,88 @@ int main()
     PPCContext av{};
     imp("XGetAVPack")(av, base);
     Expect(av.r3.u64 == 8, "XGetAVPack: 8 (Xenia's default AV pack, xam_info.cc:32)");
+
+    // XexGetModuleHandle(name*, handle*) (Xenia xboxkrnl_modules.cc:44): null or "" -> the executable's
+    // loader entry; a system module's name (any case) -> its entry; another name stops (7).
+    auto guestString = [&](const char* text) {
+        const uint32_t at = ArenaAlloc(base, uint32_t(std::strlen(text) + 1));
+        std::memcpy(base + at, text, std::strlen(text) + 1);
+        return at;
+    };
+    const uint32_t handleOut = ArenaAlloc(base, 4);
+    PPCContext gm{};
+    gm.r4.u32 = handleOut;
+    imp("XexGetModuleHandle")(gm, base);
+    const bool nullName = gm.r3.u64 == 0 && be32(handleOut) == m.ldr;
+    gm.r3.u32 = guestString(""), gm.r4.u32 = handleOut;
+    Store32(base, handleOut, 0);
+    imp("XexGetModuleHandle")(gm, base);
+    Expect(nullName && gm.r3.u64 == 0 && be32(handleOut) == m.ldr, "XexGetModuleHandle: a null or empty name gives the executable's loader entry");
+    gm.r3.u32 = guestString("XAM.XEX"), gm.r4.u32 = handleOut;
+    imp("XexGetModuleHandle")(gm, base);
+    Expect(gm.r3.u64 == 0 && be32(handleOut) == SystemModule(base, "xam.xex") && be32(handleOut) != m.ldr && be32(handleOut) != 0,
+           "XexGetModuleHandle: XAM.XEX gives xam's loader entry");
+    const uint32_t otherName = guestString("default.xex");
+    Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = otherName, c.r4.u32 = handleOut; imp("XexGetModuleHandle")(c, base); }) == int(StopCode::Unimplemented),
+           "XexGetModuleHandle: a title module name stops (7) until modules are loaded");
+
+    // XexGetModuleSection(module, name*, data*, size*) (Xenia user_module.cc:260): resource info 0x000002FF
+    // at +0x13C = size 0x24 (4 + 2 x 16), then the entries "dbgstr" (40010000, 0x200) and "rsrc1234" (40020000, 0x40).
+    std::vector<uint8_t> withResources = header;
+    withResources.resize(0x160, 0);
+    auto putR = [&](uint32_t at, uint32_t v) { for (int i = 0; i < 4; i++) withResources[at + i] = uint8_t(v >> (24 - 8 * i)); };
+    putR(0x14, 4), putR(0x30, 0x000002FF), putR(0x34, 0x13C);
+    putR(0x13C, 0x24);
+    std::memcpy(&withResources[0x140], "dbgstr\0\0", 8), putR(0x148, 0x40010000), putR(0x14C, 0x200);
+    std::memcpy(&withResources[0x150], "rsrc1234", 8), putR(0x158, 0x40020000), putR(0x15C, 0x40);
+    const Module res = CreateModule(base, withResources, 0x40000000, 0x40001000);
+    SetExecutableModule(res);
+    const uint32_t dataOut = ArenaAlloc(base, 8), sizeOut = dataOut + 4;
+    auto moduleSection = [&](uint32_t module, const char* name) {
+        PPCContext c{};
+        c.r3.u32 = module, c.r4.u32 = guestString(name), c.r5.u32 = dataOut, c.r6.u32 = sizeOut;
+        Store32(base, dataOut, 0), Store32(base, sizeOut, 0);
+        imp("XexGetModuleSection")(c, base);
+        return c.r3.u32;
+    };
+    Expect(moduleSection(res.ldr, "dbgstr") == 0 && be32(dataOut) == 0x40010000 && be32(sizeOut) == 0x200,
+           "XexGetModuleSection: dbgstr at 40010000, 0x200 bytes");
+    Expect(moduleSection(res.ldr, "rsrc1234") == 0 && be32(dataOut) == 0x40020000 && be32(sizeOut) == 0x40,
+           "XexGetModuleSection: an 8-character name (no terminator in the entry)");
+    Expect(moduleSection(res.ldr, "rsrc12345") == 0xC0000225 && moduleSection(res.ldr, "dbg") == 0xC0000225 && be32(dataOut) == 0,
+           "XexGetModuleSection: a 9-character name or a prefix is STATUS_NOT_FOUND, nothing written");
+    Expect(moduleSection(0x1234, "dbgstr") == 0xC0000008 && moduleSection(m.ldr, "dbgstr") == 0xC0000008,
+           "XexGetModuleSection: a handle that is no loaded module is STATUS_INVALID_HANDLE");
+    const uint32_t xamLdr = SystemModule(base, "xam.xex");
+    Expect(ExitCodeOf([&] { (void)moduleSection(xamLdr, "dbgstr"); }) == int(StopCode::Unimplemented),
+           "XexGetModuleSection on a system module stops (7)");
+    SetExecutableModule(m);
+
+    // ExGetXConfigSetting(category, setting, buffer*, size, required*) (Xenia xboxkrnl_xconfig.cc:44):
+    // values from Xenia's table; a too-small buffer is BUFFER_TOO_SMALL (C0000023) with required 0;
+    // no buffer with a size is INVALID_PARAMETER_3 (C00000F1); an unmodelled setting stops (7).
+    const uint32_t xbuf = ArenaAlloc(base, 8), xreq = ArenaAlloc(base, 4);
+    auto xconfig = [&](uint32_t category, uint32_t setting, uint32_t buffer, uint32_t size) {
+        PPCContext c{};
+        c.r3.u32 = category, c.r4.u32 = setting, c.r5.u32 = buffer, c.r6.u32 = size, c.r7.u32 = xreq;
+        Store32(base, xbuf, 0xAAAAAAAA), Store32(base, xbuf + 4, 0xAAAAAAAA), Store32(base, xreq, 0xAAAAAAAA);
+        imp("ExGetXConfigSetting")(c, base);
+        return c.r3.u32;
+    };
+    Expect(xconfig(3, 1, xbuf, 4) == 0 && be32(xbuf) == 0 && base[xreq] == 0 && base[xreq + 1] == 4,
+           "ExGetXConfigSetting(3, 1): time-zone bias 0, required size 4 (big-endian 16 bits)");
+    Expect(xconfig(3, 9, xbuf, 4) == 0 && be32(xbuf) == 1, "ExGetXConfigSetting(3, 9): language 1 (English)");
+    Expect(xconfig(3, 0x0A, xbuf, 4) == 0 && be32(xbuf) == 0x00040000, "ExGetXConfigSetting(3, 0x0A): video flags 0x00040000");
+    Expect(xconfig(2, 2, xbuf, 4) == 0 && be32(xbuf) == 0x00001000, "ExGetXConfigSetting(2, 2): AV region 0x00001000 (USA/Canada)");
+    Expect(xconfig(3, 0x0E, xbuf, 1) == 0 && base[xbuf] == 103 && base[xbuf + 1] == 0xAA && base[xreq + 1] == 1,
+           "ExGetXConfigSetting(3, 0x0E): country 103 (US), one byte written, required 1");
+    Expect(xconfig(3, 1, xbuf, 2) == 0xC0000023 && be32(xbuf) == 0xAAAAAAAA && base[xreq] == 0 && base[xreq + 1] == 0,
+           "ExGetXConfigSetting: a 2-byte buffer for a 4-byte setting is BUFFER_TOO_SMALL, nothing written, required 0");
+    Expect(xconfig(3, 1, 0, 4) == 0xC00000F1 && xconfig(3, 1, 0, 0) == 0 && base[xreq + 1] == 4,
+           "ExGetXConfigSetting: no buffer with a size is INVALID_PARAMETER_3; no buffer, size 0 asks the size (4)");
+    Expect(ExitCodeOf([&] { (void)xconfig(3, 0x0B, xbuf, 4); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { (void)xconfig(1, 1, xbuf, 4); }) == int(StopCode::Unimplemented),
+           "ExGetXConfigSetting: an unmodelled setting or category stops (7)");
 
     // Critical sections on the thread above (r13 = its PCR).
     PPCContext cs{};
