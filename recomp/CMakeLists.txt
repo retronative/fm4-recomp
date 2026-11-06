@@ -17,3 +17,28 @@ target_include_directories(fm4_ppc PUBLIC
 # stops with its guest address instead of calling a null host pointer.
 target_compile_options(fm4_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
   "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h")
+
+# Each module default.xex loads, as its own library from game/modules/<name>/ppc, with the same flags.
+# <name>_symbols.h (generated) renames the names every translation defines alike (PPCFuncMappings,
+# _xstart, the save/restore helpers); scripts/check_module_symbols.py then fails the build if two
+# libraries still define one symbol (the libraries' functions are weak: a duplicate would link silently).
+set(FM4_MODULE_LIBRARIES $<TARGET_FILE:fm4_ppc> ${PROJECT_SOURCE_DIR}/ppc/ppc_recomp_shared.h)
+foreach(module IN LISTS FM4_MODULES)
+  file(GLOB sources CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc/*.cpp)
+  add_library(${module}_ppc STATIC ${sources})
+  target_include_directories(${module}_ppc PRIVATE
+    ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc
+    ${PROJECT_SOURCE_DIR}/tools/XenonRecomp/thirdparty/simde)
+  target_compile_options(${module}_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h"
+    "SHELL:-include ${FM4_GENERATED}/${module}_symbols.h")
+  add_dependencies(${module}_ppc fm4_generated)
+  list(APPEND FM4_MODULE_LIBRARIES $<TARGET_FILE:${module}_ppc> ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc/ppc_recomp_shared.h)
+endforeach()
+add_custom_target(check_module_symbols
+  COMMAND Python3::Interpreter -B -I ${PROJECT_SOURCE_DIR}/scripts/check_module_symbols.py ${CMAKE_NM} ${FM4_MODULE_LIBRARIES}
+  COMMENT "Checking that no two module libraries define one symbol")
+add_dependencies(check_module_symbols fm4_ppc)
+foreach(module IN LISTS FM4_MODULES)
+  add_dependencies(check_module_symbols ${module}_ppc)
+endforeach()

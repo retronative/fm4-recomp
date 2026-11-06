@@ -51,6 +51,8 @@ TESTS = {
     "runtime": dict(cmd=["bash", "tests/run_runtime_tests.sh"], timeout=300, build=True, ran=r"^runtime tests: ",
                     deps=["tests/run_runtime_tests.sh", "tests/runtime", "runtime", "recomp", "scripts/preflight.sh",
                           "tools/XenonRecomp/XenonUtils", "tools/XenonRecomp/thirdparty/simde"]),
+    "modsyms": dict(cmd=PY + ["tests/test_check_module_symbols.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
+                    deps=["tests/test_check_module_symbols.py", "scripts/check_module_symbols.py"]),
     "gentables": dict(cmd=PY + ["tests/test_gen_runtime_tables.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
                       deps=["tests/test_gen_runtime_tables.py", "scripts/gen_runtime_tables.py"]),
     "titleaddr": dict(cmd=PY + ["tests/test_no_title_addresses.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
@@ -514,7 +516,7 @@ MUTANTS = [
          old='if any(main[k] for k in MAIN_KEYS[3:11]):',
          new='if False:', expect='test_local_flag_true_rejected'),
     dict(id='SVY5', milestone="M1", file=SURVEY, test='survey', fault='switch TOML path not checked',
-         old="if (CONFIG.parent / main['switch_table_file_path']).resolve() != SWITCH:",
+         old="if (module.config.parent / main['switch_table_file_path']).resolve() != module.switch:",
          new='if False:', expect='test_switch_tables_elsewhere'),
     dict(id='SVY6', milestone="M1", file=SURVEY, test='survey', fault='hashes not in byte order',
          old='for name in sorted(files, key=lambda n: n.encode())}',
@@ -522,8 +524,22 @@ MUTANTS = [
 
     # ---- M1: survey/survey.py, FM4 Recomp: no top-level table outside [main] ----
     dict(id='SVY7', milestone="M1", file=SURVEY, test='survey', fault='tables outside [main] accepted',
-         old="    if others:\n        fail(f'config/fm4.toml: {others} are outside [main]",
-         new="    if False:\n        fail(f'config/fm4.toml: {others} are outside [main]", expect='test_table_outside_main_rejected'),
+         old="    if others:\n        fail(f'{name}: {others} are outside [main]",
+         new="    if False:\n        fail(f'{name}: {others} are outside [main]", expect='test_table_outside_main_rejected'),
+
+    # ---- M3: survey/survey.py modules: per-module paths, deletion only in a module's own output ----
+    dict(id='SVY8', milestone="M3", file=SURVEY, test='survey', fault="any module's config may write to another module's ppc",
+         old="    if (module.config.parent / main['out_directory_path']).resolve() != module.ppc:",
+         new="    if (module.config.parent / main['out_directory_path']).resolve() not in {m.ppc for m in MODULES.values()}:", expect='test_module_paths'),
+    dict(id='SVY9', milestone="M3", file=SURVEY, test='survey', fault='an unlisted directory is emptied',
+         old="    if ppc.absolute() not in allowed:",
+         new="    if False:", expect='test_unlisted_directory_refused'),
+    dict(id='SVY10', milestone="M3", file=SURVEY, test='survey', fault='a directory under a symlink is emptied',
+         old="    if ppc.is_symlink() or ppc.parent.resolve() != ppc.parent.absolute():",
+         new="    if ppc.is_symlink():", expect='test_symlinked_parent_refused'),
+    dict(id='SVY11', milestone="M3", file=SURVEY, test='survey', fault='the facade writes to the executable\'s survey directory',
+         old="ROOT / 'game/modules/xmediafacade/survey', ROOT / 'game/modules/xmediafacade/ppc'),",
+         new="ROOT / 'game/survey', ROOT / 'game/modules/xmediafacade/ppc'),", expect='test_module_table'),
 
     # ---- M1: survey/switch_tables.py, FM4 Recomp: prove() table words and stretch to the function start ----
     dict(id='SWT11', milestone="M1", file=SWITCH_TABLES, test='switch_tables', fault="a proven table's last word counts as a fall-through",
@@ -730,6 +746,33 @@ MUTANTS = [
     dict(id='GT6', milestone="M2", file=GEN_TABLES, test='gentables', fault="stubs not checked against the translation's declarations",
          old='#include "ppc_recomp_shared.h"  // every stub must match',
          new='// every stub must match', expect='test_stubs_and_records'),
+    # ---- M3: scripts/gen_runtime_tables.py modules ----
+    dict(id='GT7', milestone="M3", file=GEN_TABLES, test='gentables', fault='the __imp__ bodies are not renamed',
+         old="for f in sorted(f for f in functions if not GENERATED_NAME.fullmatch(f)) for n in (f, '__imp__' + f)]",
+         new="for f in sorted(f for f in functions if not GENERATED_NAME.fullmatch(f)) for n in (f,)]", expect='test_module_symbols_and_stub_union'),
+    dict(id='GT8', milestone="M3", file=GEN_TABLES, test='gentables', fault="stubs only for the executable's imports",
+         old="                      for name in sorted(stubbed))",
+         new="                      for name in sorted(thunks))", expect='test_module_symbols_and_stub_union'),
+    dict(id='GT9', milestone="M3", file=GEN_TABLES, test='gentables', fault='module names not checked',
+         old="    if bad or len(set(names)) != len(names):",
+         new="    if False:", expect='test_module_names_checked'),
+    dict(id='GT10', milestone="M3", file=GEN_TABLES, test='gentables', fault="a module's thunks are not checked against its ppc/",
+         old="        _, _, mthunks, functions = load(msurvey, mppc)",
+         new="        _, _, mthunks, functions = load(survey, ppc)", expect='test_module_thunks_checked'),
+
+    # ---- M3: scripts/check_module_symbols.py ----
+    dict(id='CMS1', milestone="M3", file='scripts/check_module_symbols.py', test='modsyms', fault='mangled names not decoded',
+         old="    m = MANGLED.match(name)",
+         new="    m = None", expect='test_duplicate_translated_function_fails'),
+    dict(id='CMS2', milestone="M3", file='scripts/check_module_symbols.py', test='modsyms', fault='__imp__ bodies not translated names',
+         old="    return functions | {'__imp__' + f for f in functions} | {'PPCFuncMappings'}",
+         new="    return functions | {'PPCFuncMappings'}", expect='test_duplicate_body_and_table_fail'),
+    dict(id='CMS3', milestone="M3", file='scripts/check_module_symbols.py', test='modsyms', fault='differing ppc_context.h accepted',
+         old="    if duplicates and len(contexts) > 1:",
+         new="    if False:", expect='test_inline_duplicate_needs_identical_context'),
+    dict(id='CMS4', milestone="M3", file='scripts/check_module_symbols.py', test='modsyms', fault='archive member headers counted as symbols',
+         old="and not line.rstrip().endswith(':')}",
+         new="}", expect='test_defined_skips_headers'),
 
     # ---- M2: tests/test_no_title_addresses.py (the test itself: its pattern and scanned set) ----
     dict(id='TA1', milestone="M2", file=TITLE_TEST, test='titleaddr', fault='the address pattern matches nothing',

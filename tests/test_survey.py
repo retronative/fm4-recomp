@@ -29,41 +29,63 @@ ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 HEADER = '[main]\nfile_path = "../game/files/default.xex"\nout_directory_path = "../ppc"\n' \
          'switch_table_file_path = "switch_tables.toml"\n'
 FLAGS = ''.join(f'{k} = false\n' for k in S.MAIN_KEYS[3:11])
+DEFAULT, FACADE = S.MODULES['default'], S.MODULES['xmediafacade']
+FACADE_HEADER = '[main]\nfile_path = "../game/files/XMediaFacade_default.xex"\n' \
+                'out_directory_path = "../game/modules/xmediafacade/ppc"\nswitch_table_file_path = "switch_tables_xmediafacade.toml"\n'
 HELPERS = ''.join(f'{k} = 0x{0x82000000 + 4 * i:08X}\n' for i, k in enumerate(S.MAIN_KEYS[11:]))
 
 
 class Config(unittest.TestCase):
     def test_complete_main_accepted(self):
-        main = S.check_config(HEADER + FLAGS + HELPERS)
+        main = S.check_config(HEADER + FLAGS + HELPERS, DEFAULT)
         self.assertEqual(main['restgprlr_14_address'], 0x82000000)
 
     def test_keys_after_table_are_rejected(self):
         # The last helper key written after a hand-written [[midasm_hook]] belongs to that table.
         text = HEADER + FLAGS + ''.join(HELPERS.splitlines(True)[:-1]) + '\n[[midasm_hook]]\nname = "x"\n' + HELPERS.splitlines(True)[-1]
         with self.assertRaises(SystemExit) as e:
-            S.check_config(text)
+            S.check_config(text, DEFAULT)
         self.assertIn("'savevmx_64_address'", str(e.exception))
 
     def test_table_outside_main_rejected(self):
         # A complete [main] followed by a top-level table: XenonRecomp would ignore the table.
         text = HEADER + FLAGS + HELPERS + '\n[[runtime_routines]]\naddress = 0x82000000\nname = "x"\n'
         with self.assertRaises(SystemExit) as e:
-            S.check_config(text)
+            S.check_config(text, DEFAULT)
         self.assertIn("['runtime_routines'] are outside [main]", str(e.exception))
 
     def test_wrong_output_directory(self):
         with self.assertRaises(SystemExit) as e:
-            S.check_config(HEADER.replace('"../ppc"', '"../out"') + FLAGS + HELPERS)
+            S.check_config(HEADER.replace('"../ppc"', '"../out"') + FLAGS + HELPERS, DEFAULT)
         self.assertIn('out_directory_path', str(e.exception))
 
     def test_switch_tables_elsewhere(self):
         with self.assertRaises(SystemExit) as e:
-            S.check_config(HEADER.replace('"switch_tables.toml"', '"../game/survey/switch_tables.toml"') + FLAGS + HELPERS)
+            S.check_config(HEADER.replace('"switch_tables.toml"', '"../game/survey/switch_tables.toml"') + FLAGS + HELPERS, DEFAULT)
         self.assertIn('switch_table_file_path', str(e.exception))
+
+    def test_module_paths(self):
+        # Each module's config must name that module's own output paths.
+        self.assertIn('restgprlr_14_address', S.check_config(FACADE_HEADER + FLAGS + HELPERS, FACADE))
+        with self.assertRaises(SystemExit) as e:
+            S.check_config(HEADER + FLAGS + HELPERS, FACADE)
+        self.assertIn('out_directory_path must be ../game/modules/xmediafacade/ppc', str(e.exception))
+        with self.assertRaises(SystemExit) as e:
+            S.check_config(FACADE_HEADER + FLAGS + HELPERS, DEFAULT)
+        self.assertIn('out_directory_path must be ../ppc', str(e.exception))
+
+    def test_module_table(self):
+        # Outputs per module are distinct and none lies under game/files (the player's read-only extraction).
+        files = Path(ROOT) / 'game/files'
+        for field in ('switch', 'out', 'ppc'):
+            values = [getattr(m, field) for m in S.MODULES.values()]
+            self.assertEqual(len(values), len(set(values)), field)
+            for v in values:
+                self.assertFalse(v.is_relative_to(files), v)
 
     def test_local_flag_true_rejected(self):
         with self.assertRaises(SystemExit) as e:
-            S.check_config(HEADER + FLAGS.replace('non_volatile_as_local = false', 'non_volatile_as_local = true') + HELPERS)
+            S.check_config(HEADER + FLAGS.replace('non_volatile_as_local = false', 'non_volatile_as_local = true') + HELPERS, DEFAULT)
         self.assertIn('must stay false', str(e.exception))
 
 
@@ -79,29 +101,47 @@ class Output(unittest.TestCase):
     def test_own_output_deleted(self):
         for name in ("ppc_recomp.0.cpp", "ppc_config.h", "ppc_functions.txt"):
             (self.ppc / name).write_text("x")
-        S.empty_ppc(self.ppc)
+        S.empty_ppc(self.ppc, {self.ppc})
         self.assertEqual(list(self.ppc.iterdir()), [])
 
     def test_foreign_file_refused(self):
         (self.ppc / "ppc_recomp.0.cpp").write_text("x")
         (self.ppc / "notes.md").write_text("keep")
         with self.assertRaises(SystemExit) as e:
-            S.empty_ppc(self.ppc)
+            S.empty_ppc(self.ppc, {self.ppc})
         self.assertIn("notes.md", str(e.exception))
         self.assertEqual(sorted(p.name for p in self.ppc.iterdir()), ["notes.md", "ppc_recomp.0.cpp"])
 
     def test_subdirectory_refused(self):
         (self.ppc / "sub.cpp").mkdir()
         with self.assertRaises(SystemExit):
-            S.empty_ppc(self.ppc)
+            S.empty_ppc(self.ppc, {self.ppc})
         self.assertTrue((self.ppc / "sub.cpp").is_dir())
+
+    def test_unlisted_directory_refused(self):
+        (self.ppc / "ppc_recomp.0.cpp").write_text("x")
+        with self.assertRaises(SystemExit) as e:
+            S.empty_ppc(self.ppc, {WORK / "other"})
+        self.assertIn("not a module output directory", str(e.exception))
+        self.assertEqual([p.name for p in self.ppc.iterdir()], ["ppc_recomp.0.cpp"])
+
+    def test_symlinked_parent_refused(self):
+        # A listed directory reached through a symlink (as game/files is one) is refused, nothing deleted.
+        (self.ppc / "ppc_recomp.0.cpp").write_text("x")
+        link = WORK / "link"
+        link.symlink_to(WORK, target_is_directory=True)
+        with self.assertRaises(SystemExit) as e:
+            S.empty_ppc(link / "ppc", {link / "ppc"})
+        self.assertIn("symlink", str(e.exception))
+        self.assertEqual([p.name for p in self.ppc.iterdir()], ["ppc_recomp.0.cpp"])
 
     def test_hashes_in_byte_order(self):
         (self.ppc / "b.cpp").write_bytes(b"abc")
         (self.ppc / "B.h").write_bytes(b"")
-        switch = WORK / "switch_tables.toml"
+        switch = WORK / "config" / "switch_tables.toml"
+        switch.parent.mkdir()
         switch.write_bytes(b"")
-        hashes = S.tree_hashes(self.ppc, switch)
+        hashes = S.tree_hashes(self.ppc, switch, WORK)
         self.assertEqual(list(hashes.items()), [("config/switch_tables.toml", EMPTY), ("ppc/B.h", EMPTY), ("ppc/b.cpp", ABC)])
 
 
