@@ -5,8 +5,11 @@
 //
 // An 8-bit RGB PNG with stored (uncompressed) deflate blocks: no compression library. Taken from
 // ForzaRecomp runtime/video/presenter.cpp:280-330 (WritePng; GPL-3.0-or-later, same
-// owner), NOT YET REVIEWED here. FM4 Recomp changes: returns the bytes instead of writing a file (the
-// capture store needs the size before anything is written); uses runtime::Crc32 (layout.h).
+// owner). Reviewed against ISO/IEC 15948, RFC 1950 and RFC 1951
+// (tests/runtime/test_gpu_guard.cpp TestPng). FM4 Recomp changes: returns the bytes instead of
+// writing a file (the capture store needs the size before anything is written); uses runtime::Crc32
+// (layout.h); an empty image or an `rgb` that is not width * height * 3 bytes returns no bytes
+// (ForzaRecomp read past the end; a 0x0 image would emit a zlib stream without a block).
 #pragma once
 #include "layout.h"
 #include <algorithm>
@@ -15,8 +18,11 @@
 
 namespace runtime::video {
 
+// Empty when width or height is 0 or `rgb` is not width * height * 3 bytes.
 inline std::vector<uint8_t> EncodePngRgb8(uint32_t width, uint32_t height, const std::vector<uint8_t>& rgb)
 {
+    if (width == 0 || height == 0 || rgb.size() != size_t(width) * height * 3)
+        return {};
     std::vector<uint8_t> raw;
     raw.reserve(size_t(height) * (size_t(width) * 3 + 1));
     for (uint32_t y = 0; y < height; y++)

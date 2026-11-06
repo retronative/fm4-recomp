@@ -98,7 +98,7 @@ std::optional<CaptureStore<kCaptureRecords>> captures;
 void Require(const Verdict& v)
 {
     if (!v.ok)
-        Stop(v.stranded ? kStopGpuStranded : StopCode::Setup, "renderer: %s", v.reason.c_str());
+        Stop(v.stranded ? StopCode::GpuStranded : StopCode::Setup, "renderer: %s", v.reason.c_str());
 }
 
 Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
@@ -183,6 +183,8 @@ void Capture(uint64_t id, const char* what)
         rgb[3 * i] = uint8_t((v & 0x3FF) >> 2), rgb[3 * i + 1] = uint8_t(((v >> 10) & 0x3FF) >> 2), rgb[3 * i + 2] = uint8_t(((v >> 20) & 0x3FF) >> 2);
     }
     const std::vector<uint8_t> png = EncodePngRgb8(kDisplayWidth, kDisplayHeight, rgb);
+    if (png.empty())  // the encoder refused its input (png.h: a size mismatch or an empty image); never a 0-byte capture
+        Stop(StopCode::Setup, "renderer: capture %llu: the PNG encoder refused %zu RGB bytes for %ux%u", (unsigned long long)id, rgb.size(), kDisplayWidth, kDisplayHeight);
     std::string error;
     const bool ok = captures->Add(id, png.size(), [&](const std::string& path) {
         FILE* f = std::fopen(path.c_str(), "wb");
@@ -247,7 +249,7 @@ void CreateResources()
 void Shutdown()
 {
     if (const size_t kept = guard->Shutdown(); kept != 0)
-        Stop(kStopGpuStranded, "renderer: %zu resource(s) kept at shutdown (completion unknown); the device is not destroyed", kept);
+        Stop(StopCode::GpuStranded, "renderer: %zu resource(s) kept at shutdown (completion unknown); the device is not destroyed", kept);
     for (Slot& s : slots)
     {
         vkDestroyFence(dev.device, s.fence, nullptr);
@@ -357,7 +359,7 @@ void Draw(const uint8_t* base, uint32_t opcode)
     //   4. recording into the open slot, resources held by the slot's lifetime.
     const gpu::SubmissionGate::View v = gate.Load();
     if (v.stopping || v.stranded)
-        Stop(v.stranded ? kStopGpuStranded : StopCode::Setup, "renderer: draw after the GPU stopped");
+        Stop(v.stranded ? StopCode::GpuStranded : StopCode::Setup, "renderer: draw after the GPU stopped");
     drawsSinceSwap++;
 }
 
@@ -492,8 +494,12 @@ void RunSelfCheck()
         gpu::SubmissionGate scratch;
         GpuGuard<int, 1> g(counting, scratch, flag, gpu::FenceTimeoutNs(gpu::kFenceTimeoutMinMs));
         const Verdict v = g.Submit(0);
-        Expect(!v.ok && v.reason.find("planted by the self-check") != std::string::npos && counting.calls == 0 && scratch.Load().inFlight == 0,
-               "a planted GPU_STOP refuses the submission, naming its reason; the backend is not called");
+        // CheckGpuStop names the flag's first line: the writer's provenance line ("GPU_STOP written <when> by
+        // fm4recomp (in-process); only the owner clears it."), the reason being its second line (gpu_stop_write.h,
+        // the same layout as scripts/gpu_run.sh writes).
+        Expect(!v.ok && !v.stranded && v.reason.find("GPU_STOP written ") != std::string::npos &&
+                   v.reason.find("by fm4recomp (in-process)") != std::string::npos && counting.calls == 0 && scratch.Load().inFlight == 0,
+               "a planted GPU_STOP refuses the submission, naming the flag's first line; the backend is not called");
     }
 
     // 4. The loop-work cap (2^26): two loops of 64 (low bytes of 0x01020340 and 0x00000040) are
@@ -529,7 +535,7 @@ void RunSelfCheck()
     }
 
     Shutdown();
-    Stop(kStopGpuSelfCheck, "GPU self-check passed: device, clear and upload read back, deferred destruction, bounded fence wait (stranding "
+    Stop(StopCode::GpuSelfCheck, "GPU self-check passed: device, clear and upload read back, deferred destruction, bounded fence wait (stranding "
                             "on a scratch flag), GPU_STOP refusal, loop-work cap, capped captures; %llu validation message(s)",
          (unsigned long long)ValidationMessageCount());
 }

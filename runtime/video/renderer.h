@@ -12,7 +12,7 @@
 //   self-check  the first approved GPU run: device + validation, one clear and an upload into an
 //               offscreen display image, read back and compared on the CPU, captured through the dump
 //               ring; then each safety path exercised in-process; stops with
-//               kStopGpuSelfCheck before the title runs any code.
+//               StopCode::GpuSelfCheck (12) before the title runs any code.
 //   present     the guest front buffer is detiled and presented (offscreen, captured) at every
 //               XE_SWAP. Draws are NOT rendered yet: each swap logs how many were skipped, and the
 //               mode is diagnostic only, never a default (no draw skipping by default).
@@ -24,11 +24,6 @@
 #include <cstdint>
 
 namespace runtime::video {
-
-// Stop codes the stop drain adds to stops.h: GpuSelfCheck = 12 (the self-check
-// passed: the run's expected end), GpuStranded = 13 (a submission's completion is unknown: GPU_STOP
-// written). Spelled here until it is applied (then: StopCode::GpuSelfCheck, StopCode::GpuStranded).
-constexpr StopCode kStopGpuSelfCheck = StopCode(12), kStopGpuStranded = StopCode(13);
 
 enum class Mode
 {

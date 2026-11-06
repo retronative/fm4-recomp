@@ -177,18 +177,6 @@ GUEST_IMPORT(XamUserGetXUID, "REFERENCE_DERIVED: Xenia xam_user.cc:29-57")
     ctx.r3.u64 = result;
 }
 
-GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-130 (no controller connected)")
-{
-    // (user index, flags, X_INPUT_STATE*): the 16-byte state (packet number, gamepad) is zeroed if given, then
-    // ERROR_DEVICE_NOT_CONNECTED (0x48F): no input device is connected to this runtime yet (headless runs; real
-    // gamepad and keyboard input is a later unit). Xenia returns the same for an index of 4 or more or a non-gamepad
-    // query, and when its input drivers find no controller.
-    const uint32_t state = ctx.r5.u32;
-    if (state)
-        std::memset(base + state, 0, 16);
-    ctx.r3.u64 = 0x48F;
-}
-
 GUEST_IMPORT(XamMediaVerificationCreate, "INFERRED: disc media verification is not supported (ERROR_NOT_SUPPORTED); Xenia lists the export only (xam_table.inc:1586)")
 {
     // (...): starts verifying the disc's media. This runtime cannot verify Xbox disc media, and a verification that

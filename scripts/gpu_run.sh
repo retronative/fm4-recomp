@@ -16,8 +16,8 @@
 # fails. The runtime's own GPU entry points honour GPU_STOP too (M4 renderer work).
 # A renderer other than headless (M4): the pinned Khronos validation layer (1.4.363) is inserted and the pinned
 # MoltenVK ICD is the only driver; Metal API validation is on (MTL_DEBUG_LAYER=1). Before the runs the negative
-# control (build/native/tests/fm4_validation_control: an invalid VkFormat in a physical-device query, no device or
-# resource) must make the layer report VUID-vkGetPhysicalDeviceFormatProperties-format-parameter, else nothing runs.
+# control (build/native/tests/fm4_validation_control: a wrong sType in a physical-device query, no device or
+# resource) must make the layer report VUID-VkPhysicalDeviceProperties2-sType-sType, else nothing runs.
 # After each run its log must show the layer inserted and no validation message; captures go to run<i>.captures/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -173,9 +173,9 @@ if [ "$RENDERER" != headless ]; then
   # Negative control first: a deliberate, query-only misuse the layer must report (no device, no GPU work).
   CONTROL="$ROOT/build/native/tests/fm4_validation_control"
   perl -e 'alarm 30; exec @ARGV' "$CONTROL" > "$OUT/validation_control.log" 2>&1 || true
-  grep -q 'VUID-vkGetPhysicalDeviceFormatProperties-format-parameter' "$OUT/validation_control.log" ||
+  grep -q 'VUID-VkPhysicalDeviceProperties2-sType-sType' "$OUT/validation_control.log" ||
     { echo "gpu_run: negative control: the layer did not report the deliberate misuse; nothing runs" >&2; exit 1; }
-  echo "validation: negative control reported (VUID-vkGetPhysicalDeviceFormatProperties-format-parameter)" | tee "$OUT/validation.txt"
+  echo "validation: negative control reported (VUID-VkPhysicalDeviceProperties2-sType-sType)" | tee "$OUT/validation.txt"
 fi
 export HOME="$ROOT/game/home"
 mkdir -p "$ROOT/game/user-data"  # saved content (kernel/content.h), isolated from the read-only disc

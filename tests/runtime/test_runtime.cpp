@@ -27,6 +27,7 @@
 #include "kernel/critical_section.h"
 #include "kernel/dispatcher.h"
 #include "kernel/imports.h"
+#include "kernel/input_script.h"
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
 #include "kernel/virtual_memory.h"
@@ -471,6 +472,128 @@ int main(int, char** argv)
         imp("XamInputGetState")(pad, base);
         Expect(pad.r3.u64 == 0x48F && be32(padState) == 0 && be32(padState + 12) == 0 && be32(padState + 16) == 0xAAAAAAAA,
                "XamInputGetState: no controller: the 16-byte state zeroed (nothing past it), ERROR_DEVICE_NOT_CONNECTED");
+        // The scripted gamepad (kernel/input_script.h; FM4_INPUT_SCRIPT). Without a script (this process never loads one)
+        // the other input imports are the generated strict stubs (3).
+        Expect(!input::ScriptLoaded() && ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0, c.r4.u32 = 1, c.r5.u32 = padState; imp("XamInputGetCapabilities")(c, base); }) == int(StopCode::Import) &&
+                   ExitCodeOf([&] { PPCContext c{}; c.r4.u32 = 0, c.r5.u32 = 1, c.r6.u32 = padState; imp("XamInputGetCapabilitiesEx")(c, base); }) == int(StopCode::Import) &&
+                   ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0, c.r5.u32 = padState; imp("XamInputSetState")(c, base); }) == int(StopCode::Import),
+               "no script: XamInputGetCapabilities, XamInputGetCapabilitiesEx and XamInputSetState stay strict stubs (3)");
+        {
+            // The pure layer. Script: event 0 at vblank 600 (START | A = 0x0010 | 0x1000 = 0x1010, hid/input.h:36,43),
+            // event 1 at 700 (released). Packet numbers (sdl_input_driver.cc:190-198, :477): the first poll reports 1,
+            // a poll that sees a different active event adds exactly 1, an unchanged one repeats the number.
+            input::Script script;
+            std::string error;
+            const bool parsed = input::ParseScript("# press start\n600 START A\n700\n", script, error) && script.events.size() == 2 &&
+                                script.events[0].vblank == 600 && script.events[0].buttons == 0x1010 && script.events[1].vblank == 700 &&
+                                script.events[1].buttons == 0 && script.events[1].leftTrigger == 0;
+            input::Poller poller(script);
+            const uint64_t at[] = {0, 599, 600, 650, 700, 701};
+            const uint32_t packets[] = {1, 1, 2, 2, 3, 3};
+            const uint16_t buttons[] = {0, 0, 0x1010, 0x1010, 0, 0};
+            const long events[] = {-1, -1, 0, 0, 1, 1};
+            bool sequence = true;
+            for (int i = 0; i < 6; i++)
+            {
+                const input::Report r = poller.Poll(at[i]);
+                sequence = sequence && r.packet == packets[i] && r.buttons == buttons[i] && r.event == events[i] && r.leftTrigger == 0 && r.rightTrigger == 0;
+            }
+            Expect(parsed && sequence, "input script: 2 events parsed; polls at 0, 599, 600, 650, 700, 701 report packets 1 1 2 2 3 3, buttons 0 0 1010 1010 0 0");
+            // Two events passed between two polls with the same bytes before and after: still +1 (one change seen), and
+            // a first poll in the middle of the script is 1.
+            input::Poller skipping(script), late(script);
+            const input::Report s0 = skipping.Poll(0), s1 = skipping.Poll(800), l0 = late.Poll(650);
+            Expect(s0.packet == 1 && s0.buttons == 0 && s1.packet == 2 && s1.buttons == 0 && s1.event == 1 && l0.packet == 1 && l0.buttons == 0x1010,
+                   "input script: a poll that skips past both events adds one (packet 2, released); a first poll at 650 is packet 1 with START A");
+            // Triggers are the two bytes (FF when named), every name maps to its bit; comments and blank lines are skipped.
+            input::Script names;
+            const bool allNames = input::ParseScript("5 LT RT B\n\n# c\n  7 A X Y START BACK LB RB DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT LS RS # all\n", names, error) &&
+                                  names.events.size() == 2 && names.events[0].buttons == 0x2000 && names.events[0].leftTrigger == 0xFF &&
+                                  names.events[0].rightTrigger == 0xFF && names.events[1].buttons == 0xD3FF && names.events[1].leftTrigger == 0;
+            input::Script empty;
+            Expect(allNames && input::ParseScript("", empty, error) && empty.events.empty() && input::Describe(0x1010, 0, 0) == "A START" &&
+                       input::Describe(0, 0xFF, 0) == "LT" && input::Describe(0, 0, 0).empty(),
+                   "input script: LT RT B -> 2000 FF FF; the other 13 names -> D3FF (every bit but B and guide); an empty script is 0 events; Describe lists names");
+            // Errors name the line: a non-numeric vblank, a vblank not above the previous line's, an unknown name.
+            input::Script bad;
+            const bool e1 = !input::ParseScript("abc START\n", bad, error) && error == "line 1: the vblank must be a decimal number, not 'abc'";
+            const bool e2 = !input::ParseScript("10 A\n10 B\n", bad, error) && error == "line 2: vblank is not above the previous line's '10'";
+            const bool e3 = !input::ParseScript("1 A\n\n3 FOO A\n", bad, error) && error == "line 3: unknown button 'FOO'";
+            Expect(e1 && e2 && e3, "input script: errors name the line: non-numeric vblank, non-increasing vblank, unknown button");
+        }
+        {
+            // The imports with a script, in a child (the parent never loads one). The vblank counter stays 0 here (no
+            // interrupt timer runs in this process), so event 0 is at vblank 0 and event 1 never arrives.
+            const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
+            const std::string ok = dir + "/input_ok.txt", bad = dir + "/input_bad.txt", missing = dir + "/input_missing.txt";
+            std::ofstream(ok) << "0 START A\n1000000000 B\n";
+            std::ofstream(bad) << "10 A\n5 B\n";
+            const std::string badLine = StderrOf([&] { input::LoadScript(bad.c_str()); });
+            Expect(badLine == "[stop 9] FM4_INPUT_SCRIPT " + bad + " line 2: vblank is not above the previous line's '5'\n" &&
+                       ExitCodeOf([&] { input::LoadScript(missing.c_str()); }) == int(StopCode::Setup),
+                   "FM4_INPUT_SCRIPT: a malformed script stops (9) naming the file and line at load; an unreadable file stops (9)");
+            const std::string loadLine = StderrOf([&] { input::LoadScript(ok.c_str()); });
+            Expect(loadLine == "[input] script " + ok + ": 2 events\n", "FM4_INPUT_SCRIPT: the load logs the file and its event count");
+            const int childFailures = ExitCodeOf([&] {
+                const int before = failures;
+                input::LoadScript(ok.c_str());
+                auto getState = [&](uint32_t index, uint32_t flags, uint32_t state) {
+                    std::memset(base + padState, 0xAA, 20);
+                    PPCContext c{};
+                    c.r3.u32 = index, c.r4.u32 = flags, c.r5.u32 = state;
+                    imp("XamInputGetState")(c, base);
+                    return c.r3.u32;
+                };
+                // User 0: 0 and X_INPUT_STATE (hid/input.h:57-72): packet 00000001 at +0, buttons 1010 at +4, triggers 00 00 at
+                // +6, thumbs 0 at +8..+15, nothing past +16. A second poll with no change repeats packet 1.
+                const bool first = getState(0, 1, padState) == 0 && be32(padState) == 1 && be16(padState + 4) == 0x1010 && base[padState + 6] == 0 &&
+                                   base[padState + 7] == 0 && be32(padState + 8) == 0 && be32(padState + 12) == 0 && be32(padState + 16) == 0xAAAAAAAA;
+                const bool again = getState(0, 1, padState) == 0 && be32(padState) == 1 && be16(padState + 4) == 0x1010;
+                Expect(first && again, "XamInputGetState with a script: user 0 reports packet 1, START A (1010), triggers 0, thumbs 0; unchanged: packet 1 again");
+                // Everyone else is not connected and zeroed (xam_input.cc:98-110): users 1, 3, 4, FF; user 0 for another device
+                // type (flags 2, keyboard). (A null state pointer with the pad is a strict stop, not tested here.)
+                const bool others = getState(1, 1, padState) == 0x48F && be32(padState) == 0 && be32(padState + 12) == 0 && getState(3, 1, padState) == 0x48F &&
+                                    getState(4, 1, padState) == 0x48F && getState(0xFF, 1, padState) == 0x48F && getState(0, 2, padState) == 0x48F &&
+                                    be32(padState + 4) == 0;
+                Expect(others, "XamInputGetState with a script: users 1, 3, 4, FF and a keyboard query (flags 2) are 48F and zeroed");
+                // XamInputGetCapabilities (xam_input.cc:46-91; values sdl_input_driver.cc:685-699): 20 bytes 01 01 0000 F3FF FF FF FFFF x4
+                // FFFF FFFF, nothing past them; user 1: 48F and zeroed; Ex with unk 2: 32 (NOT_SUPPORTED), untouched; a null
+                // pointer: A0; index FF (pinned to 0): 0; a keyboard query (flags 2): 48F, zeroed.
+                const uint32_t caps = ArenaAlloc(base, 24);
+                auto capabilities = [&](uint32_t unk, uint32_t index, uint32_t flags, uint32_t out) {
+                    std::memset(base + caps, 0xAA, 24);
+                    PPCContext c{};
+                    if (unk == 1)
+                        c.r3.u32 = index, c.r4.u32 = flags, c.r5.u32 = out, imp("XamInputGetCapabilities")(c, base);
+                    else
+                        c.r3.u32 = unk, c.r4.u32 = index, c.r5.u32 = flags, c.r6.u32 = out, imp("XamInputGetCapabilitiesEx")(c, base);
+                    return c.r3.u32;
+                };
+                const uint8_t expectedCaps[20] = {0x01, 0x01, 0x00, 0x00, 0xF3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                const bool user0 = capabilities(1, 0, 1, caps) == 0 && std::memcmp(base + caps, expectedCaps, 20) == 0 && be32(caps + 20) == 0xAAAAAAAA;
+                const bool user1 = capabilities(1, 1, 1, caps) == 0x48F && be32(caps) == 0 && be32(caps + 16) == 0;
+                const bool ex = capabilities(0, 0, 1, caps) == 0 && std::memcmp(base + caps, expectedCaps, 20) == 0 && capabilities(2, 0, 1, caps) == 0x32 &&
+                                be32(caps) == 0xAAAAAAAA && capabilities(1, 0, 1, 0) == 0xA0 && capabilities(1, 0xFF, 1, caps) == 0 &&
+                                capabilities(1, 0, 2, caps) == 0x48F && be32(caps) == 0;
+                Expect(user0 && user1 && ex, "XamInputGetCapabilities(Ex) with a script: user 0 type 1 sub-type 1 flags 0 buttons F3FF triggers FF thumbs FFFF motors FFFF; "
+                                             "user 1 48F zeroed; Ex unk 2 NOT_SUPPORTED; null A0; index FF pinned to 0; keyboard 48F");
+                // XamInputSetState (xam_input.cc:126-146): user 0 accepts the rumble (0); user 1: 48F; user 4: X_E_DEVICE_NOT_CONNECTED
+                // (8007048F); a null vibration pointer: A0.
+                const uint32_t vibration = ArenaAlloc(base, 4);
+                StoreBigEndian32(base, vibration, 0xFFFF8000);
+                auto setState = [&](uint32_t index, uint32_t at) {
+                    PPCContext c{};
+                    c.r3.u32 = index, c.r4.u32 = 0, c.r5.u32 = at;
+                    imp("XamInputSetState")(c, base);
+                    return c.r3.u32;
+                };
+                Expect(setState(0, vibration) == 0 && setState(1, vibration) == 0x48F && setState(4, vibration) == ((1u << 31) | (7u << 16) | 0x48F) &&
+                           setState(0, 0) == 0xA0,
+                       "XamInputSetState with a script: user 0 accepts (0); user 1 48F; user 4 the HRESULT 8007048F; null A0");
+                _exit(failures - before);
+            });
+            Expect(childFailures == 0, "the scripted-pad import checks (child process) all pass");
+        }
         PPCContext verify{}, close{};
         verify.r3.u64 = 5;
         imp("XamMediaVerificationCreate")(verify, base);

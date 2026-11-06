@@ -12,12 +12,16 @@
 // (forzarecomp runtime/main.cpp:209-236, GPL-3.0-or-later, same owner), reviewed here.
 //
 // TiledOffset and Detile32 are taken from ForzaRecomp runtime/gpu/texture.h:18-42
-// (GPL-3.0-or-later, same owner; the formula is Xenia's texture_util TiledOffset2DOuter/Inner,
-// BSD-3-Clause), NOT YET REVIEWED here: the review must check them against Xenia 67f16c4
-// texture_util.cc (not in the local Xenia copy, which holds gpu/ headers only) and add
-// tests whose values come from it. The draft's test checks only formula-independent properties.
-// FM4 Recomp changes: namespace runtime::video; the decode is a pure function returning a reason
-// instead of stopping; Detile32 takes the source size and refuses a short buffer.
+// (GPL-3.0-or-later, same owner). The formula is Xenia xenia-canary 67f16c4e315f
+// src/xenia/gpu/texture_conversion.cc:94-110 TiledOffset2DRow/TiledOffset2DColumn (BSD-3-Clause),
+// the row/column split of texture_util.cc:443-459 GetTiledOffset2D (= shaders/texture_address.xesli
+// XeTextureTiledOffset2D, which Xenia's swap path executes). Reviewed against GetTiledOffset2D
+// (tests/runtime/test_gpu_guard.cpp TestTiledOffsetAgainstXenia,
+// expected values from Xenia only). FM4 Recomp changes: namespace runtime::video; the decode is a
+// pure function returning a reason instead of stopping; Detile32 takes the source size and refuses
+// a short buffer; the pitch is aligned up to 32 texels as GetTiledOffset2D does (xe::align), where
+// ForzaRecomp and texture_conversion.cc truncate (differs only for a pitch that is not a multiple
+// of 32, which DecodeFrontBuffer never produces).
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -64,11 +68,14 @@ inline FrontBuffer DecodeFrontBuffer(const uint32_t fetch[6], uint32_t physical,
     return f;
 }
 
-// The byte offset of texel (x, y) in a tiled 2D surface `pitch` texels wide (a multiple of 32),
+// The pitch in tiles: Xenia aligns the pitch up to 32 texels (texture_util.cc:446 xe::align).
+constexpr uint32_t TilesPerRow(uint32_t pitch) { return (pitch + 31) >> 5; }
+
+// The byte offset of texel (x, y) in a tiled 2D surface `pitch` texels wide (aligned up to 32),
 // 2^log2Bytes bytes per texel (ForzaRecomp texture.h:18-31, see the header comment).
 constexpr uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2Bytes)
 {
-    const uint32_t macroY = ((y >> 5) * (pitch >> 5)) << (log2Bytes + 7);
+    const uint32_t macroY = ((y >> 5) * TilesPerRow(pitch)) << (log2Bytes + 7);
     const uint32_t microY = ((y & 6) << 2) << log2Bytes;
     const uint32_t rowBase = macroY + ((microY & ~0xFu) << 1) + (microY & 0xF) + ((y & 8) << (3 + log2Bytes)) + ((y & 1) << 4);
     const uint32_t macroX = (x >> 5) << (log2Bytes + 7);
@@ -78,8 +85,9 @@ constexpr uint32_t TiledOffset(uint32_t x, uint32_t y, uint32_t pitch, uint32_t 
            (((((y & 8) >> 2) + (x >> 3)) & 3) << 6);
 }
 
-// The bytes a tiled 32-bit surface occupies: padded to 32x32 tiles.
-constexpr size_t TiledSize32(uint32_t pitch, uint32_t height) { return size_t(pitch) * ((height + 31) & ~31u) * 4; }
+// The bytes a tiled 32-bit surface occupies: padded to 32x32 tiles (Xenia's GetTiledAddressUpperBound2D
+// of the surface, texture_util.cc:490-518: the last tile's origin plus 0x400 << 2).
+constexpr size_t TiledSize32(uint32_t pitch, uint32_t height) { return size_t(TilesPerRow(pitch)) * 32 * ((height + 31) & ~31u) * 4; }
 
 // Tiled 32-bit surface -> linear (width x height, row-major), texels as the GPU reads them (endian 0).
 // False (nothing copied) when the source is shorter than the padded surface.

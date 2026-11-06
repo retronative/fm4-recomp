@@ -26,6 +26,13 @@ size_t ImplementedImportCount();
 bool NetworkStarted(uint32_t& versionRequest, uint8_t (&params)[13]);
 const ImportInfo& ImplementedImport(size_t index);
 
+// The scripted gamepad (test only; imports_input.cpp over input_script.h): LoadScript reads FM4_INPUT_SCRIPT's file
+// and stops (9) naming the line of a malformed script; with one loaded, user 0 has a pad.
+namespace input {
+void LoadScript(const char* path);
+bool ScriptLoaded();
+}  // namespace input
+
 // The calling guest thread's KTHREAD (its PCR's current thread; imports_object.cpp).
 uint32_t CurrentThread(const PPCContext& ctx, const uint8_t* base);
 

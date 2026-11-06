@@ -8,9 +8,9 @@
 // deliberate API misuse the pinned Khronos layer must report, else the layer set-up (not the run) is
 // broken and nothing runs. After ForzaRecomp tests/video/validation_control.cpp (a
 // size-0 buffer, VUID-VkBufferCreateInfo-size-00912; GPL-3.0-or-later, same owner). FM4 Recomp
-// changes: the misuse is a physical-device query with an invalid VkFormat (999: core formats end at
-// 184, extension formats start at 1000000000), VUID-vkGetPhysicalDeviceFormatProperties-format-parameter
-// (present in the installed layer 1.4.363). No VkDevice and no resource is created, nothing is
+// changes: the misuse is a physical-device query (vkGetPhysicalDeviceProperties2) whose structure has a
+// wrong sType, VUID-VkPhysicalDeviceProperties2-sType-sType (reported by the installed layer 1.4.363,
+// OBSERVED; an out-of-range VkFormat is not, see below), through a messenger of the instance. No VkDevice and no resource is created, nothing is
 // submitted; the layer's stateless check skips the call, so the driver never sees it, and if the
 // layer were missing the driver would only answer a format query. The layer is enabled by the
 // program itself (as fm4recomp does), with its own messenger, so the log names the VUID either way.
@@ -48,13 +48,29 @@ int main()
     VkInstance instance;
     if (vkCreateInstance(&info, nullptr, &instance) != VK_SUCCESS)
         return 2;
+    // The pNext messenger above covers only vkCreateInstance / vkDestroyInstance (VK_EXT_debug_utils: "only during
+    // instance creation and destruction"); the misuse below needs a messenger of the instance (as the renderer makes
+    // one, runtime/video/vulkan_device.cpp).
+    auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+    auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
+    if (create == nullptr || destroy == nullptr)
+        return 4;
+    VkDebugUtilsMessengerEXT handle;
+    if (create(instance, &messenger, nullptr, &handle) != VK_SUCCESS)
+        return 5;
     uint32_t count = 1;
     VkPhysicalDevice gpu;
     if (vkEnumeratePhysicalDevices(instance, &count, &gpu) < 0 || count == 0)
         return 3;
-    VkFormatProperties properties{};
-    vkGetPhysicalDeviceFormatProperties(gpu, VkFormat(999), &properties);  // invalid on purpose
+    // The misuse: a wrong sType on a physical-device query (the stateless parameter check
+    // VUID-VkPhysicalDeviceProperties2-sType-sType). OBSERVED with the pinned layer 1.4.363: an
+    // out-of-range VkFormat in vkGetPhysicalDeviceFormatProperties(2) / ImageFormatProperties is NOT reported
+    // (the local capture gpu_selfcheck2 (not distributed)), so that was not a usable control.
+    VkPhysicalDeviceProperties2 properties{};
+    properties.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;  // invalid on purpose
+    vkGetPhysicalDeviceProperties2(gpu, &properties);
     std::puts("validation control: misuse issued");
+    destroy(instance, handle, nullptr);
     vkDestroyInstance(instance, nullptr);
     return 0;
 }

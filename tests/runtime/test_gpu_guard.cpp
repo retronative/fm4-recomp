@@ -16,7 +16,9 @@
 #include "front_buffer.h"
 #include "gpu_guard.h"
 #include "png.h"
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <string>
 #include <sys/stat.h>
@@ -330,6 +332,73 @@ void TestDetileProperties()
     Expect(!Detile32(tiled.data(), tiled.size(), out, 32, 32, 32), "CONTROL: a source shorter than the padded tile is refused");
 }
 
+// Expected offsets from Xenia xenia-canary 67f16c4e315f src/xenia/gpu/texture_util.cc:443-459
+// GetTiledOffset2D (the formula Xenia's swap path executes, shaders/texture_address.xesli:15-30),
+// evaluated by an independent transcription of that function only; two rows are also computed by
+// hand.
+// 4 bytes per texel (log2 2). Xenia aligns the pitch up to 32 texels first (xe::align).
+struct TiledPoint
+{
+    uint32_t x, y, pitch, offset;
+};
+constexpr TiledPoint kXeniaAligned[] = {
+    {0, 0, 32, 0},         {31, 0, 32, 236},       {0, 31, 32, 3984},     {31, 31, 32, 3964},     {1, 0, 32, 4},
+    {0, 1, 32, 16},        {7, 0, 32, 44},         {8, 0, 32, 64},        {0, 7, 32, 784},        {0, 8, 32, 1152},
+    {0, 16, 32, 2048},     {8, 8, 32, 1216},       {16, 16, 32, 2176},    {32, 0, 1280, 4096},    {0, 32, 1280, 163840},
+    {33, 1, 1280, 4116},   {0, 719, 1280, 3606416}, {1279, 0, 1280, 159980}, {1279, 719, 1280, 3766140}, {640, 360, 1280, 1885312},
+};
+// A pitch that is not a multiple of 32: Xenia rounds 1000 up to 1024 (32 tiles per row).
+constexpr TiledPoint kXeniaUnaligned[] = {{0, 32, 1000, 131072}, {999, 32, 1000, 258092}};
+
+template <size_t N>
+bool Matches(const TiledPoint (&points)[N], const char* what)
+{
+    bool ok = true;
+    for (const TiledPoint& p : points)
+    {
+        const uint32_t got = TiledOffset(p.x, p.y, p.pitch, 2);
+        if (got != p.offset)
+            std::printf("  %s: (%u, %u) pitch %u: TiledOffset %u, Xenia %u\n", what, p.x, p.y, p.pitch, got, p.offset);
+        ok = ok && got == p.offset;
+    }
+    return ok;
+}
+
+void TestTiledOffsetAgainstXenia()
+{
+    Expect(Matches(kXeniaAligned, "aligned"), "TiledOffset equals Xenia GetTiledOffset2D at 20 points (pitch 32 and 1280)");
+    // Xenia's upper bound of a 1000x64 surface at pitch 1000: 32 tiles per row, 2 tile rows: 262 144.
+    Expect(Matches(kXeniaUnaligned, "unaligned") && TiledSize32(1000, 64) == 262144u, "TiledOffset and TiledSize32 equal Xenia at pitch 1000 (Xenia aligns the pitch up to 1024)");
+    // Whole-region digests (oracle_tiled_offset.py): sum of offset * (1 + x + pitch * y) over the
+    // first tile at pitch 32, and over rows 0-63 at pitch 1280 (two tile rows, 80 tiles).
+    uint64_t tile = 0, rows = 0;
+    for (uint32_t y = 0; y < 32; y++)
+        for (uint32_t x = 0; x < 32; x++)
+            tile += uint64_t(TiledOffset(x, y, 32, 2)) * (1 + x + 32 * y);
+    for (uint32_t y = 0; y < 64; y++)
+        for (uint32_t x = 0; x < 1280; x++)
+            rows += uint64_t(TiledOffset(x, y, 1280, 2)) * (1 + x + 1280 * y);
+    Expect(tile == 1430556672ull, "weighted digest of the first tile (pitch 32) equals Xenia's: 1 430 556 672");
+    Expect(rows == 689766811893760ull, "weighted digest of rows 0-63 at pitch 1280 equals Xenia's: 689 766 811 893 760");
+    // Xenia GetTiledAddressUpperBound2D(1280, 720, 1280, 2) (texture_util.cc:490-518): the origin of
+    // the tile holding (1279, 719) is GetTiledOffset2D(1248, 704) = 919 * 512 * 8 = 3 764 224, plus
+    // 0x400 << 2 = 4096: 3 768 320, which is the size Detile32 requires. The same at 32x32: 4096.
+    Expect(TiledSize32(1280, 720) == 3768320u && TiledSize32(32, 32) == 4096u, "TiledSize32 equals Xenia's tiled address upper bound (1280x720, 32x32)");
+    // Detile32 end to end: a 1280x720 tiled source whose word i holds i; the linear texel (x, y)
+    // must be Xenia's offset / 4 (row-major output, texels copied whole).
+    std::vector<uint8_t> tiled(TiledSize32(1280, 720));
+    for (uint32_t i = 0; i < tiled.size() / 4; i++)
+        std::memcpy(&tiled[size_t(i) * 4], &i, 4);
+    std::vector<uint32_t> linear(size_t(1280) * 720, 0xFFFFFFFFu);
+    bool placed = Detile32(tiled.data(), tiled.size(), linear.data(), 1280, 720, 1280);
+    for (const TiledPoint& p : kXeniaAligned)
+        if (p.pitch == 1280)
+            placed = placed && linear[size_t(p.y) * 1280 + p.x] == p.offset / 4;
+    Expect(placed, "Detile32 of 1280x720: the linear texel at each Xenia point holds that point's tiled word");
+    // A source of exactly the padded size is accepted; one byte short is refused (CONTROL).
+    Expect(!Detile32(tiled.data(), tiled.size() - 1, linear.data(), 1280, 720, 1280), "CONTROL: 1280x720 one byte short of 3 768 320 is refused");
+}
+
 void TestPng()
 {
     // 1x1 black: signature 8 + IHDR 12 + 13 + IDAT 12 + (2 zlib + 5 block header + 4 raw + 4 adler = 15)
@@ -341,6 +410,46 @@ void TestPng()
     const bool adler = png[52] == 0x00 && png[53] == 0x04 && png[54] == 0x00 && png[55] == 0x01;
     const bool iend = png[68] == 0xAE && png[69] == 0x42 && png[70] == 0x60 && png[71] == 0x82;
     Expect(sig && adler && iend, "PNG of one black pixel: 72 bytes, Adler-32 00040001, IEND CRC AE426082");
+    // 2x2 RGB, samples 1..12: the complete file from ISO/IEC 15948, RFC 1950 and RFC 1951
+    // (an independent transcription). Raw scanlines
+    // 0 1 2 3 4 5 6 | 0 7 8 9 10 11 12 (14 bytes); Adler-32 a = 79, b = 399 -> 018F004F; one final
+    // stored block 01 0E 00 F1 FF; CRC-32 (zlib.crc32) IHDR FDD49A73, IDAT 9E358949, IEND AE426082.
+    const std::vector<uint8_t> expected2x2 = {
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xFD, 0xD4, 0x9A,
+        0x73, 0x00, 0x00, 0x00, 0x19, 0x49, 0x44, 0x41, 0x54, 0x78, 0x01, 0x01, 0x0E, 0x00, 0xF1, 0xFF,
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x01, 0x8F,
+        0x00, 0x4F, 0x9E, 0x35, 0x89, 0x49, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+        0x60, 0x82};
+    const std::vector<uint8_t> small = EncodePngRgb8(2, 2, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    Expect(small == expected2x2, "PNG of 2x2 RGB (samples 1-12): the 82 bytes derived from the specifications");
+    // Two stored blocks: 256x86 RGB -> raw 86 * (1 + 768) = 66134 = 65535 + 599 bytes. IDAT data is
+    // 2 + (5 + 65535) + (5 + 599) + 4 = 66150 bytes (length field 00 01 02 66 at 33-36, data at
+    // 41-66190); block 1 header at 43: 00 FF FF 00 00 (not final, LEN 65535, NLEN 0); block 2 header
+    // at 65583: 01 57 02 A8 FD (final, LEN 599 = 0x257, NLEN 0xFDA8); the payloads are the raw
+    // scanlines; Adler-32 78208681 at 66187-66190 (png_expected.py); IEND at 66195; 66207 bytes.
+    std::vector<uint8_t> big(size_t(256) * 86 * 3);
+    for (size_t i = 0; i < big.size(); i++)
+        big[i] = uint8_t(3 * i + 7);
+    std::vector<uint8_t> raw;
+    for (size_t y = 0; y < 86; y++)
+        raw.push_back(0), raw.insert(raw.end(), big.begin() + y * 768, big.begin() + (y + 1) * 768);
+    const std::vector<uint8_t> two = EncodePngRgb8(256, 86, big);
+    const bool shape = two.size() == 66207 && std::vector<uint8_t>(two.begin() + 33, two.begin() + 37) == std::vector<uint8_t>{0x00, 0x01, 0x02, 0x66} &&
+                       std::vector<uint8_t>(two.begin() + 43, two.begin() + 48) == std::vector<uint8_t>{0x00, 0xFF, 0xFF, 0x00, 0x00} &&
+                       std::vector<uint8_t>(two.begin() + 65583, two.begin() + 65588) == std::vector<uint8_t>{0x01, 0x57, 0x02, 0xA8, 0xFD} &&
+                       std::vector<uint8_t>(two.begin() + 66187, two.begin() + 66191) == std::vector<uint8_t>{0x78, 0x20, 0x86, 0x81} &&
+                       std::equal(two.begin() + 66195, two.begin() + 66199, "\x00\x00\x00\x00") && two[66199] == 'I' && two[66202] == 'D';
+    const bool payload = shape && std::equal(raw.begin(), raw.begin() + 65535, two.begin() + 48) && std::equal(raw.begin() + 65535, raw.end(), two.begin() + 65588);
+    Expect(shape && payload, "PNG of 256x86: two stored blocks (65535 + 599) with the headers, payloads and Adler-32 of RFC 1951/1950");
+    // Refused inputs produce no bytes (never a read past the end or a block-less zlib stream).
+    Expect(EncodePngRgb8(2, 2, {1, 2, 3}).empty() && EncodePngRgb8(1, 1, {1, 2, 3, 4}).empty(), "CONTROL: an rgb buffer that is not width * height * 3 bytes is refused");
+    Expect(EncodePngRgb8(0, 0, {}).empty() && EncodePngRgb8(0, 4, {}).empty(), "CONTROL: an empty image is refused");
+    // Both files are left in the work directory (KEEP_WORK=1) for the wiring checks a reviewer
+    // runs by hand: Python's zlib inflates the IDAT and sips reads the size (not oracles).
+    for (const auto& [name, bytes] : {std::pair{"png_2x2.png", &small}, std::pair{"png_256x86.png", &two}})
+        if (FILE* f = std::fopen(Path(name).c_str(), "wb"))
+            std::fwrite(bytes->data(), 1, bytes->size(), f), std::fclose(f);
 }
 
 }  // namespace
@@ -366,6 +475,7 @@ int main(int argc, char** argv)
     TestCaptureStore();
     TestFrontBufferDecode();
     TestDetileProperties();
+    TestTiledOffsetAgainstXenia();
     TestPng();
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

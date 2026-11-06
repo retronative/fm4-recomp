@@ -156,6 +156,10 @@ int main(int argc, char** argv)
     }
     else
         Stop(StopCode::Setup, "--audio must be audible or mute, not %s", audioMode);
+    // The scripted gamepad (test only, kernel/input_script.h): FM4_INPUT_SCRIPT=<file> connects a pad to user 0 that
+    // presses the file's buttons at its vblanks; a malformed file stops (9) here, before the title runs.
+    if (const char* script = std::getenv("FM4_INPUT_SCRIPT"); script != nullptr && *script != '\0')
+        runtime::input::LoadScript(script);
     runtime::xma::SetDecoderFactory(runtime::xma::FfmpegDecoderFactory());  // XMA decoding (kernel/xma.h)
     runtime::ldi::SetFactory(runtime::ldi::MspackDecoderFactory());  // LZX decompression (kernel/ldi.h)
     runtime::gpu::SetStopAtSwap(uint32_t(stopAtSwap));
