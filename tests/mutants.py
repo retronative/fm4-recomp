@@ -48,6 +48,14 @@ TESTS = {
         deps=['tests/test_validate.py', 'scripts/validate.py']),
     'survey': dict(cmd=PY + ['tests/test_survey.py'], timeout=60, build=False, ran='^Ran \\d+ tests?',
         deps=['tests/test_survey.py', 'survey/survey.py']),
+    "runtime": dict(cmd=["bash", "tests/run_runtime_tests.sh"], timeout=300, build=True, ran=r"^runtime tests: ",
+                    deps=["tests/run_runtime_tests.sh", "tests/runtime", "runtime", "recomp", "scripts/preflight.sh",
+                          "tools/XenonRecomp/XenonUtils", "tools/XenonRecomp/thirdparty/simde"]),
+    "gentables": dict(cmd=PY + ["tests/test_gen_runtime_tables.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
+                      deps=["tests/test_gen_runtime_tables.py", "scripts/gen_runtime_tables.py"]),
+    "titleaddr": dict(cmd=PY + ["tests/test_no_title_addresses.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
+                      deps=["tests/test_no_title_addresses.py", "runtime", "recomp", "tests/runtime", "CMakeLists.txt",
+                            "scripts/build.sh", "scripts/measure_tu.sh", "scripts/gen_runtime_tables.py", "scripts/run_attempt.sh"]),
     "translib": dict(cmd=PY + ["tests/test_translator_lib.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
                      deps=["tests/test_translator_lib.py", "tests/translator_lib.sh"]),
 }
@@ -65,6 +73,25 @@ DISASM = "tools/XenonRecomp/thirdparty/disasm/ppc-dis.c"
 TRANSLIB = "tests/translator_lib.sh"
 CONFIG_CPP = "tools/XenonRecomp/XenonRecomp/recompiler_config.cpp"
 ARTIFACTS = "scripts/artifacts.py"
+STOPS_CPP = "runtime/stops.cpp"
+GUEST_MEMORY = "runtime/guest_memory.cpp"
+LAYOUT_H = "runtime/layout.h"
+GEN_TABLES = "scripts/gen_runtime_tables.py"
+TITLE_TEST = "tests/test_no_title_addresses.py"
+K_MODULE = 'runtime/kernel/module.cpp'
+K_IMPMOD = 'runtime/kernel/imports_module.cpp'
+K_THREAD = 'runtime/kernel/thread_state.cpp'
+K_IMPMEM = 'runtime/kernel/imports_memory.cpp'
+K_VMEM = 'runtime/kernel/virtual_memory.cpp'
+K_CRIT = 'runtime/kernel/critical_section.cpp'
+K_DISP = 'runtime/kernel/dispatcher.cpp'
+K_ARENA = 'runtime/kernel/arena.cpp'
+K_IMPTHR = 'runtime/kernel/imports_thread.cpp'
+K_IMPSYNC = 'runtime/kernel/imports_sync.cpp'
+K_THREADS = 'runtime/kernel/threads.cpp'
+K_IMPOBJ = 'runtime/kernel/imports_object.cpp'
+K_IMPTIME = 'runtime/kernel/imports_time.cpp'
+K_IMPXAM = 'runtime/kernel/imports_xam.cpp'
 SURVEY = 'survey/survey.py'
 VALIDATE = 'scripts/validate.py'
 SWITCH_TABLES = 'survey/switch_tables.py'
@@ -610,13 +637,256 @@ MUTANTS = [
          old="    fixture('residual_stops', lambda:",
          new="    (lambda *a: None)('residual_stops', lambda:", expect='test_every_injection_detected'),
 
+    # ---- M2: runtime/stops.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='RT1', milestone="M2", file=STOPS_CPP, test='runtime', fault='an import stop exits like a residual stop',
+         old='    Stop(StopCode::Import, "import %s called from',
+         new='    Stop(StopCode::Residual, "import %s called from', expect='an import stub stops (3)'),
+    dict(id='RT2', milestone="M2", file=STOPS_CPP, test='runtime', fault='an import stop reports r6 as r7 and r8',
+         old='ctx.r6.u32, ctx.r7.u32, ctx.r8.u32);',
+         new='ctx.r6.u32, ctx.r6.u32, ctx.r6.u32);', expect='six argument registers'),
+    dict(id='RT3', milestone="M2", file=STOPS_CPP, test='runtime', fault='the residual stop reports index 0',
+         old='name, address,\n         index, lr);',
+         new='name, address,\n         index & 0, lr);', expect='the residual stop names the dispatch'),
+    dict(id='RT4', milestone="M2", file=STOPS_CPP, test='runtime', fault='indirect calls not checked against the code range',
+         old='PPCFunc* function = runtime::IsCodeAddress(target, PPC_CODE_BASE, PPC_CODE_SIZE) ? PPC_LOOKUP_FUNC(base, target) : nullptr;',
+         new='PPCFunc* function = PPC_LOOKUP_FUNC(base, target);', expect='indirect call outside the code stops'),
+    dict(id='RT5', milestone="M2", file=STOPS_CPP, test='runtime', fault='a missing indirect target is called',
+         old='    if (function == nullptr)\n        Stop(StopCode::IndirectCall,',
+         new='    if (false)\n        Stop(StopCode::IndirectCall,', expect='indirect call to a code word with no function stops'),
+    dict(id='RT6', milestone="M2", file=STOPS_CPP, test='runtime', fault='mftb returns instead of stopping',
+         old='    Stop(StopCode::Unimplemented, "mftb: the guest time base is not implemented (M3)");',
+         new='    return 0;', expect='mftb stops until M3'),
+
+    # ---- M2: runtime/guest_memory.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='RT7', milestone="M2", file=GUEST_MEMORY, test='runtime', fault='SIGBUS not handled (macOS reports PROT_NONE accesses as SIGBUS)',
+         old='    sigaction(SIGBUS, &action, nullptr);\n',
+         new='', expect='a read of a data-import guard stops (5)'),
+    dict(id='RT8', milestone="M2", file=GUEST_MEMORY, test='runtime', fault='translated traps not handled',
+         old='    sigaction(SIGTRAP, &action, nullptr);\n',
+         new='', expect='a translated trap stops (10)'),
+    dict(id='RT9', milestone="M2", file=GUEST_MEMORY, test='runtime', fault='read-only protection leaves pages writable',
+         old='    if (mprotect(base + guest, size, PROT_READ) != 0)',
+         new='    if (mprotect(base + guest, size, PROT_READ | PROT_WRITE) != 0)', expect='a write to a read-only guest page stops (5)'),
+
+    # ---- M2: runtime/layout.h (tests/run_runtime_tests.sh) ----
+    dict(id='RT10', milestone="M2", file=LAYOUT_H, test='runtime', fault='a guard past the last import named',
+         old='if (address < kGuardBase || (address - kGuardBase) / page >= count)',
+         new='if (address < kGuardBase || (address - kGuardBase) / page > count)', expect='negative: past the last guard is no import'),
+    dict(id='RT11', milestone="M2", file=LAYOUT_H, test='runtime', fault='a code-only page kept writable',
+         old='        if (!sections[i].code && sections[i].start < page + size && page < sections[i].end)',
+         new='        if (sections[i].start < page + size && page < sections[i].end)', expect='pages: data-overlapping writable'),
+    dict(id='RT12', milestone="M2", file=LAYOUT_H, test='runtime', fault='unaligned code addresses accepted',
+         old='    return address >= codeBase && address - codeBase < codeSize && (address & 3) == 0;',
+         new='    return address >= codeBase && address - codeBase < codeSize;', expect='code address: inside, aligned'),
+    dict(id='RT13', milestone="M2", file=LAYOUT_H, test='runtime', fault='CRC-32 polynomial wrong',
+         old='(0xEDB88320u & (0u - (crc & 1)))',
+         new='(0xEDB88321u & (0u - (crc & 1)))', expect='CRC-32 check value'),
+
+    # ---- M2: scripts/gen_runtime_tables.py (tests/test_gen_runtime_tables.py) ----
+    dict(id='GT1', milestone="M2", file=GEN_TABLES, test='gentables', fault='unexpected import kinds accepted',
+         old="    if kinds:\n        sys.exit(f'gen_runtime_tables: unexpected import record kinds",
+         new="    if False:\n        sys.exit(f'gen_runtime_tables: unexpected import record kinds", expect='test_unexpected_kind_refused'),
+    dict(id='GT2', milestone="M2", file=GEN_TABLES, test='gentables', fault='ppc/ declarations not required to be imports',
+         old='    if declared != set(thunks):',
+         new='    if not set(thunks) <= declared:', expect='test_declaration_missing_from_survey_refused'),
+    dict(id='GT3', milestone="M2", file=GEN_TABLES, test='gentables', fault='thunks not required to be declared',
+         old='    if declared != set(thunks):',
+         new='    if not declared <= set(thunks):', expect='test_thunk_missing_from_ppc_refused'),
+    dict(id='GT4', milestone="M2", file=GEN_TABLES, test='gentables', fault='the image is not checked against ppc/',
+         old="    if layout.get('PPC_IMAGE_BASE') != report['base'] or layout.get('PPC_IMAGE_SIZE') != report['size'] \\\n            or len(image) != report['size']:",
+         new='    if False:', expect='test_image_mismatch_refused'),
+    dict(id='GT5', milestone="M2", file=GEN_TABLES, test='gentables', fault='stop messages keep the __imp__ prefix',
+         old='PpcImportStop("{name.removeprefix("__imp__")}", ctx)',
+         new='PpcImportStop("{name}", ctx)', expect='test_stubs_and_records'),
+    dict(id='GT6', milestone="M2", file=GEN_TABLES, test='gentables', fault="stubs not checked against the translation's declarations",
+         old='#include "ppc_recomp_shared.h"  // every stub must match',
+         new='// every stub must match', expect='test_stubs_and_records'),
+
+    # ---- M2: tests/test_no_title_addresses.py (the test itself: its pattern and scanned set) ----
+    dict(id='TA1', milestone="M2", file=TITLE_TEST, test='titleaddr', fault='the address pattern matches nothing',
+         old="PATTERNS = [re.compile(r'0x8[0-9A-Fa-f]{7}'), re.compile(r'sub_8[0-9A-Fa-f]{7}')]",
+         new="PATTERNS = [re.compile(r'0x9[0-9A-Fa-f]{7}'), re.compile(r'sub_8[0-9A-Fa-f]{7}')]", expect='test_control_patterns_match'),
+    dict(id='TA2', milestone="M2", file=TITLE_TEST, test='titleaddr', fault='a scanned path is mistyped',
+         old="SCANNED = ['runtime', 'recomp',",
+         new="SCANNED = ['runtimes', 'recomp',", expect='test_every_scanned_path_exists'),
+
+    # ---- M3: runtime/kernel/critical_section.cpp (tests/run_runtime_tests.sh) ----
+
+    # ---- M3: runtime/kernel/dispatcher.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KA12', milestone="M3", file=K_DISP, test='runtime', fault='a satisfied wait does not reset a synchronization event',
+         old='    else if (base[header] == dispatch::kSynchronizationEvent || base[header] == dispatch::kSynchronizationTimer)',
+         new='    else if (base[header] == dispatch::kSynchronizationTimer)', expect='a synchronization event wakes exactly one wait'),
+
+    # ---- M3: runtime/kernel/imports_memory.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KB1', milestone="M3", file=K_IMPMEM, test='runtime', fault='sizes not rounded to pages',
+         old='    size = (size + round - 1) / round * round;',
+         new='    (void)round;', expect='its size rounds to 64 KB'),
+    dict(id='KB2', milestone="M3", file=K_IMPMEM, test='runtime', fault='MEM_TOP_DOWN ignored',
+         old='                                               (type & mem::kTopDown) != 0);',
+         new='                                               false);', expect='top-down large-page allocation'),
+    dict(id='KB5', milestone="M3", file=K_IMPMEM, test='runtime', fault='a release with a size accepted',
+         old='        (type == mem::kDecommit && size == 0) || (type == mem::kRelease && size != 0))',
+         new='        (type == mem::kDecommit && size == 0))', expect='decommit of size 0, release with a size'),
+    dict(id='KB6', milestone="M3", file=K_IMPMEM, test='runtime', fault='a null base reports success',
+         old='        ctx.r3.u64 = 0xC00000A0;  // STATUS_MEMORY_NOT_ALLOCATED',
+         new='        ctx.r3.u64 = 0;', expect='a null base is NOT_ALLOCATED'),
+    dict(id='KB7', milestone="M3", file=K_IMPMEM, test='runtime', fault='MmSetAddressProtect does not protect',
+         old='    if (heap == nullptr || !heap->Protect(address, size, protect, nullptr))',
+         new='    if (heap == nullptr || (heap->Protect(address, size, protect, nullptr), false))', expect='a protection size that runs past the heap'),
+
+    # ---- M3: runtime/kernel/imports_module.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KA6', milestone="M3", file=K_IMPMOD, test='runtime', fault='RtlImageXexHeaderField returns 0',
+         old='    ctx.r3.u64 = runtime::XexHeaderField(base, ctx.r3.u32, ctx.r4.u32);',
+         new='    ctx.r3.u64 = 0;', expect='RtlImageXexHeaderField through the import registry'),
+
+    # ---- M3: runtime/kernel/module.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KA1', milestone="M3", file=K_MODULE, test='runtime', fault='XexHeaderField returns the value for an 0x01 key',
+         old='case 0x01: return entry + 4;',
+         new='case 0x01: return Load32(base, entry + 4);', expect='XexHeaderField: inline value'),
+    dict(id='KA2', milestone="M3", file=K_MODULE, test='runtime', fault='XexExecutableModuleHandle holds the header copy',
+         old='Store32(base, block, module.ldr);',
+         new='Store32(base, block, module.header);', expect="XexExecutableModuleHandle: the executable's loader entry"),
+    dict(id='KA3', milestone="M3", file=K_MODULE, test='runtime', fault='the loader entry has no header base',
+         old='Store32(base, m.ldr + ldr::kXexHeaderBase, m.header);',
+         new='Store32(base, m.ldr + ldr::kXexHeaderBase, 0);', expect='loader entry: header base'),
+    dict(id='KA4', milestone="M3", file=K_MODULE, test='runtime', fault='XboxHardwareInfo reports 1 CPU',
+         old='         base[block + 4] = 6;',
+         new='         base[block + 4] = 1;', expect='XboxHardwareInfo: flags 0x20, 6 CPUs'),
+    dict(id='KA5', milestone="M3", file=K_MODULE, test='runtime', fault='XboxKrnlVersion build off by one',
+         old='         Store16(base, block + 4, 17559);',
+         new='         Store16(base, block + 4, 17558);', expect='XboxKrnlVersion: 8 bytes'),
+
+    # ---- M3: runtime/kernel/thread_state.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KA7', milestone="M3", file=K_THREAD, test='runtime', fault="the PCR's current thread is the PCR",
+         old='Put32(base, p + pcr::kCurrentThread, k);',
+         new='Put32(base, p + pcr::kCurrentThread, p);', expect='PCR: TLS at +0'),
+    dict(id='KA8', milestone="M3", file=K_THREAD, test='runtime', fault='the TLS template is not copied',
+         old='std::memcpy(base + t.tls, base + tls.rawDataAddress, tls.rawDataSize);',
+         new='(void)0;', expect='TLS: the template copied'),
+    dict(id='KA9', milestone="M3", file=K_THREAD, test='runtime', fault='the process type is 0',
+         old='Put8(base, p + process::kProcessType, kProcessTypeTitle);',
+         new='Put8(base, p + process::kProcessType, 0);', expect='process block: TLS sizes'),
+
+    # ---- M3: runtime/kernel/virtual_memory.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KB8', milestone="M3", file=K_VMEM, test='runtime', fault='the first 64 KB not reserved',
+         old='    v00000000->AllocFixed(0, 0x10000, mem::kReserve, page::kNoAccess);',
+         new='    (void)0;', expect='a 4 KB-page allocation skips the reserved first 64 KB'),
+    dict(id='KB9', milestone="M3", file=K_VMEM, test='runtime', fault='released pages not zeroed',
+         old='    Zero(index, p.allocationPages);',
+         new='    (void)0;', expect='a released page committed again reads zero'),
+
+    # ---- M3: patches/xenonrecomp/0036 (ours: guarded residual switch over verified cases) ----
+    dict(id='R36a', milestone="M3", file=RECOMP, test='analysis', fault='cases not checked against the table words',
+         old='if (switchTable->second.table == 0 || word == nullptr || ByteSwap(*word) != cases[i])',
+         new='if (switchTable->second.table == 0 || word == nullptr)', expect='test_guarded_residual_case_must_be_the_table_word'),
+    dict(id='R36b', milestone="M3", file=RECOMP, test='analysis', fault='cases outside the function accepted',
+         old='                        if (cases[i] < fn.base || cases[i] >= fn.base + fn.size)',
+         new='                        if (false)', expect='test_guarded_residual_case_inside_the_function'),
+    dict(id='R36c', milestone="M3", file=RECOMP, test='analysis', fault='the loaded target is not checked',
+         old='                        println("\\t\\tif ({}.u32 != 0x{:X}u) PpcResidualStop(0x{:X}u, \\"{}\\", {}.u32, uint32_t(ctx.lr));", ctr(), cases[i], base, name, index);\n',
+         new='', expect='test_guarded_residual'),
+    dict(id='R36d', milestone="M3", file=RECOMP, test='analysis', fault='the default does not stop',
+         old='                    println("\\t\\tPpcResidualStop(0x{:X}u, \\"{}\\", {}.u32, uint32_t(ctx.lr));", base, name, index);\n                    println("\\t}}");',
+         new='                    println("\\t\\t__builtin_trap();");\n                    println("\\t}}");', expect='test_guarded_residual'),
+    dict(id='R36e', milestone="M3", file=RECOMP, test='analysis', fault='guarded cases not labels',
+         old='            for (auto label : residual->second.cases)\n                labels.emplace(label);',
+         new='            for (auto label : residual->second.cases)\n                (void)label;', expect='test_guarded_residual'),
+
+    # ---- M3: patches/xenonrecomp/0036, cases parsed strictly ----
+    dict(id='R36f', milestone="M3", file=CONFIG_CPP, test='analysis', fault='an empty case list accepted',
+         old='                    casesOk = casesOk && !stop.cases.empty();',
+         new='                    casesOk = casesOk;', expect='test_guarded_residual_cases_must_be_addresses'),
+    dict(id='R36g', milestone="M3", file=CONFIG_CPP, test='analysis', fault='a non-numeric case accepted',
+         old='                        casesOk = casesOk && label.has_value();',
+         new='                        casesOk = casesOk || label.has_value();', expect='test_guarded_residual_cases_must_be_addresses'),
+
+    # ---- M3 unit C: runtime/kernel/imports_module.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC21', milestone="M3", file=K_IMPMOD, test='runtime', fault='XexCheckExecutablePrivilege always 1',
+         old='    ctx.r3.u64 = (flags >> privilege) & 1;',
+         new='    ctx.r3.u64 = ((flags >> privilege) & 1) | 1;', expect='XexCheckExecutablePrivilege: privilege 10 set'),
+
+    # ---- M3 unit C: runtime/kernel/imports_object.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC13', milestone="M3", file=K_IMPOBJ, test='runtime', fault='object types not checked',
+         old='    if (typeAddress && typeAddress != expected)',
+         new='    if (false)', expect='the thread type on an event: type mismatch'),
+    dict(id='KC14', milestone="M3", file=K_IMPOBJ, test='runtime', fault='the current-thread pseudo-handle names nothing',
+         old='        return KernelObject{ObjectType::Thread, Load32(base, ctx.r13.u32 + pcr::kCurrentThread)};',
+         new='        if (base && ctx.r13.u32) return std::nullopt;', expect='the current-thread pseudo-handle gives its KTHREAD'),
+    dict(id='KC15', milestone="M3", file=K_IMPOBJ, test='runtime', fault='NtResumeThread reports previous count 1',
+         old='    const uint32_t previous = runtime::ResumeGuestThread(base, object->header);',
+         new='    const uint32_t previous = 1;', expect='one resume is not enough'),
+    dict(id='KC16', milestone="M3", file=K_IMPOBJ, test='runtime', fault='DUPLICATE_CLOSE_SOURCE ignored',
+         old='    if (options == 1 && handle != runtime::kCurrentThreadHandle)',
+         new='    if (false && options == 1)', expect='duplicating with DUPLICATE_CLOSE_SOURCE'),
+    dict(id='KC17', milestone="M3", file=K_IMPOBJ, test='runtime', fault='NtClose always succeeds',
+         old='    ctx.r3.u64 = runtime::CloseHandle(ctx.r3.u32) ? runtime::status::kSuccess : runtime::status::kInvalidHandle;',
+         new='    ctx.r3.u64 = runtime::status::kSuccess;', expect='NtClose: once, then invalid'),
+    dict(id='KC18', milestone="M3", file=K_IMPOBJ, test='runtime', fault='unknown wait types accepted',
+         old='    if (count == 0 || count > 64 || type > 1)',
+         new='    if (count == 0 || count > 64)', expect='an unknown wait type or an unknown handle: invalid parameter'),
+
+    # ---- M3 unit C: runtime/kernel/imports_sync.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC5', milestone="M3", file=K_IMPSYNC, test='runtime', fault='events created unsignalled',
+         old='    Store32(base, header + dispatch::kSignalState, initial ? 1 : 0);',
+         new='    Store32(base, header + dispatch::kSignalState, initial & 0);', expect='a signalled synchronization event satisfies one wait'),
+    dict(id='KC6', milestone="M3", file=K_IMPSYNC, test='runtime', fault='event names not looked up',
+         old='    const auto handle = LookupName(name, existing);',
+         new='    const auto handle = name.empty() ? LookupName(name, existing) : std::optional<uint32_t>{};', expect='the same name again: OBJECT_NAME_EXISTS'),
+    dict(id='KC7', milestone="M3", file=K_IMPSYNC, test='runtime', fault='NtSetEvent accepts any object',
+         old='    if (!object || object->type != ObjectType::Event)',
+         new='    if (!object)', expect='NtSetEvent on a semaphore: OBJECT_TYPE_MISMATCH'),
+    dict(id='KC8', milestone="M3", file=K_IMPSYNC, test='runtime', fault='NtSetEvent reports previous state 1',
+         old='        Store32(base, ctx.r4.u32, uint32_t(previous));',
+         new='        Store32(base, ctx.r4.u32, uint32_t(previous) | 1);', expect='NtSetEvent: signalled, the previous state written'),
+    dict(id='KC9', milestone="M3", file=K_IMPSYNC, test='runtime', fault='NtClearEvent does not reset',
+         old='    ResetEvent(base, object->header);',
+         new='    (void)0;', expect='NtClearEvent: reset'),
+
+    # ---- M3 unit C: runtime/kernel/imports_thread.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC1', milestone="M3", file=K_IMPTHR, test='runtime', fault='KeGetCurrentProcessType always 1',
+         old='ctx.r3.u64 = base[runtime::CurrentProcess(ctx, base) + runtime::process::kProcessType];',
+         new='ctx.r3.u64 = 1;', expect='KeGetCurrentProcessType reads the process block'),
+    dict(id='KC2', milestone="M3", file=K_IMPTHR, test='runtime', fault='TLS slots overlap the static data',
+         old='    return Load32(base, kthread + kthread::kTls) + Load32(base, process + process::kTlsDataSize) + slot * 4;',
+         new='    return Load32(base, kthread + kthread::kTls) + 0 * Load32(base, process + process::kTlsDataSize) + slot * 4;', expect='TLS slots: allocated in order'),
+    dict(id='KC3', milestone="M3", file=K_IMPTHR, test='runtime', fault="KeTlsFree clears no thread's slot",
+         old='    for (uint32_t thread : runtime::AllThreads())',
+         new='    for (uint32_t thread : std::vector<uint32_t>{})', expect='free clears the slot in every thread'),
+    dict(id='KC4', milestone="M3", file=K_IMPTHR, test='runtime', fault='affinity picks the lowest CPU',
+         old='    const uint32_t cpu = 31 - __builtin_clz(affinity);',
+         new='    const uint32_t cpu = __builtin_ctz(affinity);', expect='KeSetAffinityThread: previous mask out, highest CPU'),
+
+    # ---- M3 unit C: runtime/kernel/imports_time.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC19', milestone="M3", file=K_IMPTIME, test='runtime', fault='KeQuerySystemTime writes the low word first',
+         old='    runtime::Store32(base, ctx.r3.u32, uint32_t(now >> 32));',
+         new='    runtime::Store32(base, ctx.r3.u32, uint32_t(now));', expect='KeQuerySystemTime: a FILETIME after 2026-01-01'),
+    dict(id='KC20', milestone="M3", file=K_IMPTIME, test='runtime', fault='the performance frequency is 50 MHz',
+         old='    ctx.r3.u64 = runtime::kTimebaseHz;  // the time base (mftb) frequency',
+         new='    ctx.r3.u64 = 50000000;', expect='KeQueryPerformanceFrequency: 49,875,000 Hz'),
+
+    # ---- M3 unit C: runtime/kernel/threads.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KC10', milestone="M3", file=K_THREADS, test='runtime', fault='exit status always 0',
+         old='            code = ctx.r3.u32;',
+         new='            code = 0;', expect='its result is the exit status'),
+    dict(id='KC11', milestone="M3", file=K_THREADS, test='runtime', fault='CREATE_SUSPENDED ignored',
+         old='        base[state.kthread + kthread_state::kSuspendCount] = (flags & 1) ? 1 : 0;',
+         new='        base[state.kthread + kthread_state::kSuspendCount] = 0;', expect='a thread created suspended runs only after resume'),
+    dict(id='KC12', milestone="M3", file=K_THREADS, test='runtime', fault='XAPI startup gets the context as start',
+         old='            ctx.r3.u64 = s.start;',
+         new='            ctx.r3.u64 = s.context;', expect='an XAPI thread runs startup(start, context)'),
+
+    # ---- M3: runtime/kernel/imports_xam.cpp (tests/run_runtime_tests.sh) ----
+    dict(id='KD1', milestone="M3", file=K_IMPXAM, test='runtime', fault='XGetAVPack reports VGA (6)',
+         old='    ctx.r3.u64 = 8;',
+         new='    ctx.r3.u64 = 6;', expect='XGetAVPack: 8'),
+
     # ---- M1: patches/xenonrecomp/0035, residual_stops entries validated ----
     dict(id='R35f', milestone="M1", file=CONFIG_CPP, test='analysis', fault='names not checked',
-         old='if (!address || !plain || !residualStops.emplace(*address, name).second)',
-         new='if (!address || !residualStops.emplace(*address, name).second)', expect='test_residual_stop_needs_a_plain_name'),
+         old='if (!address || !plain || !casesOk || !residualStops.emplace(*address, std::move(stop)).second)',
+         new='if (!address || !casesOk || !residualStops.emplace(*address, std::move(stop)).second)', expect='test_residual_stop_needs_a_plain_name'),
     dict(id='R35g', milestone="M1", file=CONFIG_CPP, test='analysis', fault='an entry without an address accepted',
-         old='if (!address || !plain || !residualStops.emplace(*address, name).second)',
-         new='if (!plain || !residualStops.emplace(address.value_or(0), name).second)', expect='test_residual_stop_needs_a_plain_name'),
+         old='if (!address || !plain || !casesOk || !residualStops.emplace(*address, std::move(stop)).second)',
+         new='if (!plain || !casesOk || !residualStops.emplace(address.value_or(0), std::move(stop)).second)', expect='test_residual_stop_needs_a_plain_name'),
 
     # ---- M1: patches/xenonrecomp/0035 (ours: listed residual switch dispatches compile to a named runtime stop) ----
     dict(id='R35a', milestone="M1", file=RECOMP, test='analysis', fault='a listed residual stays fatal',
@@ -629,8 +899,8 @@ MUTANTS = [
          old='        if (!residualStopsReached.count(address))',
          new='        if (false)', expect='test_residual_stop_not_reached_is_fatal'),
     dict(id='R35d', milestone="M1", file=RECOMP, test='analysis', fault='the stop names another register',
-         old='ctx.lr));", base, stop->second, r(switchTable->second.r));',
-         new='ctx.lr));", base, stop->second, "ctx.r0");', expect='test_residual_stop'),
+         old='println("\\tPpcResidualStop(0x{:X}u, \\"{}\\", {}.u32, uint32_t(ctx.lr));", base, name, index);',
+         new='println("\\tPpcResidualStop(0x{:X}u, \\"{}\\", {}.u32, uint32_t(ctx.lr));", base, name, "ctx.r0");', expect='test_residual_stop'),
     dict(id='R35e', milestone="M1", file=RECOMP, test='analysis', fault='the stop falls through into an empty switch',
          old='                switchTable = config.switchTables.end();\n                break;\n            }\n            if (switchTable->second.labels.empty())',
          new='            }\n            if (switchTable->second.labels.empty())', expect='test_residual_stop'),
@@ -733,8 +1003,8 @@ MUTANTS = [
          old='println("\\tswitch ({}.u32) {{", r(switchTable->second.r));',
          new='println("\\tswitch ({}.u64) {{", r(switchTable->second.r));', expect='test_switch_proven'),
     dict(id='S25b', milestone="M1", file=RECOMP, test='analysis', fault='out-of-bound index returns silently (fail-open)',
-         old='println("\\tdefault:");',
-         new='println("\\tdefault: return;");', expect='test_switch_proven'),
+         old='            println("\\tdefault:");\n            println("\\t\\t__builtin_trap();");',
+         new='            println("\\tdefault: return;");\n            println("\\t\\t__builtin_trap();");', expect='test_switch_proven'),
     dict(id='S25c', milestone="M1", file=RECOMP, test='analysis', fault='unproven switch emitted as an empty switch',
          old='if (switchTable->second.labels.empty())',
          new='if (false)', expect='test_switch_without_bound_is_fatal'),

@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 ForzaRecomp contributors
+// Copyright (C) 2026 FM4 Recomp contributors
+//
+// Taken from ForzaRecomp runtime/stops.h (GPL-3.0-or-later, same owner), reviewed and re-tested here.
+// FM4 Recomp changes: Strict (ForzaRecomp's PpcStrictStop, patch 0029) is Residual: our patch 0035's
+// PpcResidualStop for the accepted residual switch dispatches.
+//
+// Strict stops: everything the runtime does not implement ends the run with a report and an exit
+// code the launcher checks (scripts/run_attempt.sh). Nothing is ever faked as success.
+#pragma once
+#include <ppc_config.h>
+#include <ppc_context.h>
+
+enum class StopCode : int
+{
+    Import = 3,         // an import was called (none is implemented in M2)
+    Residual = 4,       // a residual switch dispatch was reached (PpcResidualStop, patch 0035)
+    GuestFault = 5,     // a guest access to unmapped memory (data-import guards included)
+    IndirectCall = 6,   // an indirect call to an address with no translated function
+    Unimplemented = 7,  // a runtime interface the translation needs (M3)
+    EntryReturned = 8,  // the title entry returned to the host
+    Setup = 9,          // the runtime could not start (wrong image, no memory, bad arguments)
+    Trap = 10,          // a translated trap: a proven switch's impossible default, padding reached
+    Deadline = 124,     // no stop within the deadline (a hang)
+};
+
+[[noreturn]] void Stop(StopCode code, const char* format, ...) __attribute__((format(printf, 2, 3)));
+
+// Called by every generated import stub (fm4_imports.cpp).
+[[noreturn]] void PpcImportStop(const char* name, PPCContext& ctx);

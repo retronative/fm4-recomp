@@ -67,7 +67,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mutants import MUTANTS, TESTS  # noqa: E402
 
-SYNC_DIRS = ["survey", "tests", "scripts", "patches", "tools/XenonRecomp"]
+SYNC_DIRS = ["survey", "tests", "scripts", "patches", "runtime", "recomp", "tools/XenonRecomp"]
+SYNC_FILES = ["CMakeLists.txt"]
 LLVM = "/opt/homebrew/opt/llvm/bin"
 XR_TARGETS = ["XenonRecomp", "XenonAnalyse"]
 LEDGER = os.path.join(ROOT, "research", "mutation", "ledger.json")
@@ -115,6 +116,9 @@ class Tree:
             os.makedirs(dst, exist_ok=True)
             subprocess.run(["rsync", "-a", "--delete", "--exclude", "/build/", "--exclude", "__pycache__",
                             src + "/", dst + "/"], check=True)
+        for f in SYNC_FILES:
+            if os.path.isfile(os.path.join(self.root, f)):
+                shutil.copy2(os.path.join(self.root, f), os.path.join(self.scratch, f))
 
     def build(self):
         xr = os.path.join(self.scratch, "tools", "XenonRecomp")
