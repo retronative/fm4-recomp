@@ -22,6 +22,8 @@ bool RegisterImport(const char* name, const char* provenance, void (*function)(P
 // The implementation of an import by name, or null.
 void (*FindImport(const char* name))(PPCContext&, uint8_t*);
 size_t ImplementedImportCount();
+// Networking (offline policy, imports_net.cpp): whether the local stack was started, its version request and parameters.
+bool NetworkStarted(uint32_t& versionRequest, uint8_t (&params)[13]);
 const ImportInfo& ImplementedImport(size_t index);
 
 // The calling guest thread's KTHREAD (its PCR's current thread; imports_object.cpp).

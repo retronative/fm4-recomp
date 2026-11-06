@@ -15,8 +15,14 @@
 #include "indirect.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
+#include "kernel/content.h"
+#include "kernel/audio.h"
+#include "kernel/xma.h"
+#include "kernel/stfs.h"
+#include "kernel/ldi.h"
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
+#include "kernel/cp_trace.h"
 #include "kernel/loader.h"
 #include "kernel/critical_section.h"
 #include "kernel/dispatcher.h"
@@ -30,7 +36,12 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <tuple>
 #include <vector>
+
+// recomp/mmio.h (defined in kernel/xma.cpp)
+uint32_t PpcMmioLoad32(uint8_t* base, uint32_t address);
+void PpcMmioStore32(uint8_t* base, uint32_t address, uint32_t value);
 #include "layout.h"
 #include "stops.h"
 #include <cstdio>
@@ -147,6 +158,8 @@ bool called = false;
 std::atomic<uint32_t> threadSaw{0};
 PPC_FUNC(ThreadBody) { (void)base; threadSaw = ctx.r3.u32; ctx.r3.u64 = 0x77; }               // start(context) -> 0x77
 PPC_FUNC(XapiStartup) { (void)base; threadSaw = ctx.r3.u32 ^ ctx.r4.u32; ctx.r3.u64 = 0x99; } // startup(start, context)
+std::atomic<uint32_t> audioArgument{0};
+PPC_FUNC(AudioCallback) { audioArgument = runtime::Load32(base, ctx.r3.u32); }  // callback(wrapped argument)
 PPC_FUNC(Terminating) { (void)ctx, (void)base; runtime::ExitCurrentGuestThread(0x55); }
 PPC_FUNC(TerminatingThroughImport);
 // A synthetic title module's functions (loader tests): its DllMain records its arguments and returns
@@ -350,6 +363,23 @@ int main(int, char** argv)
     // XexCheckExecutablePrivilege(n): bit n of the executable's system flags (0x00030000 = 0x12345678 here):
     // 0x12345678 >> 10 = 0x48D15 (odd: 1), >> 11 = 0x2468A (even: 0); n >= 32 stops (7).
     SetExecutableModule(m);
+    {
+        // XamGetCurrentTitleId: this header has no execution info: stops (7); one with execution info (optional header
+        // 00040006 -> data at +0x30, title id at +0xC = 4D530910, FM4's) gives 4D530910. XamNuiIdentityGetSessionId: 0.
+        Expect(ExitCodeOf([&] { PPCContext c{}; imp("XamGetCurrentTitleId")(c, base); }) == int(StopCode::Unimplemented),
+               "XamGetCurrentTitleId: no execution info stops (7)");
+        std::vector<uint8_t> withInfo(0x140, 0);
+        auto putInfo = [&](uint32_t at, uint32_t v) { for (int i = 0; i < 4; i++) withInfo[at + i] = uint8_t(v >> (24 - 8 * i)); };
+        withInfo[0] = 'X', withInfo[1] = 'E', withInfo[2] = 'X', withInfo[3] = '2';
+        putInfo(0x10, 0x100), putInfo(0x104, 0x00F50000), putInfo(0x14, 1), putInfo(0x18, 0x00040006), putInfo(0x1C, 0x30), putInfo(0x3C, 0x4D530910);
+        SetExecutableModule(CreateModule(base, withInfo, 0x40000000, 0x40001000));
+        PPCContext title{}, session{};
+        imp("XamGetCurrentTitleId")(title, base);
+        session.r3.u64 = 0x1234;
+        imp("XamNuiIdentityGetSessionId")(session, base);
+        SetExecutableModule(m);
+        Expect(title.r3.u64 == 0x4D530910 && session.r3.u64 == 0, "XamGetCurrentTitleId: the execution info's title id (4D530910); NUI session id 0");
+    }
     PPCContext priv{};
     priv.r3.u32 = 10; imp("XexCheckExecutablePrivilege")(priv, base);
     const uint32_t bit10 = priv.r3.u32;
@@ -363,6 +393,780 @@ int main(int, char** argv)
     PPCContext region{};
     imp("XGetGameRegion")(region, base);
     Expect(region.r3.u64 == 0xFF, "XGetGameRegion: 0x00FF for country 103 (Xenia xam_info.cc:231)");
+    // Offline networking (Xenia xam_net.cc): XNetStartupEx(1, params with size byte 13,
+    // 0x20511C00) succeeds (0) and records the 13 parameter bytes and the version request; the link reports 0 (none);
+    // another caller or a parameter block of another size stops (7).
+    {
+        const uint32_t netParams = ArenaAlloc(base, 16);
+        for (uint32_t i = 0; i < 13; i++) base[netParams + i] = uint8_t(i == 0 ? 13 : 0x40 + i);
+        PPCContext net{};
+        net.r3.u64 = 1, net.r4.u32 = netParams, net.r5.u32 = 0x20511C00;
+        imp("NetDll_XNetStartupEx")(net, base);
+        uint32_t version = 0;
+        uint8_t recorded[13] = {};
+        const bool up = net.r3.u64 == 0 && NetworkStarted(version, recorded) && version == 0x20511C00 && recorded[0] == 13 && recorded[12] == 0x4C;
+        PPCContext link{};
+        link.r3.u64 = 1;
+        imp("NetDll_XNetGetEthernetLinkStatus")(link, base);
+        Expect(up && link.r3.u64 == 0, "offline networking: XNetStartupEx(1, 13-byte params, 0x20511C00) = 0, recorded; the link reports none (0)");
+        Expect(ExitCodeOf([&] { PPCContext c = net; c.r3.u64 = 2; imp("NetDll_XNetStartupEx")(c, base); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { base[netParams] = 12; PPCContext c = net; imp("NetDll_XNetStartupEx")(c, base); }) == int(StopCode::Unimplemented),
+               "offline networking: caller 2, or a parameter block of size 12, stops (7)");
+        const uint32_t wsa = ArenaAlloc(base, 0x200);
+        std::memset(base + wsa, 0xAA, 0x200);
+        PPCContext ws{};
+        ws.r3.u64 = 1, ws.r4.u64 = 0x0202, ws.r5.u32 = wsa, ws.r6.u32 = 0x20511C00;
+        imp("NetDll_WSAStartupEx")(ws, base);
+        Expect(ws.r3.u64 == 0 && be32(wsa) == 0x02020202 && base[wsa + 4] == 0 && base[wsa + 0x105] == 0 && be32(wsa + 0x186) == 0 &&
+                   be32(wsa + 0x18C) == 0xAAAAAAAA &&
+                   ExitCodeOf([&] { PPCContext c = ws; c.r3.u64 = 1, c.r4.u64 = 0x0101; imp("NetDll_WSAStartupEx")(c, base); }) == int(StopCode::Unimplemented),
+               "offline networking: WSAStartupEx(1, 2.2) = 0, WSADATA 2.2/2.2, empty strings, 0 limits, vendor word untouched; 1.1 stops (7)");
+        // FM4 also asks for 2.0 (0x0002, MAKEWORD(2, 0)): wVersion 2.0 (big-endian 00 02), wHighVersion 2.2 (02 02).
+        PPCContext ws20 = ws;
+        ws20.r3.u64 = 1, ws20.r4.u64 = 0x0002;
+        imp("NetDll_WSAStartupEx")(ws20, base);
+        Expect(ws20.r3.u64 == 0 && be32(wsa) == 0x00020202 &&
+                   ExitCodeOf([&] { PPCContext c = ws; c.r3.u64 = 1, c.r4.u64 = 0x0302; imp("NetDll_WSAStartupEx")(c, base); }) == int(StopCode::Unimplemented),
+               "offline networking: WSAStartupEx(1, 2.0): wVersion 2.0, wHighVersion 2.2; 2.3 stops (7)");
+    }
+    {
+        const uint32_t speakers = ArenaAlloc(base, 4);
+        PPCContext sc{};
+        sc.r3.u32 = speakers;
+        imp("XAudioGetSpeakerConfig")(sc, base);
+        Expect(sc.r3.u64 == 0 && be32(speakers) == 0x00010001, "XAudioGetSpeakerConfig: 0x00010001 (Xenia xboxkrnl_audio.cc:22)");
+        // A frame's layout (conversion.h): float (channel, sample) is at byte (channel * 256 + sample) * 4, big-endian;
+        // out[sample * 6 + channel]. 3F800000 = 1.0f, C0000000 = -2.0f, 3EC00000 = 0.375f (IEEE 754, by hand).
+        std::vector<uint8_t> frame(audio::kFrameBytes, 0);
+        const auto put = [&](uint32_t channel, uint32_t sample, uint32_t bits) {
+            for (int i = 0; i < 4; i++) frame[(channel * 256 + sample) * 4 + i] = uint8_t(bits >> (24 - 8 * i));
+        };
+        put(2, 5, 0x3F800000), put(0, 0, 0xC0000000), put(5, 255, 0x3EC00000);
+        std::vector<float> out(audio::kFrameFloats, 9.0f);
+        audio::Interleave(frame.data(), out.data());
+        Expect(audio::kFrameBytes == 6144 && out[5 * 6 + 2] == 1.0f && out[0] == -2.0f && out[255 * 6 + 5] == 0.375f &&
+                   out[5 * 6 + 3] == 0.0f && out[2 * 6 + 5] == 0.0f,
+               "audio frame: channel-major big-endian floats become interleaved host floats (sample * 6 + channel)");
+        const uint32_t block = ArenaAlloc(base, 8);
+        PPCContext reg{};
+        reg.r3.u32 = 0, reg.r4.u32 = speakers;
+        imp("XAudioRegisterRenderDriverClient")(reg, base);
+        PPCContext regZero{};
+        regZero.r3.u32 = block, regZero.r4.u32 = speakers;  // block holds {0, 0}: no callback
+        imp("XAudioRegisterRenderDriverClient")(regZero, base);
+        Expect(reg.r3.u32 == ((1u << 31) | (7u << 16) | 0x57) && regZero.r3.u32 == reg.r3.u32,
+               "XAudioRegisterRenderDriverClient: a null block or callback is X_E_INVALIDARG (xboxkrnl_audio.cc:57-65)");
+        PPCContext vol{};
+        vol.r3.u64 = 1, vol.r4.u32 = block;
+        imp("XAudioGetVoiceCategoryVolume")(vol, base);
+        Expect(vol.r3.u64 == 0 && be32(block) == 0x3F800000, "XAudioGetVoiceCategoryVolume: 1.0f (3F800000), 0 (Xenia xboxkrnl_audio.cc:41-48)");
+        PPCContext ducker{};
+        ducker.r3.u64 = 0;
+        imp("XAudioEnableDucker")(ducker, base);
+        Expect(ducker.r3.u64 == 0, "XAudioEnableDucker: accepted, 0 (no voice chat to duck under; Xenia xboxkrnl_audio.cc:52)");
+        const uint32_t padState = ArenaAlloc(base, 20);
+        std::memset(base + padState, 0xAA, 20);
+        PPCContext pad{};
+        pad.r3.u64 = 0, pad.r4.u64 = 1, pad.r5.u32 = padState;
+        imp("XamInputGetState")(pad, base);
+        Expect(pad.r3.u64 == 0x48F && be32(padState) == 0 && be32(padState + 12) == 0 && be32(padState + 16) == 0xAAAAAAAA,
+               "XamInputGetState: no controller: the 16-byte state zeroed (nothing past it), ERROR_DEVICE_NOT_CONNECTED");
+        PPCContext verify{}, close{};
+        verify.r3.u64 = 5;
+        imp("XamMediaVerificationCreate")(verify, base);
+        imp("XamMediaVerificationClose")(close, base);
+        Expect(verify.r3.u64 == 50 && close.r3.u64 == 0, "XamMediaVerificationCreate: ERROR_NOT_SUPPORTED (no disc verification); Close: 0");
+        PPCContext studio{};
+        studio.r3.u64 = 1;
+        imp("XamXStudioRequest")(studio, base);
+        Expect(studio.r3.u32 == ((1u << 31) | 0x4001), "XamXStudioRequest: no XStudio service: E_NOTIMPL");
+        PPCContext xlfs{};
+        imp("XamXlfsInitializeUploadQueue")(xlfs, base);
+        Expect(xlfs.r3.u32 == ((1u << 31) | 0x4005), "XamXlfsInitializeUploadQueue: offline, no LIVE upload queue: E_FAIL");
+        PPCContext trueColor{};
+        trueColor.r3.u64 = 1;
+        imp("XamNuiGetTrueColorInfo")(trueColor, base);
+        Expect(trueColor.r3.u32 == ((1u << 31) | 0x4001), "XamNuiGetTrueColorInfo: no Kinect camera: E_NOTIMPL (FM4's own missing-export answer)");
+        PPCContext tilt{};
+        tilt.r3.u32 = 0;
+        imp("XamNuiCameraTiltSetCallback")(tilt, base);
+        Expect(tilt.r3.u64 == 0 && ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0x1234; imp("XamNuiCameraTiltSetCallback")(c, base); }) ==
+                                     int(StopCode::Unimplemented),
+               "XamNuiCameraTiltSetCallback: recorded (never fires without a Kinect), 0; a non-function callback stops (7)");
+        const uint32_t dashInfo = ArenaAlloc(base, 16);
+        PPCContext dash{};
+        dash.r3.u32 = dashInfo;
+        imp("XamGetActiveDashAppInfo")(dash, base);
+        Expect(dash.r3.u32 == ((1u << 31) | 0x4005) && be32(dashInfo) == 0 && be32(dashInfo + 8) == 0,
+               "XamGetActiveDashAppInfo: no active dashboard app: E_FAIL, nothing written");
+        PPCContext cam{};
+        cam.r3.u32 = dashInfo;
+        imp("PsCamDeviceRequest")(cam, base);
+        Expect(cam.r3.u32 == ((3u << 30) | 0x9D), "PsCamDeviceRequest: no camera: STATUS_DEVICE_NOT_CONNECTED");
+        PPCContext cacheOpen{};
+        cacheOpen.r3.u32 = dashInfo;
+        imp("XamCacheOpenFile")(cacheOpen, base);
+        Expect(cacheOpen.r3.u64 == 0x48F, "XamCacheOpenFile: no hard disk, no XAM cache: ERROR_DEVICE_NOT_CONNECTED");
+        PPCContext cacheReset{};
+        cacheReset.r3.u64 = 24;
+        imp("XamCacheReset")(cacheReset, base);
+        Expect(cacheReset.r3.u64 == 0x48F, "XamCacheReset: no XAM cache: ERROR_DEVICE_NOT_CONNECTED");
+        const uint32_t nui = ArenaAlloc(base, 28);
+        std::memset(base + nui, 0xAA, 28);
+        PPCContext nuiCall{};
+        nuiCall.r3.u32 = nui;
+        imp("XamNuiGetDeviceStatus")(nuiCall, base);
+        Expect(be32(nui) == 0 && be32(nui + 12) == 0 && be32(nui + 20) == 0 && be32(nui + 24) == 0xAAAAAAAA,
+               "XamNuiGetDeviceStatus: no Kinect: the 24-byte status zeroed (status +12 = 0), nothing past it");
+        // XamContentOpenFile: FM4's "update:\\Database.xmplr" -> ERROR_FILE_NOT_FOUND (no title update); "game:\\x" stops (7).
+        auto cString = [&](const char* text) { const uint32_t at = ArenaAlloc(base, uint32_t(std::strlen(text)) + 1); std::memcpy(base + at, text, std::strlen(text) + 1); return at; };
+        const uint32_t root = cString("stexemplar"), updatePath = cString("update:\\Database.xmplr"), gamePath = cString("cache:\\x");
+        auto openContent = [&](uint32_t path) {
+            PPCContext c{};
+            c.r1.u32 = ArenaAlloc(base, 0x80), c.r3.u32 = 0xFF, c.r4.u32 = root, c.r5.u32 = path, c.r6.u32 = 0x43;
+            imp("XamContentOpenFile")(c, base);
+            return c.r3.u32;
+        };
+        Expect(openContent(updatePath) == 2 && ExitCodeOf([&] { (void)openContent(gamePath); }) == int(StopCode::Unimplemented),
+               "XamContentOpenFile: an update:\\ file is not found (no title update installed); another path stops (7)");
+        // Notification listeners (kernel/imports_notify.cpp; Xenia xam_notify.cc): FM4's call (mask EF, version 9) gives
+        // a listener handle, not signalled, with nothing queued (no startup notifications: policy); XNotifyGetNext
+        // then gives 0 with id and data 0; version 11 stops; a handle that is no listener stops.
+        PPCContext listen{};
+        listen.r3.u64 = 0xEF, listen.r4.u64 = 9;
+        imp("XamNotifyCreateListener")(listen, base);
+        const uint32_t listener = listen.r3.u32;
+        const auto object = LookupHandle(listener);
+        const uint32_t idOut = ArenaAlloc(base, 8);
+        StoreBigEndian32(base, idOut, 0xAAAAAAAA), StoreBigEndian32(base, idOut + 4, 0xBBBBBBBB);
+        PPCContext next{};
+        next.r3.u32 = listener, next.r5.u32 = idOut, next.r6.u32 = idOut + 4;
+        imp("XNotifyGetNext")(next, base);
+        Expect(object && object->type == ObjectType::NotifyListener && be32(object->header + 4) == 0 && next.r3.u64 == 0 &&
+                   be32(idOut) == 0 && be32(idOut + 4) == 0,
+               "XamNotifyCreateListener(EF, 9): an unsignalled listener; XNotifyGetNext: nothing queued (0, id 0, data 0)");
+        Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u64 = 0xEF, c.r4.u64 = 11; imp("XamNotifyCreateListener")(c, base); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { PPCContext c = next; c.r3.u32 = 0xF00D; imp("XNotifyGetNext")(c, base); }) == int(StopCode::Unimplemented),
+               "XamNotifyCreateListener version 11, or XNotifyGetNext on a handle that is no listener, stops (7)");
+        // XamUserReadProfileSettings (Xenia xam_user.cc:159-339). Keys by hand (id 14 bits, 2, size 12, type 4):
+        // 10040001 int32, 40640002 string of 0x64 = 100 bytes, 63E80003 binary of 0x3E8 = 1000 bytes: needed =
+        // 8 + 3 x 40 + 100 + 1000 = 1228. The overlapped pointer is the 9th argument (stack r1 + 0x54).
+        const uint32_t keys = ArenaAlloc(base, 12), sizeAt = ArenaAlloc(base, 4), settings = ArenaAlloc(base, 1228), stackFrame = ArenaAlloc(base, 0x100);
+        StoreBigEndian32(base, keys, 0x10040001), StoreBigEndian32(base, keys + 4, 0x40640002), StoreBigEndian32(base, keys + 8, 0x63E80003);
+        auto profile = [&](uint32_t user, uint32_t count, uint32_t sizePtr, uint32_t size, uint32_t buffer, uint32_t xuids = 0) {
+            StoreBigEndian32(base, sizeAt, size);
+            PPCContext c{};
+            c.r1.u32 = stackFrame, c.r3.u32 = 0xFFFE07D1, c.r4.u32 = user, c.r5.u32 = xuids, c.r7.u32 = count, c.r8.u32 = keys;
+            c.r9.u32 = sizePtr, c.r10.u32 = buffer;
+            imp("XamUserReadProfileSettings")(c, base);
+            return c.r3.u32;
+        };
+        Expect(profile(0xFF, 3, sizeAt, 0, 0) == 0x7A && be32(sizeAt) == 1228 && profile(0xFF, 3, sizeAt, 1227, settings) == 0x7A &&
+                   be32(sizeAt) == 1227 && profile(0xFF, 3, sizeAt, 1228, settings) == 0x525,
+               "XamUserReadProfileSettings: size query 1228 (INSUFFICIENT_BUFFER), a short buffer INSUFFICIENT_BUFFER, then user FF: NO_SUCH_USER");
+        Expect(profile(0xFF, 0, sizeAt, 0, 0) == 0x57 && profile(0xFF, 33, sizeAt, 0, 0) == 0x57 && profile(0xFF, 3, 0, 0, 0) == 0x57 &&
+                   profile(0xFF, 3, sizeAt, 5, 0) == 0x57 &&
+                   ExitCodeOf([&] { (void)profile(0, 3, sizeAt, 1228, settings); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)profile(0xFF, 3, sizeAt, 1228, settings, 1); }) == int(StopCode::Unimplemented),
+               "XamUserReadProfileSettings: 0 or 33 settings, no size pointer, a size without a buffer: INVALID_PARAMETER; user 0 asking for "
+               "settings the profile lacks (10040001 etc.), or an XUID that is not user 0's, stops (7)");
+        {
+            // User 0's profile (profile_settings.cpp; Xenia xam_user.cc:283-320, gamercard policy). Ids by hand:
+            // 10040003 vibration (int32 3), 10040006 gamercard cred (int32: 0, not Xenia's FA), 4064000F picture key
+            // (wstring, size field 0x064 = 100: unset). needed = 8 + 3 x 40 + 100 = 228. Buffer B: header {3, B+8};
+            // record n at B+8+40n: from +0 (1), user index +8 (0) and FFFFFFFF at +C, id +10, type byte +18, value +20.
+            // The unset picture key: from 1, type 4, size and pointer 0.
+            const uint32_t ids3 = ArenaAlloc(base, 12), b = ArenaAlloc(base, 228), ov = ArenaAlloc(base, 0x1C);
+            StoreBigEndian32(base, ids3, 0x10040003), StoreBigEndian32(base, ids3 + 4, 0x10040006), StoreBigEndian32(base, ids3 + 8, 0x4064000F);
+            auto read = [&](uint32_t user, uint32_t size, uint32_t overlapped) {
+                std::memset(base + b, 0xAA, 228);
+                StoreBigEndian32(base, sizeAt, size);
+                StoreBigEndian32(base, stackFrame + 0x54, overlapped);
+                PPCContext c{};
+                c.r1.u32 = stackFrame, c.r3.u32 = 0xFFFE07D1, c.r4.u32 = user, c.r7.u32 = 3, c.r8.u32 = ids3, c.r9.u32 = sizeAt, c.r10.u32 = b;
+                imp("XamUserReadProfileSettings")(c, base);
+                StoreBigEndian32(base, stackFrame + 0x54, 0);
+                return c.r3.u32;
+            };
+            const uint32_t r0 = b + 8, r1 = b + 48, r2 = b + 88;
+            const bool query = read(0, 0, 0) == 0x7A && be32(sizeAt) == 228;
+            const bool records = read(0, 228, 0) == 0 && be32(b) == 3 && be32(b + 4) == b + 8 &&
+                                 be32(r0) == 1 && be32(r0 + 8) == 0 && be32(r0 + 0xC) == 0xFFFFFFFF && be32(r0 + 0x10) == 0x10040003 &&
+                                 base[r0 + 0x18] == 1 && be32(r0 + 0x20) == 3 &&
+                                 be32(r1 + 0x10) == 0x10040006 && base[r1 + 0x18] == 1 && be32(r1 + 0x20) == 0 &&
+                                 be32(r2) == 1 && be32(r2 + 0x10) == 0x4064000F && base[r2 + 0x18] == 4 && be32(r2 + 0x20) == 0 && be32(r2 + 0x24) == 0;
+            Expect(query && records, "XamUserReadProfileSettings user 0: 228 bytes; vibration 3, cred 0 (no invented gamerscore), picture key unset");
+            // XOVERLAPPED (kernel/overlapped.h; Xenia CompleteOverlappedImmediate, kernel_state.cc:793-800): user 0 ->
+            // ERROR_IO_PENDING, result 0, length 0, extended error 0, records written; user 1 -> result 525, length
+            // FFFFFFFF, extended error 525; a completion routine stops (7) before the buffer is touched.
+            std::memset(base + ov, 0, 0x1C);
+            const bool pending0 = read(0, 228, ov) == 0x3E5 && be32(ov) == 0 && be32(ov + 4) == 0 && be32(ov + 0x18) == 0 && be32(b) == 3;
+            std::memset(base + ov, 0, 0x1C);
+            const bool pending1 = read(1, 228, ov) == 0x3E5 && be32(ov) == 0x525 && be32(ov + 4) == 0xFFFFFFFF && be32(ov + 0x18) == 0x525 &&
+                                  be32(b) == 0xAAAAAAAA;
+            StoreBigEndian32(base, ov + 0x10, 0x1000);
+            Expect(pending0 && pending1 && ExitCodeOf([&] { (void)read(0, 228, ov); }) == int(StopCode::Unimplemented),
+                   "XamUserReadProfileSettings with an XOVERLAPPED: completed at once (0 / 525, length 0 / FFFFFFFF), ERROR_IO_PENDING; "
+                   "a completion routine stops (7)");
+            // XamGetOverlappedResult (Xenia xam_msg.cc:113-136): a completed 0 with length 0x24 -> 0, length 0x24 written;
+            // a completed 525 -> 525 (Win32 codes pass XSUCCEEDED, so length FFFFFFFF is written too); pending without an
+            // event -> ERROR_IO_INCOMPLETE (3E4), which passes XSUCCEEDED too (xbox.h:33), so its length (0) is written.
+            const uint32_t lengthOut = ArenaAlloc(base, 4);
+            auto result = [&](uint32_t r, uint32_t length) {
+                std::memset(base + ov, 0, 0x1C);
+                StoreBigEndian32(base, ov, r), StoreBigEndian32(base, ov + 4, length), StoreBigEndian32(base, lengthOut, 0xAAAAAAAA);
+                PPCContext c{};
+                c.r3.u32 = ov, c.r4.u32 = lengthOut, c.r5.u32 = 1;
+                imp("XamGetOverlappedResult")(c, base);
+                return std::make_pair(c.r3.u32, be32(lengthOut));
+            };
+            Expect(result(0, 0x24) == std::make_pair(0u, 0x24u) && result(0x525, 0xFFFFFFFF) == std::make_pair(0x525u, 0xFFFFFFFFu) &&
+                       result(0x3E5, 0) == std::make_pair(0x3E4u, 0u),
+                   "XamGetOverlappedResult: completed results and lengths returned; pending without an event: ERROR_IO_INCOMPLETE");
+        }
+        PPCContext voice{};
+        voice.r3.u64 = 0x1234;
+        imp("XamVoiceIsActiveProcess")(voice, base);
+        Expect(voice.r3.u64 == 0, "XamVoiceIsActiveProcess: 0, no voice session (Xenia xam_voice.cc:20)");
+        PPCContext mic{};
+        mic.r3.u64 = 0, mic.r4.u64 = 1, mic.r5.u64 = 0x1234;
+        imp("XamVoiceSetMicArrayIdleUsers")(mic, base);
+        Expect(mic.r3.u64 == 0, "XamVoiceSetMicArrayIdleUsers: no Kinect, nothing to set: 0");
+        // XamUserGetDeviceContext (Xenia xam_input.cc:221): user 0 is signed in (compatibility policy): 0, context 0; user 1
+        // is not: 8007048F, context 0; index FF: 0, context FF.
+        const uint32_t deviceOut = ArenaAlloc(base, 4);
+        auto device = [&](uint32_t index) {
+            StoreBigEndian32(base, deviceOut, 0xAAAAAAAA);
+            PPCContext c{};
+            c.r3.u32 = index, c.r4.u32 = 1, c.r5.u32 = deviceOut;
+            imp("XamUserGetDeviceContext")(c, base);
+            return std::make_pair(c.r3.u32, be32(deviceOut));
+        };
+        Expect(device(0) == std::make_pair(0u, 0u) && device(1) == std::make_pair((1u << 31) | (7u << 16) | 0x48Fu, 0u) && device(0xFF) == std::make_pair(0u, 0xFFu),
+               "XamUserGetDeviceContext: user 0 (signed in) 0; user 1 DEVICE_NOT_CONNECTED, context 0; FF itself");
+        // XamUserGetName (Xenia xam_user.cc:111): FM4's FE: E_INVALIDARG, nothing written; user 0: "User\0", 0; with
+        // length 3 truncated to "Us\0"; user 1: E_NO_SUCH_USER (80070525).
+        const uint32_t nameOut = ArenaAlloc(base, 16);
+        auto name = [&](uint32_t index, uint32_t length) {
+            std::memset(base + nameOut, 0xAA, 16);
+            PPCContext c{};
+            c.r3.u32 = index, c.r4.u32 = nameOut, c.r5.u32 = length;
+            imp("XamUserGetName")(c, base);
+            return c.r3.u32;
+        };
+        const bool invalid = name(0xFE, 16) == ((1u << 31) | (7u << 16) | 0x57) && base[nameOut] == 0xAA;
+        const bool user0 = name(0, 16) == 0 && std::memcmp(base + nameOut, "User", 5) == 0 && base[nameOut + 5] == 0xAA;
+        const bool truncated = name(0, 3) == 0 && std::memcmp(base + nameOut, "Us", 3) == 0 && base[nameOut + 3] == 0xAA;
+        Expect(invalid && user0 && truncated && name(1, 16) == ((1u << 31) | (7u << 16) | 0x525),
+               "XamUserGetName: FE E_INVALIDARG; user 0 \"User\" (truncated to the length); user 1 E_NO_SUCH_USER");
+        // XamUserGetXUID (Xenia xam_user.cc:29): FM4's (FE, 7): E_INVALIDARG, XUID 0; (0, 7) and (0, 1): B13EBABEBABEBABE;
+        // (0, 2): the offline profile has no online XUID: E_NO_SUCH_USER, 0; (1, 7): E_NO_SUCH_USER, 0.
+        const uint32_t xuidOut = ArenaAlloc(base, 8);
+        auto xuid = [&](uint32_t index, uint32_t mask) {
+            StoreBigEndian32(base, xuidOut, 0xAAAAAAAA), StoreBigEndian32(base, xuidOut + 4, 0xAAAAAAAA);
+            PPCContext c{};
+            c.r3.u32 = index, c.r4.u32 = mask, c.r5.u32 = xuidOut;
+            imp("XamUserGetXUID")(c, base);
+            return std::make_pair(c.r3.u32, uint64_t(be32(xuidOut)) << 32 | be32(xuidOut + 4));
+        };
+        const uint32_t invalidArg = (1u << 31) | (7u << 16) | 0x57, noSuchUser = (1u << 31) | (7u << 16) | 0x525;
+        Expect(xuid(0xFE, 7) == std::make_pair(invalidArg, 0ull) && xuid(0, 7) == std::make_pair(0u, 0xB13EBABEBABEBABEull) &&
+                   xuid(0, 1) == std::make_pair(0u, 0xB13EBABEBABEBABEull) && xuid(0, 2) == std::make_pair(noSuchUser, 0ull) &&
+                   xuid(1, 7) == std::make_pair(noSuchUser, 0ull),
+               "XamUserGetXUID: FE E_INVALIDARG; user 0 (offline profile) its XUID for masks 7 and 1, none for online-only 2; user 1 none");
+        // User queries (kernel/imports_user.cpp; Xenia xam_user.cc). Sign-in state: user 0 1, user 1 0, FF 0. Sign-in info
+        // (40 bytes): user 0 flags 0: XUID B13EBABEBABEBABE at +0, state 1 at +C, "User" at +18; flags 1 (online XUID only):
+        // XUID 0 (offline profile); user 1: NO_SUCH_USER, record zeroed; no record: E_INVALIDARG. Privilege (any) of user 0:
+        // denied (0), ERROR_SUCCESS; index 5: 57; user 1: 525. Index from user 0's XUID: 0; tier 0; country 103; friends:
+        // none, 0 for user 0, 525 for user 1; another XUID stops (7).
+        auto user = [&](const char* name, uint64_t r3, uint32_t r4 = 0, uint32_t r5 = 0, uint32_t r6 = 0) {
+            PPCContext c{};
+            c.r3.u64 = r3, c.r4.u32 = r4, c.r5.u32 = r5, c.r6.u32 = r6;
+            imp(name)(c, base);
+            return c.r3.u32;
+        };
+        const bool states = user("XamUserGetSigninState", 0) == 1 && user("XamUserGetSigninState", 1) == 0 && user("XamUserGetSigninState", 0xFF) == 0;
+        const uint32_t info = ArenaAlloc(base, 40);
+        std::memset(base + info, 0xAA, 40);
+        const bool info0 = user("XamUserGetSigninInfo", 0, 0, info) == 0 && be32(info) == 0xB13EBABE && be32(info + 4) == 0xBABEBABE &&
+                           be32(info + 8) == 0 && be32(info + 0xC) == 1 && std::memcmp(base + info + 0x18, "User", 5) == 0 && be32(info + 0x24) == 0;
+        const bool infoOnline = user("XamUserGetSigninInfo", 0, 1, info) == 0 && be32(info) == 0 && be32(info + 4) == 0 && be32(info + 0xC) == 1;
+        std::memset(base + info, 0xAA, 40);
+        const bool info1 = user("XamUserGetSigninInfo", 1, 0, info) == noSuchUser && be32(info) == 0 && be32(info + 0x24) == 0 &&
+                           user("XamUserGetSigninInfo", 0, 0, 0) == invalidArg;
+        Expect(states && info0 && infoOnline && info1,
+               "XamUserGetSigninState/Info: user 0 signed in locally (1), XUID unless online-only asked, \"User\"; user 1 NO_SUCH_USER, zeroed");
+        const uint32_t result = ArenaAlloc(base, 4);
+        StoreBigEndian32(base, result, 0xAAAAAAAA);
+        const bool privilege = user("XamUserCheckPrivilege", 0, 0xFC, result) == 0 && be32(result) == 0 &&
+                               user("XamUserCheckPrivilege", 5, 0xFC, result) == 0x57 && user("XamUserCheckPrivilege", 1, 0xFC, result) == 0x525;
+        StoreBigEndian32(base, result, 0xAAAAAAAA);
+        const bool index = user("XamUserGetIndexFromXUID", 0xB13EBABEBABEBABEull, 0, result) == 0 && be32(result) == 0;
+        StoreBigEndian32(base, result, 0xAAAAAAAA);
+        const bool friends = user("XamUserAreUsersFriends", 0, 0, 0, result) == 0 && be32(result) == 0 &&
+                             user("XamUserAreUsersFriends", 1, 0, 0, result) == 0x525;
+        Expect(privilege && index && friends && user("XamUserGetMembershipTierFromXUID", 0xB13EBABEBABEBABEull) == 0 &&
+                   user("XamUserGetOnlineCountryFromXUID", 0xB13EBABEBABEBABEull) == 103 &&
+                   ExitCodeOf([&] { (void)user("XamUserGetMembershipTierFromXUID", 0x0009000000000001ull); }) == int(StopCode::Unimplemented),
+               "user 0: privileges denied (offline), index 0 from its XUID, tier none, country 103 (US), no friends; another XUID stops (7)");
+        // Profile enumeration (Xenia 838850f xam_enum.cc:166-203): FM4's create (device 0): a handle, 0; the first
+        // XamProfileEnumerate writes one 0x188-byte record: XUID B13EBABEBABEBABE, account gamertag "User" UTF-16BE at
+        // 8 + 8, no online XUID (8 + 0x28), cached flags 103 << 8 | 1 << 25 = 02006700 (8 + 0x30), device 1 at 0x184; the
+        // second: ERROR_NO_MORE_FILES (0x12), nothing written; an XOVERLAPPED stops (7).
+        const uint32_t profHandle = ArenaAlloc(base, 4), profBuf = ArenaAlloc(base, 0x190);
+        PPCContext profCreate{};
+        profCreate.r3.u32 = 0, profCreate.r4.u32 = profHandle;
+        imp("XamProfileCreateEnumerator")(profCreate, base);
+        auto profNext = [&](uint32_t overlapped = 0) {
+            std::memset(base + profBuf, 0xAA, 0x190);
+            PPCContext c{};
+            c.r3.u32 = be32(profHandle), c.r5.u32 = profBuf, c.r6.u32 = overlapped;
+            imp("XamProfileEnumerate")(c, base);
+            return c.r3.u32;
+        };
+        const bool firstProfile = profCreate.r3.u64 == 0 && profNext() == 0 && be32(profBuf) == 0xB13EBABE && be32(profBuf + 4) == 0xBABEBABE &&
+                                  be32(profBuf + 16) == 0x00550073 && be32(profBuf + 20) == 0x00650072 && be32(profBuf + 24) == 0 &&
+                                  be32(profBuf + 8 + 0x28) == 0 && be32(profBuf + 8 + 0x30) == 0x02006700 && be32(profBuf + 0x184) == 1 &&
+                                  be32(profBuf + 0x188) == 0xAAAAAAAA;
+        Expect(firstProfile && profNext() == 0x12 && be32(profBuf) == 0xAAAAAAAA &&
+                   ExitCodeOf([&] { (void)profNext(profBuf); }) == int(StopCode::Unimplemented),
+               "XamProfileEnumerate: the local profile once (XUID, \"User\", offline, US/English, device 1), then NO_MORE_FILES");
+        Expect(user("XamReadBiometricData", 0xB13EBABEBABEBABEull, profBuf) == 0x490, "XamReadBiometricData: none for the local profile: ERROR_NOT_FOUND");
+    }
+    // ---- XMA pass (kernel/xma_pass.h): taken with the unit from ForzaRecomp tests/runtime/test_runtime.cpp
+    // (lines 1232-1580; expected values worked out by hand there; the packet-header vector re-derived here), re-run here.
+    // FM4 Recomp changes: none.
+    {
+        // XMA context and packet header fields (apu/xma.h), values built by hand from the layout:
+        // word 0 = 5 | 3 << 12 | 1 << 20 | 8 << 22 | 17 << 27; word 1 = 4 << 20 | 2 << 27 | 1 << 29 |
+        // 1u << 31; word 2 = 0x2ABCDEF | 0x3F << 26; word 9 = 1 << 30; packet bytes 14 91 A3 07 hold
+        // frame count 5, first frame bit 0x1234 (15 bits across bytes 0-2), metadata 3, skip 7.
+        {
+            const uint32_t w[16] = {5u | 3u << 12 | 1u << 20 | 8u << 22 | 17u << 27, 4u << 20 | 2u << 27 | 1u << 29 | 1u << 31,
+                                    0x2ABCDEFu | 0x3Fu << 26, 0, 0, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u, 1u << 30};
+            const apu::XmaContext c = apu::DecodeContext(w);
+            Expect(c.inputBuffer0PacketCount == 5 && c.loopCount == 3 && c.inputBuffer0Valid == 1 && c.inputBuffer1Valid == 0 &&
+                       c.outputBufferBlockCount == 8 && c.outputBufferWriteOffset == 17 && c.subframeDecodeCount == 4 &&
+                       apu::SampleRateHz(c.sampleRate) == 44100 && c.isStereo == 1 && c.outputBufferValid == 1 &&
+                       c.inputBufferReadOffset == 0x2ABCDEF && c.unknown2 == 0x3F && c.inputBuffer0 == 0x11111111u &&
+                       c.outputBuffer == 0x33333333u && c.workBuffer == 0x44444444u && c.stopWhenDone == 1 && c.interruptWhenDone == 0,
+                   "XMA context fields (Xenia's XMA_CONTEXT_DATA layout) from hand-built words");
+            const uint8_t packet[4] = {0x14, 0x91, 0xA3, 0x07};
+            const apu::XmaPacketHeader h = apu::DecodePacketHeader(packet);
+            Expect(h.frameCount == 5 && h.frameOffsetBits == 0x1234 && h.metadata == 3 && h.skipCount == 7,
+                   "XMA packet header: frame count 5, first frame at bit 0x1234, metadata 3, skip 7");
+            const uint8_t shifted[4] = {0x17, 0x91, 0xA3, 0x07};  // negative control: bits 1-0 of byte 0 are offset bits 14-13
+            Expect(apu::DecodePacketHeader(shifted).frameOffsetBits == 0x7234 && apu::DecodePacketHeader(shifted).frameCount == 5,
+                   "negative control: byte 0's two low bits belong to the frame offset, not the frame count");
+        }
+        {
+            // XMA decoding pass (apu/xma.h) with a fake decoder whose sample value encodes the
+            // frame it was given (its length and first payload bits), so wrong framing shows.
+            using namespace apu;
+            struct Fake : XmaFrameDecoder
+            {
+                std::vector<std::vector<uint8_t>>* seen; uint32_t* seenBits; int silentFirst; bool failing = false;
+                bool Decode(const uint8_t* bits, uint32_t count, std::vector<float> (&ch)[2], uint32_t& samples, std::string& error) override
+                {
+                    if (failing) { error = "fake error"; return false; }
+                    seen->emplace_back(bits, bits + (count + 7) / 8);
+                    seenBits[seen->size() - 1] = count;
+                    if (silentFirst-- > 0) { samples = 0; return true; }
+                    ch[0].assign(kXmaSamplesPerFrame, float(count) / 32767.0f);  // every sample: the frame's bit count
+                    samples = kXmaSamplesPerFrame;
+                    return true;
+                }
+            };
+            std::vector<std::vector<uint8_t>> seen;
+            uint32_t seenBits[64] = {};
+            int silentFirst = 1;
+            bool failing = false;
+            XmaDecoderFactory factory = [&](uint32_t rate, uint32_t channels, std::string&) -> std::unique_ptr<XmaFrameDecoder> {
+                if (rate != 44100 || channels != 1) return nullptr;
+                auto f = std::make_unique<Fake>(); f->seen = &seen; f->seenBits = seenBits; f->silentFirst = silentFirst; f->failing = failing; return f;
+            };
+            // Guest memory: physical 0x10000 input 0, 0x20000 input 1, 0x30000 output.
+            std::vector<uint8_t> in0(2 * kXmaPacketBytes, 0xFF), in1(kXmaPacketBytes, 0xFF), out(16 * kXmaBlockBytes, 0xEE);
+            XmaMemory memory = [&](uint32_t physical, uint32_t bytes) -> uint8_t* {
+                if (physical == 0x10000 && bytes <= in0.size()) return in0.data();
+                if (physical == 0x20000 && bytes <= in1.size()) return in1.data();
+                if (physical == 0x30000 && bytes <= out.size()) return out.data();
+                return nullptr;
+            };
+            auto putBits = [](std::vector<uint8_t>& d, uint32_t pos, uint32_t value, uint32_t count) {
+                for (uint32_t i = 0; i < count; i++) {
+                    const uint32_t b = value >> (count - 1 - i) & 1, at = pos + i; const uint8_t m = uint8_t(0x80 >> (at & 7));
+                    d[at >> 3] = uint8_t(b ? d[at >> 3] | m : d[at >> 3] & ~m);
+                }
+            };
+            // A frame of `length` bits at `pos`: its 15-bit length, then a 16-bit tag, then zeros.
+            auto frame = [&](std::vector<uint8_t>& d, uint32_t pos, uint32_t length, uint32_t tag) {
+                putBits(d, pos, length, 15); putBits(d, pos + 15, tag, 16);
+                for (uint32_t i = 31; i < length; i++) putBits(d, pos + i, 0, 1);
+            };
+            auto header = [&](std::vector<uint8_t>& d, uint32_t packet, uint32_t frames, uint32_t previousBits) {
+                const uint32_t at = packet * kXmaPacketBytes;
+                d[at] = uint8_t(frames << 2 | previousBits >> 13); d[at + 1] = uint8_t(previousBits >> 5); d[at + 2] = uint8_t((previousBits & 31) << 3); d[at + 3] = 0;
+            };
+            auto words = [&](uint32_t packets0, bool valid0, uint32_t packets1, bool valid1, uint32_t blocks, uint32_t readBlock, uint32_t writeBlock) {
+                std::array<uint32_t, 16> w{};
+                w[0] = packets0 | uint32_t(valid0) << 20 | uint32_t(valid1) << 21 | blocks << 22 | writeBlock << 27;
+                w[1] = packets1 | 4u << 20 | 2u << 27 | 1u << 31;  // 44.1 kHz mono, output valid
+                w[2] = 32; w[5] = 0x10000; w[6] = 0x20000; w[7] = 0x30000; w[9] = readBlock;
+                return w;
+            };
+            auto run = [&](std::array<uint32_t, 16>& w, XmaContextState& st) {
+                uint32_t raw[16]; std::copy(w.begin(), w.end(), raw);
+                XmaPassResult r = XmaPass(raw, st, memory, factory);
+                std::copy(raw, raw + 16, w.begin());
+                return r;
+            };
+            // 1. FM4's case: one packet, frames of 100, 200 and 300 bits, an 8-block ring (two mono
+            //    frames). The decoder's first frame yields nothing: three frames fill the ring.
+            header(in0, 0, 3, 0);
+            frame(in0, 32, 100, 0xA001); frame(in0, 132, 200, 0xA002); frame(in0, 332, 300, 0xA003);
+            {
+                auto w = words(1, true, 0, false, 8, 0, 0);
+                XmaContextState st;
+                const XmaPassResult r = run(w, st);
+                const XmaContext c = DecodeContext(reinterpret_cast<const uint32_t(&)[16]>(*w.data()));
+                Expect(r.ok && r.frames == 3 && r.framesWritten == 2 && seen.size() == 3 && seenBits[0] == 100 && seenBits[1] == 200 &&
+                           seenBits[2] == 300 && seen[1][0] == 0x01 && seen[1][1] == 0x91 && c.inputBufferReadOffset == 632 &&
+                           c.outputBufferWriteOffset == 0 && c.outputBufferValid == 0 && c.inputBuffer0Valid == 1,
+                       "XMA pass: frames cut at their 15-bit lengths (100, 200, 300 bits); the silent first frame writes nothing; two frames "
+                       "fill the 8-block ring, which becomes invalid (full); read offset 32 + 600");
+                // Samples: 200/32767 -> 200 (0x00C8) then 300 (0x012C), big-endian, 512 each.
+                Expect(out[0] == 0x00 && out[1] == 0xC8 && out[1022] == 0x00 && out[1023] == 0xC8 && out[1024] == 0x01 && out[1025] == 0x2C &&
+                           out[2047] == 0x2C && out[2048] == 0xEE,
+                       "the ring holds exactly what the decoder returned, big-endian, nothing past the two frames");
+                // 2. A half-drained ring (read block 4, write 0): one frame of space; the next frame
+                //    (the padding first) ends the packet, the buffer is used up and swapped.
+                w[9] = 4; w[1] |= 1u << 31;
+                const XmaPassResult r2 = run(w, st);
+                const XmaContext c2 = DecodeContext(reinterpret_cast<const uint32_t(&)[16]>(*w.data()));
+                Expect(r2.ok && r2.frames == 0 && c2.inputBuffer0Valid == 0 && c2.currentBuffer == 1 && c2.inputBufferReadOffset == 32 &&
+                           c2.outputBufferValid == 1 && c2.outputBufferWriteOffset == 0,
+                       "after the packet's last frame: padding, the buffer is used up: swapped (valid 0, current 1, offset 32); input 1 invalid: the pass ends");
+            }
+            // 3. A frame split across the two buffers: input 0's second frame starts 48 bits before
+            //    the end; input 1's packet says 48... bits belong to it, then one more frame.
+            in0.assign(in0.size(), 0xFF); in1.assign(in1.size(), 0xFF); std::fill(out.begin(), out.end(), 0xEE); seen.clear(); silentFirst = 0;
+            header(in0, 0, 2, 0);
+            frame(in0, 32, kXmaPacketBits - 32 - 100, 0xB001);
+            const uint32_t splitAt = kXmaPacketBits - 100, splitLength = 400;  // 100 bits here, 300 in input 1
+            frame(in0, splitAt, 100, 0xB002);  // length field and tag; the length is patched below
+            putBits(in0, splitAt, splitLength, 15);
+            header(in1, 0, 1, 300);
+            for (uint32_t i = 0; i < 300; i++) putBits(in1, 32 + i, (i % 3) == 0, 1);
+            frame(in1, 332, 120, 0xB003);
+            {
+                auto w = words(1, true, 1, true, 12, 0, 0);  // a ring of exactly 3 frames: the pass ends after input 1's frame
+                XmaContextState st;
+                const XmaPassResult r = run(w, st);
+                const XmaContext c = DecodeContext(reinterpret_cast<const uint32_t(&)[16]>(*w.data()));
+                bool joined = seen.size() >= 2 && seenBits[1] == splitLength && ReadBits(seen[1].data(), 0, 15) == splitLength &&
+                              ReadBits(seen[1].data(), 15, 16) == 0xB002;
+                for (uint32_t i = 0; joined && i < 300; i++)
+                    joined = ReadBits(seen[1].data(), 100 + i, 1) == uint32_t((i % 3) == 0);
+                Expect(r.ok && r.frames == 3 && joined && seenBits[2] == 120 && c.currentBuffer == 1 && c.inputBuffer0Valid == 0 &&
+                           c.inputBuffer1Valid == 1 && c.inputBufferReadOffset == 452 && c.outputBufferWriteOffset == 0 && c.outputBufferValid == 0,
+                       "a frame split across the buffers: 100 bits from input 0 and the 300 input 1's header names, joined bit for bit; then "
+                       "input 1's own frame (read offset 32 + 300 + 120); 3 frames fill the 12-block ring");
+                // The next pass, with the ring drained: input 1 ends in padding, is used up and swapped back.
+                w[1] |= 1u << 31;
+                const XmaPassResult r2 = run(w, st);
+                const XmaContext c2 = DecodeContext(reinterpret_cast<const uint32_t(&)[16]>(*w.data()));
+                Expect(r2.ok && r2.frames == 0 && c2.inputBuffer1Valid == 0 && c2.currentBuffer == 0 && c2.inputBufferReadOffset == 32,
+                       "input 1 used up: swapped (valid 0, current 0, offset 32); input 0 already invalid: the pass ends");
+            }
+            // 4. Refusals: an inconsistent header, a decoder error, no decoder, stereo, a part frame.
+            {
+                header(in1, 0, 1, 299);
+                auto w = words(1, true, 1, true, 16, 0, 0);
+                XmaContextState st;
+                const XmaPassResult r = run(w, st);
+                Expect(!r.ok && r.error.find("previous-frame bits (299)") != std::string::npos,
+                       "negative control: input 1's header disagreeing with the split frame (299 vs 300 bits) fails the pass");
+                header(in1, 0, 1, 300);
+            }
+            {
+                failing = true;
+                auto w = words(1, true, 0, false, 16, 0, 0);
+                XmaContextState st;
+                Expect(!run(w, st).ok, "a decoder error fails the pass (the caller stops; nothing is written)");
+                failing = false;
+                XmaContextState none;
+                uint32_t raw[16]; std::copy(w.begin(), w.end(), raw);
+                Expect(!XmaPass(raw, none, memory, nullptr).ok, "no decoder built in: the pass fails");
+                auto looped = words(1, true, 0, false, 16, 0, 0); looped[0] |= 2u << 12;
+                XmaContextState st2;
+                Expect(!run(looped, st2).ok, "loops are not implemented: the pass fails");
+            }
+            {
+                // 6. Packets of another stream between ours (skip count): input 0 has 3 packets;
+                //    packet 0 says skip 1, so our next packet is 2, not 1 (packet 1 is all 0xFF but
+                //    its header would be read as 62 frames if visited).
+                in0.assign(3 * kXmaPacketBytes, 0xFF);
+                header(in0, 0, 1, 0); in0[3] = 1;               // skip 1
+                frame(in0, 32, 100, 0xC001);
+                header(in0, 2, 1, 0);
+                frame(in0, 2 * kXmaPacketBits + 32, 120, 0xC002);
+                seen.clear(); silentFirst = 0;
+                auto w = words(3, true, 0, false, 16, 0, 0);
+                XmaContextState st;
+                const XmaPassResult r = run(w, st);
+                Expect(r.ok && r.frames == 2 && seenBits[0] == 100 && seenBits[1] == 120 && ReadBits(seen[1].data(), 15, 16) == 0xC002,
+                       "skip count: after packet 0 (skip 1) the stream continues in packet 2, not packet 1");
+                // 7. A packet that begins with bits of a frame never started fails the pass.
+                in0.assign(2 * kXmaPacketBytes, 0xFF);
+                header(in0, 0, 1, 0); frame(in0, 32, 100, 0xC003);
+                header(in0, 1, 1, 50);
+                auto w2 = words(2, true, 0, false, 16, 0, 0);
+                XmaContextState st2;
+                const XmaPassResult r2 = run(w2, st2);
+                Expect(!r2.ok && r2.error.find("never started") != std::string::npos,
+                       "a packet beginning with 50 bits of a frame this stream never started fails the pass");
+                // 8. A decoder returning part of a frame fails the pass.
+                struct Partial : XmaFrameDecoder
+                {
+                    bool Decode(const uint8_t*, uint32_t, std::vector<float> (&ch)[2], uint32_t& samples, std::string&) override
+                    {
+                        ch[0].assign(300, 0.0f); samples = 300; return true;
+                    }
+                };
+                XmaContextState st3;
+                st3.decoder = std::make_unique<Partial>(); st3.decoderRate = 44100; st3.decoderChannels = 1;
+                auto w3 = words(2, true, 0, false, 16, 0, 0);
+                uint32_t raw[16]; std::copy(w3.begin(), w3.end(), raw);
+                const XmaPassResult r3 = XmaPass(raw, st3, memory, factory);
+                Expect(!r3.ok && r3.error.find("300 samples") != std::string::npos, "a decoder returning 300 samples (not a whole frame) fails the pass");
+                // 9. A pass that writes nothing leaves an empty ring valid (equal offsets mean empty).
+                in0.assign(2 * kXmaPacketBytes, 0xFF);
+                header(in0, 0, 1, 0); frame(in0, 32, 100, 0xC004);
+                seen.clear(); silentFirst = 1;
+                auto w4 = words(1, true, 0, false, 16, 0, 0);
+                XmaContextState st4;
+                const XmaPassResult r4 = run(w4, st4);
+                const XmaContext c4 = DecodeContext(reinterpret_cast<const uint32_t(&)[16]>(*w4.data()));
+                Expect(r4.ok && r4.frames == 1 && r4.framesWritten == 0 && c4.outputBufferValid == 1 && c4.outputBufferWriteOffset == 0,
+                       "a pass whose only frame yields no samples: the empty ring stays valid");
+                // 10. Interrupt-when-done alone also fails the pass.
+                auto w5 = words(1, true, 0, false, 16, 0, 0); w5[9] |= 1u << 31;
+                XmaContextState st5;
+                Expect(!run(w5, st5).ok, "interrupt-when-done alone fails the pass (not implemented)");
+                // 11. A frame ending 4 bits past its packet is split: the 4 bits come from the next buffer.
+                in0.assign(2 * kXmaPacketBytes, 0xFF); in1.assign(kXmaPacketBytes, 0xFF);
+                header(in0, 0, 2, 0); frame(in0, 32, 1000, 0xC005);
+                const uint32_t second = 1032, secondLength = kXmaPacketBits - second + 4;
+                frame(in0, second, kXmaPacketBits - second, 0xC006); putBits(in0, second, secondLength, 15);
+                header(in1, 0, 0, 4); putBits(in1, 32, 0x5, 4);  // the 4 bits: 0101
+                seen.clear(); silentFirst = 0;
+                auto w6 = words(1, true, 1, true, 8, 0, 0);
+                XmaContextState st6;
+                const XmaPassResult r6 = run(w6, st6);
+                Expect(r6.ok && r6.frames == 2 && seenBits[1] == secondLength && ReadBits(seen[1].data(), secondLength - 4, 4) == 0x5,
+                       "a frame ending 4 bits past its packet: split, its last 4 bits (0101) taken from input 1");
+            }
+            {
+                // 13. Review findings: a new buffer that begins with bits of a frame never started; a
+                //     skip past the buffer's end; subframe skip and loop-subframe fields; a NaN sample;
+                //     a short tail of padding or of a length field; a split frame not at a packet start.
+                in0.assign(2 * kXmaPacketBytes, 0xFF); in1.assign(kXmaPacketBytes, 0xFF);
+                header(in0, 0, 1, 0); frame(in0, 32, 100, 0xE001);
+                header(in1, 0, 1, 50);
+                silentFirst = 0;
+                auto w = words(1, true, 1, true, 16, 0, 0);
+                XmaContextState st;
+                const XmaPassResult r = run(w, st);
+                Expect(!r.ok && r.error.find("50 bits of a frame that was never started") != std::string::npos,
+                       "after a swap, input 1's packet beginning with 50 bits of an unseen frame fails the pass");
+                header(in1, 0, 1, 0);
+                in0[3] = 3;  // skip 3 packets past a 1-packet buffer
+                auto w2 = words(1, true, 1, true, 16, 0, 0);
+                XmaContextState st2;
+                const XmaPassResult r2 = run(w2, st2);
+                Expect(!r2.ok && r2.error.find("skip count past the end") != std::string::npos,
+                       "a skip count running past the buffer's end fails the pass (not decoded from the other buffer)");
+                in0[3] = 0;
+                auto w3 = words(1, true, 0, false, 16, 0, 0); w3[1] |= 1u << 24;  // subframe skip 1
+                auto w4 = words(1, true, 0, false, 16, 0, 0); w4[1] |= 1u << 14;  // loop subframe end 1
+                XmaContextState st3, st4;
+                Expect(!run(w3, st3).ok && !run(w4, st4).ok, "a subframe skip count or a loop-subframe field fails the pass");
+                struct NotANumber : XmaFrameDecoder
+                {
+                    bool Decode(const uint8_t*, uint32_t, std::vector<float> (&ch)[2], uint32_t& samples, std::string&) override
+                    {
+                        ch[0].assign(kXmaSamplesPerFrame, 0.0f); ch[0][7] = std::nanf(""); samples = kXmaSamplesPerFrame; return true;
+                    }
+                };
+                XmaContextState st5;
+                st5.decoder = std::make_unique<NotANumber>(); st5.decoderRate = 44100; st5.decoderChannels = 1;
+                auto w5 = words(1, true, 0, false, 16, 0, 0);
+                uint32_t raw5[16]; std::copy(w5.begin(), w5.end(), raw5);
+                const XmaPassResult r5 = XmaPass(raw5, st5, memory, factory);
+                Expect(!r5.ok && r5.error.find("NaN") != std::string::npos, "a NaN sample fails the pass");
+                // A frame ending 10 bits before the packet's end: 10 one bits are padding (next
+                // packet); 10 bits that are not all ones would be a frame split inside its length.
+                in0.assign(2 * kXmaPacketBytes, 0xFF);
+                header(in0, 0, 1, 0); frame(in0, 32, kXmaPacketBits - 32 - 10, 0xE002);
+                header(in0, 1, 1, 0); frame(in0, kXmaPacketBits + 32, 100, 0xE003);
+                seen.clear();
+                auto w6 = words(2, true, 0, false, 16, 0, 0);
+                XmaContextState st6;
+                const XmaPassResult r6 = run(w6, st6);
+                Expect(r6.ok && r6.frames == 2 && seenBits[1] == 100, "10 bits of one-padding at a packet's end: the next packet's frame follows");
+                // A frame split inside its length field: 200 bits, of which the last 10 bits of
+                // packet 0 hold the length's first 10 bits (200 >> 5 = 6) and packet 1 (header:
+                // 190 previous-frame bits) the length's last 5 (200 & 31 = 8) and the rest; then
+                // packet 1's own 100-bit frame.
+                putBits(in0, kXmaPacketBits - 10, 200 >> 5, 10);
+                header(in0, 1, 1, 190);
+                putBits(in0, kXmaPacketBits + 32, 200 & 31, 5);
+                for (uint32_t i = 5; i < 190; i++) putBits(in0, kXmaPacketBits + 32 + i, (i % 5) == 0, 1);
+                frame(in0, kXmaPacketBits + 32 + 190, 100, 0xE004);
+                seen.clear();
+                auto w7 = words(2, true, 0, false, 16, 0, 0);
+                XmaContextState st7;
+                const XmaPassResult r7 = run(w7, st7);
+                bool joined7 = seen.size() == 3 && seenBits[1] == 200 && ReadBits(seen[1].data(), 0, 15) == 200;
+                for (uint32_t i = 5; joined7 && i < 190; i++)
+                    joined7 = ReadBits(seen[1].data(), 10 + i, 1) == uint32_t((i % 5) == 0);
+                Expect(r7.ok && r7.frames == 3 && joined7 && seenBits[2] == 100,
+                       "a frame split inside its length field (10 + 5 bits): joined to 200 bits bit for bit, then packet 1's frame");
+                header(in0, 1, 1, 189);
+                auto w7b = words(2, true, 0, false, 16, 0, 0);
+                XmaContextState st7b;
+                const XmaPassResult r7b = run(w7b, st7b);
+                Expect(!r7b.ok && r7b.error.find("previous-frame bits (189)") != std::string::npos,
+                       "negative control: a header naming 189 bits for the 190-bit rest of a length-split frame fails the pass");
+                XmaContextState st8;
+                AppendBits(st8.partial, st8.partialBits, in0.data(), 32, 40);  // a split frame in progress
+                auto w8 = words(2, true, 0, false, 16, 0, 0); w8[2] = 132;     // but the read offset is mid-packet
+                uint32_t raw8[16]; std::copy(w8.begin(), w8.end(), raw8);
+                const XmaPassResult r8 = XmaPass(raw8, st8, memory, factory);
+                Expect(!r8.ok && r8.error.find("does not continue at a packet's start") != std::string::npos,
+                       "a split frame whose continuation is not at a packet's start fails the pass");
+            }
+            {
+                // 12. Stereo: a 2-channel decoder (fake: left 0.25, right -0.25), frames of 2048
+                //     bytes interleaved left, right: 0x2000, 0xE000 (-8191.75 rounds to -8192).
+                struct Stereo : XmaFrameDecoder
+                {
+                    bool Decode(const uint8_t*, uint32_t, std::vector<float> (&ch)[2], uint32_t& samples, std::string&) override
+                    {
+                        ch[0].assign(kXmaSamplesPerFrame, 0.25f); ch[1].assign(kXmaSamplesPerFrame, -0.25f); samples = kXmaSamplesPerFrame; return true;
+                    }
+                };
+                XmaDecoderFactory stereoFactory = [](uint32_t, uint32_t channels, std::string&) -> std::unique_ptr<XmaFrameDecoder> {
+                    return channels == 2 ? std::make_unique<Stereo>() : nullptr;
+                };
+                in0.assign(2 * kXmaPacketBytes, 0xFF);
+                header(in0, 0, 2, 0); frame(in0, 32, 100, 0xD001); frame(in0, 132, 100, 0xD002);
+                std::fill(out.begin(), out.end(), 0xEE);
+                auto w = words(1, true, 0, false, 12, 0, 0); w[1] |= 1u << 29;  // stereo, a 12-block ring: one stereo frame (8 blocks) fits
+                uint32_t raw[16]; std::copy(w.begin(), w.end(), raw);
+                XmaContextState st;
+                const XmaPassResult r = XmaPass(raw, st, memory, stereoFactory);
+                const XmaContext c = DecodeContext(raw);
+                bool interleaved = true;
+                for (uint32_t i = 0; i < 512; i++)
+                    interleaved = interleaved && out[4 * i] == 0x20 && out[4 * i + 1] == 0x00 && out[4 * i + 2] == 0xE0 && out[4 * i + 3] == 0x00;
+                Expect(r.ok && r.framesWritten == 1 && interleaved && out[2048] == 0xEE && c.outputBufferWriteOffset == 8 && c.outputBufferValid == 1 &&
+                           c.inputBufferReadOffset == 132,
+                       "stereo: one 2048-byte frame, left/right interleaved (0x2000, 0xE000); 4 blocks left are too few for the next: the pass stops");
+            }
+            {
+                // 5. Conversion: x 32767, nearest (ties to even), saturated.
+                uint8_t b[2];
+                StoreSample(b, 0.5f); const bool half = b[0] == 0x40 && b[1] == 0x00;
+                StoreSample(b, -1.0f); const bool minus = b[0] == 0x80 && b[1] == 0x01;
+                StoreSample(b, 1.5f); const bool high = b[0] == 0x7F && b[1] == 0xFF;
+                StoreSample(b, -2.0f); const bool low = b[0] == 0x80 && b[1] == 0x00;
+                Expect(half && minus && high && low, "samples: 0.5 -> 0x4000 (16383.5 to even), -1 -> 0x8001, 1.5 and -2 saturate");
+            }
+        }
+    }
+    {
+        // RtlMultiByteToUnicodeN (Xenia xboxkrnl_rtl.cc:357): FM4's shape, dest 10 bytes, source "abcde" (5): 5 units
+        // 00 61 .. 00 65, written 10; dest 6 bytes: 3 units, written 6, the 4th unit untouched; byte 0xE9 stops (7).
+        const uint32_t src = ArenaAlloc(base, 8), dst = ArenaAlloc(base, 16), wr = ArenaAlloc(base, 4);
+        std::memcpy(base + src, "abcde", 5);
+        auto widen = [&](uint32_t destLength, uint32_t sourceLength) {
+            std::memset(base + dst, 0xAA, 16);
+            PPCContext c{};
+            c.r3.u32 = dst, c.r4.u32 = destLength, c.r5.u32 = wr, c.r6.u32 = src, c.r7.u32 = sourceLength;
+            imp("RtlMultiByteToUnicodeN")(c, base);
+            return c.r3.u32;
+        };
+        const bool full = widen(10, 5) == 0 && be32(dst) == 0x00610062 && be32(dst + 8) == 0x0065AAAA && be32(wr) == 10;
+        const bool shorter = widen(6, 5) == 0 && be32(dst + 4) == 0x0063AAAA && be32(wr) == 6;
+        base[src + 2] = 0xE9;
+        Expect(full && shorter && ExitCodeOf([&] { (void)widen(10, 5); }) == int(StopCode::Unimplemented),
+               "RtlMultiByteToUnicodeN: ASCII widened to big-endian UTF-16, limited by the destination; a non-ASCII byte stops (7)");
+        {
+            // LDI (kernel/imports_ldi.cpp) with a fake decoder that records its window and fills the block with its size's
+            // low byte. FM4's create: block max 8000, configuration {80000, 0} -> window 2^19 (the first word), handle written, 0;
+            // LDIDecompress(handle, src, 300, dst, size* = 0x8000): the decoder gets 300 bytes and 0x8000 to produce; size
+            // written back 0x8000; 0. Another configuration, an unknown handle, a size over 32 KB, a decoder error, and a
+            // second destroy stop (7).
+            struct FakeLzx : ldi::Decoder
+            {
+                bool fail = false;
+                bool Decompress(const uint8_t*, uint32_t srcBytes, uint8_t* dst, uint32_t dstBytes, std::string& error) override
+                {
+                    if (fail || srcBytes != 300) return error = "fake error", false;
+                    std::memset(dst, uint8_t(dstBytes), dstBytes);
+                    return true;
+                }
+            };
+            uint32_t seenBits = 0;
+            ldi::SetFactory([&](uint32_t windowBits, std::string&) -> std::unique_ptr<ldi::Decoder> { seenBits = windowBits; return std::make_unique<FakeLzx>(); });
+            const uint32_t blockMax = ArenaAlloc(base, 4), cfg = ArenaAlloc(base, 8), handleAt = ArenaAlloc(base, 4), sizeIo = ArenaAlloc(base, 4);
+            const uint32_t srcBuf = ArenaAlloc(base, 300), dstBuf = ArenaAlloc(base, 0x8000);
+            StoreBigEndian32(base, blockMax, 0x8000), StoreBigEndian32(base, cfg, 0x80000), StoreBigEndian32(base, cfg + 4, 0);
+            auto create = [&] {
+                PPCContext c{};
+                c.r3.u32 = blockMax, c.r4.u32 = cfg, c.r9.u32 = handleAt;
+                imp("LDICreateDecompression")(c, base);
+                return c.r3.u32;
+            };
+            auto decompress = [&](uint32_t handle, uint32_t want) {
+                StoreBigEndian32(base, sizeIo, want);
+                PPCContext c{};
+                c.r3.u32 = handle, c.r4.u32 = srcBuf, c.r5.u32 = 300, c.r6.u32 = dstBuf, c.r7.u32 = sizeIo;
+                imp("LDIDecompress")(c, base);
+                return c.r3.u32;
+            };
+            const bool created = create() == 0 && seenBits == 19 && be32(handleAt) != 0;
+            const uint32_t handle = be32(handleAt);
+            const bool decoded = decompress(handle, 0x8000) == 0 && be32(sizeIo) == 0x8000 && base[dstBuf] == 0 && base[dstBuf + 0x7FFF] == 0 &&
+                                 decompress(handle, 0x47) == 0 && base[dstBuf] == 0x47 && base[dstBuf + 0x46] == 0x47;
+            PPCContext destroy{};
+            destroy.r3.u32 = handle;
+            imp("LDIDestroyDecompression")(destroy, base);
+            Expect(created && decoded && destroy.r3.u64 == 0,
+                   "LDI: FM4's configuration {80000, 0} -> a 2^19 window; blocks decoded to the size asked, written back; destroy 0");
+            Expect(ExitCodeOf([&] { StoreBigEndian32(base, cfg + 4, 1); (void)create(); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { StoreBigEndian32(base, cfg, 0x30000); (void)create(); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)decompress(handle, 0x8000); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)create(); (void)decompress(be32(handleAt), 0x8001); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { PPCContext again{}; again.r3.u32 = handle; imp("LDIDestroyDecompression")(again, base); }) == int(StopCode::Unimplemented),
+                   "LDI: a second word other than 0, a window that is no power of two, a destroyed handle, more than 32 KB, a second destroy stop (7)");
+            ldi::SetFactory(nullptr);
+        }
+        PPCContext etx{};
+        etx.r3.u32 = src, etx.r8.u32 = wr;
+        StoreBigEndian32(base, wr, 0x12345678);
+        imp("EtxProducerRegister")(etx, base);
+        Expect(etx.r3.u64 == 0 && be32(wr) == 0x12345678, "EtxProducerRegister: no trace consumer: 0, nothing written");
+        PPCContext etxOff{};
+        etxOff.r3.u32 = src;
+        imp("EtxProducerUnregister")(etxOff, base);
+        Expect(etxOff.r3.u64 == 0, "EtxProducerUnregister: nothing registered: 0");
+    }
+    PPCContext sysVersion{};
+    imp("XamGetSystemVersion")(sysVersion, base);
+    Expect(sysVersion.r3.u64 == ((2u << 28) | (17559u << 8)), "XamGetSystemVersion: 2.0.17559.0 packed as major << 28 | minor << 24 | build << 8 | QFE");
     // XGetVideoMode / VdQueryVideoMode (xbox.h:264): 1280, 720, progressive 0, widescreen 1, HD 1, 60.0f =
     // 0x42700000 (IEEE 754: exponent 5 + 127 = 0x84, mantissa 0.875), NTSC 1, 0x4A, 0x01, three zero words.
     const uint32_t videoMode = ArenaAlloc(base, 48);
@@ -451,7 +1255,39 @@ int main(int, char** argv)
             std::ofstream(disc + "/Media/Cars.bin") << cars;
         }
         std::ofstream(disc + "/Media/Empty.bin");
-        MountDisc(disc);
+        {
+            // Pkg.xmplr: a read-only STFS package built by hand (stfsinfo.py's layout). Header: PIRS, header size 1712 at
+            // 340 (data base round up to 2000), volume type 0 at 3A9, descriptor at 379: length 24, flags 1 (read-only),
+            // table 1 block (LE) at block 0 (LE24), total blocks 4 (BE at 379 + 1C). Block n's data is at
+            // 2000 + (n + 1) * 1000 for n < 170 (one level-0 hash table, at 2000). Entries (40 bytes) at 3000: A.BIN
+            // (5000 bytes, blocks 1 -> 2), D (directory), D/B.TXT (3 bytes "xyz", block 3). Hash records (18 bytes, next
+            // block at +14): 1 -> 2, 2 -> FFFFFF, 3 -> FFFFFF.
+            std::string pkg(0x7000, '\0');
+            auto be32At = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) pkg[at + i] = char(v >> (24 - 8 * i)); };
+            auto le24At = [&](size_t at, uint32_t v) { for (int i = 0; i < 3; i++) pkg[at + i] = char(v >> (8 * i)); };
+            pkg.replace(0, 4, "PIRS");
+            be32At(0x340, 0x1712), be32At(0x3A9, 0);
+            pkg[0x379] = 0x24, pkg[0x37B] = 1, pkg[0x37C] = 1, le24At(0x37E, 0), be32At(0x379 + 0x1C, 4);
+            auto entry = [&](size_t at, const char* name, uint8_t flags, uint32_t blocks, uint32_t start, uint16_t parent, uint32_t length) {
+                pkg.replace(at, std::strlen(name), name);
+                pkg[at + 40] = char(flags | std::strlen(name));
+                le24At(at + 44, blocks), le24At(at + 47, start);
+                pkg[at + 50] = char(parent >> 8), pkg[at + 51] = char(parent);
+                be32At(at + 52, length);
+            };
+            entry(0x3000, "A.BIN", 0, 2, 1, 0xFFFF, 5000);
+            entry(0x3040, "D", 0x80, 0, 0, 0xFFFF, 0);
+            entry(0x3080, "B.TXT", 0, 1, 3, 1, 3);
+            be32At(0x2000 + 1 * 0x18 + 0x14, 2), be32At(0x2000 + 2 * 0x18 + 0x14, 0xFFFFFF), be32At(0x2000 + 3 * 0x18 + 0x14, 0xFFFFFF);
+            for (size_t i = 0; i < 5000; i++) pkg[(i < 4096 ? 0x4000 + i : 0x5000 + i - 4096)] = char('a' + i % 26);
+            pkg.replace(0x6000, 3, "xyz");
+            std::ofstream(disc + "/Pkg.xmplr", std::ios::binary) << pkg;
+        }
+        // Its disc map (survey/gdfx.py's format: path, sector, size, attributes in hex): Media is a directory (0x90) of
+        // 0x800 bytes at sector 0x20; Cars.bin 5000 = 0x1388 bytes at sector 0x30; Empty.bin; Mod.xex (the loader test).
+        std::ofstream(disc + "/../disc_map.tsv") << "Media\t20\t800\t90\nMedia/Cars.bin\t30\t1388\t80\nMedia/Empty.bin\t31\t0\t80\n"
+                                                    "Mod.xex\t40\t180\t80\nPkg.xmplr\t50\t7000\t80\n";
+        MountDisc(disc, disc + "/../disc_map.tsv");
     gpu::InitializeRegisters(base);
     Expect(gpu::ReadRegister(base, 0x0F00) == 0x08100748 && gpu::ReadRegister(base, 0x0F01) == 0x0000200E &&
                gpu::ReadRegister(base, 0x194C) == 0x2D0 && gpu::ReadRegister(base, 0x1951) == 1 && gpu::ReadRegister(base, 0x1961) == 0x050002D0 &&
@@ -476,11 +1312,11 @@ int main(int, char** argv)
         // 1970-01-01 as FILETIME: 11644473600 s x 10^7 = 116444736000000000; 5000 bytes -> 3 sectors of 2048 = 6144.
         const bool timesOk = query("GAME:\\media\\CARS.BIN") == 0 && be64(info) == 116444736000000000ull && be64(info + 8) == 116444736000000000ull &&
                              be64(info + 16) == 116444736000000000ull && be64(info + 24) == 116444736000000000ull;
-        Expect(timesOk && be64(info + 32) == 6144 && be64(info + 40) == 5000 && be32(info + 48) == 0x01 && be32(info + 52) == 0,
-               "NtQueryFullAttributesFile(GAME:\\media\\CARS.BIN): 1970 times, allocation 6144, size 5000, read-only, any case");
-        Expect(query("d:\\Media") == 0 && be32(info + 48) == 0x11 && be64(info + 40) == 0 && query("game:\\Media\\Empty.bin") == 0 &&
-                   be64(info + 32) == 0 && be64(info + 40) == 0,
-               "NtQueryFullAttributesFile: d:\\Media is a read-only directory (0x11); an empty file allocates 0");
+        Expect(timesOk && be64(info + 32) == 6144 && be64(info + 40) == 5000 && be32(info + 48) == 0x81 && be32(info + 52) == 0,
+               "NtQueryFullAttributesFile(GAME:\\media\\CARS.BIN): 1970 times, allocation 6144, size 5000, its disc attributes 0x80 + read-only, any case");
+        Expect(query("d:\\Media") == 0 && be32(info + 48) == 0x91 && be64(info + 40) == 0x800 && query("game:\\Media\\Empty.bin") == 0 &&
+                   be64(info + 32) == 0 && be64(info + 40) == 0 && query("game:\\") == 0 && be32(info + 48) == 0x10,
+               "NtQueryFullAttributesFile: d:\\Media 0x91 with its directory size 0x800 (disc map); an empty file allocates 0; the root is 0x10");
         Expect(query("game:\\missing") == 0xC000000F && query("game:\\Media\\Cars.bin\\x") == 0xC000000F &&
                    query("\\Device\\Cdrom0\\Media\\..\\Media\\Cars.bin") == 0 && query("game:\\a+b") == 0xC0000033,
                "NtQueryFullAttributesFile: missing or under a file NO_SUCH_FILE; the device path and .. resolve; a reserved character OBJECT_NAME_INVALID");
@@ -560,13 +1396,66 @@ int main(int, char** argv)
             return c.r3.u32;
         };
         const bool networkOpen = information(openHandle, 64, 34) == 0 && be64(fileInfo) == 116444736000000000ull &&
-                                 be64(fileInfo + 32) == 6144 && be64(fileInfo + 40) == 5000 && be32(fileInfo + 48) == 1 &&
+                                 be64(fileInfo + 32) == 6144 && be64(fileInfo + 40) == 5000 && be32(fileInfo + 48) == 0x81 &&
                                  be32(fileInfo + 56) == 0 && be32(fileInfo + 60) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 56;
-        Expect(networkOpen && information(openHandle, 8, 14) == 0 && be64(fileInfo) == 0 && be32(ioStatus + 4) == 8,
-               "NtQueryInformationFile: network open (34) of Cars.bin, the buffer's rest zeroed, io status {0, 56}; position (14) 0 {0, 8}");
+        Expect(networkOpen && information(openHandle, 8, 14) == 0 && be64(fileInfo) == 0 && be32(ioStatus + 4) == 8 &&
+                   information(openHandle, 4, 26) == 0 && be32(fileInfo) == 0x30 && be32(ioStatus + 4) == 4,
+               "NtQueryInformationFile: network open (34) of Cars.bin, the buffer's rest zeroed, io status {0, 56}; position (14) 0 {0, 8}; sector (26) 0x30 {0, 4}");
         Expect(information(openHandle, 55, 34) == 0xC0000004 && be32(fileInfo) == 0xAAAAAAAA && information(0x1234, 64, 34) == 0xC0000008 &&
                    ExitCodeOf([&] { (void)information(openHandle, 64, 5); }) == int(StopCode::Unimplemented),
                "NtQueryInformationFile: 55 bytes INFO_LENGTH_MISMATCH (nothing written), no file INVALID_HANDLE, another class stops (7)");
+        // NtSetInformationFile (Xenia xboxkrnl_io_info.cc:186): position (14) from big-endian 64 bits 0x1_00000FA0 reads
+        // back the same through class 14, io status {0, 8}; 7 bytes INFO_LENGTH_MISMATCH; no file INVALID_HANDLE;
+        // class 13 (disposition) stops (7). The position is put back to 0 for the reads below.
+        auto setPosition = [&](uint32_t handle, uint32_t length, uint32_t infoClass, uint64_t position) {
+            Store32(base, fileInfo, uint32_t(position >> 32)), Store32(base, fileInfo + 4, uint32_t(position));
+            Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+            PPCContext c{};
+            c.r3.u32 = handle, c.r4.u32 = ioStatus, c.r5.u32 = fileInfo, c.r6.u32 = length, c.r7.u32 = infoClass;
+            imp("NtSetInformationFile")(c, base);
+            return c.r3.u32;
+        };
+        const bool set = setPosition(openHandle, 8, 14, 0x100000FA0ull) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 8 &&
+                         information(openHandle, 8, 14) == 0 && be64(fileInfo) == 0x100000FA0ull;
+        Expect(set && setPosition(openHandle, 7, 14, 0) == 0xC0000004 && setPosition(0x1234, 8, 14, 0) == 0xC0000008 &&
+                   ExitCodeOf([&] { (void)setPosition(openHandle, 8, 13, 0); }) == int(StopCode::Unimplemented) &&
+                   setPosition(openHandle, 8, 14, 0) == 0,
+               "NtSetInformationFile: position (14) set and read back {0, 8}; 7 bytes INFO_LENGTH_MISMATCH; no file INVALID_HANDLE; class 13 stops (7)");
+        // STFS (kernel/stfs.h). Arithmetic by hand (read-only: one table per level, base 2000): block 0 -> 3000 (one
+        // table before it); block 170 -> 2000 + 173 * 1000 = AF000 (tables at 0 and 172, the level-1 table at 171... the
+        // index gains (170+170)/170 = 2 and (170+28900)/28900 = 1); the level-0 table of block 170 is block 172.
+        Expect(stfs::Package::BlockToOffset(0, 1, 0x2000) == 0x3000 && stfs::Package::BlockToOffset(170, 1, 0x2000) == 0x2000 + 173 * 0x1000 &&
+                   stfs::Package::HashBlockNumber(5, 0, 1) == 0 && stfs::Package::HashBlockNumber(170, 0, 1) == 172,
+               "STFS block arithmetic (read-only format): data and level-0 hash block numbers, by hand");
+        // XamContentOpenFile mounts game:\\Pkg.xmplr as "pkgroot:"; pkgroot:\\a.bin (any case) is a read-only file
+        // (attributes 81) of 5000 bytes whose bytes 4094..4097 span blocks 1 and 2 ("lmno": 4094 % 26 = 12 -> 'm'?
+        // 4094 = 157 * 26 + 12 -> 'm', so 4093 -> 'l'); pkgroot:\\D\\B.TXT reads "xyz"; D is a directory (10);
+        // a missing name is not found; mounting the same root again stops (7); XamContentClose unmounts it.
+        {
+            auto cStr = [&](const char* text) { const uint32_t at = ArenaAlloc(base, uint32_t(std::strlen(text)) + 1); std::memcpy(base + at, text, std::strlen(text) + 1); return at; };
+            const uint32_t pkgRoot = cStr("pkgroot"), pkgPath = cStr("game:\\Pkg.xmplr"), pkgStack = ArenaAlloc(base, 0x80);
+            auto mount = [&] {
+                PPCContext c{};
+                c.r1.u32 = pkgStack, c.r3.u32 = 0xFF, c.r4.u32 = pkgRoot, c.r5.u32 = pkgPath, c.r6.u32 = 0x43;
+                imp("XamContentOpenFile")(c, base);
+                return c.r3.u32;
+            };
+            DiscEntry a, d, b, none;
+            std::string dev;
+            uint8_t span[4] = {}, xyz[4] = {};
+            const bool mounted = mount() == 0 && ResolveGuestPath("pkgroot:\\a.bin", a, dev) == Resolved::Found && a.size == 5000 &&
+                                 DiscAttributes(a) == 0x81 && ReadDiscFile(a, 4093, span, 4) == 4 && std::memcmp(span, "lmno", 4) == 0 &&
+                                 ResolveGuestPath("PKGROOT:\\D\\B.TXT", b, dev) == Resolved::Found && ReadDiscFile(b, 0, xyz, 4) == 3 &&
+                                 std::memcmp(xyz, "xyz", 3) == 0 && ResolveGuestPath("pkgroot:\\D", d, dev) == Resolved::Found && d.directory &&
+                                 DiscAttributes(d) == 0x10 && ResolveGuestPath("pkgroot:\\c.bin", none, dev) == Resolved::NotFound;
+            const bool again = ExitCodeOf([&] { (void)mount(); }) == int(StopCode::Unimplemented);
+            PPCContext closeRoot{};
+            closeRoot.r3.u32 = pkgRoot;
+            imp("XamContentClose")(closeRoot, base);
+            Expect(mounted && again && closeRoot.r3.u64 == 0 && ResolveGuestPath("pkgroot:\\a.bin", none, dev) == Resolved::OtherDevice,
+                   "XamContentOpenFile: a disc package mounted read-only as a root (files 81, directories 10, reads across blocks); "
+                   "mounting twice stops (7); XamContentClose unmounts");
+        }
         // NtReadFile(handle, event, APC, context, io status*, buffer*, length, offset*) (Xenia xboxkrnl_io.cc:184,
         // disc_image_file.cc:26), on the synchronous Cars.bin. Byte i is 'A' + i % 26: offset 30 -> 'E' (30 % 26 = 4),
         // 39 -> 'N' (13), 40 -> 'O', 45 -> 'T' (19), 4998 -> 'G' (4998 % 26 = 6).
@@ -716,6 +1605,17 @@ int main(int, char** argv)
                 imp("VdInitializeEngines")(c, base);
                 return c.r3.u32;
             };
+            // The GPU stop flag (gpu/gpu_stop.h, --gpu-stop): no path, or a flag present, refuses with stop 9 naming it; an
+            // absent flag lets the engines start.
+            const std::string planted = disc + "/../planted_GPU_STOP", absent = disc + "/../absent_GPU_STOP";
+            std::ofstream(planted) << "planted for the test\n";
+            gpu::SetGpuStopPath(nullptr);
+            const bool noPath = ExitCodeOf([&] { (void)engines(0x94010000u, 0x40001000, 0x40002000); }) == int(StopCode::Setup);
+            gpu::SetGpuStopPath(planted.c_str());
+            const std::string refusal = StderrOf([&] { (void)engines(0x94010000u, 0x40001000, 0x40002000); });
+            gpu::SetGpuStopPath(absent.c_str());
+            Expect(noPath && refusal.find("[stop 9] VdInitializeEngines: GPU work is stopped") == 0 && refusal.find("planted for the test") != std::string::npos,
+                   "VdInitializeEngines: without a stop-flag path, or with the flag present, stops (9) naming the flag's reason");
             Expect(ExitCodeOf([&] { (void)engines(0x94010004u, 0x40001000, 0x40002000); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { (void)engines(0x94010000u, 0x50001000, 0x40002000); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { (void)engines(0x94010000u, 0x40001000, 0x3FFFFFFC); }) == int(StopCode::Unimplemented),
@@ -739,6 +1639,44 @@ int main(int, char** argv)
             Expect(notifications.size() == 1 && notifications[0].first == 0x94010010u && notifications[0].second == 2 &&
                        ExitCodeOf([&] { terminate(0x94010004u, 1, 1); }) == int(StopCode::Unimplemented),
                    "ExRegisterTitleTerminateNotification: added and removed by routine; a routine that is no function stops (7)");
+        }
+        std::ofstream(disc + "/Media/Extra.bin") << "x";  // on the host, not in the disc map
+        Expect(ExitCodeOf([&] { (void)query("game:\\Media\\Extra.bin"); }) == int(StopCode::Setup),
+               "a file on the host but not in the disc map stops (9)");
+        unlink((disc + "/Media/Extra.bin").c_str());
+        // Saved content (kernel/content.h; Xenia xam_content.cc:72, xam_enum.cc:30): a fresh user-data directory has no saved
+        // games: the enumerator (buffer size 5 x 0x134 = 0x604) gives ERROR_NO_MORE_FILES (0x12) and 0 items; a stored record
+        // (as a creation leaves it) is listed with its bytes; device 2 is E_INVALIDARG (buffer size 0); type 2 stops (7).
+        {
+            const std::string user = disc + "/../user-data";
+            mkdir(user.c_str(), 0755);
+            unlink((user + "/content/1/00000001/save0001.xcontent").c_str());  // a failed run keeps its work folder
+            MountUserData(user);
+            const uint32_t sizeOut = ArenaAlloc(base, 4), enumOut = ArenaAlloc(base, 4), items = ArenaAlloc(base, 0x200), got = ArenaAlloc(base, 4);
+            auto create = [&](uint32_t device, uint32_t type) {
+                PPCContext c{};
+                c.r3.u64 = 0xFE, c.r4.u64 = device, c.r5.u64 = type, c.r7.u64 = 5, c.r8.u32 = sizeOut, c.r9.u32 = enumOut;
+                imp("XamContentCreateEnumerator")(c, base);
+                return c.r3.u32;
+            };
+            auto enumerate = [&] {
+                PPCContext c{};
+                c.r3.u32 = be32(enumOut), c.r5.u32 = items, c.r6.u32 = 0x200, c.r7.u32 = got;
+                imp("XamEnumerate")(c, base);
+                return c.r3.u32;
+            };
+            const bool empty = create(0, 1) == 0 && be32(sizeOut) == 0x604 && enumerate() == 0x12 && be32(got) == 0;
+            const std::string typeDir = user + "/content/1/00000001";
+            mkdir((user + "/content").c_str(), 0755), mkdir((user + "/content/1").c_str(), 0755), mkdir(typeDir.c_str(), 0755);
+            std::string record(0x134, '\0');
+            record[3] = 1, record[7] = 1;                    // device 1, type 1 (big-endian)
+            record.replace(0x108, 8, "save0001");            // the file name
+            std::ofstream(typeDir + "/save0001.xcontent", std::ios::binary) << record;
+            const bool listed = create(1, 1) == 0 && enumerate() == 0 && be32(got) == 1 && be32(items) == 1 && be32(items + 4) == 1 &&
+                                std::memcmp(base + items + 0x108, "save0001", 8) == 0 && enumerate() == 0x12;
+            Expect(empty && listed && create(2, 1) == ((1u << 31) | (7u << 16) | 0x57) && be32(sizeOut) == 0 &&
+                       ExitCodeOf([&] { (void)create(0, 2); }) == int(StopCode::Unimplemented),
+                   "saved content: empty at first (NO_MORE_FILES); a stored record is enumerated once; device 2 E_INVALIDARG; type 2 stops (7)");
         }
         symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
         Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup), "a symlink on the disc stops (9)");
@@ -1207,6 +2145,305 @@ int main(int, char** argv)
     WaitForEvent(base, k);
     Expect(threadSaw == 0x1234 && be32(k + kthread_state::kExitStatus) == 0x77 && base[k + kthread_state::kTerminated] == 1 &&
            be32(k + kthread::kThreadId) == id && be32(k + 4) == 1, "a raw thread runs start(context); its result is the exit status");
+    {
+        // Timers (kernel/imports_timer.cpp; Xenia xboxkrnl_threading.cc:798-877): FM4's call NtCreateTimer(handle*, 0, 1)
+        // gives a synchronization timer (dispatcher type 9), unsignalled; NtSetTimerEx with a relative due time of
+        // -200000 (20 ms in 100 ns units) signals it, and a wait (1 s limit) consumes it (auto-reset, type 9);
+        // NtCancelTimer disarms it and reports state 0; type 2 is STATUS_INVALID_PARAMETER; an APC routine stops (7).
+        const uint32_t handleOut = ArenaAlloc(base, 4), due = ArenaAlloc(base, 8), stateOut = ArenaAlloc(base, 4), timerStack = ArenaAlloc(base, 0x100);
+        PPCContext create{};
+        create.r3.u32 = handleOut, create.r5.u64 = 1;
+        imp("NtCreateTimer")(create, base);
+        const uint32_t timer = be32(handleOut);
+        const auto timerObject = LookupHandle(timer);
+        Expect(create.r3.u64 == 0 && timerObject && timerObject->type == ObjectType::Timer && base[timerObject->header] == 9 &&
+                   be32(timerObject->header + 4) == 0, "NtCreateTimer(type 1): an unsignalled synchronization timer (dispatcher type 9)");
+        StoreBigEndian32(base, due, 0xFFFFFFFF), StoreBigEndian32(base, due + 4, uint32_t(-200000));
+        auto setTimer = [&](uint32_t handle, uint32_t routine) {
+            PPCContext c{};
+            c.r1.u32 = timerStack, c.r3.u32 = handle, c.r4.u32 = due, c.r5.u32 = routine;
+            imp("NtSetTimerEx")(c, base);
+            return c.r3.u32;
+        };
+        const int64_t second = -10000000;
+        const bool fired = setTimer(timer, 0) == 0 && WaitForObject(base, timerObject->header, &second) && be32(timerObject->header + 4) == 0;
+        PPCContext cancel{};
+        cancel.r3.u32 = timer, cancel.r4.u32 = stateOut;
+        imp("NtCancelTimer")(cancel, base);
+        PPCContext bad{};
+        bad.r3.u32 = handleOut, bad.r5.u64 = 2;
+        imp("NtCreateTimer")(bad, base);
+        Expect(fired && cancel.r3.u64 == 0 && be32(stateOut) == 0 && bad.r3.u32 == 0xC000000D && setTimer(0x1234, 0) == 0xC0000008 &&
+                   ExitCodeOf([&] { (void)setTimer(timer, 0x1000); }) == int(StopCode::Unimplemented),
+               "NtSetTimerEx: 20 ms later the timer wakes a wait and auto-resets; NtCancelTimer reports 0; type 2 INVALID_PARAMETER; "
+               "no timer INVALID_HANDLE; an APC routine stops (7)");
+    }
+    {
+        // XMP (kernel/imports_xmsg.cpp; Xenia xmp_app.cc:391-436). XN_XMP_PLAYBACKCONTROLLERCHANGED = 0A000003: mask
+        // index (id >> 25) & 3F = 5, version (id >> 16) & 1FF = 0, so a listener with mask bit 5 gets it. FM4's
+        // XMPSetPlaybackController(2, 4, 0) hands control to the system player: 0, last error 0, one notification
+        // with data 1 (!client); the same call again changes nothing (no second notification); the getter answers
+        // controller 0, not locked; (2, 1, 0), another app, or an XOVERLAPPED stops (7).
+        PPCContext listen{};
+        listen.r3.u64 = 1u << 5, listen.r4.u64 = 9;
+        imp("XamNotifyCreateListener")(listen, base);
+        const uint32_t xmpListener = listen.r3.u32, args = ArenaAlloc(base, 12), outs = ArenaAlloc(base, 16);
+        auto xmp = [&](uint32_t app, uint32_t message, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t overlapped = 0) {
+            StoreBigEndian32(base, args, a0), StoreBigEndian32(base, args + 4, a1), StoreBigEndian32(base, args + 8, a2);
+            StoreBigEndian32(base, t.kthread + kthread::kLastError, 0x1234);
+            PPCContext c{};
+            c.r13.u32 = t.pcr, c.r3.u32 = app, c.r4.u32 = message, c.r5.u32 = overlapped, c.r6.u32 = args, c.r7.u32 = 12;
+            imp("XMsgStartIORequestEx")(c, base);
+            return c.r3.u32;
+        };
+        auto nextNote = [&] {
+            PPCContext c{};
+            c.r3.u32 = xmpListener, c.r5.u32 = outs, c.r6.u32 = outs + 4;
+            imp("XNotifyGetNext")(c, base);
+            return std::make_tuple(c.r3.u32, be32(outs), be32(outs + 4));
+        };
+        const bool set = xmp(0xFA, 0x0007001A, 2, 4, 0) == 0 && be32(t.kthread + kthread::kLastError) == 0 &&
+                         nextNote() == std::make_tuple(1u, 0x0A000003u, 1u);
+        const bool same = xmp(0xFA, 0x0007001A, 2, 4, 0) == 0 && std::get<0>(nextNote()) == 0;
+        const bool get = xmp(0xFA, 0x0007001B, 2, outs + 8, outs + 12) == 0 && be32(outs + 8) == 0 && be32(outs + 12) == 0;
+        Expect(set && same && get, "XMPSetPlaybackController(2, 4, 0): 0, last error 0, XN_XMP_PLAYBACKCONTROLLERCHANGED(1) once; getter: 0, not locked");
+        Expect(ExitCodeOf([&] { (void)xmp(0xFA, 0x0007001A, 2, 1, 0); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)xmp(0xFB, 0x0007001A, 2, 4, 0); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)xmp(0xFA, 0x0007001A, 2, 4, 0, args); }) == int(StopCode::Unimplemented),
+               "XMP: controller 1 with client 2, another app, or an XOVERLAPPED stops (7)");
+        PPCContext nuiRequest{};
+        nuiRequest.r13.u32 = t.pcr, nuiRequest.r3.u32 = 0xFE, nuiRequest.r4.u32 = 0x0002A005, nuiRequest.r6.u32 = args, nuiRequest.r7.u32 = 24;
+        imp("XMsgStartIORequest")(nuiRequest, base);
+        PPCContext nuiRelease = nuiRequest;
+        nuiRelease.r3.u32 = 0xFE, nuiRelease.r4.u32 = 0x0002A006;
+        const uint32_t nuiFirst = nuiRequest.r3.u32;
+        imp("XMsgStartIORequest")(nuiRelease, base);
+        Expect(nuiFirst == ((1u << 31) | 0x4005) && nuiRelease.r3.u32 == ((1u << 31) | 0x4005) &&
+                   ExitCodeOf([&] { PPCContext c = nuiRelease; c.r3.u32 = 0xFE, c.r4.u32 = 0x0002A009; imp("XMsgStartIORequest")(c, base); }) ==
+                       int(StopCode::Unimplemented),
+               "XMsgStartIORequest: XAM 0002A005 and 0002A006 (Kinect requests) E_FAIL; 0002A009 still stops (7)");
+        PPCContext nui8 = nuiRelease;
+        nui8.r3.u32 = 0xFE, nui8.r4.u32 = 0x0002A008;
+        imp("XMsgStartIORequest")(nui8, base);
+        PPCContext nui7 = nuiRelease;
+        nui7.r3.u32 = 0xFE, nui7.r4.u32 = 0x0002A007;
+        imp("XMsgStartIORequest")(nui7, base);
+        Expect(nui8.r3.u32 == ((1u << 31) | 0x4005) && nui7.r3.u32 == ((1u << 31) | 0x4005), "XMsgStartIORequest: XAM 0002A007 and 0002A008 (Kinect requests) E_FAIL");
+        // XMsgInProcessCall: XLiveBase (FC) 00058004 with FM4's size 0: logon id 0 (no LIVE logon), 0; XMP through the
+        // same call; an unknown XLiveBase message stops (7).
+        StoreBigEndian32(base, outs, 0xAAAAAAAA);
+        PPCContext logon{};
+        logon.r3.u32 = 0xFC, logon.r4.u32 = 0x00058004, logon.r5.u32 = outs;
+        imp("XMsgInProcessCall")(logon, base);
+        PPCContext viaInProcess{};
+        StoreBigEndian32(base, args, 2), StoreBigEndian32(base, args + 4, outs + 8), StoreBigEndian32(base, args + 8, outs + 12);
+        viaInProcess.r3.u32 = 0xFA, viaInProcess.r4.u32 = 0x0007001B, viaInProcess.r5.u32 = args, viaInProcess.r6.u32 = 12;
+        imp("XMsgInProcessCall")(viaInProcess, base);
+        Expect(logon.r3.u64 == 0 && be32(outs) == 0 && viaInProcess.r3.u64 == 0 &&
+                   ExitCodeOf([&] { PPCContext c = logon; c.r3.u32 = 0xFC, c.r4.u32 = 0x00058005; imp("XMsgInProcessCall")(c, base); }) ==
+                       int(StopCode::Unimplemented),
+               "XMsgInProcessCall: XLiveBase logon id 0 (offline), XMP getter through it; another XLiveBase message stops (7)");
+        // KeInitializeMutant / KeReleaseMutant (NT semantics, INFERRED): a free mutant: type 2, signal state 1, empty wait
+        // list (+8 and +C point at +8), no owner; owned at creation: state 0, owner the calling KTHREAD. Releasing it from
+        // that thread returns the previous state 0 and frees it (state 1, owner 0); releasing a mutant the thread does
+        // not own stops (5); abandoning stops (7).
+        const uint32_t mutant = ArenaAlloc(base, 0x20);
+        PPCContext initMutant{};
+        initMutant.r13.u32 = t.pcr, initMutant.r3.u32 = mutant, initMutant.r4.u64 = 0;
+        imp("KeInitializeMutant")(initMutant, base);
+        const bool freeMutant = base[mutant] == 2 && be32(mutant + 4) == 1 && be32(mutant + 8) == mutant + 8 && be32(mutant + 0xC) == mutant + 8 &&
+                                be32(mutant + 0x18) == 0;
+        initMutant.r3.u32 = mutant, initMutant.r4.u64 = 1;
+        imp("KeInitializeMutant")(initMutant, base);
+        const bool owned = be32(mutant + 4) == 0 && be32(mutant + 0x18) == t.kthread;
+        PPCContext releaseMutant{};
+        releaseMutant.r13.u32 = t.pcr, releaseMutant.r3.u32 = mutant;
+        imp("KeReleaseMutant")(releaseMutant, base);
+        Expect(freeMutant && owned && releaseMutant.r3.u64 == 0 && be32(mutant + 4) == 1 && be32(mutant + 0x18) == 0,
+               "KeInitializeMutant: free (type 2, state 1, empty list) or owned by the caller (state 0); KeReleaseMutant by the owner: previous 0, freed");
+        Expect(ExitCodeOf([&] { PPCContext c = releaseMutant; c.r3.u32 = mutant; imp("KeReleaseMutant")(c, base); }) == int(StopCode::GuestFault) &&
+                   ExitCodeOf([&] { PPCContext c = releaseMutant; c.r3.u32 = mutant, c.r5.u64 = 1; imp("KeReleaseMutant")(c, base); }) ==
+                       int(StopCode::Unimplemented),
+               "KeReleaseMutant: a mutant the thread does not own stops (5); abandoning stops (7)");
+        // XLiveBase 0x58046 (a documented compatibility exception): 0, and the 16 bytes at the buffer stay AA; 0x58047 still
+        // stops (7): success is not generalized.
+        std::memset(base + outs, 0xAA, 16);
+        PPCContext live{};
+        live.r3.u32 = 0xFC, live.r4.u32 = 0x00058046, live.r5.u32 = outs, live.r6.u32 = 16;
+        imp("XMsgInProcessCall")(live, base);
+        bool untouched = true;
+        for (uint32_t i = 0; i < 16; i++) untouched = untouched && base[outs + i] == 0xAA;
+        Expect(live.r3.u64 == 0 && untouched &&
+                   ExitCodeOf([&] { PPCContext c = live; c.r3.u32 = 0xFC, c.r4.u32 = 0x00058047; imp("XMsgInProcessCall")(c, base); }) ==
+                       int(StopCode::Unimplemented),
+               "XLiveBase 0x58046: success, buffer unchanged (compatibility exception); 0x58047 still stops (7)");
+        std::memset(base + outs, 0xAA, 16);
+        PPCContext friends{};
+        friends.r3.u32 = 0xFC, friends.r4.u32 = 0x00058020, friends.r5.u32 = outs, friends.r6.u32 = 16;
+        imp("XMsgInProcessCall")(friends, base);
+        Expect(friends.r3.u32 == ((1u << 31) | 0x4005) && be32(outs) == 0xAAAAAAAA,
+               "XLiveBase 0x58020 (friends enumerate): E_FAIL, nothing written (offline: no LIVE friends list)");
+        PPCContext xamMsg{};
+        xamMsg.r3.u32 = 0xFE, xamMsg.r4.u32 = 0x0002B003, xamMsg.r5.u32 = outs;
+        imp("XMsgInProcessCall")(xamMsg, base);
+        PPCContext xamMsg4{};
+        xamMsg4.r3.u32 = 0xFE, xamMsg4.r4.u32 = 0x0002B004;
+        imp("XMsgInProcessCall")(xamMsg4, base);
+        Expect(xamMsg.r3.u32 == ((1u << 31) | 0x4005) && xamMsg4.r3.u32 == ((1u << 31) | 0x4005) &&
+                   ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0xFE, c.r4.u32 = 0x0002B005; imp("XMsgInProcessCall")(c, base); }) ==
+                       int(StopCode::Unimplemented),
+               "XAM messages 0002B003 and 0002B004: E_FAIL (unsupported, results unused by FM4); 0002B005 still stops (7)");
+        std::memset(base + outs, 0xAA, 16);
+        PPCContext nuiSettings{};
+        nuiSettings.r3.u32 = 0xFE, nuiSettings.r4.u32 = 0x0002C00C, nuiSettings.r5.u32 = outs;
+        imp("XMsgInProcessCall")(nuiSettings, base);
+        Expect(nuiSettings.r3.u32 == ((1u << 31) | 0x4005) && be32(outs) == 0xAAAAAAAA,
+               "XAM message 0002C00C (Kinect control settings): E_FAIL, nothing written (no Kinect; FM4 uses its defaults)");
+        PPCContext nuiCallback{};
+        nuiCallback.r3.u32 = 0xFE, nuiCallback.r4.u32 = 0x0002C009, nuiCallback.r5.u32 = outs;
+        imp("XMsgInProcessCall")(nuiCallback, base);
+        Expect(nuiCallback.r3.u32 == ((1u << 31) | 0x4005), "XAM message 0002C009 (NUI callback registration): E_FAIL (no Kinect events)");
+    }
+    {
+        // The audio client (kernel/audio.h): 64 callbacks at registration (audio_system.cc:38, :52, :182), then one
+        // per consumed frame; an empty queue is silence and returns no permit (sdl_audio_driver.cc:130-160).
+        const uint32_t code = uint32_t(PPC_CODE_BASE) + 0x30;
+        PPC_LOOKUP_FUNC(base, code) = AudioCallback;
+        RegisterCode(PPC_CODE_BASE, PPC_CODE_SIZE, PPC_IMAGE_BASE, PPC_IMAGE_SIZE);  // the callback must be a translated function
+        const uint32_t block = ArenaAlloc(base, 16), driverOut = block + 8, frame = ArenaAlloc(base, audio::kFrameBytes);
+        StoreBigEndian32(base, block, code), StoreBigEndian32(base, block + 4, 0x1234ABCD);
+        PPCContext none{};
+        none.r3.u32 = block, none.r4.u32 = driverOut;
+        Expect(ExitCodeOf([&] { imp("XAudioRegisterRenderDriverClient")(none, base); }) == int(StopCode::Setup),
+               "audio: registering with no sink (no --audio) stops (9)");
+        audio::SetSink(audio::Sink::External);
+        PPCContext reg = none;
+        imp("XAudioRegisterRenderDriverClient")(reg, base);
+        Expect(reg.r3.u64 == 0 && be32(driverOut) == 0x41550000 && audio::WaitForCallbacks(64, 5000) && audioArgument == 0x1234ABCD &&
+                   !audio::WaitForCallbacks(65, 200),
+               "audio: register -> driver 0x41550000, exactly 64 callbacks with the wrapped argument (a pointer to 1234ABCD)");
+        StoreBigEndian32(base, frame + (1 * 256 + 3) * 4, 0x3F800000);
+        PPCContext submit{};
+        submit.r3.u32 = 0x41550000, submit.r4.u32 = frame;
+        PPCContext s1 = submit, s2 = submit;
+        imp("XAudioSubmitRenderDriverFrame")(s1, base);
+        StoreBigEndian32(base, frame + (1 * 256 + 3) * 4, 0);  // the frame was copied at submission
+        imp("XAudioSubmitRenderDriverFrame")(s2, base);
+        std::vector<float> out(audio::kFrameFloats);
+        const bool first = audio::ConsumeFrame(out.data());
+        const bool played = first && out[3 * 6 + 1] == 1.0f && audio::WaitForCallbacks(65, 5000);
+        const bool second = audio::ConsumeFrame(out.data()) && out[3 * 6 + 1] == 0.0f && audio::WaitForCallbacks(66, 5000);
+        out[0] = 7.0f;
+        const bool silent = !audio::ConsumeFrame(out.data()) && out[0] == 0.0f && !audio::WaitForCallbacks(67, 200);
+        const audio::Counters c = audio::GetCounters();
+        Expect(s1.r3.u64 == 0 && s2.r3.u64 == 0 && played && second && silent && c.submitted == 2 && c.consumed == 2 && c.silent == 1 &&
+                   c.callbacks == 66 && c.queued == 0,
+               "audio: each consumed frame (copied at submission) plays and returns one callback; an empty queue plays silence, no callback");
+        PPCContext wrong = submit;
+        wrong.r3.u32 = 0x41550001;
+        Expect(ExitCodeOf([&] { imp("XAudioSubmitRenderDriverFrame")(wrong, base); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { PPCContext again = none; imp("XAudioRegisterRenderDriverClient")(again, base); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { for (uint32_t i = 0; i <= audio::kMaxQueued; i++) { PPCContext s = submit; imp("XAudioSubmitRenderDriverFrame")(s, base); } }) ==
+                       int(StopCode::Unimplemented),
+               "audio: an unknown driver, a second client, or more than 256 waiting frames stops (7)");
+    }
+    {
+        // XamAlloc / XamFree (Xenia xam_info.cc:361-418): FM4's (0, 0x2E6C): 0, a zeroed, writable xamBlock in the 4 KB
+        // virtual heap (3 pages); XamFree of it 0, and of it again (or of any other address) stops (7); flags
+        // 10000000 (another XAM heap) stop (7).
+        const uint32_t blockOut = ArenaAlloc(base, 4);
+        PPCContext alloc{};
+        alloc.r3.u64 = 0, alloc.r4.u64 = 0x2E6C, alloc.r5.u32 = blockOut;
+        imp("XamAlloc")(alloc, base);
+        const uint32_t xamBlock = be32(blockOut);
+        bool zeroed = xamBlock != 0;
+        for (uint32_t i = 0; zeroed && i < 0x2E6C; i++) zeroed = base[xamBlock + i] == 0;
+        if (zeroed) base[xamBlock + 0x2E6B] = 1;
+        PPCContext freeCall{};
+        freeCall.r3.u32 = xamBlock;
+        imp("XamFree")(freeCall, base);
+        Expect(alloc.r3.u64 == 0 && zeroed && LookupHeap(xamBlock) == VirtualHeap(4096) && freeCall.r3.u64 == 0 &&
+                   ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = xamBlock; imp("XamFree")(c, base); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { PPCContext c = alloc; c.r3.u64 = 0x10000000; imp("XamAlloc")(c, base); }) == int(StopCode::Unimplemented),
+               "XamAlloc(0, 0x2E6C): a zeroed writable xamBlock in the 4 KB virtual heap; XamFree releases it once; another heap's flags stop (7)");
+        // XMA registers and contexts (kernel/xma.h). Register r is at 7FEA0000 + 4r (Xenia xma_decoder.cc:114); a
+        // store's value is as PPC_STORE_U32 takes it, so the device word bit i (context i) is stored as bswap(1 << i).
+        const uint32_t plain = ArenaAlloc(base, 16);
+        PpcMmioStore32(base, plain, 0x11223344);
+        Expect(base[plain] == 0x11 && base[plain + 3] == 0x44 && PpcMmioLoad32(base, plain) == 0x11223344,
+               "device-access hooks outside the XMA block: plain big-endian guest memory");
+        const uint32_t arrayPhysical = __builtin_bswap32(PpcMmioLoad32(base, 0x7FEA1800));
+        uint32_t array = 0;
+        Expect(PpcMmioLoad32(base, 0x7FEA1818) == 0 && PhysicalToGuest(arrayPhysical, array) && LookupHeap(array) == PhysicalHeap(0x10000),
+               "XMA 606 reads 0 (no context in progress); 600 reads the context array's physical address (lwbrx: little-endian)");
+        const uint32_t out = ArenaAlloc(base, 4);
+        auto create = [&] { PPCContext c{}; c.r3.u32 = out; imp("XMACreateContext")(c, base); return std::make_pair(c.r3.u32, be32(out)); };
+        const auto c0 = create(), c1 = create();
+        PPCContext rel{};
+        rel.r3.u32 = array + 64;
+        imp("XMAReleaseContext")(rel, base);
+        const auto again = create();
+        Expect(c0 == std::make_pair(0u, array) && c1 == std::make_pair(0u, array + 64) && rel.r3.u64 == 0 && again.second == array + 64,
+               "XMACreateContext: lowest free context of the array (64 bytes each); a released one is reused");
+        Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = array + 32; imp("XMAReleaseContext")(c, base); }) == int(StopCode::Unimplemented),
+               "XMAReleaseContext of an address that is no allocated context stops (7)");
+        PpcMmioStore32(base, 0x7FEA1804, 0x02000000), PpcMmioStore32(base, 0x7FEA1804, 0x03000000);
+        Expect(xma::GetCounters().bracketWrites == 2 &&
+                   ExitCodeOf([&] { PpcMmioStore32(base, 0x7FEA1804, 0x04000000); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)PpcMmioLoad32(base, 0x7FEA1804); }) == int(StopCode::Unimplemented),
+               "XMA 601: 0x02000000 and 0x03000000 accepted (Xenia: around a lock); another value, or a read, stops (7)");
+        // Clear context 0 (6A0, Xenia XmaContext::Clear): from all ones, word 0 loses bits 20-21 and 27-31 (07CFFFFF),
+        // word 1 bit 31 (7FFFFFFF), word 2 bits 0-25 (FC000000), word 9 bits 0-4 (FFFFFFE0); context 1 keeps its words.
+        for (uint32_t w = 0; w < 32; w++) StoreBigEndian32(base, array + 4 * w, 0xFFFFFFFF);
+        PpcMmioStore32(base, 0x7FEA1A80, 0x01000000);
+        Expect(be32(array) == 0x07CFFFFF && be32(array + 4) == 0x7FFFFFFF && be32(array + 8) == 0xFC000000 && be32(array + 36) == 0xFFFFFFE0 &&
+                   be32(array + 12) == 0xFFFFFFFF && be32(array + 64) == 0xFFFFFFFF,
+               "XMA clear (6A0, bit 0): context 0's valid bits and offsets 0, nothing else");
+        Expect(ExitCodeOf([&] { PpcMmioStore32(base, 0x7FEA1940, 0x20000000); }) == int(StopCode::Unimplemented),
+               "a kick of context 5, which is not allocated, stops (7)");
+        // A kick that decodes (650, bit 0) with a fake decoder (512 samples of 0.5 -> 4000 big-endian). Input: one packet,
+        // header 04 00 01 00 (1 frame, first frame at bit 0, metadata 1 = XMA2, skip 0); a 32-bit frame at bit 32 (length
+        // field 0x0020: bytes 00 41 with frame bit 47 = 1), then all ones. Output: 4 blocks = 1024 bytes = one mono frame.
+        // Expected: one frame decoded and written, the ring full (write = read = 0, output valid cleared), read offset 64.
+        const uint32_t io = PhysicalHeap(0x10000)->Alloc(0x10000, 0x10000, mem::kReserve | mem::kCommit, page::kReadWrite, false);
+        uint32_t ioPhysical = 0;
+        Expect(io != 0 && PhysicalAddress(io, ioPhysical), "a physical page for the XMA test buffers");
+        std::memset(base + io, 0xFF, 2048);
+        const uint8_t head[6] = {0x04, 0x00, 0x01, 0x00, 0x00, 0x41};
+        std::memcpy(base + io, head, sizeof head);
+        std::memset(base + io + 0x1000, 0xEE, 1024);
+        const uint32_t words[16] = {1u | 1u << 20 | 4u << 22, 3u << 27 | 1u << 31, 32, 0, 0, ioPhysical, 0, ioPhysical + 0x1000};
+        for (uint32_t w = 0; w < 16; w++) StoreBigEndian32(base, array + 4 * w, words[w]);
+        uint32_t seenBits = 0;
+        uint8_t seenBytes[4] = {};
+        struct Fake : apu::XmaFrameDecoder
+        {
+            uint32_t* bits; uint8_t* bytes;
+            bool Decode(const uint8_t* frame, uint32_t count, std::vector<float> (&ch)[2], uint32_t& samples, std::string&) override
+            {
+                *bits = count, std::memcpy(bytes, frame, 4);
+                ch[0].assign(apu::kXmaSamplesPerFrame, 0.5f);
+                samples = apu::kXmaSamplesPerFrame;
+                return true;
+            }
+        };
+        xma::SetDecoderFactory([&](uint32_t rate, uint32_t channels, std::string&) -> std::unique_ptr<apu::XmaFrameDecoder> {
+            if (rate != 48000 || channels != 1) return nullptr;
+            auto f = std::make_unique<Fake>(); f->bits = &seenBits, f->bytes = seenBytes; return f;
+        });
+        PpcMmioStore32(base, 0x7FEA1940, 0x01000000);
+        bool samples = true;
+        for (uint32_t i = 0; i < 1024; i += 2) samples = samples && base[io + 0x1000 + i] == 0x40 && base[io + 0x1000 + i + 1] == 0x00;
+        const xma::Counters xc = xma::GetCounters();
+        Expect(seenBits == 32 && seenBytes[0] == 0x00 && seenBytes[1] == 0x41 && seenBytes[2] == 0xFF && samples &&
+                   be32(array) == words[0] && be32(array + 4) == (3u << 27) && be32(array + 8) == 64 && be32(array + 16) == 0 &&
+                   xc.passes == 1 && xc.framesDecoded == 1 && xc.framesWritten == 1,
+               "XMA kick: the frame's 32 bits reach the decoder; 512 samples 0x4000 fill the ring; output valid cleared (full), read offset 64");
+        const uint32_t idleBefore = xma::GetCounters().idleKicks;
+        PpcMmioStore32(base, 0x7FEA1940, 0x01000000);
+        Expect(xma::GetCounters().idleKicks == idleBefore + 1 && xma::GetCounters().passes == 1, "a kick with the output buffer invalid does nothing (idle)");
+        xma::SetDecoderFactory(nullptr);
+    }
     k = CreateGuestThread(base, 0x100, uint32_t(PPC_CODE_BASE) + 0x24, 0xF0F0, 0x0F0F, 0, id);
     WaitForEvent(base, k);
     Expect(threadSaw == 0xFFFF && be32(k + kthread_state::kExitStatus) == 0 &&
@@ -1219,6 +2456,16 @@ int main(int, char** argv)
     Expect(ResumeGuestThread(base, k) == 1, "resume returns the previous suspend count");
     WaitForEvent(base, k);
     Expect(waited && threadSaw == 0x4321, "a thread created suspended runs only after resume");
+    // KeResumeThread (by KTHREAD; Xenia xboxkrnl_threading.cc:213): a suspended thread's previous count 1, then it runs;
+    // a KTHREAD the runtime did not create stops (7).
+    k = CreateGuestThread(base, 0, 0, uint32_t(PPC_CODE_BASE) + 0x20, 0x2222, 1, id);
+    PPCContext keResume{};
+    keResume.r3.u32 = k;
+    imp("KeResumeThread")(keResume, base);
+    WaitForEvent(base, k);
+    Expect(keResume.r3.u64 == 1 && threadSaw == 0x2222 &&
+               ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0x7E00FF00; imp("KeResumeThread")(c, base); }) == int(StopCode::Unimplemented),
+           "KeResumeThread: previous suspend count 1, the thread runs; an unknown KTHREAD stops (7)");
     k = CreateGuestThread(base, 0, 0, uint32_t(PPC_CODE_BASE) + 0x28, 0, 0, id);
     WaitForEvent(base, k);
     Expect(be32(k + kthread_state::kExitStatus) == 0x55, "ExTerminateThread ends the thread with its exit code");
@@ -1527,6 +2774,13 @@ int main(int, char** argv)
     // type 3 = 3 << 30 | (count - 1) << 16 | opcode << 8 | predicate). Memory: one 64 KB page of the A0000000 view.
     {
         using namespace gpu;
+        // The census hash (survey/fxobj.py): for words below 256 it equals byte-wise FNV-1a-64 of those bytes. A guest word
+        // 0x61000000 is the bytes 61 00 00 00; loaded little-endian it is 0x61 = "a": FNV-1a-64("a") = af63dc4c8601ec8c
+        // (published vector) for type 0; type 1 changes the seed's low bit.
+        const uint32_t guestA = 0x61000000u;
+        Expect(ShaderHash(0, &guestA, 1) == 0xaf63dc4c8601ec8cull && ShaderHash(0, &guestA, 0) == 0xcbf29ce484222325ull &&
+                   ShaderHash(1, &guestA, 0) == 0xcbf29ce484222324ull,
+               "ShaderHash: the census recipe (FNV-1a-64 of \"a\" = af63dc4c8601ec8c; seed ^ type)");
         Expect(GpuSwap(0x11223344, 0) == 0x11223344 && GpuSwap(0x11223344, 1) == 0x22114433 && GpuSwap(0x11223344, 2) == 0x44332211 &&
                    GpuSwap(0x11223344, 3) == 0x33441122,
                "GpuSwap: none, 8in16, 8in32, 16in32 (xenos.h:1070-1087)");
@@ -1560,6 +2814,18 @@ int main(int, char** argv)
         Expect(be32(page) == 0xAABBCCDD && be32(page + 4) == 0x01020304 && be32(page + 8) == 0xCAFE && ReadRegister(base, reg::kVgtEventInitiator) == 0x14 &&
                    be32(page + 0x10) == 0x12345678,
                "PM4: MEM_WRITE and EVENT_WRITE_SHD with 8in32 store big-endian; a scratch register enabled in SCRATCH_UMSK is written to SCRATCH_ADDR");
+        // LOAD_ALU_CONSTANT (opcode 2F; Xenia pm4_command_processor_implement.h:1181-1232): {physical address, index |
+        // type << 16, size}: ALU (type 0) index 5 from two big-endian words -> registers 4005, 4006; fetch (type 1)
+        // index 2, one word -> 4802; type 5 stops (7). Header C0022F00: type 3, 3 words, opcode 2F.
+        put(0x500, {0x3F800000, 0x40000000, 0x12345678});
+        put(0x480, {0xC0022F00, phys + 0x500, 5, 2, 0xC0022F00, phys + 0x508, (1u << 16) | 2, 1});
+        put(0x4A0, {0xC0022F00, phys + 0x500, 5u << 16, 1});
+        CpState constants;
+        if (mapped)
+            Execute(base, page + 0x480, 8, 0, 8, constants);
+        Expect(ReadRegister(base, 0x4005) == 0x3F800000 && ReadRegister(base, 0x4006) == 0x40000000 && ReadRegister(base, 0x4802) == 0x12345678 &&
+                   ExitCodeOf([&] { CpState c; Execute(base, page + 0x4A0, 4, 0, 4, c); }) == int(StopCode::Unimplemented),
+               "PM4 LOAD_ALU_CONSTANT: ALU and fetch constants from memory (big-endian) at their register bases; type 5 stops (7)");
         // A ring of 4 words read from word 3 with wraparound: a type-0 header at word 3, its values at words 0 and 1.
         put(0x300, {0x22, 0x33, 0, 0x00012004});
         CpState ring;

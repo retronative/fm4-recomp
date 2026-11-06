@@ -20,6 +20,12 @@
 #include "guest_memory.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
+#include "kernel/content.h"
+#include "kernel/audio.h"
+#include "audio_sdl.h"
+#include "xma_ffmpeg.h"
+#include "ldi_mspack.h"
+#include "kernel/xma.h"
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
 #include "kernel/imports.h"
@@ -60,6 +66,8 @@ const char* DescribeGuest(uint32_t guest)
         return dataImports[size_t(index)];  // a data import's guard: its value is undocumented
     if (guest >= runtime::kStacksBase && guest < runtime::kStacksEnd)
         return "a guest stack guard page (stack overflow or underflow)";
+    if (guest - runtime::xma::kRegisterBase < runtime::xma::kRegisterBytes)
+        return "the XMA decoder's registers: an access the translator did not mark as a device access (recomp/mmio.h)";
     return nullptr;
 }
 
@@ -103,7 +111,12 @@ int main(int argc, char** argv)
     const char* imagePath = nullptr;
     const char* xexPath = nullptr;
     const char* discPath = nullptr;
+    const char* discMapPath = nullptr;
+    const char* gpuStopPath = nullptr;
+    const char* userDataPath = nullptr;
+    const char* audioMode = nullptr;
     const char* modulesPath = nullptr;
+    int stopAtSwap = 0;
     int deadline = 0;
     for (int i = 1; i < argc; i += 2)
     {
@@ -112,15 +125,36 @@ int main(int argc, char** argv)
         if (!std::strcmp(argv[i], "--image")) imagePath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--xex")) xexPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--disc")) discPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--disc-map")) discMapPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--gpu-stop")) gpuStopPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--user-data")) userDataPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--audio")) audioMode = argv[i + 1];
         else if (!std::strcmp(argv[i], "--modules")) modulesPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--stop-at-swap")) stopAtSwap = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--deadline")) deadline = std::atoi(argv[i + 1]);
         else Stop(StopCode::Setup, "unknown option %s", argv[i]);
     }
-    if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || modulesPath == nullptr || deadline <= 0)
-        Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> "
-             "--modules <game/modules> --deadline <seconds> (all required)");
+    if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
+        Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --disc-map <disc1_gdfx.tsv> "
+             "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --stop-at-swap <n> --deadline <seconds> (all required)");
+    // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
+    // the same 48 kHz pacing, frame conversion and callbacks (kernel/audio.h).
+    if (!std::strcmp(audioMode, "audible"))
+        runtime::audio::StartSdlAudio();
+    else if (!std::strcmp(audioMode, "mute"))
+    {
+        runtime::audio::SetSink(runtime::audio::Sink::Clock);
+        std::fprintf(stderr, "[audio] mute: no audio device opened; the 48 kHz clock pulls one frame every 256 samples (same pacing, conversion and callbacks as audible)\n");
+    }
+    else
+        Stop(StopCode::Setup, "--audio must be audible or mute, not %s", audioMode);
+    runtime::xma::SetDecoderFactory(runtime::xma::FfmpegDecoderFactory());  // XMA decoding (kernel/xma.h)
+    runtime::ldi::SetFactory(runtime::ldi::MspackDecoderFactory());  // LZX decompression (kernel/ldi.h)
+    runtime::gpu::SetStopAtSwap(uint32_t(stopAtSwap));
+    runtime::gpu::SetGpuStopPath(gpuStopPath);
     runtime::SetModuleImages(fm4::kModules, std::size(fm4::kModules), modulesPath);  // XexLoadImage (kernel/loader.h)
-    runtime::MountDisc(discPath);  // read-only: game:\ and d:\ (kernel/file_system.h)
+    runtime::MountDisc(discPath, discMapPath);
+    runtime::MountUserData(userDataPath);  // saved content, writable and isolated (kernel/content.h)  // read-only: game:\ and d:\ (kernel/file_system.h)
     const auto image = ReadChecked(imagePath, fm4::kImageSize, fm4::kImageCrc32, true);
     const auto header = ReadChecked(xexPath, fm4::kHeaderSize, fm4::kHeaderCrc32, false);
 
@@ -196,6 +230,8 @@ int main(int argc, char** argv)
         std::this_thread::sleep_for(std::chrono::seconds(deadline));
         ReportGuestContexts();
         runtime::gpu::ReportCommandProcessor();
+        runtime::audio::Report("deadline");
+        runtime::xma::Report("deadline");
         Stop(StopCode::Deadline, "no stop within %d s", deadline);
     }).detach();
 

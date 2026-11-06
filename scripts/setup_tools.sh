@@ -11,6 +11,8 @@
 #                         order) on branch fm4, built: XenonRecomp and XenonAnalyse
 #   tools/extract-xiso    pinned extract-xiso, to unpack the player's disc images
 #   tools/survey/         one binary per survey/*.cpp, linked against XenonRecomp's libraries
+#   tools/ffmpeg-xma      FFmpeg (pinned release, SHA-256 checked) with patches/ffmpeg/*.patch: static libavcodec and
+#                         libavutil with only the xmaframes decoder, LGPL (scripts/build_ffmpeg_xma.sh checks it)
 #
 # Needs git, CMake, Ninja and clang 18 or newer. LLVM=<bin dir> selects the compiler; by default
 # Homebrew LLVM. After changing a patch: git -C tools/XenonRecomp checkout -q --detach &&
@@ -23,6 +25,9 @@ XENONRECOMP_COMMIT=ddd128bcca99fe8bfbb99bea583c972351fa6ace
 EXTRACT_XISO_URL=https://github.com/XboxDev/extract-xiso.git
 EXTRACT_XISO_COMMIT=3f5b62cfe68f000b0e3c8a30104973f3a297948e
 BRANCH=fm4
+# FFmpeg 7.1.1 release tarball; the SHA-256 agrees with ReCarbon's independent pin (scripts/setup_tools.sh).
+FFMPEG_VERSION=7.1.1
+FFMPEG_SHA256=733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1
 if [ -z "${LLVM:-}" ]; then
   if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then LLVM=/opt/homebrew/opt/llvm/bin
   else LLVM="$(dirname "$(command -v clang)")"; fi
@@ -76,4 +81,19 @@ for src in "$ROOT"/survey/*.cpp; do
     echo "built tools/survey/$(basename "$bin")"
   fi
 done
-echo "setup_tools: XenonRecomp $(git -C "$XR" rev-parse --short HEAD) on $BRANCH, extract-xiso $(git -C "$XISO" rev-parse --short HEAD)"
+# FFmpeg-XMA: rebuilt when the tarball, a patch or the build script changes (a stamp of their hashes).
+FF="$TOOLS/ffmpeg-xma"
+mkdir -p "$TOOLS/ffmpeg-src"
+tarball="$TOOLS/ffmpeg-src/ffmpeg-$FFMPEG_VERSION.tar.xz"
+if [ ! -f "$tarball" ]; then
+  curl -sfL -o "$tarball.part" "https://ffmpeg.org/releases/ffmpeg-$FFMPEG_VERSION.tar.xz"
+  mv "$tarball.part" "$tarball"
+fi
+echo "$FFMPEG_SHA256  $tarball" | shasum -a 256 -c --quiet || { echo "setup_tools: $tarball does not match its SHA-256" >&2; exit 1; }
+stamp="$( { echo "$FFMPEG_SHA256"; shasum -a 256 "$ROOT"/patches/ffmpeg/*.patch "$ROOT/scripts/build_ffmpeg_xma.sh" | cut -d' ' -f1; "$LLVM/clang" --version | head -1; } | shasum -a 256 | cut -d' ' -f1)"
+if [ "$(cat "$FF/stamp" 2>/dev/null)" != "$stamp" ]; then
+  "$ROOT/scripts/build_ffmpeg_xma.sh" "$tarball" "$FF" "$LLVM/clang"
+  echo "$stamp" > "$FF/stamp"
+fi
+
+echo "setup_tools: XenonRecomp $(git -C "$XR" rev-parse --short HEAD) on $BRANCH, extract-xiso $(git -C "$XISO" rev-parse --short HEAD), FFmpeg-XMA $FFMPEG_VERSION ($(sed -n 's/^license (configure): //p' "$FF/build-info.txt"))"

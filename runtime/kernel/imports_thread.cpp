@@ -304,3 +304,15 @@ GUEST_IMPORT(ExTerminateThread, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc 
     // Never returns (threads.h ExitCurrentGuestThread; a runtime service thread stops instead).
     runtime::ExitCurrentGuestThread(ctx.r3.u32);
 }
+
+GUEST_IMPORT(KeResumeThread, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc:213-224 KeResumeThread (by KTHREAD); result: previous suspend count from NT (INFERRED)")
+{
+    // (KTHREAD*): decrements the thread's suspend count and starts it at zero (threads.h ResumeGuestThread), as
+    // NtResumeThread does by handle. Returns the previous suspend count, NT's documented result (Xenia returns
+    // X_STATUS_SUCCESS instead; FM4's two call sites do not use the result, OBSERVED in the translation). A KTHREAD the
+    // runtime did not create stops (Xenia: INVALID_HANDLE), as KeSetBasePriorityThread does.
+    runtime::ThreadState state{};
+    if (!runtime::FindThread(ctx.r3.u32, state))
+        Stop(StopCode::Unimplemented, "KeResumeThread(%08X): not a thread the runtime created (lr=%08X)", ctx.r3.u32, uint32_t(ctx.lr));
+    ctx.r3.u64 = runtime::ResumeGuestThread(base, state.kthread);
+}

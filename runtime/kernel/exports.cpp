@@ -30,6 +30,10 @@ constexpr SystemExport kExports[] = {
     {"xam.xex", 0x2FD, "XamReadTileToTextureEx", "Xenia xam_table.inc:561"},
     {"xam.xex", 0x369, "XuiAlloc", "Xenia xam_table.inc:669"},
     {"xam.xex", 0x8DF, "XamNuiGetTrueColorInfo", "Xenia xam_table.inc:1568"},
+    // Resolved after the first frames.
+    {"xam.xex", 0x50, "NetDll_XNetStartupEx", "Xenia xam_table.inc:80"},
+    {"xam.xex", 0x24, "NetDll_WSAStartupEx", "Xenia xam_table.inc:50"},
+    {"xam.xex", 0x48C, "XamVoiceSetMicArrayIdleUsers", "Xenia xam_table.inc:960"},
     // Resolved by FM4's static initializers (reference/kernel/xam_ordinals.md, second section).
     {"xam.xex", 0x1BA, "XamInputGetUserVibrationLevel", "Xenia xam_table.inc:239"},
     {"xam.xex", 0x208, "XamUserGetDeviceContext", "Xenia xam_table.inc:317"},

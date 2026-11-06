@@ -12,6 +12,8 @@
 #include "imports.h"
 #include "arena.h"
 #include "virtual_memory.h"
+#include <mutex>
+#include <set>
 
 namespace {
 
@@ -224,4 +226,45 @@ GUEST_IMPORT(MmFreePhysicalMemory, "REFERENCE_DERIVED: Xenia xboxkrnl_memory.cc 
     const bool physical = heap == PhysicalHeap(4096) || heap == PhysicalHeap(64 * 1024) || heap == PhysicalHeap(16 * 1024 * 1024);
     if (!physical || !heap->Release(address, nullptr))
         Stop(StopCode::Unimplemented, "MmFreePhysicalMemory(%u, %08X): not the base of a physical allocation", ctx.r3.u32, address);
+}
+
+namespace {
+std::mutex xamHeapLock;
+std::set<uint32_t> xamBlocks;  // blocks XamAlloc handed out (their base addresses)
+}  // namespace
+
+GUEST_IMPORT(XamAlloc, "REFERENCE_DERIVED: Xenia xam_info.cc:361-382 XamAllocImpl (system heap, X_ERROR_SUCCESS)")
+{
+    // (flags, size, block*): a zeroed block of `size` bytes, 0. Xenia allocates from its system heap; here the block
+    // is whole pages of the 4 KB virtual heap (a freeable allocation; pages are zeroed when committed, which also
+    // satisfies flag 00100000, "no zeroing needed"). The flags' top 4 bits select one of XAM's heaps (Xenia's note);
+    // only flags 0 and 00100000 are modelled, others, a zero size or a full heap stop (7).
+    const uint32_t flags = ctx.r3.u32, size = ctx.r4.u32, out = ctx.r5.u32;
+    if ((flags & ~0x00100000u) != 0 || size == 0)
+        Stop(StopCode::Unimplemented, "XamAlloc(flags %08X, size %u) is not modelled", flags, size);
+    const uint32_t block = runtime::VirtualHeap(4096)->Alloc(size, 4096, runtime::mem::kReserve | runtime::mem::kCommit,
+                                                             runtime::page::kReadWrite, false);
+    if (block == 0)
+        Stop(StopCode::Unimplemented, "XamAlloc: no room for %u bytes", size);
+    {
+        std::lock_guard guard(xamHeapLock);
+        xamBlocks.insert(block);
+    }
+    runtime::Store32(base, out, block);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(XamFree, "REFERENCE_DERIVED: Xenia xam_info.cc:413-418 (system heap free, X_ERROR_SUCCESS)")
+{
+    // (block*): frees a block XamAlloc handed out, 0. Anything else stops (7): Xenia's heap would ignore or corrupt.
+    const uint32_t block = ctx.r3.u32;
+    {
+        std::lock_guard guard(xamHeapLock);
+        if (xamBlocks.erase(block) == 0)
+            Stop(StopCode::Unimplemented, "XamFree(%08X): not a block XamAlloc handed out", block);
+    }
+    uint32_t released = 0;
+    if (!runtime::VirtualHeap(4096)->Release(block, &released))
+        Stop(StopCode::Unimplemented, "XamFree(%08X): the heap could not release it", block);
+    ctx.r3.u64 = 0;
 }

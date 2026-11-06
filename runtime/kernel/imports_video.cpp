@@ -5,6 +5,7 @@
 // src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc, src/xenia/kernel/xam/xam_video.cc, src/xenia/xbox.h:264.
 #include "imports.h"
 #include "graphics.h"
+#include "gpu/gpu_stop.h"
 #include "command_processor.h"
 #include "virtual_memory.h"
 #include <cstdio>
@@ -48,6 +49,11 @@ GUEST_IMPORT(VdInitializeEngines, "REFERENCE_DERIVED: Xenia xboxkrnl_video.cc:23
     // checks: the callback is a translated function and both microcode pointers lie in the executable's image;
     // a second call stops (7).
     using namespace runtime;
+    // The first GPU entry point: refuse while the GPU stop flag is set (or cannot be checked; gpu/gpu_stop.h fails closed).
+    const gpu::GpuStopCheck stopFlag = gpu::CheckGpuStop(gpu::GpuStopPath());
+    if (stopFlag.stopped)
+        Stop(StopCode::Setup, "VdInitializeEngines: GPU work is stopped (%s): %s", gpu::GpuStopPath() ? gpu::GpuStopPath() : "no --gpu-stop path",
+             stopFlag.reason.c_str());
     gpu::Engines& e = gpu::EngineState();
     if (e.initialized)
         Stop(StopCode::Unimplemented, "VdInitializeEngines called a second time");

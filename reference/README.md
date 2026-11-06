@@ -13,6 +13,7 @@ local and not distributed: they hold data derived from the game.
 | Recompiler | [unproven_switches.md](recompiler/unproven_switches.md) | Switch dispatches without a proven bound, the first diagnostic survey |
 | Recompiler | [unproven_switch_c.md](recompiler/unproven_switch_c.md), [unproven_switch_d.md](recompiler/unproven_switch_d.md) | The two bounded analyses of the 0x82ADA478 dispatch |
 | Kernel | [xam_ordinals.md](kernel/xam_ordinals.md) | xam ordinals FM4 resolves at run time |
+| Kernel | [audio.md](kernel/audio.md) | The audio render client and output |
 | GPU | [gpu_path.md](gpu/gpu_path.md) | VdInitializeEngines to the first VdSwap |
 
 ## Sources FM4 copies or adapts code from

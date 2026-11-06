@@ -5,6 +5,7 @@
 // src/xenia/gpu/pm4_command_processor_implement.h unless named otherwise.
 #include "command_processor.h"
 #include "graphics.h"
+#include "cp_trace.h"
 #include "imports.h"
 #include "virtual_memory.h"
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace runtime::gpu {
 namespace {
@@ -21,8 +23,8 @@ constexpr uint32_t kSwapSignature = 0x53574150;  // "SWAP" (xenos.h:28)
 
 // PM4 type-3 opcodes (xenos.h:1594-1655).
 enum : uint32_t {
-    kNop = 0x10, kRegRmw = 0x21, kDrawIndx = 0x22, kVizQuery = 0x23, kWaitForIdle = 0x26, kImLoadImmediate = 0x2B,
-    kSetConstant = 0x2D, kDrawIndx2 = 0x36, kIndirectBufferPfd = 0x37, kInvalidateState = 0x3B, kWaitRegMem = 0x3C,
+    kNop = 0x10, kRegRmw = 0x21, kDrawIndx = 0x22, kVizQuery = 0x23, kWaitForIdle = 0x26, kImLoad = 0x27, kImLoadImmediate = 0x2B,
+    kSetConstant = 0x2D, kLoadAluConstant = 0x2F, kDrawIndx2 = 0x36, kIndirectBufferPfd = 0x37, kInvalidateState = 0x3B, kWaitRegMem = 0x3C,
     kMemWrite = 0x3D, kRegToMem = 0x3E, kIndirectBuffer = 0x3F, kCondWrite = 0x45, kEventWrite = 0x46, kMeInit = 0x48,
     kSetBinMask = 0x50, kSetBinSelect = 0x51, kInterrupt = 0x54, kSetConstant2 = 0x55, kEventWriteShd = 0x58,
     kContextUpdate = 0x5E, kSetBinMaskLo = 0x60, kSetBinMaskHi = 0x61, kSetBinSelectLo = 0x62, kSetBinSelectHi = 0x63,
@@ -64,7 +66,7 @@ struct Reader
     }
 };
 
-std::atomic<uint32_t> ringStart{0}, ringWords{0}, readIndex{0}, writeBack{0};
+std::atomic<uint32_t> ringStart{0}, ringWords{0}, readIndex{0}, writeBack{0}, stopAtSwap{1};
 std::mutex stateLock;
 CpState ringState;
 
@@ -160,9 +162,37 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         }
         switch (opcode)
         {
-        case kMeInit: case kNop: case kInvalidateState: case kImLoadImmediate: case kContextUpdate: case kWaitForIdle:
-            break;  // nothing to do headless (:612-628; the shader upload is not used)
+        case kMeInit: case kNop: case kInvalidateState: case kContextUpdate: case kWaitForIdle:
+            break;  // nothing to do headless (:612-628)
+        case kImLoadImmediate:  // {type, start << 16 | size in words}, then the microcode inline (:1274-1308)
+        {
+            const uint32_t type = next(), sizeWords = next() & 0xFFFF;
+            if (sizeWords > remaining)
+                Stop(StopCode::Unimplemented, "GPU: IM_LOAD_IMMEDIATE of %u words in a %u-word packet", sizeWords, count);
+            if (TraceEnabled())
+            {
+                std::vector<uint32_t> code(sizeWords);
+                for (uint32_t i = 0; i < sizeWords; i++)
+                    code[i] = next();
+                TraceShader(type, sizeWords, ShaderHash(type, code.data(), sizeWords), true);
+            }
+            break;  // the shader upload itself is not used headless
+        }
+        case kImLoad:  // {address | type, start << 16 | size in words} (:1244-1272)
+        {
+            const uint32_t addressType = next(), sizeWords = next() & 0xFFFF;
+            if (TraceEnabled())
+            {
+                std::vector<uint32_t> code(sizeWords);
+                const uint32_t at = PhysicalToGuest(addressType & ~3u);
+                for (uint32_t i = 0; i < sizeWords; i++)
+                    code[i] = Load32(base, at + 4 * i);
+                TraceShader(addressType & 3, sizeWords, ShaderHash(addressType & 3, code.data(), sizeWords), false);
+            }
+            break;
+        }
         case kDrawIndx: case kDrawIndx2:
+            TraceDraw(base, state.draws, opcode);
             state.draws++;  // counted, not drawn
             break;
         case kInterrupt:  // per CPU bit, interrupt source 1 (:630-641)
@@ -179,7 +209,11 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             if (magic != kSwapSignature)
                 Stop(StopCode::Unimplemented, "GPU: a swap packet without its signature (%08X)", magic);
             state.swaps++;
-            Stop(StopCode::FirstSwap, "first swap: front buffer %08X, %ux%u", frontBuffer, width, height);
+            if (state.swaps == 1 && stopAtSwap.load() == 1)
+                Stop(StopCode::FirstSwap, "first swap: front buffer %08X, %ux%u", frontBuffer, width, height);
+            if (state.swaps >= stopAtSwap.load())
+                Stop(StopCode::FirstSwap, "swap %llu: front buffer %08X, %ux%u", (unsigned long long)state.swaps, frontBuffer, width, height);
+            break;
         }
         case kIndirectBuffer: case kIndirectBufferPfd:  // (:670-678, ExecuteIndirectBuffer)
         {
@@ -275,6 +309,16 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 CpWriteRegister(base, index, next());
             break;
         }
+        case kLoadAluConstant:  // {physical address, offset | type << 16, size in words}: from memory (:1181-1232)
+        {
+            const uint32_t address = next() & 0x3FFFFFFF, offsetType = next(), size = next() & 0xFFF, type = (offsetType >> 16) & 0xFF;
+            const uint32_t bases[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};  // as SET_CONSTANT (command_processor.cc:657-690)
+            if (type > 4)
+                Stop(StopCode::Unimplemented, "GPU: LOAD_ALU_CONSTANT of type %u", type);
+            for (uint32_t i = 0; i < size; i++)  // big-endian words (WriteRegistersFromMem: load_and_swap, :609-616)
+                CpWriteRegister(base, bases[type] + (offsetType & 0x7FF) + i, Load32(base, PhysicalToGuest(address + 4 * i)));
+            break;
+        }
         case kSetConstant2:  // (:1170-1179)
         {
             for (uint32_t index = next() & 0xFFFF; remaining; index++)
@@ -294,6 +338,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             next();
     }
 }
+
+void SetStopAtSwap(uint32_t n) { stopAtSwap = n; }
 
 void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
 {

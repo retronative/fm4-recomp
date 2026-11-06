@@ -6,7 +6,7 @@
 # first GPU run). After ForzaRecomp's gpu_run.sh (zsh), re-written in bash: a zsh
 # `status` variable once disabled a watchdog silently.
 #
-#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds>
+#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute>
 #   scripts/gpu_run.sh --self-test        # checks the refusal and lock-up detection on planted files; runs nothing
 #
 # Before: refuses if research/GPU_STOP exists (only the owner clears it), runs scripts/preflight.sh (the machine must
@@ -21,7 +21,10 @@ REPORT_DIRS=("$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticRep
 # Lock-up lines. "GPU Hang Error ... kIOGPUCommandBufferCallbackErrorHang" is the line Metal logged in ForzaRecomp-recarbon's
 # real hang (its syslog), which left no .ips report.
 LOG_PATTERN='GPU Hang|kIOGPUCommandBufferCallbackError|GPU Restart|gpu restart|IOGPUFamily.*(timeout|timed out|hang|lockup|panic)|GPU.*(hang|lockup) detected'
-LOG_PREDICATE='process == "fm4recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal"'
+# The log tool records its own invocation, predicate text included ("GPU Hang"), so its lines are excluded twice
+# (predicate and lockup_lines): otherwise the check matches itself (this once
+# wrote a false GPU_STOP).
+LOG_PREDICATE='(process == "fm4recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal") AND process != "log"'
 LOCK="$ROOT/research/.gpu_run.lock"
 
 # New lock-up evidence (reports newer than the marker file $1) in the report directories given after it; prints
@@ -43,7 +46,12 @@ lockup_evidence() {
 log_evidence() {
   local since="$1" saved="$2"
   /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" --predicate "$LOG_PREDICATE" > "$saved" 2>/dev/null || true
-  grep -E "$LOG_PATTERN" "$saved" | head -20 || true
+  lockup_lines "$saved"
+}
+
+# Lock-up lines in a saved log, never the log tool's own lines (its invocation repeats the predicate).
+lockup_lines() {
+  grep -Ev '^[0-9: .-]+ +[A-Za-z]+ +log\[[0-9]+:' "$1" | grep -E "$LOG_PATTERN" | head -20 || true
 }
 
 # One GPU run on the machine at a time: a mkdir lock holding the owner's pid; a lock whose pid is gone is reclaimed.
@@ -88,6 +96,24 @@ if [ "${1:-}" = "--self-test" ]; then
   if echo "$hang" | grep -Eq "$LOG_PATTERN" && echo "kernel: IOGPUFamily: GPU Restart" | grep -Eq "$LOG_PATTERN" &&
      ! echo "fm4recomp: [runtime] calling the title entry" | grep -Eq "$LOG_PATTERN"; then :; else
     echo "self-test FAIL: the log pattern (the real Metal hang line, a GPU restart, an ordinary line)" >&2; exit 1; fi
+  # The earlier false positive: the log tool's own invocation line (it repeats the predicate) must not count;
+  # the real hang line in the same log must.
+  printf '%s\n' "2026-11-06 13:53:20.064 Df log[33771:7df138] [com.apple.log:] log run noninteractively, args: '/usr/bin/log' 'show' '--predicate' 'eventMessage CONTAINS \"GPU Hang\"'" "$hang" > "$work/self.log"
+  { [ "$(lockup_lines "$work/self.log" | wc -l | tr -d ' ')" = 1 ] && lockup_lines "$work/self.log" | grep -q kIOGPUCommandBufferCallbackErrorHang; } ||
+    { echo "self-test FAIL: the log tool's own line counted, or the hang line missed" >&2; exit 1; }
+  # The real pipeline (log show + predicate + filter) on the real system log: a clearly marked hang line written with
+  # logger must be found. The real lock is held meanwhile, so no GPU run can see this line in its window.
+  take_lock
+  since=$(date +%s)
+  logger -t fm4-recomp-gpu-run-selftest "fm4-recomp gpu_run self-test (not a real hang): Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)"
+  found=""
+  for attempt in 1 2 3 4 5; do
+    sleep 1
+    found="$(log_evidence "$since" "$work/real.log" | grep 'gpu_run self-test' || true)"
+    [ -n "$found" ] && break
+  done
+  [ -n "$found" ] || { echo "self-test FAIL: the real system log pipeline did not find the marked hang line" >&2; exit 1; }
+  rm -f "$LOCK/pid"; rmdir "$LOCK"; trap - EXIT
   LOCK="$work/lock"
   ( take_lock; [ -f "$LOCK/pid" ] ) || { echo "self-test FAIL: lock not taken" >&2; exit 1; }
   [ ! -d "$LOCK" ] || { echo "self-test FAIL: lock not released" >&2; exit 1; }
@@ -102,12 +128,14 @@ if [ "${1:-}" = "--self-test" ]; then
   if ( refuse_if_stopped "$STOP_FLAG" ) 2>/dev/null; then echo "self-test FAIL: a stop flag did not refuse" >&2; exit 1; fi
   ( refuse_if_stopped "$work/absent" ) || { echo "self-test FAIL: refused without a stop flag" >&2; exit 1; }
   rm -r "$work"  # the self-test's own temporary directory under build/
-  echo "gpu_run self-test: PASS (reports: empty, new, old; log pattern: the real Metal hang line, a GPU restart, an ordinary line; GPU_STOP written; refusal with and without a flag; lock: taken, released, stale reclaimed, live refused)"
+  echo "gpu_run self-test: PASS (reports: empty, new, old; log pattern: the real Metal hang line, a GPU restart, an ordinary line, the log tool's own line excluded; the real system log (a marked logger line found); GPU_STOP written; refusal with and without a flag; lock: taken, released, stale reclaimed, live refused)"
   exit 0
 fi
 
-[ $# -eq 3 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> | --self-test" >&2; exit 2; }
-OUT="$1"; RUNS="$2"; DEADLINE="$3"
+[ $# -eq 5 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> | --self-test" >&2; exit 2; }
+OUT="$1"; RUNS="$2"; DEADLINE="$3"; STOP_AT_SWAP="$4"; AUDIO="$5"
+[[ "$AUDIO" == audible || "$AUDIO" == mute ]] || { echo "audio must be audible or mute" >&2; exit 2; }
+[[ "$STOP_AT_SWAP" =~ ^[1-9][0-9]*$ ]] || { echo "the swap to stop at must be a positive integer" >&2; exit 2; }
 [[ "$RUNS" =~ ^[1-9][0-9]*$ && "$DEADLINE" =~ ^[1-9][0-9]*$ ]] || { echo "runs and deadline must be positive integers" >&2; exit 2; }
 refuse_if_stopped "$STOP_FLAG"
 take_lock
@@ -117,8 +145,9 @@ OUT="$(cd "$OUT" && pwd)"
 "$ROOT/scripts/build.sh" "$OUT/build"
 BIN="$ROOT/build/native/runtime/fm4recomp"
 shasum -a 256 "$BIN" "$ROOT/game/survey/image.bin" | sed "s|$ROOT/||" | tee "$OUT/binary.sha256"
-echo "audio: none linked yet (no SDL); the dummy-driver check applies once audio exists" | tee "$OUT/audio.txt"
+echo "audio: $AUDIO (fm4recomp --audio $AUDIO; the run's \"[audio]\" line names the device or says none was opened)" | tee "$OUT/audio.txt"
 export HOME="$ROOT/game/home"
+mkdir -p "$ROOT/game/user-data"  # saved content (kernel/content.h), isolated from the read-only disc
 mkdir -p "$HOME"
 for i in $(seq 1 "$RUNS"); do
   since=$(date +%s)
@@ -131,12 +160,15 @@ for i in $(seq 1 "$RUNS"); do
     $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[launcher] deadline: process group killed\n"; exit 124 };
     alarm $deadline + 30; waitpid $pid, 0; alarm 0;
     my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-    "$DEADLINE" "$BIN" --image "$ROOT/game/survey/image.bin" --xex "$ROOT/game/files/default.xex" --disc "$ROOT/game/files" \
-    --modules "$ROOT/game/modules" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
+    "$DEADLINE" "$BIN" --image "$ROOT/game/survey/image.bin" --xex "$ROOT/game/files/default.xex" --disc "$ROOT/game/files" --disc-map "$ROOT/game/survey/disc1_gdfx.tsv" \
+    --modules "$ROOT/game/modules" --gpu-stop "$STOP_FLAG" --user-data "$ROOT/game/user-data" --audio "$AUDIO" --stop-at-swap "$STOP_AT_SWAP" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
   echo "$status" > "$OUT/run$i.exit"
   echo "run $i: exit $status, $(grep -m1 '^\[stop ' "$OUT/run$i.err" || echo 'no stop line')"
   sleep 2  # let reports and log lines land
   evidence="$(lockup_evidence "$OUT/run$i.start" "${REPORT_DIRS[@]}" || true)$(log_evidence "$since" "$OUT/run$i.syslog.txt")"
   [ -z "$evidence" ] || trip "run $i ($OUT): $evidence"
+  # The log must name the audio mode given (audible: driver and device; mute: no device opened).
+  if [ "$AUDIO" = mute ]; then audio_line='[audio] mute: no audio device opened'; else audio_line='[audio] audible: '; fi
+  grep -F -m1 "$audio_line" "$OUT/run$i.err" >> "$OUT/audio.txt" || { echo "run $i: no \"$audio_line\" line in its log" >&2; exit 1; }
 done
 echo "gpu_run: $RUNS run(s), no lock-up evidence"

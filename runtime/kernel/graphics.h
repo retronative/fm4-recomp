@@ -32,6 +32,11 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value);
 
 // The engines (VdInitializeEngines): HLE; the runtime's command processor is the engine, so the microcode
 // the guest passes is recorded but not run.
+// The GPU stop flag (fm4recomp --gpu-stop, required): every GPU entry point checks it first (gpu/gpu_stop.h);
+// VdInitializeEngines is the first, and the renderer (M4) will start from it.
+void SetGpuStopPath(const char* path);
+const char* GpuStopPath();
+
 struct Engines { bool initialized = false; uint32_t callback = 0, callbackArg = 0, pfp = 0, me = 0, gpuIdentifierAddress = 0; };
 Engines& EngineState();
 

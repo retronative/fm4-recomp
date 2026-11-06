@@ -104,4 +104,10 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value) { Store32(base
 
 Engines& EngineState() { return engines; }
 
+namespace {
+const char* gpuStopPath = nullptr;
+}  // namespace
+void SetGpuStopPath(const char* path) { gpuStopPath = path; }
+const char* GpuStopPath() { return gpuStopPath; }
+
 }  // namespace runtime::gpu

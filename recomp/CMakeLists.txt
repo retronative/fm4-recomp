@@ -14,9 +14,10 @@ target_include_directories(fm4_ppc PUBLIC
   ${PROJECT_SOURCE_DIR}/ppc
   ${PROJECT_SOURCE_DIR}/tools/XenonRecomp/thirdparty/simde)
 # Every indirect call goes through the runtime's checked lookup (recomp/indirect.h): a missing target
-# stops with its guest address instead of calling a null host pointer.
+# stops with its guest address instead of calling a null host pointer. Device accesses the translator marks
+# (eieio-ordered stores, lwbrx) go through the runtime too (recomp/mmio.h).
 target_compile_options(fm4_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
-  "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h")
+  "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h" "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h")
 
 # Each module default.xex loads, as its own library from game/modules/<name>/ppc, with the same flags.
 # <name>_symbols.h (generated) renames the names every translation defines alike (PPCFuncMappings,
@@ -30,7 +31,7 @@ foreach(module IN LISTS FM4_MODULES)
     ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc
     ${PROJECT_SOURCE_DIR}/tools/XenonRecomp/thirdparty/simde)
   target_compile_options(${module}_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
-    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h"
+    "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h" "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h"
     "SHELL:-include ${FM4_GENERATED}/${module}_symbols.h")
   add_dependencies(${module}_ppc fm4_generated)
   list(APPEND FM4_MODULE_LIBRARIES $<TARGET_FILE:${module}_ppc> ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc/ppc_recomp_shared.h)

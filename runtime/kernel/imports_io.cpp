@@ -172,10 +172,12 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
     // (INFO_LENGTH_MISMATCH), the handle (INVALID_HANDLE), the buffer zeroed, then the io status
     // {status, bytes written}. Any other class stops (7).
     const uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32, info = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
-    constexpr uint32_t kPosition = 14, kNetworkOpen = 34;
-    if (infoClass != kPosition && infoClass != kNetworkOpen)
+    // FileSectorInformation (26): the file's first sector in the disc volume (from the disc map). Xenia returns a hash
+    // of the path (io_info.cc:94-104, "used to identify files"); INFERRED from the class's name.
+    constexpr uint32_t kPosition = 14, kSector = 26, kNetworkOpen = 34;
+    if (infoClass != kPosition && infoClass != kSector && infoClass != kNetworkOpen)
         Stop(StopCode::Unimplemented, "NtQueryInformationFile: information class %u is not implemented", infoClass);
-    const uint32_t needed = infoClass == kPosition ? 8 : kNetworkOpenInformationSize;
+    const uint32_t needed = infoClass == kPosition ? 8 : infoClass == kSector ? 4 : kNetworkOpenInformationSize;
     if (length < needed)
         return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH
     const auto object = runtime::LookupHandle(handle);
@@ -183,7 +185,9 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
     if (file == nullptr)
         return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
     std::memset(base + info, 0, length);
-    if (infoClass == kPosition)
+    if (infoClass == kSector)
+        runtime::Store32(base, info, file->entry.sector);
+    else if (infoClass == kPosition)
     {
         runtime::Store32(base, info, uint32_t(file->position >> 32));
         runtime::Store32(base, info + 4, uint32_t(file->position));
@@ -192,6 +196,28 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
         WriteNetworkOpenInformation(base, info, file->entry);
     if (ioStatus)
         runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, needed);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc:186-245 NtSetInformationFile (XFilePositionInformation)")
+{
+    // (handle, io status*, info*, length, class): FilePositionInformation (14) sets the position from its big-endian
+    // 64 bits. Xenia's order: a length below the class's minimum (8) is INFO_LENGTH_MISMATCH, an unknown handle
+    // INVALID_HANDLE; then the io status {0, 8} and 0. Any other class stops (7): disposition (deletion) and
+    // allocation are writes to a read-only disc that Xenia ignores, not modelled until a run needs them.
+    const uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32, info = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
+    constexpr uint32_t kPosition = 14;
+    if (infoClass != kPosition)
+        Stop(StopCode::Unimplemented, "NtSetInformationFile: information class %u is not implemented", infoClass);
+    if (length < 8)
+        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH
+    const auto object = runtime::LookupHandle(handle);
+    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
+    if (file == nullptr)
+        return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
+    file->position = uint64_t(runtime::Load32(base, info)) << 32 | runtime::Load32(base, info + 4);
+    if (ioStatus)
+        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, 8);
     ctx.r3.u64 = 0;
 }
 

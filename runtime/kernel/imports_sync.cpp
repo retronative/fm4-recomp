@@ -199,3 +199,46 @@ GUEST_IMPORT(KeResetEvent, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc KeRes
     // (event*): clears the event; returns the previous state.
     ctx.r3.u64 = uint32_t(runtime::ResetEvent(base, GuestEvent(base, ctx.r3.u32, "KeResetEvent")));
 }
+
+// KeInitializeMutant and KeReleaseMutant. Xenia
+// 67f16c4 has neither (xboxkrnl_table.inc lists them); the semantics are NT's (INFERRED) over the KMUTANT model
+// NtCreateMutant already uses.
+GUEST_IMPORT(KeInitializeMutant, "INFERRED: NT KeInitializeMutant (KMUTANT: type 2, wait list head, owner +0x18, abandoned +0x1C); Xenia has none")
+{
+    // (mutant*, initial owner): the 0x20-byte KMUTANT is cleared, then: type 2, signal state 1 (free) or 0 (owned
+    // once by the calling thread, whose KTHREAD becomes the owner), the wait list head pointing at itself (+8, +0xC;
+    // an empty NT list, as the title's own inline initialisation of dispatcher objects writes it). NT also links an
+    // owned mutant into its owner's mutant list (for abandonment at thread exit); not modelled, as for NtCreateMutant.
+    // A null or misaligned pointer stops.
+    using namespace runtime;
+    const uint32_t mutant = ctx.r3.u32, initialOwner = ctx.r4.u32;
+    if (mutant == 0 || mutant % 4)
+        Stop(StopCode::GuestFault, "KeInitializeMutant(%08X): null or misaligned (lr=%08X)", mutant, uint32_t(ctx.lr));
+    std::memset(base + mutant, 0, 0x20);
+    base[mutant] = dispatch::kMutant;
+    Store32(base, mutant + dispatch::kSignalState, initialOwner ? 0 : 1);
+    Store32(base, mutant + 8, mutant + 8);
+    Store32(base, mutant + 0xC, mutant + 8);
+    Store32(base, mutant + kMutantOwner, initialOwner ? CurrentThread(ctx, base) : 0);
+}
+
+GUEST_IMPORT(KeReleaseMutant, "INFERRED: NT KeReleaseMutant (previous signal state; not owned raises STATUS_MUTANT_NOT_OWNED); Xenia has none")
+{
+    // (mutant*, priority increment, abandoned, wait): releases one level held by the calling thread and returns the
+    // signal state before (dispatcher.h ReleaseMutant). The increment has no effect (no priority boosts) and `wait`
+    // needs nothing, as for KeSetEvent. A release by a thread that does not own the mutant makes NT raise an
+    // exception (STATUS_MUTANT_NOT_OWNED), which is not modelled: it stops. Abandoning (NT: frees the mutant whoever
+    // owns it and marks it abandoned) is not modelled and stops; so does an object that is not a mutant.
+    using namespace runtime;
+    const uint32_t mutant = ctx.r3.u32, abandoned = ctx.r5.u32;
+    if (mutant == 0 || mutant % 4 || base[mutant] != dispatch::kMutant)
+        Stop(StopCode::GuestFault, "KeReleaseMutant(%08X): not a mutant (lr=%08X)", mutant, uint32_t(ctx.lr));
+    if (abandoned & 0xFF)  // BOOLEAN
+        Stop(StopCode::Unimplemented, "KeReleaseMutant(%08X, abandoned): abandoning a mutant is not implemented (lr=%08X)", mutant,
+             uint32_t(ctx.lr));
+    int32_t previous = 0;
+    if (!ReleaseMutant(base, mutant, CurrentThread(ctx, base), previous))
+        Stop(StopCode::GuestFault, "KeReleaseMutant(%08X): not owned by the calling thread (signal state %d, owner %08X; NT raises "
+             "STATUS_MUTANT_NOT_OWNED) (lr=%08X)", mutant, previous, Load32(base, mutant + kMutantOwner), uint32_t(ctx.lr));
+    ctx.r3.u64 = uint32_t(previous);
+}

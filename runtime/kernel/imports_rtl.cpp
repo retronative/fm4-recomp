@@ -4,6 +4,7 @@
 // Rtl string imports. Semantics: Xenia xenia-canary 67f16c4e315f,
 // src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc; X_ANSI_STRING = {be16 length, be16 maximum length, be32 buffer}.
 #include "imports.h"
+#include <cstdio>
 #include <cstring>
 
 GUEST_IMPORT(RtlInitAnsiString, "REFERENCE_DERIVED: Xenia xboxkrnl_rtl.cc:224 RtlInitAnsiString")
@@ -71,4 +72,39 @@ GUEST_IMPORT(RtlFillMemoryUlong, "REFERENCE_DERIVED: Xenia xboxkrnl_rtl.cc:78 Rt
     const uint32_t destination = ctx.r3.u32, count = ctx.r4.u32 >> 2, pattern = ctx.r5.u32;
     for (uint32_t i = 0; i < count; i++)
         runtime::Store32(base, destination + 4 * i, pattern);
+}
+
+GUEST_IMPORT(RtlMultiByteToUnicodeN, "REFERENCE_DERIVED: Xenia xboxkrnl_rtl.cc:357-377 (kSketchy); ASCII only")
+{
+    // (wchar dest*, dest length in bytes, written*, source*, source length): min(dest length / 2, source length)
+    // characters, each byte widened to a big-endian UTF-16 unit; *written (if given) = characters x 2; 0. Xenia widens
+    // every byte (Latin-1) and marks itself sketchy: for a byte of 0x80 or more the result depends on the ANSI code
+    // page (UNRESOLVED), so such a byte stops (7); ASCII is exact.
+    const uint32_t dest = ctx.r3.u32, destLength = ctx.r4.u32, written = ctx.r5.u32, source = ctx.r6.u32, sourceLength = ctx.r7.u32;
+    const uint32_t count = destLength / 2 < sourceLength ? destLength / 2 : sourceLength;
+    for (uint32_t i = 0; i < count; i++)
+        if (base[source + i] >= 0x80)
+            Stop(StopCode::Unimplemented, "RtlMultiByteToUnicodeN: byte %02X at %u needs the ANSI code page (not modelled)", base[source + i], i);
+    for (uint32_t i = 0; i < count; i++)
+        base[dest + 2 * i] = 0, base[dest + 2 * i + 1] = base[source + i];
+    if (written)
+        runtime::Store32(base, written, count * 2);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(EtxProducerRegister, "APPROXIMATE: Xenia lists the export only (xboxkrnl_table.inc); no event-trace consumer exists; FM4 ignores the result (VERIFIED)")
+{
+    // (descriptor*, ?, ?, ?, ?, ?): registers an event-trace (ETX) producer, which feeds a diagnostics consumer. No
+    // consumer exists in this runtime, so nothing is registered or written: 0, logged once. FM4's caller does not read
+    // the result (VERIFIED in our translation). Semantics UNKNOWN; logging through the producer stays a strict stop.
+    static bool logged = false;
+    if (!logged)
+        logged = true, std::fprintf(stderr, "[runtime] EtxProducerRegister(%08X): no trace consumer, nothing registered\n", ctx.r3.u32);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(EtxProducerUnregister, "APPROXIMATE: the counterpart of EtxProducerRegister, which registers nothing here; Xenia lists the export only")
+{
+    // (descriptor*, ...): unregisters an event-trace producer. Nothing was registered (no trace consumer): 0.
+    ctx.r3.u64 = 0;
 }

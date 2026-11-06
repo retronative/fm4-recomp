@@ -31,6 +31,9 @@ struct CpState
     uint32_t waitingOn = 0;                        // the address or register a WAIT_REG_MEM polls (0: none)
 };
 
+// The run stops (11) at swap number `n` (fm4recomp --stop-at-swap n, required; M3's evidence is n = 1).
+void SetStopAtSwap(uint32_t n);
+
 // Executes `words` 32-bit words from a buffer starting at guest address `start` that is `size` words long and
 // read from word `from` with wraparound (a ring; an indirect buffer has size == words and from 0). Stops (11) at
 // an XE_SWAP packet; stops (7) at an opcode not modelled, a packet longer than the data, or a wait that is never

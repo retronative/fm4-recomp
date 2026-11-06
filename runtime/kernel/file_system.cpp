@@ -6,12 +6,17 @@
 #include "arena.h"
 #include "objects.h"
 #include "stops.h"
+#include "stfs.h"
 #include <algorithm>
 #include <map>
 #include <mutex>
+#include <cctype>
 #include <climits>
 #include <cstdlib>
 #include <dirent.h>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -21,6 +26,8 @@ namespace runtime {
 namespace {
 
 std::string discRoot;  // realpath of the extracted disc
+struct MapEntry { uint32_t sector; uint64_t size; uint32_t attributes; };
+std::unordered_map<std::string, MapEntry> discMap;  // by path relative to the root, '/'-separated, disc case
 constexpr std::string_view kCdrom = "\\Device\\Cdrom0";
 constexpr std::string_view kLinks[] = {"game:", "d:"};
 
@@ -51,8 +58,24 @@ std::vector<std::string_view> SplitPath(std::string_view path)
 
 }  // namespace
 
-void MountDisc(const std::string& root)
+void MountDisc(const std::string& root, const std::string& map)
 {
+    std::ifstream in(map);
+    if (!in)
+        Stop(StopCode::Setup, "--disc-map %s cannot be read (survey/gdfx.py writes it)", map.c_str());
+    discMap.clear();
+    std::string line;
+    while (std::getline(in, line))
+    {
+        std::istringstream fields(line);
+        std::string path, sector, size, attributes;
+        if (!std::getline(fields, path, '\t') || !std::getline(fields, sector, '\t') || !std::getline(fields, size, '\t') ||
+            !std::getline(fields, attributes) || path.empty())
+            Stop(StopCode::Setup, "--disc-map %s: a malformed line: %.80s", map.c_str(), line.c_str());
+        discMap[path] = MapEntry{uint32_t(std::stoul(sector, nullptr, 16)), std::stoull(size, nullptr, 16), uint32_t(std::stoul(attributes, nullptr, 16))};
+    }
+    if (discMap.empty())
+        Stop(StopCode::Setup, "--disc-map %s is empty", map.c_str());
     char resolved[PATH_MAX];
     struct stat info;
     if (realpath(root.c_str(), resolved) == nullptr || stat(resolved, &info) != 0 || !S_ISDIR(info.st_mode))
@@ -111,12 +134,74 @@ bool TitleUpdatePath(std::string_view device)
 
 uint32_t DiscAttributes(const DiscEntry& entry)
 {
-    return (entry.directory ? file_attribute::kDirectory : 0) | file_attribute::kReadOnly;
+    return entry.attributes;
 }
 
 uint64_t DiscAllocationSize(const DiscEntry& entry)
 {
     return (entry.size + kDiscSectorSize - 1) / kDiscSectorSize * kDiscSectorSize;
+}
+
+namespace {
+std::mutex rootsLock;
+std::map<std::string, std::shared_ptr<const stfs::Package>> contentRoots;  // by lower-case root name
+
+std::string Lower(std::string_view s)
+{
+    std::string out(s);
+    for (char& c : out)
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+    return out;
+}
+
+// "<root>:\a\b" inside a mounted package; any other device is OtherDevice.
+Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
+{
+    const size_t colon = device.find(':');
+    if (colon == std::string::npos)
+        return Resolved::OtherDevice;
+    std::shared_ptr<const stfs::Package> package;
+    {
+        std::lock_guard guard(rootsLock);
+        const auto it = contentRoots.find(Lower(std::string_view(device).substr(0, colon)));
+        if (it == contentRoots.end())
+            return Resolved::OtherDevice;
+        package = it->second;
+    }
+    int32_t at = -1;  // the package root
+    for (const std::string_view part : SplitPath(std::string_view(device).substr(colon + 1)))
+    {
+        if (at >= 0 && !package->Files()[size_t(at)].directory)
+            return Resolved::NotFound;
+        int32_t found = -1;
+        for (size_t i = 0; i < package->Files().size(); i++)
+            if (package->Files()[i].parent == at && EqualCase(package->Files()[i].name, part))
+                found = int32_t(i);
+        if (found < 0)
+            return Resolved::NotFound;
+        at = found;
+    }
+    entry = DiscEntry{};
+    entry.host = package->Host();
+    entry.package = package;
+    entry.packageFile = at;
+    entry.directory = at < 0 || package->Files()[size_t(at)].directory;
+    entry.size = entry.directory ? 0 : package->Files()[size_t(at)].length;
+    entry.attributes = entry.directory ? file_attribute::kDirectory : 0x80 | file_attribute::kReadOnly;
+    return Resolved::Found;
+}
+}  // namespace
+
+bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package)
+{
+    std::lock_guard guard(rootsLock);
+    return contentRoots.emplace(Lower(root), std::move(package)).second;
+}
+
+bool UnmountContentRoot(const std::string& root)
+{
+    std::lock_guard guard(rootsLock);
+    return contentRoots.erase(Lower(root)) == 1;
 }
 
 Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& device)
@@ -133,11 +218,11 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
             }
     }
     if (device.compare(0, kCdrom.size(), kCdrom) != 0)
-        return Resolved::OtherDevice;
+        return ResolveContentPath(device, entry);
     if (discRoot.empty())
         Stop(StopCode::Setup, "no disc is mounted (--disc)");
 
-    std::string host = discRoot;
+    std::string host = discRoot, relative;
     bool directory = true;
     for (const std::string_view part : SplitPath(std::string_view(device).substr(kCdrom.size())))
     {
@@ -160,16 +245,27 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
         if (matches > 1)
             Stop(StopCode::Setup, "%s holds %d names equal to %.*s in any case", host.c_str(), matches, int(part.size()), part.data());
         host += "/" + match;
+        relative += (relative.empty() ? "" : "/") + match;
         struct stat info;
         if (lstat(host.c_str(), &info) != 0 || S_ISLNK(info.st_mode))
             Stop(StopCode::Setup, "%s on the disc is a symlink or unreadable", host.c_str());
         directory = S_ISDIR(info.st_mode);
         entry.size = directory ? 0 : uint64_t(info.st_size);
     }
-    if (host == discRoot)
-        entry.size = 0;
     entry.host = host;
     entry.directory = directory;
+    if (relative.empty())  // the root (Xenia disc_image_device.cc:116: directory, no other attribute)
+    {
+        entry.size = 0, entry.sector = 0, entry.attributes = file_attribute::kDirectory;
+        return Resolved::Found;
+    }
+    const auto it = discMap.find(relative);
+    if (it == discMap.end() || ((it->second.attributes & file_attribute::kDirectory) != 0) != directory ||
+        (!directory && it->second.size != entry.size))
+        Stop(StopCode::Setup, "%s on the disc does not match the disc map (not listed, or another kind or size)", relative.c_str());
+    entry.size = it->second.size;  // a directory: its directory data size (Xenia: the dirent length)
+    entry.sector = it->second.sector;
+    entry.attributes = it->second.attributes | file_attribute::kReadOnly;  // (:146)
     return Resolved::Found;
 }
 
@@ -197,6 +293,8 @@ OpenFile* FindOpenFile(uint32_t body)
 
 uint32_t ReadDiscFile(const DiscEntry& entry, uint64_t offset, uint8_t* buffer, uint32_t size)
 {
+    if (entry.package)
+        return entry.packageFile < 0 ? 0 : entry.package->Read(uint32_t(entry.packageFile), offset, buffer, size);
     if (offset >= entry.size)
         return 0;
     const uint32_t wanted = uint32_t(std::min<uint64_t>(size, entry.size - offset));
