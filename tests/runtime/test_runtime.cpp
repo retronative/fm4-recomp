@@ -245,6 +245,15 @@ int main(int, char** argv)
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const uint64_t tbDelta = PpcQueryTimebase() - tb1;
     Expect(tb1 >= tb0 && tbDelta >= 997500 && tbDelta < 5 * 997500, "mftb: the time base advances at 49,875,000 Hz (about 997,500 ticks in 20 ms)");
+    // The hang report: a registered context prints its registers; an unregistered one does not.
+    PPCContext hung{};
+    hung.lr = 0x40001234, hung.ctr.u64 = 0x40005678, hung.r1.u64 = 0x70001000, hung.r3.u64 = 3, hung.r6.u64 = 6;
+    RegisterGuestContext(&hung, 0x7E000100);
+    const std::string report = StderrOf([] { ReportGuestContexts(); });
+    UnregisterGuestContext(&hung);
+    Expect(report == "[hang] thread KTHREAD 7E000100: lr=40001234 ctr=40005678 r1=70001000 r3=00000003 r4=00000000 r5=00000000 r6=00000006\n" &&
+               StderrOf([] { ReportGuestContexts(); }).find("7E000100") == std::string::npos,
+           "the hang report prints each registered guest thread's lr, ctr, r1, r3-r6; unregistered threads disappear");
     Expect(ExitCodeOf([] { (void)PpcJumpBuffer(0x40002000); }) == int(StopCode::Unimplemented), "setjmp/longjmp stops until M3 (7)");
     Expect(ExitCodeOf([&] { PpcRuntime_switch_fiber(ctx, base); }) == int(StopCode::Unimplemented), "a fiber switch stops until M3 (7)");
     Expect(ExitCodeOf([&] { PpcRuntime_restore_context(ctx, base); }) == int(StopCode::Unimplemented), "a context restore stops until M3 (7)");
@@ -350,6 +359,19 @@ int main(int, char** argv)
     PPCContext region{};
     imp("XGetGameRegion")(region, base);
     Expect(region.r3.u64 == 0xFF, "XGetGameRegion: 0x00FF for country 103 (Xenia xam_info.cc:231)");
+    // XGetVideoMode / VdQueryVideoMode (xbox.h:264): 1280, 720, progressive 0, widescreen 1, HD 1, 60.0f =
+    // 0x42700000 (IEEE 754: exponent 5 + 127 = 0x84, mantissa 0.875), NTSC 1, 0x4A, 0x01, three zero words.
+    const uint32_t videoMode = ArenaAlloc(base, 48);
+    const uint32_t expectedMode[12] = {1280, 720, 0, 1, 1, 0x42700000, 1, 0x4A, 0x01, 0, 0, 0};
+    auto modeIs = [&] { for (int i = 0; i < 12; i++) if (be32(videoMode + 4 * i) != expectedMode[i]) return false; return true; };
+    for (const char* name : {"XGetVideoMode", "VdQueryVideoMode"})
+    {
+        for (int i = 0; i < 12; i++) Store32(base, videoMode + 4 * i, 0xAAAAAAAA);
+        PPCContext vm{};
+        vm.r3.u32 = videoMode;
+        imp(name)(vm, base);
+        Expect(modeIs(), name);
+    }
     // No launch data (a cold start; Xenia xam_info.cc:294-323): size 0 and ERROR_NOT_FOUND (0x490);
     // no size pointer: ERROR_INVALID_PARAMETER (0x57); the data: ERROR_NOT_FOUND.
     const uint32_t launchSize = ArenaAlloc(base, 4);

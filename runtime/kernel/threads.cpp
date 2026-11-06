@@ -46,6 +46,7 @@ void* Run(void* argument)
     ctx.r1.u64 = s.state.stackBase - 0x100;
     ctx.r13.u64 = s.state.pcr;
     uint32_t code = 0;
+    RegisterGuestContext(&ctx, k);  // the hang report
     try
     {
         // With an XAPI startup routine it runs startup(start, context); else start(context),
@@ -67,6 +68,7 @@ void* Run(void* argument)
     {
         code = exit.code;
     }
+    UnregisterGuestContext(&ctx);
     s.base[k + kthread_state::kTerminated] = 1;
     Store32(s.base, k + kthread_state::kExitStatus, code);
     SetEvent(s.base, k);  // a thread object is signalled when it ends; waiters wake

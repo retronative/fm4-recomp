@@ -101,6 +101,7 @@ K_IMPIO = 'runtime/kernel/imports_io.cpp'
 K_IMPRTL = 'runtime/kernel/imports_rtl.cpp'
 K_FS = 'runtime/kernel/file_system.cpp'
 K_LOADER = 'runtime/kernel/loader.cpp'
+K_IMPVIDEO = 'runtime/kernel/imports_video.cpp'
 SURVEY = 'survey/survey.py'
 VALIDATE = 'scripts/validate.py'
 SWITCH_TABLES = 'survey/switch_tables.py'
@@ -1198,6 +1199,21 @@ MUTANTS = [
     dict(id='KD27', milestone="M3", file=K_IMPXAM, test='runtime', fault='the European region (0x02FE)',
          old='    ctx.r3.u64 = 0x00FF;',
          new='    ctx.r3.u64 = 0x02FE;', expect='XGetGameRegion: 0x00FF'),
+    dict(id='KV1', milestone="M3", file=K_IMPVIDEO, test='runtime', fault='the refresh rate stored as an integer',
+         old='    const uint32_t words[12] = {1280, 720, 0, 1, 1, refreshBits, 1, 0x4A, 0x01, 0, 0, 0};',
+         new='    const uint32_t words[12] = {1280, 720, 0, 1, 1, refreshBits * 0 + 60, 1, 0x4A, 0x01, 0, 0, 0};', expect='XGetVideoMode'),
+    dict(id='KV2', milestone="M3", file=K_IMPVIDEO, test='runtime', fault='width and height swapped',
+         old='    const uint32_t words[12] = {1280, 720, 0, 1, 1, refreshBits, 1, 0x4A, 0x01, 0, 0, 0};',
+         new='    const uint32_t words[12] = {720, 1280, 0, 1, 1, refreshBits, 1, 0x4A, 0x01, 0, 0, 0};', expect='XGetVideoMode'),
+    dict(id='KV3', milestone="M3", file=K_IMPVIDEO, test='runtime', fault='the reserved words not cleared',
+         old='    for (int i = 0; i < 12; i++)\n        runtime::Store32(base, mode + 4 * i, words[i]);',
+         new='    for (int i = 0; i < 9; i++)\n        runtime::Store32(base, mode + 4 * i, words[i]);', expect='XGetVideoMode'),
+    dict(id='RT14', milestone="M3", file=STOPS_CPP, test='runtime', fault='an unregistered thread stays in the hang report',
+         old='        if (guestContexts[i].compare_exchange_strong(expected, nullptr))\n            return;',
+         new='        if (expected == nullptr)\n            return;', expect='the hang report prints'),
+    dict(id='RT15', milestone="M3", file=STOPS_CPP, test='runtime', fault='the hang report omits ctr',
+         old='uint32_t(c->lr), c->ctr.u32, c->r1.u32,',
+         new='uint32_t(c->lr), 0u, c->r1.u32,', expect='the hang report prints'),
     dict(id='KD1', milestone="M3", file=K_IMPXAM, test='runtime', fault='XGetAVPack reports VGA (6)',
          old='    ctx.r3.u64 = 8;',
          new='    ctx.r3.u64 = 6;', expect='XGetAVPack: 8'),

@@ -85,6 +85,7 @@ void* RunGuest(void*)
     PPCContext ctx{};
     ctx.r1.u64 = mainThread.stackBase - 0x100;  // room for the entry's back chain and save area
     ctx.r13.u64 = mainThread.pcr;
+    RegisterGuestContext(&ctx, mainThread.kthread);  // the hang report
     std::fprintf(stderr, "[runtime] calling the title entry %08X\n", fm4::kEntry);
     PPCFunc* entry = PPC_LOOKUP_FUNC(base, fm4::kEntry);
     if (entry == nullptr)
@@ -190,6 +191,7 @@ int main(int argc, char** argv)
     runtime::InstallGuestFaultHandler(base, DescribeGuest);
     std::thread([deadline] {
         std::this_thread::sleep_for(std::chrono::seconds(deadline));
+        ReportGuestContexts();
         Stop(StopCode::Deadline, "no stop within %d s", deadline);
     }).detach();
 

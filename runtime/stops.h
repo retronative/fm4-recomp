@@ -29,3 +29,11 @@ enum class StopCode : int
 
 // Called by every generated import stub (fm4_imports.cpp).
 [[noreturn]] void PpcImportStop(const char* name, PPCContext& ctx);
+
+// Hang report (M3 "a hang report with guest registers"): each guest thread registers its context while
+// it runs; the deadline prints every registered thread's lr, ctr, r1 and r3-r6 before stopping (124).
+// The values are the context's memory, so a register the compiled code holds elsewhere may be older.
+constexpr size_t kMaxGuestContexts = 64;
+void RegisterGuestContext(const PPCContext* ctx, uint32_t kthread);
+void UnregisterGuestContext(const PPCContext* ctx);
+void ReportGuestContexts();

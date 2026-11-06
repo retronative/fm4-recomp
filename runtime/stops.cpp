@@ -11,6 +11,7 @@
 #include "layout.h"
 #include "kernel/exports.h"
 #include "kernel/loader.h"
+#include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <unistd.h>
@@ -70,4 +71,41 @@ PPC_FUNC(PpcRuntime_restore_context)
 {
     (void)base;
     Stop(StopCode::Unimplemented, "context restore is not implemented (M3; lr=%08X)", uint32_t(ctx.lr));
+}
+
+namespace {
+std::atomic<const PPCContext*> guestContexts[kMaxGuestContexts];
+std::atomic<uint32_t> guestThreads[kMaxGuestContexts];
+}  // namespace
+
+void RegisterGuestContext(const PPCContext* ctx, uint32_t kthread)
+{
+    for (size_t i = 0; i < kMaxGuestContexts; i++)
+    {
+        const PPCContext* empty = nullptr;
+        if (guestContexts[i].compare_exchange_strong(empty, ctx))
+        {
+            guestThreads[i] = kthread;
+            return;
+        }
+    }
+    Stop(StopCode::Setup, "more than %zu guest threads for the hang report", kMaxGuestContexts);
+}
+
+void UnregisterGuestContext(const PPCContext* ctx)
+{
+    for (size_t i = 0; i < kMaxGuestContexts; i++)
+    {
+        const PPCContext* expected = ctx;
+        if (guestContexts[i].compare_exchange_strong(expected, nullptr))
+            return;
+    }
+}
+
+void ReportGuestContexts()
+{
+    for (size_t i = 0; i < kMaxGuestContexts; i++)
+        if (const PPCContext* c = guestContexts[i].load())
+            std::fprintf(stderr, "[hang] thread KTHREAD %08X: lr=%08X ctr=%08X r1=%08X r3=%08X r4=%08X r5=%08X r6=%08X\n",
+                         guestThreads[i].load(), uint32_t(c->lr), c->ctr.u32, c->r1.u32, c->r3.u32, c->r4.u32, c->r5.u32, c->r6.u32);
 }
