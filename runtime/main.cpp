@@ -13,10 +13,11 @@
 // and call the title entry. M2 implements no import and no thread layout: the run ends at the
 // first strict stop (stops.h), which the launch harness records.
 //
-//   fm4recomp --image game/survey/image.bin --xex game/files/default.xex --deadline <seconds>
+//   fm4recomp --image game/survey/image.bin --xex game/files/default.xex --disc game/files --deadline <seconds>
 #include "fm4_image.h"
 #include "guest_memory.h"
 #include "kernel/arena.h"
+#include "kernel/file_system.h"
 #include "kernel/imports.h"
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
@@ -95,6 +96,7 @@ int main(int argc, char** argv)
 {
     const char* imagePath = nullptr;
     const char* xexPath = nullptr;
+    const char* discPath = nullptr;
     int deadline = 0;
     for (int i = 1; i < argc; i += 2)
     {
@@ -102,11 +104,13 @@ int main(int argc, char** argv)
             Stop(StopCode::Setup, "option %s needs a value", argv[i]);
         if (!std::strcmp(argv[i], "--image")) imagePath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--xex")) xexPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--disc")) discPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--deadline")) deadline = std::atoi(argv[i + 1]);
         else Stop(StopCode::Setup, "unknown option %s", argv[i]);
     }
-    if (imagePath == nullptr || xexPath == nullptr || deadline <= 0)
-        Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --deadline <seconds> (all required)");
+    if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || deadline <= 0)
+        Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --deadline <seconds> (all required)");
+    runtime::MountDisc(discPath);  // read-only: game:\ and d:\ (kernel/file_system.h)
     const auto image = ReadChecked(imagePath, fm4::kImageSize, fm4::kImageCrc32, true);
     const auto header = ReadChecked(xexPath, fm4::kHeaderSize, fm4::kHeaderCrc32, false);
 

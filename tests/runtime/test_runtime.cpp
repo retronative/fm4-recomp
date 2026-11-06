@@ -14,6 +14,7 @@
 #include "guest_memory.h"
 #include "indirect.h"
 #include "kernel/arena.h"
+#include "kernel/file_system.h"
 #include "kernel/critical_section.h"
 #include "kernel/dispatcher.h"
 #include "kernel/imports.h"
@@ -31,6 +32,10 @@
 #include "stops.h"
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <string>
 #include <sys/wait.h>
 #include <thread>
@@ -149,7 +154,7 @@ PPC_FUNC(Translated)
 
 }  // namespace
 
-int main()
+int main(int, char** argv)
 {
     using namespace runtime;
     // Line-buffered, with a start line: a check's FAIL line survives a later stop (_exit) or the
@@ -375,6 +380,144 @@ int main()
     rs.r3.u32 = ansi, rs.r4.u32 = 0;
     imp("RtlInitAnsiString")(rs, base);
     Expect(ansiOk && be32(ansi) == 0 && be32(ansi + 4) == 0, "RtlInitAnsiString: length 7, maximum 8, buffer; a null source gives 0, 0, 0");
+    {
+        // The disc (kernel/file_system.h; Xenia vfs). Paths, by hand from base/utf8.cc:684 canonicalize_path:
+        Expect(CanonicalGuestPath("game:\\Media\\..\\x") == "game:\\x" && CanonicalGuestPath("game:\\..\\x") == "game:\\x" &&
+                   CanonicalGuestPath("\\a\\.\\b\\") == "\\a\\b" && CanonicalGuestPath("a//b") == "a\\b" &&
+                   CanonicalGuestPath("..\\a") == "a",
+               "canonical guest paths: .. stops at a device, . and empty parts dropped, rooted kept");
+        Expect(ValidGuestPath("game:\\Media\\x_1.bin") && !ValidGuestPath("game:\\a+b") && !ValidGuestPath("game:\\a*") &&
+                   !ValidGuestPath("game:\\a?") && !ValidGuestPath("game:\\\x7f") && !ValidGuestPath("game:\\\x1f"),
+               "valid guest paths: printable ASCII without reserved characters (Xenia xboxkrnl_io.cc:42)");
+        // A synthetic disc next to the test binary: Media/Cars.bin (5000 bytes, byte i = 'A' + i % 26),
+        // Media/Empty.bin (0 bytes).
+        const std::string disc = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/')) + "/disc";
+        mkdir(disc.c_str(), 0755);
+        mkdir((disc + "/Media").c_str(), 0755);
+        {
+            std::string cars(5000, ' ');
+            for (size_t i = 0; i < cars.size(); i++) cars[i] = char('A' + i % 26);
+            std::ofstream(disc + "/Media/Cars.bin") << cars;
+        }
+        std::ofstream(disc + "/Media/Empty.bin");
+        MountDisc(disc);
+        const uint32_t attrs = ArenaAlloc(base, 12), nameString = ArenaAlloc(base, 8), info = ArenaAlloc(base, 56);
+        auto query = [&](const char* path, uint32_t root = 0) {
+            const uint32_t text = guestString(path);
+            Store32(base, nameString, uint32_t(std::strlen(path)) << 16 | uint32_t(std::strlen(path) + 1));
+            Store32(base, nameString + 4, text);
+            Store32(base, attrs, root), Store32(base, attrs + 4, nameString), Store32(base, attrs + 8, 0x40);
+            for (uint32_t i = 0; i < 56; i += 4) Store32(base, info + i, 0xAAAAAAAA);
+            PPCContext c{};
+            c.r3.u32 = attrs, c.r4.u32 = info;
+            imp("NtQueryFullAttributesFile")(c, base);
+            return c.r3.u32;
+        };
+        auto be64 = [&](uint32_t at) { return uint64_t(be32(at)) << 32 | be32(at + 4); };
+        // 1970-01-01 as FILETIME: 11644473600 s x 10^7 = 116444736000000000; 5000 bytes -> 3 sectors of 2048 = 6144.
+        const bool timesOk = query("GAME:\\media\\CARS.BIN") == 0 && be64(info) == 116444736000000000ull && be64(info + 8) == 116444736000000000ull &&
+                             be64(info + 16) == 116444736000000000ull && be64(info + 24) == 116444736000000000ull;
+        Expect(timesOk && be64(info + 32) == 6144 && be64(info + 40) == 5000 && be32(info + 48) == 0x01 && be32(info + 52) == 0,
+               "NtQueryFullAttributesFile(GAME:\\media\\CARS.BIN): 1970 times, allocation 6144, size 5000, read-only, any case");
+        Expect(query("d:\\Media") == 0 && be32(info + 48) == 0x11 && be64(info + 40) == 0 && query("game:\\Media\\Empty.bin") == 0 &&
+                   be64(info + 32) == 0 && be64(info + 40) == 0,
+               "NtQueryFullAttributesFile: d:\\Media is a read-only directory (0x11); an empty file allocates 0");
+        Expect(query("game:\\missing") == 0xC000000F && query("game:\\Media\\Cars.bin\\x") == 0xC000000F &&
+                   query("\\Device\\Cdrom0\\Media\\..\\Media\\Cars.bin") == 0 && query("game:\\a+b") == 0xC0000033,
+               "NtQueryFullAttributesFile: missing or under a file NO_SUCH_FILE; the device path and .. resolve; a reserved character OBJECT_NAME_INVALID");
+        Expect(ExitCodeOf([&] { (void)query("cache:\\x"); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)query("\\Device\\Harddisk0\\Partition1\\x"); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)query("game:\\Media", 0x1234); }) == int(StopCode::Unimplemented) &&
+                   query("game:\\Media", 0xFFFFFFFD) == 0,
+               "NtQueryFullAttributesFile: another device or a root handle stops (7); ObDosDevices (FFFFFFFD) is accepted");
+        // NtCreateFile(handle*, access, attributes*, io status*, allocation*, file attributes, share, disposition,
+        // options on the stack at r1 + 0x54) (Xenia xboxkrnl_io.cc:98): FM4's read open (kReadAccess, FILE_OPEN,
+        // synchronous non-directory 0x60) gives a File handle and io status {0, FILE_OPENED 1}.
+        // GENERIC_READ (bit 31) | SYNCHRONIZE (0x100000) | FILE_READ_ATTRIBUTES (0x80): FM4's read open.
+        constexpr uint32_t kReadAccess = (1u << 31) | 0x00100000u | 0x80u;
+        const uint32_t fileOut = ArenaAlloc(base, 4), ioStatus = ArenaAlloc(base, 8), stack = ArenaAlloc(base, 0x60);
+        auto create = [&](const char* path, uint32_t access, uint32_t disposition, uint32_t options, uint32_t attributesAt = 1) {
+            (void)query(path);  // fills the attributes and name string for `path`
+            Store32(base, fileOut, 0xAAAAAAAA), Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+            Store32(base, stack + 0x54, options);
+            PPCContext c{};
+            c.r1.u32 = stack, c.r3.u32 = fileOut, c.r4.u32 = access, c.r5.u32 = attributesAt ? attrs : 0, c.r6.u32 = ioStatus;
+            c.r8.u32 = 0x80, c.r9.u32 = 1, c.r10.u32 = disposition;
+            imp("NtCreateFile")(c, base);
+            return c.r3.u32;
+        };
+        const bool opened = create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x60) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 1;
+        const auto fileObject = LookupHandle(be32(fileOut));
+        const OpenFile* openFile = fileObject ? FindOpenFile(fileObject->header) : nullptr;
+        Expect(opened && fileObject && fileObject->type == ObjectType::File && openFile && openFile->entry.size == 5000 && openFile->position == 0,
+               "NtCreateFile(game:\\Media\\Cars.bin, read, FILE_OPEN): a File handle, io status {0, FILE_OPENED}, size 5000, position 0");
+        Expect(create("game:\\Media\\nothing.bin", kReadAccess, 1, 0x60) == 0xC000000F && be32(ioStatus) == 0xC000000F &&
+                   be32(ioStatus + 4) == 5 && be32(fileOut) == 0xFFFFFFFF &&
+                   create("game:\\Media", kReadAccess, 1, 0x60) == 0xC00000BA && create("game:\\Media", kReadAccess, 1, 0x20) == 0 &&
+                   create("game:\\Media\\Cars.bin", kReadAccess, 3, 0x60) == 0 && create("game:\\x", kReadAccess, 1, 0x60, 0) == 0xC000000D,
+               "NtCreateFile: missing NO_SUCH_FILE {.., FILE_DOES_NOT_EXIST 5}, handle -1; a directory as a non-directory FILE_IS_A_DIRECTORY; OPEN_IF of an existing file opens; no attributes INVALID_PARAMETER");
+        Expect(ExitCodeOf([&] { (void)create("game:\\Media\\Cars.bin", 0x40000000, 1, 0x60); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)create("game:\\Media\\New.bin", kReadAccess, 2, 0x60); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)create("game:\\Media\\New.bin", kReadAccess, 3, 0x60); }) == int(StopCode::Unimplemented),
+               "NtCreateFile: write access, FILE_CREATE, or OPEN_IF of a missing file stop (7): the disc is read-only");
+        PPCContext openCall{};
+        (void)query("game:\\Media\\Cars.bin");
+        openCall.r3.u32 = fileOut, openCall.r4.u32 = kReadAccess, openCall.r5.u32 = attrs, openCall.r6.u32 = ioStatus, openCall.r7.u32 = 0x60;
+        imp("NtOpenFile")(openCall, base);
+        Expect(openCall.r3.u64 == 0 && be32(ioStatus + 4) == 1 && LookupHandle(be32(fileOut)).has_value(), "NtOpenFile: FILE_OPEN of an existing file");
+        // NtQueryInformationFile(handle, io status*, info*, length, class) (Xenia xboxkrnl_io_info.cc:58): class 34
+        // gives the same 56 bytes as above for the open Cars.bin, io status {0, 56}, and zeroes the rest of a
+        // 64-byte buffer; class 14 the position 0 {0, 8}; 55 bytes INFO_LENGTH_MISMATCH; no file INVALID_HANDLE.
+        const uint32_t openHandle = be32(fileOut), fileInfo = ArenaAlloc(base, 64);
+        auto information = [&](uint32_t handle, uint32_t length, uint32_t infoClass) {
+            for (uint32_t i = 0; i < 64; i += 4) Store32(base, fileInfo + i, 0xAAAAAAAA);
+            Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+            PPCContext c{};
+            c.r3.u32 = handle, c.r4.u32 = ioStatus, c.r5.u32 = fileInfo, c.r6.u32 = length, c.r7.u32 = infoClass;
+            imp("NtQueryInformationFile")(c, base);
+            return c.r3.u32;
+        };
+        const bool networkOpen = information(openHandle, 64, 34) == 0 && be64(fileInfo) == 116444736000000000ull &&
+                                 be64(fileInfo + 32) == 6144 && be64(fileInfo + 40) == 5000 && be32(fileInfo + 48) == 1 &&
+                                 be32(fileInfo + 56) == 0 && be32(fileInfo + 60) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 56;
+        Expect(networkOpen && information(openHandle, 8, 14) == 0 && be64(fileInfo) == 0 && be32(ioStatus + 4) == 8,
+               "NtQueryInformationFile: network open (34) of Cars.bin, the buffer's rest zeroed, io status {0, 56}; position (14) 0 {0, 8}");
+        Expect(information(openHandle, 55, 34) == 0xC0000004 && be32(fileInfo) == 0xAAAAAAAA && information(0x1234, 64, 34) == 0xC0000008 &&
+                   ExitCodeOf([&] { (void)information(openHandle, 64, 5); }) == int(StopCode::Unimplemented),
+               "NtQueryInformationFile: 55 bytes INFO_LENGTH_MISMATCH (nothing written), no file INVALID_HANDLE, another class stops (7)");
+        // NtReadFile(handle, event, APC, context, io status*, buffer*, length, offset*) (Xenia xboxkrnl_io.cc:184,
+        // disc_image_file.cc:26), on the synchronous Cars.bin. Byte i is 'A' + i % 26: offset 30 -> 'E' (30 % 26 = 4),
+        // 39 -> 'N' (13), 40 -> 'O', 45 -> 'T' (19), 4998 -> 'G' (4998 % 26 = 6).
+        const uint32_t readBuffer = ArenaAlloc(base, 16), offsetValue = ArenaAlloc(base, 8);
+        auto readFile = [&](uint32_t handle, uint32_t length, int64_t offset, uint32_t event = 0) {  // offset -2: none
+            for (uint32_t i = 0; i < 16; i += 4) Store32(base, readBuffer + i, 0x2E2E2E2E);
+            Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+            Store32(base, offsetValue, uint32_t(uint64_t(offset) >> 32)), Store32(base, offsetValue + 4, uint32_t(offset));
+            PPCContext c{};
+            c.r3.u32 = handle, c.r4.u32 = event, c.r7.u32 = ioStatus, c.r8.u32 = readBuffer, c.r9.u32 = length;
+            c.r10.u32 = offset == -2 ? 0 : offsetValue;
+            imp("NtReadFile")(c, base);
+            return c.r3.u32;
+        };
+        auto position = [&] { return FindOpenFile(LookupHandle(openHandle)->header)->position; };
+        const bool at30 = readFile(openHandle, 10, 30) == 0 && base[readBuffer] == 'E' && base[readBuffer + 9] == 'N' &&
+                          base[readBuffer + 10] == '.' && be32(ioStatus) == 0 && be32(ioStatus + 4) == 10 && position() == 40;
+        const bool atPosition = readFile(openHandle, 5, -2) == 0 && base[readBuffer] == 'O' && position() == 45 &&
+                                readFile(openHandle, 1, -1) == 0 && base[readBuffer] == 'T' && position() == 46;
+        Expect(at30 && atPosition, "NtReadFile: 10 bytes at 30 (E..N), io status {0, 10}, position 40; then from the position (no offset, or -1)");
+        const bool tail = readFile(openHandle, 10, 4998) == 0 && base[readBuffer] == 'G' && base[readBuffer + 2] == '.' &&
+                          be32(ioStatus + 4) == 2 && position() == 5000;
+        Expect(tail && readFile(openHandle, 10, 5000) == 0xC0000011 && be32(ioStatus) == 0xC0000011 && be32(ioStatus + 4) == 0 &&
+                   readFile(openHandle, 0, 9999) == 0 && readFile(0x1234, 4, 0) == 0xC0000008,
+               "NtReadFile: 2 bytes at 4998, then END_OF_FILE {C0000011, 0}; zero length succeeds; no file INVALID_HANDLE");
+        const uint32_t asyncHandle = create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x40) == 0 ? be32(fileOut) : 0;
+        Expect(asyncHandle && ExitCodeOf([&] { (void)readFile(asyncHandle, 4, 0); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)readFile(openHandle, 4, 0, 0x88); }) == int(StopCode::Unimplemented),
+               "NtReadFile: an asynchronous file or an event stops (7)");
+        symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
+        Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup), "a symlink on the disc stops (9)");
+        unlink((disc + "/Link").c_str());
+    }
     PPCContext gm{};
     gm.r4.u32 = handleOut;
     imp("XexGetModuleHandle")(gm, base);
