@@ -22,6 +22,7 @@ enum class StopCode : int
     EntryReturned = 8,  // the title entry returned to the host
     Setup = 9,          // the runtime could not start (wrong image, no memory, bad arguments)
     Trap = 10,          // a translated trap: a proven switch's impossible default, padding reached
+    FirstSwap = 11,     // M3's goal: the command processor executed the first swap packet (VdSwap)
     Deadline = 124,     // no stop within the deadline (a hang)
 };
 

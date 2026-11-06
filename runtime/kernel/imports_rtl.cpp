@@ -64,3 +64,11 @@ GUEST_IMPORT(RtlNtStatusToDosError, "REFERENCE_DERIVED: Xenia xboxkrnl_error.cc:
         return (void)(ctx.r3.u64 = status & 0xFFFF);
     Stop(StopCode::Unimplemented, "RtlNtStatusToDosError(%08X): a status the runtime's table does not list", ctx.r3.u32);
 }
+
+GUEST_IMPORT(RtlFillMemoryUlong, "REFERENCE_DERIVED: Xenia xboxkrnl_rtl.cc:78 RtlFillMemoryUlong")
+{
+    // (destination*, length in bytes, pattern): length / 4 words of the pattern, big-endian.
+    const uint32_t destination = ctx.r3.u32, count = ctx.r4.u32 >> 2, pattern = ctx.r5.u32;
+    for (uint32_t i = 0; i < count; i++)
+        runtime::Store32(base, destination + 4 * i, pattern);
+}

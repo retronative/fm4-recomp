@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace runtime {
@@ -68,5 +69,8 @@ const LoadedModule* LoadedModuleByLdr(uint32_t ldr);
 // Whether `name` names the module file `fileName` (the directory ignored; with or without the
 // extension; any case): Xenia XModule::Matches.
 bool NamesModule(const char* name, const char* fileName);
+
+// The title-terminate notifications registered so far ({routine, priority}; ExRegisterTitleTerminateNotification).
+std::vector<std::pair<uint32_t, uint32_t>> TitleTerminateNotifications();
 
 }  // namespace runtime

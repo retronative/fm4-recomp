@@ -20,6 +20,8 @@
 #include "guest_memory.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
+#include "kernel/graphics.h"
+#include "kernel/command_processor.h"
 #include "kernel/imports.h"
 #include "kernel/loader.h"
 #include "kernel/module.h"
@@ -124,6 +126,7 @@ int main(int argc, char** argv)
 
     base = runtime::ReserveGuestMemory();
     runtime::InitializeHeaps(base);  // the guest's virtual and physical heaps (kernel/virtual_memory.h)
+    runtime::gpu::InitializeRegisters(base);  // the GPU register page (kernel/graphics.h)
     runtime::CommitGuestMemory(base, fm4::kImageBase, fm4::kImageSize);
     std::memcpy(base + fm4::kImageBase, image.data(), image.size());
 
@@ -192,6 +195,7 @@ int main(int argc, char** argv)
     std::thread([deadline] {
         std::this_thread::sleep_for(std::chrono::seconds(deadline));
         ReportGuestContexts();
+        runtime::gpu::ReportCommandProcessor();
         Stop(StopCode::Deadline, "no stop within %d s", deadline);
     }).detach();
 

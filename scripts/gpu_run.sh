@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 FM4 Recomp contributors
+#
+# The watchdog launcher for every run that may touch the GPU (run safety; M4 before the
+# first GPU run). After ForzaRecomp's gpu_run.sh (zsh), re-written in bash: a zsh
+# `status` variable once disabled a watchdog silently.
+#
+#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds>
+#   scripts/gpu_run.sh --self-test        # checks the refusal and lock-up detection on planted files; runs nothing
+#
+# Before: refuses if research/GPU_STOP exists (only the owner clears it), runs scripts/preflight.sh (the machine must
+# be free), builds, records the binary's SHA-256. Each run: its own process group, the deadline, then TERM and KILL.
+# After each run: a new gpuEvent-*.ips report in the diagnostic reports, or a GPU restart / timeout message in the
+# system log since the run started, is a lock-up: research/GPU_STOP is written with the evidence and the launcher
+# fails. The runtime's own GPU entry points honour GPU_STOP too (M4 renderer work).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+STOP_FLAG="$ROOT/research/GPU_STOP"
+REPORT_DIRS=("$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports")
+# Lock-up lines. "GPU Hang Error ... kIOGPUCommandBufferCallbackErrorHang" is the line Metal logged in ForzaRecomp-recarbon's
+# real hang (its syslog), which left no .ips report.
+LOG_PATTERN='GPU Hang|kIOGPUCommandBufferCallbackError|GPU Restart|gpu restart|IOGPUFamily.*(timeout|timed out|hang|lockup|panic)|GPU.*(hang|lockup) detected'
+LOG_PREDICATE='process == "fm4recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal"'
+LOCK="$ROOT/research/.gpu_run.lock"
+
+# New lock-up evidence (reports newer than the marker file $1) in the report directories given after it; prints
+# it, returns 0 if any. (BSD find has no epoch form for -newermt, so a marker file touched at the run's start.)
+lockup_evidence() {
+  local marker="$1"; shift
+  local found=1 dir file
+  for dir in "$@"; do
+    [ -d "$dir" ] || continue
+    while IFS= read -r -d '' file; do
+      echo "gpuEvent report: $file"
+      found=0
+    done < <(find "$dir" -maxdepth 1 -name 'gpuEvent-*.ips' -newer "$marker" -print0 2>/dev/null)
+  done
+  return $found
+}
+
+# The system log since epoch $1 (GPU and Metal lines, and this binary's), saved to $2; prints its lock-up lines.
+log_evidence() {
+  local since="$1" saved="$2"
+  /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" --predicate "$LOG_PREDICATE" > "$saved" 2>/dev/null || true
+  grep -E "$LOG_PATTERN" "$saved" | head -20 || true
+}
+
+# One GPU run on the machine at a time: a mkdir lock holding the owner's pid; a lock whose pid is gone is reclaimed.
+take_lock() {
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    local holder; holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      echo "gpu_run: refused: another GPU run holds $LOCK (pid $holder)" >&2; exit 3
+    fi
+    rm -f "$LOCK/pid" && rmdir "$LOCK" && mkdir "$LOCK" || { echo "gpu_run: cannot take $LOCK" >&2; exit 3; }
+  fi
+  echo $$ > "$LOCK/pid"
+  trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
+}
+
+# Refuses (exit 3) if the stop flag $1 exists.
+refuse_if_stopped() {
+  if [ -e "$1" ]; then
+    echo "gpu_run: refused: $1 exists (an earlier lock-up); only the owner clears it:" >&2
+    cat "$1" >&2
+    exit 3
+  fi
+}
+
+trip() {
+  { echo "GPU_STOP written $(date '+%Y-%m-%d %H:%M:%S') by scripts/gpu_run.sh; only the owner clears it."; echo "$1"; } > "$STOP_FLAG"
+  echo "gpu_run: LOCK-UP EVIDENCE, wrote $STOP_FLAG:" >&2
+  echo "$1" >&2
+  exit 3
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  mkdir -p "$ROOT/build"
+  work="$(mktemp -d "$ROOT/build/gpu_run_selftest.XXXXXX")"
+  touch -t 202601010000 "$work/marker"
+  if lockup_evidence "$work/marker" "$work" >/dev/null; then echo "self-test FAIL: evidence in an empty directory" >&2; exit 1; fi
+  touch "$work/gpuEvent-2026-11-06-000000.ips"
+  if ! lockup_evidence "$work/marker" "$work" | grep -q gpuEvent-2026; then echo "self-test FAIL: a new gpuEvent report not detected" >&2; exit 1; fi
+  touch -t 202001010000 "$work/gpuEvent-old.ips"
+  if lockup_evidence "$work/marker" "$work" | grep -q gpuEvent-old; then echo "self-test FAIL: an old report counted" >&2; exit 1; fi
+  hang='2026-11-05 10:29:20.283 E  forzarecomp[98678:17bada] (Metal) Execution of the command buffer was aborted due to an error during execution. Caused GPU Hang Error (00000003:kIOGPUCommandBufferCallbackErrorHang)'
+  if echo "$hang" | grep -Eq "$LOG_PATTERN" && echo "kernel: IOGPUFamily: GPU Restart" | grep -Eq "$LOG_PATTERN" &&
+     ! echo "fm4recomp: [runtime] calling the title entry" | grep -Eq "$LOG_PATTERN"; then :; else
+    echo "self-test FAIL: the log pattern (the real Metal hang line, a GPU restart, an ordinary line)" >&2; exit 1; fi
+  LOCK="$work/lock"
+  ( take_lock; [ -f "$LOCK/pid" ] ) || { echo "self-test FAIL: lock not taken" >&2; exit 1; }
+  [ ! -d "$LOCK" ] || { echo "self-test FAIL: lock not released" >&2; exit 1; }
+  mkdir "$LOCK" && echo 999999 > "$LOCK/pid"
+  ( take_lock ) || { echo "self-test FAIL: a stale lock not reclaimed" >&2; exit 1; }
+  mkdir "$LOCK" && echo $$ > "$LOCK/pid"
+  if ( take_lock ) 2>/dev/null; then echo "self-test FAIL: a live lock not refused" >&2; exit 1; fi
+  rm -f "$LOCK/pid" && rmdir "$LOCK"
+  STOP_FLAG="$work/GPU_STOP"
+  if ( trip "planted evidence" ) 2>/dev/null; then echo "self-test FAIL: trip did not fail" >&2; exit 1; fi
+  grep -q "planted evidence" "$STOP_FLAG" || { echo "self-test FAIL: GPU_STOP not written" >&2; exit 1; }
+  if ( refuse_if_stopped "$STOP_FLAG" ) 2>/dev/null; then echo "self-test FAIL: a stop flag did not refuse" >&2; exit 1; fi
+  ( refuse_if_stopped "$work/absent" ) || { echo "self-test FAIL: refused without a stop flag" >&2; exit 1; }
+  rm -r "$work"  # the self-test's own temporary directory under build/
+  echo "gpu_run self-test: PASS (reports: empty, new, old; log pattern: the real Metal hang line, a GPU restart, an ordinary line; GPU_STOP written; refusal with and without a flag; lock: taken, released, stale reclaimed, live refused)"
+  exit 0
+fi
+
+[ $# -eq 3 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> | --self-test" >&2; exit 2; }
+OUT="$1"; RUNS="$2"; DEADLINE="$3"
+[[ "$RUNS" =~ ^[1-9][0-9]*$ && "$DEADLINE" =~ ^[1-9][0-9]*$ ]] || { echo "runs and deadline must be positive integers" >&2; exit 2; }
+refuse_if_stopped "$STOP_FLAG"
+take_lock
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
+"$ROOT/scripts/preflight.sh" --gpu
+"$ROOT/scripts/build.sh" "$OUT/build"
+BIN="$ROOT/build/native/runtime/fm4recomp"
+shasum -a 256 "$BIN" "$ROOT/game/survey/image.bin" | sed "s|$ROOT/||" | tee "$OUT/binary.sha256"
+echo "audio: none linked yet (no SDL); the dummy-driver check applies once audio exists" | tee "$OUT/audio.txt"
+export HOME="$ROOT/game/home"
+mkdir -p "$HOME"
+for i in $(seq 1 "$RUNS"); do
+  since=$(date +%s)
+  touch "$OUT/run$i.start"
+  status=0
+  perl -e '
+    my ($deadline, @cmd) = @ARGV;
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    if (!$pid) { setpgrp(0, 0); exec @cmd; die "exec: $!\n"; }
+    $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[launcher] deadline: process group killed\n"; exit 124 };
+    alarm $deadline + 30; waitpid $pid, 0; alarm 0;
+    my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
+    "$DEADLINE" "$BIN" --image "$ROOT/game/survey/image.bin" --xex "$ROOT/game/files/default.xex" --disc "$ROOT/game/files" \
+    --modules "$ROOT/game/modules" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
+  echo "$status" > "$OUT/run$i.exit"
+  echo "run $i: exit $status, $(grep -m1 '^\[stop ' "$OUT/run$i.err" || echo 'no stop line')"
+  sleep 2  # let reports and log lines land
+  evidence="$(lockup_evidence "$OUT/run$i.start" "${REPORT_DIRS[@]}" || true)$(log_evidence "$since" "$OUT/run$i.syslog.txt")"
+  [ -z "$evidence" ] || trip "run $i ($OUT): $evidence"
+done
+echo "gpu_run: $RUNS run(s), no lock-up evidence"

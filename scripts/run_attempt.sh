@@ -49,7 +49,7 @@ done
 import json, sys
 from pathlib import Path
 out, runs = Path(sys.argv[1]), int(sys.argv[2])
-STOPS = {3: 'import', 4: 'residual', 5: 'guest fault', 6: 'indirect call', 7: 'unimplemented', 10: 'trap'}
+STOPS = {3: 'import', 4: 'residual', 5: 'guest fault', 6: 'indirect call', 7: 'unimplemented', 10: 'trap', 11: 'first swap'}
 rows = []
 for i in range(1, runs + 1):
     err = (out / f'run{i}.err').read_text(errors='replace')

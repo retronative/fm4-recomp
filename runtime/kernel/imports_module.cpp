@@ -18,6 +18,8 @@
 #include "module.h"
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <utility>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -31,6 +33,11 @@ std::vector<uint8_t> ReadHostFile(const std::string& path)
 }
 
 thread_local bool inEntry = false;  // a load from inside a DllMain stops
+
+// Title-terminate notifications ({routine, priority}; Xenia kernel_state.cc:165-180). The runtime never ends the
+// title normally (a run ends at a stop), so they are recorded and never called.
+std::mutex terminateLock;
+std::vector<std::pair<uint32_t, uint32_t>> terminateNotifications;
 
 // Loads a translated title module named `text` (Xenia KernelState::LoadUserModule, FinishLoadingUserModule
 // kernel_state.cc:452): the file comes from the disc and must be the one translated (size and CRC-32),
@@ -234,3 +241,27 @@ GUEST_IMPORT(XexGetProcedureAddress, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.
     runtime::Store32(base, out, runtime::ExportTrampoline(base, *e));
     ctx.r3.u64 = 0;
 }
+
+GUEST_IMPORT(ExRegisterTitleTerminateNotification, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:206, xbox.h:307 X_EX_TITLE_TERMINATE_REGISTRATION")
+{
+    // (registration*, create): {routine +0, priority +4}; create adds it, otherwise the routine is removed. The
+    // routine must be a translated function (else stop 7): it would run when the title ends.
+    const uint32_t reg = ctx.r3.u32, routine = runtime::Load32(base, reg), priority = runtime::Load32(base, reg + 4);
+    std::lock_guard guard(terminateLock);
+    if (ctx.r4.u32 != 0)
+    {
+        if (runtime::FindFunction(base, routine) == nullptr)
+            Stop(StopCode::Unimplemented, "ExRegisterTitleTerminateNotification: routine %08X is no translated function", routine);
+        terminateNotifications.emplace_back(routine, priority);
+    }
+    else
+        std::erase_if(terminateNotifications, [&](const auto& n) { return n.first == routine; });
+}
+
+namespace runtime {
+std::vector<std::pair<uint32_t, uint32_t>> TitleTerminateNotifications()
+{
+    std::lock_guard guard(terminateLock);
+    return terminateNotifications;
+}
+}  // namespace runtime

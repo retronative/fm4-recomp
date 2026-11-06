@@ -150,6 +150,7 @@ void StartServiceThread(uint8_t* base, uint8_t cpu, std::function<void(PPCContex
         PPCContext ctx{};
         ctx.r1.u64 = service->state.stackBase - 0x100;
         ctx.r13.u64 = service->state.pcr;
+        RegisterGuestContext(&ctx, service->state.kthread);  // the hang report
         try
         {
             service->body(ctx);

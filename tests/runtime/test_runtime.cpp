@@ -15,6 +15,8 @@
 #include "indirect.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
+#include "kernel/graphics.h"
+#include "kernel/command_processor.h"
 #include "kernel/loader.h"
 #include "kernel/critical_section.h"
 #include "kernel/dispatcher.h"
@@ -175,6 +177,8 @@ int main(int, char** argv)
     std::printf("runtime tests: started\n");
     const size_t page = 16384;
     Expect(GuardIndex(GuardAddress(0, page), page, 13) == 0, "guard 0 names import 0");
+    Expect(GuardsFit(13, page) && !GuardsFit((gpu::kRegisterBase - kGuardBase) / page + 1, page) && gpu::RegisterAddress(0x1C5) == 0x7FC80714u,
+           "the guards end below the GPU register page 7FC80000; register 1C5 (CP_RB_WPTR) is at 7FC80714");
     Expect(GuardIndex(GuardAddress(12, page) + 0x20, page, 13) == 12, "a field access in guard 12 names import 12");
     Expect(GuardIndex(GuardAddress(13, page), page, 13) == -1, "negative: past the last guard is no import");
     Expect(GuardIndex(kGuardBase - 4, page, 13) == -1, "negative: below the guards is no import");
@@ -448,6 +452,11 @@ int main(int, char** argv)
         }
         std::ofstream(disc + "/Media/Empty.bin");
         MountDisc(disc);
+    gpu::InitializeRegisters(base);
+    Expect(gpu::ReadRegister(base, 0x0F00) == 0x08100748 && gpu::ReadRegister(base, 0x0F01) == 0x0000200E &&
+               gpu::ReadRegister(base, 0x194C) == 0x2D0 && gpu::ReadRegister(base, 0x1951) == 1 && gpu::ReadRegister(base, 0x1961) == 0x050002D0 &&
+               base[0x7FC80000u + 4 * 0x1961] == 0x05 && gpu::ReadRegister(base, gpu::reg::kCpRbWptr) == 0,
+           "GPU registers: Xenia's five constants (graphics_system.cc:209-224), big-endian; CP_RB_WPTR starts at 0");
         const uint32_t attrs = ArenaAlloc(base, 12), nameString = ArenaAlloc(base, 8), info = ArenaAlloc(base, 56);
         auto setPath = [&](const char* path, uint32_t root = 0) {  // the attributes and name string, no call
             const uint32_t text = guestString(path);
@@ -698,6 +707,38 @@ int main(int, char** argv)
             images[1] = second, images[1].fileName = "Mod.xex", images[0].fileName = "Other.xex";
             Expect(ExitCodeOf([&] { (void)load("game:\\Mod.xex"); }) == int(StopCode::Unimplemented), "a DllMain returning FALSE stops (7)");
             dllMainResult = 1;
+
+            // VdInitializeEngines (Xenia xboxkrnl_video.cc:235; HLE): FM4's shape (r3 511C0000, a translated callback,
+            // its argument, PFP and ME microcode in the executable's image 40000000-40F50000 here) -> 1, recorded.
+            auto engines = [&](uint32_t callback, uint32_t pfp, uint32_t me) {
+                PPCContext c{};
+                c.r3.u32 = 0x511C0000, c.r4.u32 = callback, c.r5.u32 = 0x1234, c.r6.u32 = pfp, c.r7.u32 = me;
+                imp("VdInitializeEngines")(c, base);
+                return c.r3.u32;
+            };
+            Expect(ExitCodeOf([&] { (void)engines(0x94010004u, 0x40001000, 0x40002000); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)engines(0x94010000u, 0x50001000, 0x40002000); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)engines(0x94010000u, 0x40001000, 0x3FFFFFFC); }) == int(StopCode::Unimplemented),
+                   "VdInitializeEngines: a callback that is no translated function, or microcode outside the image, stops (7)");
+            const bool first = engines(0x94010000u, 0x40001000, 0x40002000) == 1;
+            const gpu::Engines& e = gpu::EngineState();
+            Expect(first && e.initialized && e.callback == 0x94010000u && e.callbackArg == 0x1234 && e.pfp == 0x40001000 && e.me == 0x40002000 &&
+                       ExitCodeOf([&] { (void)engines(0x94010000u, 0x40001000, 0x40002000); }) == int(StopCode::Unimplemented),
+                   "VdInitializeEngines: 1, the callback, argument and microcode recorded; a second call stops (7)");
+            // ExRegisterTitleTerminateNotification({routine, priority}, create) (Xenia xboxkrnl_modules.cc:206): add
+            // {94010000, 1}, add {94010010, 2}, remove 94010000 -> [{94010010, 2}]; a routine that is no function stops.
+            const uint32_t registration = ArenaAlloc(base, 16);
+            auto terminate = [&](uint32_t routine, uint32_t priority, uint32_t create) {
+                Store32(base, registration, routine), Store32(base, registration + 4, priority);
+                PPCContext c{};
+                c.r3.u32 = registration, c.r4.u32 = create;
+                imp("ExRegisterTitleTerminateNotification")(c, base);
+            };
+            terminate(0x94010000u, 1, 1), terminate(0x94010010u, 2, 1), terminate(0x94010000u, 1, 0);
+            const auto notifications = TitleTerminateNotifications();
+            Expect(notifications.size() == 1 && notifications[0].first == 0x94010010u && notifications[0].second == 2 &&
+                       ExitCodeOf([&] { terminate(0x94010004u, 1, 1); }) == int(StopCode::Unimplemented),
+                   "ExRegisterTitleTerminateNotification: added and removed by routine; a routine that is no function stops (7)");
         }
         symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
         Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup), "a symlink on the disc stops (9)");
@@ -1479,6 +1520,76 @@ int main(int, char** argv)
     Expect(u.stackLimit >= t.stackBase + 16384, "consecutive stacks are separated by a guard page");
     Expect(PlaceStack(0x70000000, 0x10001, 0x4000).base == 0x70000000 + 0x4000 + 0x14000,
            "a stack size is rounded up to whole pages");
+    }
+
+    // The headless command processor (kernel/command_processor.h), on hand-built PM4 (xenos.h MakePacketType0/1/3:
+    // type 0 = ((count - 1) << 16) | index | one-register << 15; type 1 = 1 << 30 | index2 << 11 | index1;
+    // type 3 = 3 << 30 | (count - 1) << 16 | opcode << 8 | predicate). Memory: one 64 KB page of the A0000000 view.
+    {
+        using namespace gpu;
+        Expect(GpuSwap(0x11223344, 0) == 0x11223344 && GpuSwap(0x11223344, 1) == 0x22114433 && GpuSwap(0x11223344, 2) == 0x44332211 &&
+                   GpuSwap(0x11223344, 3) == 0x33441122,
+               "GpuSwap: none, 8in16, 8in32, 16in32 (xenos.h:1070-1087)");
+        const uint32_t page = PhysicalHeap(64 * 1024)->Alloc(0x10000, 0x10000, mem::kReserve | mem::kCommit, page::kReadWrite, false);
+        uint32_t phys = 0;
+        const bool mapped = page != 0 && PhysicalAddress(page, phys) && gpu::PhysicalToGuest(phys) == page;
+        auto put = [&](uint32_t offset, std::initializer_list<uint32_t> words) { for (uint32_t w : words) { Store32(base, page + offset, w); offset += 4; } };
+        CpState st;
+        // Sub-buffer at +0x100: type 0 writing register 2003 = 7.
+        put(0x100, {0x00002003, 7});
+        put(0x200, {  // 44 words at +0x200; the writes they make land at +0, +8 and +0x10
+            0x00012000, 0x11, 0x22,                     // type 0: 2000 = 11, 2001 = 22
+            0x0001A002, 0x33, 0x44,                     // type 0, one register: 2002 = 33 then 44
+            (1u << 30) | (0x11u << 11) | 0x10, 0x55, 0x66,  // type 1: 10 = 55, 11 = 66
+            2u << 30,                                   // type 2: no-op
+            0xC0022100, 0x0010, 0xFFFF, 0x05,           // REG_RMW (13-bit index): 10 = (55 & FFFF) | 5 = 55
+            0xC0023D00, phys | 2, 0xAABBCCDD, 0x01020304, // MEM_WRITE 8in32 at +0: two words big-endian
+            0xC0025800, 0x14, (phys + 8) | 2, 0xCAFE,     // EVENT_WRITE_SHD: initiator 14, value CAFE at +8
+            0x000001DC, 1, 0x000001DD, phys + 0x10,       // SCRATCH_UMSK = 1, SCRATCH_ADDR = +0x10
+            0x00000578, 0x12345678,                       // SCRATCH_REG0 -> big-endian at +0x10
+            0xC0013F00, phys + 0x100, 2,                  // INDIRECT_BUFFER: +0x100, 2 words
+            0xC0043C00, 3, 0x2003, 7, 0xFFFFFFFF, 0,       // WAIT_REG_MEM register 2003 == 7 (satisfied)
+            0xC0015100, 0, 0,                             // SET_BIN_SELECT 0
+            0xC0022101, 0x0011, 0, 0x99,                  // a predicated REG_RMW on 11: skipped
+        });
+        if (mapped)
+            Execute(base, page + 0x200, 44, 0, 44, st);
+        Expect(mapped && ReadRegister(base, 0x2000) == 0x11 && ReadRegister(base, 0x2001) == 0x22 && ReadRegister(base, 0x2002) == 0x44 &&
+                   ReadRegister(base, 0x10) == 0x55 && ReadRegister(base, 0x11) == 0x66 && ReadRegister(base, 0x2003) == 7,
+               "PM4: type 0 (range and one register), type 1, type 2, REG_RMW, an indirect buffer; a predicated packet skipped after SET_BIN_SELECT 0");
+        Expect(be32(page) == 0xAABBCCDD && be32(page + 4) == 0x01020304 && be32(page + 8) == 0xCAFE && ReadRegister(base, reg::kVgtEventInitiator) == 0x14 &&
+                   be32(page + 0x10) == 0x12345678,
+               "PM4: MEM_WRITE and EVENT_WRITE_SHD with 8in32 store big-endian; a scratch register enabled in SCRATCH_UMSK is written to SCRATCH_ADDR");
+        // A ring of 4 words read from word 3 with wraparound: a type-0 header at word 3, its values at words 0 and 1.
+        put(0x300, {0x22, 0x33, 0, 0x00012004});
+        CpState ring;
+        Execute(base, page + 0x300, 4, 3, 3, ring);
+        Expect(ReadRegister(base, 0x2004) == 0x22 && ReadRegister(base, 0x2005) == 0x33, "PM4: a ring read wraps around its end");
+        put(0x400, {0xC0036400, 0x53574150, 0x1B441000, 1280, 720});
+        put(0x420, {0xC0007F00, 0});
+        put(0x430, {0xC0042100, 0x2000});
+        Expect(StderrOf([&] { CpState c; Execute(base, page + 0x400, 5, 0, 5, c); }) == "[stop 11] first swap: front buffer 1B441000, 1280x720\n" &&
+                   ExitCodeOf([&] { CpState c; Execute(base, page + 0x400, 5, 0, 5, c); }) == int(StopCode::FirstSwap) &&
+                   ExitCodeOf([&] { CpState c; Execute(base, page + 0x420, 2, 0, 2, c); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { CpState c; Execute(base, page + 0x430, 2, 0, 2, c); }) == int(StopCode::Unimplemented),
+               "PM4: XE_SWAP stops (11) with the front buffer and size; an unmodelled opcode and a packet longer than its data stop (7)");
+
+        // VdSwap (Xenia xboxkrnl_video.cc:394-476): front buffer = this page (fetch dword 1 = page | 0x86 low bits, dword 2 =
+        // height - 1 << 13 | width - 1 = 719 << 13 | 1279), format 6, colour space 0, width/height on the stack (arguments 8, 9).
+        const uint32_t args = ArenaAlloc(base, 0x100), slot = page + 0x800;
+        put(0x500, {0x11111111, page | 0x86, (719u << 13) | 1279, 0x44444444, 0x55555555, 0x66666666});
+        Store32(base, args, page), Store32(base, args + 4, 6), Store32(base, args + 8, 0), Store32(base, args + 12, 1280), Store32(base, args + 16, 720);
+        Store32(base, args + 0x80 + 0x54, args + 12), Store32(base, args + 0x80 + 0x5C, args + 16);
+        PPCContext swap{};
+        swap.r1.u32 = args + 0x80, swap.r3.u32 = slot, swap.r4.u32 = page + 0x500, swap.r8.u32 = args, swap.r9.u32 = args + 4, swap.r10.u32 = args + 8;
+        (void)StderrOf([] {});
+        imp("VdSwap")(swap, base);
+        Expect(be32(slot) == 0x00054800 && be32(slot + 4) == 0x11111111 && be32(slot + 8) == ((phys & 0xFFFFF000u) | 0x86) &&
+                   be32(slot + 28) == 0xC0036400 && be32(slot + 32) == 0x53574150 && be32(slot + 36) == phys && be32(slot + 40) == 1280 &&
+                   be32(slot + 44) == 720 && be32(slot + 48) == (2u << 30) && be32(slot + 252) == (2u << 30),
+               "VdSwap: the slot holds type 0 (6 fetch words to 4800, physical base), XE_SWAP {SWAP, physical, 1280, 720}, type-2 fill");
+        Store32(base, args + 4, 7);
+        Expect(ExitCodeOf([&] { PPCContext c = swap; imp("VdSwap")(c, base); }) == int(StopCode::Unimplemented), "VdSwap: format 7 stops (7)");
     }
 
     std::printf("runtime tests: %d failures\n", failures);

@@ -18,7 +18,7 @@ namespace runtime {
 // which is never mapped: the first access faults and names the import (M2-T04).
 constexpr uint32_t kGuardBase = 0x7F000000u;
 
-constexpr uint32_t kGuardEnd = 1u << 31;  // the top of the user address range
+constexpr uint32_t kGuardEnd = 0x7FC80000u;  // the GPU register page (kernel/graphics.h)
 
 constexpr uint32_t GuardAddress(size_t index, size_t page) { return kGuardBase + uint32_t(index * page); }
 constexpr bool GuardsFit(size_t count, size_t page) { return count * page <= kGuardEnd - kGuardBase; }
