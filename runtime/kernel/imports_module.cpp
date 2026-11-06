@@ -4,7 +4,8 @@
 //
 // Taken from ForzaRecomp runtime/kernel/imports_module.cpp (GPL-3.0-or-later, same owner),
 // reviewed and re-tested here. FM4 Recomp changes: only the imports a run has reached so far
-// (RtlImageXexHeaderField, XexCheckExecutablePrivilege, XexGetModuleHandle, XexGetModuleSection); the
+// (RtlImageXexHeaderField, XexCheckExecutablePrivilege, XexGetModuleHandle, XexGetModuleSection, XexLoadImage,
+// XexGetProcedureAddress); the
 // others stay strict stubs until reached. Until title modules are loaded (XexLoadImage), the executable
 // is the only title module: any other module name stops, and only its handle has sections.
 //
@@ -12,6 +13,7 @@
 // src/xenia/kernel/xboxkrnl/xboxkrnl_rtl.cc:501 RtlImageXexHeaderField_entry, which returns
 // UserModule::GetOptHeader(memory, header, key, out) (src/xenia/kernel/user_module.cc:314).
 #include "imports.h"
+#include "exports.h"
 #include "module.h"
 #include <cstring>
 
@@ -77,4 +79,46 @@ GUEST_IMPORT(XexGetModuleSection, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:
         return;
     }
     ctx.r3.u64 = 0xC0000225;  // STATUS_NOT_FOUND
+}
+
+GUEST_IMPORT(XexLoadImage, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:94 XexLoadImage, xmodule.h:41 load_count")
+{
+    // (name*, flags, minimum version, handle*): a module already loaded gives its loader entry and
+    // its load count (big-endian 16 bits at +0x40) goes up. The system modules (xam.xex,
+    // xboxkrnl.exe) are always loaded (Xenia: KernelState::GetModule finds them). Loading a title
+    // module is not implemented yet: any other name stops.
+    const uint32_t name = ctx.r3.u32, handle = ctx.r6.u32;
+    const char* text = name ? reinterpret_cast<const char*>(base + name) : "";
+    const uint32_t ldr = *text ? runtime::SystemModule(base, text) : 0;
+    if (ldr == 0)
+        Stop(StopCode::Unimplemented, "XexLoadImage(\"%.64s\", flags %X): loading a title module is not implemented", text, ctx.r4.u32);
+    const uint32_t count = uint32_t(base[ldr + 0x40] << 8 | base[ldr + 0x41]) + 1;
+    base[ldr + 0x40] = uint8_t(count >> 8), base[ldr + 0x41] = uint8_t(count);
+    runtime::Store32(base, handle, ldr);
+    ctx.r3.u64 = 0;  // X_STATUS_SUCCESS
+}
+
+GUEST_IMPORT(XexGetProcedureAddress, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:160 XexGetProcedureAddress, kernel_module.cc:87")
+{
+    // (module, ordinal or name*, address*): a system module's export by ordinal gives its trampoline
+    // (exports.h). An ordinal the runtime does not know, a lookup by name (a value above 0xFFFF), or
+    // the executable's own exports stop (7): a real console may have them, so no failure is invented.
+    // A handle that is no module: STATUS_INVALID_HANDLE (as Xenia).
+    const uint32_t module = ctx.r3.u32, ordinal = ctx.r4.u32, out = ctx.r5.u32;
+    if (ordinal > 0xFFFF)
+        Stop(StopCode::Unimplemented, "XexGetProcedureAddress by name (\"%.64s\") is not implemented",
+             reinterpret_cast<const char*>(base + ordinal));
+    const char* system = runtime::SystemModuleName(module);
+    if (system == nullptr)
+    {
+        if (module == 0 || module == runtime::ExecutableModule().ldr)
+            Stop(StopCode::Unimplemented, "XexGetProcedureAddress(executable, ordinal %u): its exports are not implemented", ordinal);
+        ctx.r3.u64 = 0xC0000008;  // STATUS_INVALID_HANDLE
+        return;
+    }
+    const runtime::SystemExport* e = runtime::FindSystemExport(system, ordinal);
+    if (e == nullptr)
+        Stop(StopCode::Unimplemented, "XexGetProcedureAddress(%s, ordinal %u = 0x%X): an export the runtime does not know", system, ordinal, ordinal);
+    runtime::Store32(base, out, runtime::ExportTrampoline(base, *e));
+    ctx.r3.u64 = 0;
 }

@@ -11,3 +11,24 @@ GUEST_IMPORT(XGetAVPack, "REFERENCE_DERIVED: Xenia xam_info.cc:205 XGetAVPack re
     // The AV pack in use. Xenia notes games use it as a PAL check and accept 3, 4, 6 or 8; 8 is its default.
     ctx.r3.u64 = 8;
 }
+
+// Launch data: the runtime always starts the title cold (no other title launched it with data), so
+// there is none (Xenia: loader_data.launch_data_present false).
+GUEST_IMPORT(XamLoaderGetLaunchDataSize, "REFERENCE_DERIVED: Xenia xam_info.cc:294 XamLoaderGetLaunchDataSize (no launch data)")
+{
+    // (size*): ERROR_INVALID_PARAMETER (0x57) without a pointer; else size 0 and ERROR_NOT_FOUND (0x490).
+    if (ctx.r3.u32 == 0)
+    {
+        ctx.r3.u64 = 0x57;
+        return;
+    }
+    runtime::Store32(base, ctx.r3.u32, 0);
+    ctx.r3.u64 = 0x490;
+}
+
+GUEST_IMPORT(XamLoaderGetLaunchData, "REFERENCE_DERIVED: Xenia xam_info.cc:311 XamLoaderGetLaunchData (no launch data)")
+{
+    // (buffer*, size): nothing copied, ERROR_NOT_FOUND (0x490).
+    (void)base;
+    ctx.r3.u64 = 0x490;
+}

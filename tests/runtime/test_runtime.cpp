@@ -330,6 +330,31 @@ int main()
     PPCContext av{};
     imp("XGetAVPack")(av, base);
     Expect(av.r3.u64 == 8, "XGetAVPack: 8 (Xenia's default AV pack, xam_info.cc:32)");
+    // No launch data (a cold start; Xenia xam_info.cc:294-323): size 0 and ERROR_NOT_FOUND (0x490);
+    // no size pointer: ERROR_INVALID_PARAMETER (0x57); the data: ERROR_NOT_FOUND.
+    const uint32_t launchSize = ArenaAlloc(base, 4);
+    Store32(base, launchSize, 0xAAAAAAAA);
+    PPCContext ld{};
+    ld.r3.u32 = launchSize;
+    imp("XamLoaderGetLaunchDataSize")(ld, base);
+    const bool sizeNotFound = ld.r3.u64 == 0x490 && be32(launchSize) == 0;
+    ld.r3.u64 = 0;
+    imp("XamLoaderGetLaunchDataSize")(ld, base);
+    const bool noPointer = ld.r3.u64 == 0x57;
+    ld.r3.u32 = launchSize, ld.r4.u32 = 16;
+    imp("XamLoaderGetLaunchData")(ld, base);
+    // FscSetCacheElementCount(0, count) (Xenia xboxkrnl_io.cc:669): success for FM4's shape (0, 0x400);
+    // another first argument, a zero count or one above 65536 stops (7).
+    PPCContext fsc{};
+    fsc.r3.u64 = 0, fsc.r4.u64 = 0x400;
+    imp("FscSetCacheElementCount")(fsc, base);
+    Expect(fsc.r3.u64 == 0 &&
+               ExitCodeOf([&] { PPCContext c{}; c.r3.u64 = 1, c.r4.u64 = 0x400; imp("FscSetCacheElementCount")(c, base); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { PPCContext c{}; c.r4.u64 = 0; imp("FscSetCacheElementCount")(c, base); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { PPCContext c{}; c.r4.u64 = 0x10001; imp("FscSetCacheElementCount")(c, base); }) == int(StopCode::Unimplemented),
+           "FscSetCacheElementCount(0, 0x400): success; (1, 0x400), (0, 0), (0, 0x10001) stop (7)");
+    Expect(sizeNotFound && noPointer && ld.r3.u64 == 0x490,
+           "XamLoaderGetLaunchDataSize: size 0, ERROR_NOT_FOUND (no pointer: INVALID_PARAMETER); XamLoaderGetLaunchData: ERROR_NOT_FOUND");
 
     // XexGetModuleHandle(name*, handle*) (Xenia xboxkrnl_modules.cc:44): null or "" -> the executable's
     // loader entry; a system module's name (any case) -> its entry; another name stops (7).
@@ -339,6 +364,17 @@ int main()
         return at;
     };
     const uint32_t handleOut = ArenaAlloc(base, 4);
+    // RtlInitAnsiString(string*, source*) (Xenia xboxkrnl_rtl.cc:224): game:\x (7 characters: g a m e : \ x)
+    // gives length 7, maximum 8, the source address (big-endian 16, 16, 32 bits); a null source gives 0, 0, 0.
+    const uint32_t ansi = ArenaAlloc(base, 8), ansiSource = guestString("game:\\x");
+    Store32(base, ansi, 0xAAAAAAAA), Store32(base, ansi + 4, 0xAAAAAAAA);
+    PPCContext rs{};
+    rs.r3.u32 = ansi, rs.r4.u32 = ansiSource;
+    imp("RtlInitAnsiString")(rs, base);
+    const bool ansiOk = be32(ansi) == 0x00070008 && be32(ansi + 4) == ansiSource;
+    rs.r3.u32 = ansi, rs.r4.u32 = 0;
+    imp("RtlInitAnsiString")(rs, base);
+    Expect(ansiOk && be32(ansi) == 0 && be32(ansi + 4) == 0, "RtlInitAnsiString: length 7, maximum 8, buffer; a null source gives 0, 0, 0");
     PPCContext gm{};
     gm.r4.u32 = handleOut;
     imp("XexGetModuleHandle")(gm, base);
@@ -354,6 +390,52 @@ int main()
     const uint32_t otherName = guestString("default.xex");
     Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = otherName, c.r4.u32 = handleOut; imp("XexGetModuleHandle")(c, base); }) == int(StopCode::Unimplemented),
            "XexGetModuleHandle: a title module name stops (7) until modules are loaded");
+
+    // XexLoadImage(name*, flags, version, handle*) (Xenia xboxkrnl_modules.cc:94): xam.xex is always loaded:
+    // its loader entry, success, and its load count (+0x40, big-endian 16 bits) goes 0 -> 1 -> 2.
+    const uint32_t xam = SystemModule(base, "xam.xex");
+    PPCContext li{};
+    li.r3.u32 = guestString("xam.xex"), li.r4.u32 = 9, li.r6.u32 = handleOut;
+    Store32(base, handleOut, 0);
+    imp("XexLoadImage")(li, base);
+    const bool firstLoad = li.r3.u64 == 0 && be32(handleOut) == xam && base[xam + 0x40] == 0 && base[xam + 0x41] == 1;
+    li.r3.u32 = guestString("XAM.XEX");
+    imp("XexLoadImage")(li, base);
+    Expect(firstLoad && li.r3.u64 == 0 && be32(handleOut) == xam && base[xam + 0x40] == 0 && base[xam + 0x41] == 2,
+           "XexLoadImage(xam.xex): its loader entry, success, load count 1 then 2 (any case)");
+    const uint32_t facadeName = guestString("XMediaFacade_default.xex");
+    Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = facadeName, c.r6.u32 = handleOut; imp("XexLoadImage")(c, base); }) == int(StopCode::Unimplemented),
+           "XexLoadImage: a title module stops (7) until loading is implemented");
+
+    // XexGetProcedureAddress(module, ordinal, out*) (Xenia xboxkrnl_modules.cc:160): xam ordinal 0xAFF is
+    // XamPartyGetUserList (xam_table.inc:1686): a trampoline address, the same each time, outside the
+    // executable's code; an indirect call to it stops like an unimplemented import (3) naming the export.
+    const uint32_t procOut = ArenaAlloc(base, 4);
+    auto procedure = [&](uint32_t module, uint32_t ordinal) {
+        PPCContext c{};
+        c.r3.u32 = module, c.r4.u32 = ordinal, c.r5.u32 = procOut;
+        Store32(base, procOut, 0);
+        imp("XexGetProcedureAddress")(c, base);
+        return c.r3.u32;
+    };
+    const bool procFound = procedure(xam, 0xAFF) == 0;
+    const uint32_t trampoline = be32(procOut);
+    Expect(procFound && trampoline != 0 && !IsCodeAddress(trampoline, PPC_CODE_BASE, PPC_CODE_SIZE) && procedure(xam, 0xAFF) == 0 &&
+               be32(procOut) == trampoline,
+           "XexGetProcedureAddress(xam, 0xAFF): a trampoline, the same address each time");
+    Expect(procedure(xam, 0x305) == 0 && be32(procOut) != trampoline && be32(procOut) != 0,
+           "XexGetProcedureAddress(xam, 0x305 XamShowPartyUI): its own trampoline");
+    PPCContext viaPointer{};
+    viaPointer.lr = 0x40001234;
+    Expect(StderrOf([&] { PpcCallIndirect(viaPointer, base, trampoline); }).find("[stop 3] import XamPartyGetUserList called from 40001234") == 0 &&
+               ExitCodeOf([&] { PpcCallIndirect(viaPointer, base, trampoline); }) == int(StopCode::Import),
+           "calling the trampoline stops like an unimplemented import (3), naming XamPartyGetUserList");
+    Expect(ExitCodeOf([&] { (void)procedure(xam, 0xB01); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { (void)procedure(xam, guestString("XamPartyGetUserList")); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { (void)procedure(0, 1); }) == int(StopCode::Unimplemented) &&
+               ExitCodeOf([&] { (void)procedure(SystemModule(base, "xboxkrnl.exe"), 0xAFF); }) == int(StopCode::Unimplemented),
+           "XexGetProcedureAddress: an unknown ordinal, a name, the executable's exports, or xam's ordinal asked of xboxkrnl stop (7)");
+    Expect(procedure(0x1234, 0xAFF) == 0xC0000008 && be32(procOut) == 0, "XexGetProcedureAddress: a handle that is no module is STATUS_INVALID_HANDLE");
 
     // XexGetModuleSection(module, name*, data*, size*) (Xenia user_module.cc:260): resource info 0x000002FF
     // at +0x13C = size 0x24 (4 + 2 x 16), then the entries "dbgstr" (40010000, 0x200) and "rsrc1234" (40020000, 0x40).
