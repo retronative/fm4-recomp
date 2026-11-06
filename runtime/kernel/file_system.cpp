@@ -103,6 +103,12 @@ bool ValidGuestPath(std::string_view path)
     return true;
 }
 
+bool TitleUpdatePath(std::string_view device)
+{
+    constexpr std::string_view kUpdate = "update:";
+    return device.size() >= kUpdate.size() && EqualCase(device.substr(0, kUpdate.size()), kUpdate);
+}
+
 uint32_t DiscAttributes(const DiscEntry& entry)
 {
     return (entry.directory ? file_attribute::kDirectory : 0) | file_attribute::kReadOnly;

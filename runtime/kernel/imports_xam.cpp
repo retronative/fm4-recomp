@@ -32,3 +32,12 @@ GUEST_IMPORT(XamLoaderGetLaunchData, "REFERENCE_DERIVED: Xenia xam_info.cc:311 X
     (void)base;
     ctx.r3.u64 = 0x490;
 }
+
+GUEST_IMPORT(XGetGameRegion, "REFERENCE_DERIVED: Xenia xam_info.cc:217 xeXGetGameRegion (table by user country)")
+{
+    // Xenia maps the user's country to a region through its table; the runtime's country is 103 (US, the
+    // XConfig policy in imports_xconfig.cpp), and table[103] (xam_info.cc:231, the 8th value of the 13th
+    // row) is 0x00FF (North America).
+    (void)base;
+    ctx.r3.u64 = 0x00FF;
+}

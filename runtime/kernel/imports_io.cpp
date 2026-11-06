@@ -6,7 +6,10 @@
 #include "imports.h"
 #include "file_system.h"
 #include "objects.h"
+#include <optional>
+#include "dispatcher.h"
 #include <string>
+#include <string_view>
 
 GUEST_IMPORT(FscSetCacheElementCount, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:669 FscSetCacheElementCount (a stub: success)")
 {
@@ -68,7 +71,10 @@ GUEST_IMPORT(NtQueryFullAttributesFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc
     }
     runtime::DiscEntry entry;
     std::string device;
-    switch (runtime::ResolveGuestPath(path, entry, device))
+    runtime::Resolved resolved = runtime::ResolveGuestPath(path, entry, device);
+    if (resolved == runtime::Resolved::OtherDevice && runtime::TitleUpdatePath(device))
+        resolved = runtime::Resolved::NotFound;  // no title update installed (file_system.h)
+    switch (resolved)
     {
     case runtime::Resolved::OtherDevice:
         Stop(StopCode::Unimplemented, "NtQueryFullAttributesFile(\"%s\" = %s): not on the disc, and no other device is mounted",
@@ -91,7 +97,8 @@ constexpr uint32_t kWriteAccess = 0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 |
 constexpr uint32_t kOpen = 1, kOpenIf = 3;                       // FileDisposition (Xenia vfs/entry.h:47)
 constexpr uint32_t kOpened = 1, kDoesNotExist = 5;               // FileAction (Xenia vfs/entry.h:38)
 constexpr uint32_t kNonDirectoryFile = 0x40;                     // FILE_NON_DIRECTORY_FILE
-constexpr uint32_t kSynchronousIo = 0x10 | 0x20;                 // FILE_SYNCHRONOUS_IO_ALERT, _NONALERT
+constexpr uint32_t kSynchronousIo = 0x10 | 0x20;
+constexpr std::string_view kHardDisk = "\\Device\\Harddisk0";  // absent (owner policy, below)                 // FILE_SYNCHRONOUS_IO_ALERT, _NONALERT
 
 // NtCreateFile/NtOpenFile on the read-only disc (Xenia xboxkrnl_io.cc:98, virtual_file_system.cc:181).
 void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t handleOut, uint32_t access, uint32_t attributes,
@@ -108,15 +115,29 @@ void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t han
     const std::string path = ObjectPath(ctx, base, attributes, import);
     if (!runtime::ValidGuestPath(path))
         return (void)(ctx.r3.u64 = 0xC0000033);  // STATUS_OBJECT_NAME_INVALID
+    runtime::DiscEntry entry;
+    std::string device;
+    const runtime::Resolved resolved = runtime::ResolveGuestPath(path, entry, device);
+    // A compatibility policy, not verified console behaviour: the console has no
+    // hard disk. An open on \Device\Harddisk0 fails with STATUS_OBJECT_NAME_NOT_FOUND, the output handle
+    // X_INVALID_HANDLE_VALUE and the io status {status, FILE_DOES_NOT_EXIST}, as Xenia's failed opens
+    // (xboxkrnl_io.cc:150-170); nothing is read or written. Xenia's NullDevice (success for all I/O,
+    // emulator.cc:910-924) is not used.
+    if (resolved == runtime::Resolved::OtherDevice && device.compare(0, kHardDisk.size(), kHardDisk) == 0 &&
+        (device.size() == kHardDisk.size() || device[kHardDisk.size()] == '\\'))
+        return finish(0xC0000034, kDoesNotExist, 0xFFFFFFFF);  // STATUS_OBJECT_NAME_NOT_FOUND
+    if (resolved == runtime::Resolved::OtherDevice && runtime::TitleUpdatePath(device))
+        return finish(0xC000000F, kDoesNotExist, 0xFFFFFFFF);  // no title update installed: STATUS_NO_SUCH_FILE
+    if (resolved == runtime::Resolved::OtherDevice)  // first, so the stop names the real reason
+        Stop(StopCode::Unimplemented, "%s(\"%s\" = %s, access %08X, disposition %u): not on the disc, and no other device is mounted",
+             import, path.c_str(), device.c_str(), access, disposition);
     if ((access & kWriteAccess) || (disposition != kOpen && disposition != kOpenIf))
         Stop(StopCode::Unimplemented, "%s(\"%s\", access %08X, disposition %u): the disc is read-only; writing is not modelled",
              import, path.c_str(), access, disposition);
-    runtime::DiscEntry entry;
-    std::string device;
-    switch (runtime::ResolveGuestPath(path, entry, device))
+    switch (resolved)
     {
     case runtime::Resolved::OtherDevice:
-        Stop(StopCode::Unimplemented, "%s(\"%s\" = %s): not on the disc, and no other device is mounted", import, path.c_str(), device.c_str());
+        break;  // stopped above
     case runtime::Resolved::NotFound:
         if (disposition == kOpenIf)
             Stop(StopCode::Unimplemented, "%s(\"%s\", OPEN_IF): would create a file on the read-only disc", import, path.c_str());
@@ -176,27 +197,38 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
 
 GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile, xfile.cc:96 XFile::Read, disc_image_file.cc:26")
 {
-    // (handle, event, APC routine, APC context, io status*, buffer*, length, offset*): a synchronous read
-    // at *offset, or at the file position if there is no offset (or it is -1). At or past the end:
-    // END_OF_FILE; a zero length succeeds with 0 bytes (Xenia). The io status gets {status, bytes}. The
-    // position becomes offset + bytes read: NT's rule for synchronous I/O (Xenia adds the bytes to the
-    // old position instead). An event, an APC or a file opened for asynchronous I/O stops (7).
+    // (handle, event, APC routine, APC context, io status*, buffer*, length, offset*). Xenia completes every
+    // read at once: the io status gets {status, bytes}, the event (if any) is set, and a file opened for
+    // asynchronous I/O returns PENDING unless the read hit the end (completing before returning is a valid
+    // order for asynchronous I/O). The read is at *offset, or at the file position if there is no offset (or
+    // it is -1); at or past the end: END_OF_FILE; a zero length succeeds with 0 bytes. A synchronous file's
+    // position becomes offset + bytes (NT's rule; Xenia adds the bytes to the old position). NT keeps no
+    // position for asynchronous files, so such a read without an offset stops (7); so does an APC.
     const uint32_t handle = ctx.r3.u32, event = ctx.r4.u32, apc = ctx.r5.u32, ioStatus = ctx.r7.u32;
     const uint32_t buffer = ctx.r8.u32, length = ctx.r9.u32, offsetAt = ctx.r10.u32;
+    std::optional<runtime::KernelObject> eventObject;
+    if (event != 0)
+    {
+        eventObject = runtime::LookupHandle(event);
+        if (!eventObject || eventObject->type != runtime::ObjectType::Event)
+            return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
+    }
     const auto object = runtime::LookupHandle(handle);
     runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
     if (file == nullptr)
         return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
-    if (event != 0 || apc != 0 || !file->synchronous)
-        Stop(StopCode::Unimplemented, "NtReadFile(%08X, event %08X, APC %08X, %s): only synchronous reads without an event or APC are implemented",
-             handle, event, apc, file->synchronous ? "synchronous" : "asynchronous");
+    if ((apc & ~1u) != 0)
+        Stop(StopCode::Unimplemented, "NtReadFile(%08X): an APC routine (%08X) is not implemented", handle, apc);
     uint64_t offset = file->position;
+    bool explicitOffset = false;
     if (offsetAt != 0)
     {
         const uint64_t given = uint64_t(runtime::Load32(base, offsetAt)) << 32 | runtime::Load32(base, offsetAt + 4);
         if (given != ~uint64_t(0))
-            offset = given;
+            offset = given, explicitOffset = true;
     }
+    if (!file->synchronous && !explicitOffset)
+        Stop(StopCode::Unimplemented, "NtReadFile(%08X): an asynchronous read without an offset", handle);
     uint32_t status = 0, bytes = 0;
     if (length != 0)
     {
@@ -205,9 +237,11 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
         else
             bytes = runtime::ReadDiscFile(file->entry, offset, base + buffer, length);
     }
-    if (status == 0)
+    if (status == 0 && file->synchronous)
         file->position = offset + bytes;
     if (ioStatus)
         runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, bytes);
-    ctx.r3.u64 = status;
+    if (eventObject)
+        runtime::SetEvent(base, eventObject->header);
+    ctx.r3.u64 = !file->synchronous && status == 0 ? 0x103 : status;  // STATUS_PENDING
 }

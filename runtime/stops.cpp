@@ -10,6 +10,7 @@
 #include "indirect.h"
 #include "layout.h"
 #include "kernel/exports.h"
+#include "kernel/loader.h"
 #include <cstdarg>
 #include <cstdio>
 #include <unistd.h>
@@ -42,7 +43,8 @@ void PpcResidualStop(uint32_t address, const char* name, uint32_t index, uint32_
 
 void PpcCallIndirect(PPCContext& ctx, uint8_t* base, uint32_t target)
 {
-    PPCFunc* function = runtime::IsCodeAddress(target, PPC_CODE_BASE, PPC_CODE_SIZE) ? PPC_LOOKUP_FUNC(base, target) : nullptr;
+    PPCFunc* function = runtime::IsCodeAddress(target, PPC_CODE_BASE, PPC_CODE_SIZE) ? PPC_LOOKUP_FUNC(base, target)
+                                                                                    : runtime::FindFunction(base, target);  // a loaded module
     if (function == nullptr)
         if (const runtime::SystemExport* e = runtime::TrampolineExport(target))  // XexGetProcedureAddress
             return runtime::CallExport(ctx, base, *e);

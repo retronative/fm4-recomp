@@ -15,6 +15,7 @@
 #include "indirect.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
+#include "kernel/loader.h"
 #include "kernel/critical_section.h"
 #include "kernel/dispatcher.h"
 #include "kernel/imports.h"
@@ -146,6 +147,17 @@ PPC_FUNC(ThreadBody) { (void)base; threadSaw = ctx.r3.u32; ctx.r3.u64 = 0x77; } 
 PPC_FUNC(XapiStartup) { (void)base; threadSaw = ctx.r3.u32 ^ ctx.r4.u32; ctx.r3.u64 = 0x99; } // startup(start, context)
 PPC_FUNC(Terminating) { (void)ctx, (void)base; runtime::ExitCurrentGuestThread(0x55); }
 PPC_FUNC(TerminatingThroughImport);
+// A synthetic title module's functions (loader tests): its DllMain records its arguments and returns
+// dllMainResult; a helper reached by an indirect call.
+uint32_t dllMainArgs[3] = {}, dllMainCalls = 0, dllMainResult = 1, moduleHelperCalls = 0;
+PPC_FUNC(ModuleDllMain)
+{
+    (void)base;
+    dllMainArgs[0] = ctx.r3.u32, dllMainArgs[1] = ctx.r4.u32, dllMainArgs[2] = ctx.r5.u32;
+    dllMainCalls++;
+    ctx.r3.u64 = dllMainResult;
+}
+PPC_FUNC(ModuleHelper) { (void)ctx, (void)base; moduleHelperCalls++; }
 PPC_FUNC(Translated)
 {
     (void)ctx, (void)base;
@@ -335,6 +347,9 @@ int main(int, char** argv)
     PPCContext av{};
     imp("XGetAVPack")(av, base);
     Expect(av.r3.u64 == 8, "XGetAVPack: 8 (Xenia's default AV pack, xam_info.cc:32)");
+    PPCContext region{};
+    imp("XGetGameRegion")(region, base);
+    Expect(region.r3.u64 == 0xFF, "XGetGameRegion: 0x00FF for country 103 (Xenia xam_info.cc:231)");
     // No launch data (a cold start; Xenia xam_info.cc:294-323): size 0 and ERROR_NOT_FOUND (0x490);
     // no size pointer: ERROR_INVALID_PARAMETER (0x57); the data: ERROR_NOT_FOUND.
     const uint32_t launchSize = ArenaAlloc(base, 4);
@@ -348,6 +363,16 @@ int main(int, char** argv)
     const bool noPointer = ld.r3.u64 == 0x57;
     ld.r3.u32 = launchSize, ld.r4.u32 = 16;
     imp("XamLoaderGetLaunchData")(ld, base);
+    // RtlNtStatusToDosError (Xenia xboxkrnl_error.cc:974): table entries C0000034 -> 2 (:220), PENDING 103 -> 0x3E5 (:34), C0000011 -> 0x26
+    // (:185), C00000BA -> 5 (:354); 0 and a customer code (bit 29: 0x2000ABCD) unchanged; HRESULT 8007:0057 -> 0x57;
+    // 0xD0000034 (bits 28-29 cleared: C0000034) -> 2; 0xC0010005 -> 5; an unlisted status stops (7).
+    auto dosError = [&](uint32_t status) { PPCContext c{}; c.r3.u64 = status; imp("RtlNtStatusToDosError")(c, base); return c.r3.u32; };
+    Expect(dosError(0xC0000034) == 2 && dosError(0x103) == 0x3E5 && dosError(0xC0000011) == 0x26 && dosError(0xC00000BA) == 5 && dosError(0) == 0 &&
+               ExitCodeOf([&] { _exit(dosError(0x2000ABCD) == 0x2000ABCD ? 0 : 1); }) == 0 &&
+               ExitCodeOf([&] { _exit(int(dosError((0x8007u << 16) | 0x57))); }) == 0x57 &&
+               ExitCodeOf([&] { _exit(int(dosError(0xD0000034))); }) == 2 && ExitCodeOf([&] { _exit(int(dosError(0xC0010005))); }) == 5 &&
+               ExitCodeOf([&] { (void)dosError(0xC0000001); }) == int(StopCode::Unimplemented),
+           "RtlNtStatusToDosError: table entries, rules for 0, customer codes, 8007xxxx, Dxxxxxxx, C001xxxx; an unlisted status stops (7)");
     // FscSetCacheElementCount(0, count) (Xenia xboxkrnl_io.cc:669): success for FM4's shape (0, 0x400);
     // another first argument, a zero count or one above 65536 stops (7).
     PPCContext fsc{};
@@ -402,11 +427,14 @@ int main(int, char** argv)
         std::ofstream(disc + "/Media/Empty.bin");
         MountDisc(disc);
         const uint32_t attrs = ArenaAlloc(base, 12), nameString = ArenaAlloc(base, 8), info = ArenaAlloc(base, 56);
-        auto query = [&](const char* path, uint32_t root = 0) {
+        auto setPath = [&](const char* path, uint32_t root = 0) {  // the attributes and name string, no call
             const uint32_t text = guestString(path);
             Store32(base, nameString, uint32_t(std::strlen(path)) << 16 | uint32_t(std::strlen(path) + 1));
             Store32(base, nameString + 4, text);
             Store32(base, attrs, root), Store32(base, attrs + 4, nameString), Store32(base, attrs + 8, 0x40);
+        };
+        auto query = [&](const char* path, uint32_t root = 0) {
+            setPath(path, root);
             for (uint32_t i = 0; i < 56; i += 4) Store32(base, info + i, 0xAAAAAAAA);
             PPCContext c{};
             c.r3.u32 = attrs, c.r4.u32 = info;
@@ -437,7 +465,7 @@ int main(int, char** argv)
         constexpr uint32_t kReadAccess = (1u << 31) | 0x00100000u | 0x80u;
         const uint32_t fileOut = ArenaAlloc(base, 4), ioStatus = ArenaAlloc(base, 8), stack = ArenaAlloc(base, 0x60);
         auto create = [&](const char* path, uint32_t access, uint32_t disposition, uint32_t options, uint32_t attributesAt = 1) {
-            (void)query(path);  // fills the attributes and name string for `path`
+            setPath(path);
             Store32(base, fileOut, 0xAAAAAAAA), Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
             Store32(base, stack + 0x54, options);
             PPCContext c{};
@@ -456,6 +484,29 @@ int main(int, char** argv)
                    create("game:\\Media", kReadAccess, 1, 0x60) == 0xC00000BA && create("game:\\Media", kReadAccess, 1, 0x20) == 0 &&
                    create("game:\\Media\\Cars.bin", kReadAccess, 3, 0x60) == 0 && create("game:\\x", kReadAccess, 1, 0x60, 0) == 0xC000000D,
                "NtCreateFile: missing NO_SUCH_FILE {.., FILE_DOES_NOT_EXIST 5}, handle -1; a directory as a non-directory FILE_IS_A_DIRECTORY; OPEN_IF of an existing file opens; no attributes INVALID_PARAMETER");
+        // No hard disk: FM4's open of \Device\Harddisk0\partition0 (access C0100000 =
+        // GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) gives STATUS_OBJECT_NAME_NOT_FOUND (C0000034), handle -1, io
+        // status {C0000034, FILE_DOES_NOT_EXIST 5}; NtOpenFile the same. A name that only starts like the device
+        // (\Device\Harddisk01) is another device: it stops; so does any other device.
+        constexpr uint32_t kReadWrite = (1u << 31) | (1u << 30) | 0x00100000u;
+        const bool hddAbsent = create("\\Device\\Harddisk0\\partition0", kReadWrite, 1, 0x60) == 0xC0000034 &&
+                               be32(fileOut) == 0xFFFFFFFF && be32(ioStatus) == 0xC0000034 && be32(ioStatus + 4) == 5 &&
+                               create("\\Device\\Harddisk0", kReadAccess, 1, 0x20) == 0xC0000034;
+        setPath("\\Device\\Harddisk0\\Partition1\\x");
+        PPCContext hddOpen{};
+        hddOpen.r3.u32 = fileOut, hddOpen.r4.u32 = kReadAccess, hddOpen.r5.u32 = attrs, hddOpen.r6.u32 = ioStatus, hddOpen.r7.u32 = 0x60;
+        imp("NtOpenFile")(hddOpen, base);
+        Expect(hddAbsent && hddOpen.r3.u64 == 0xC0000034 && be32(fileOut) == 0xFFFFFFFF,
+               "NtCreateFile/NtOpenFile on \\Device\\Harddisk0: OBJECT_NAME_NOT_FOUND, handle -1, io status {C0000034, 5} (no hard disk)");
+        // No title update installed (file_system.h; Xenia kernel_state.cc:482-510): update:\media.zip (FM4's query)
+        // and an open of UPDATE:\default.xexp give NO_SUCH_FILE; the open: handle -1, {C000000F, 5}.
+        Expect(query("update:\\media.zip") == 0xC000000F && create("update:\\default.xexp", kReadAccess, 1, 0x60) == 0xC000000F &&
+                   be32(fileOut) == 0xFFFFFFFF && be32(ioStatus) == 0xC000000F && be32(ioStatus + 4) == 5 &&
+                   ExitCodeOf([&] { _exit(create("UPDATE:\\default.xexp", kReadAccess, 1, 0x60) == 0xC000000F ? 0 : 1); }) == 0,
+               "update: (no title update installed): NtQueryFullAttributesFile and NtCreateFile give NO_SUCH_FILE, handle -1, {C000000F, 5}");
+        Expect(StderrOf([&] { (void)create("\\Device\\Harddisk01\\x", kReadWrite, 1, 0x60); }).find("not on the disc") != std::string::npos &&
+                   ExitCodeOf([&] { (void)create("cache:\\x", kReadAccess, 1, 0x60); }) == int(StopCode::Unimplemented),
+               "NtCreateFile: another device (Harddisk01, cache:) stops naming it, not the read-only disc");
         Expect(ExitCodeOf([&] { (void)create("game:\\Media\\Cars.bin", 0x40000000, 1, 0x60); }) == int(StopCode::Unimplemented) &&
                    ExitCodeOf([&] { (void)create("game:\\Media\\New.bin", kReadAccess, 2, 0x60); }) == int(StopCode::Unimplemented) &&
                    ExitCodeOf([&] { (void)create("game:\\Media\\New.bin", kReadAccess, 3, 0x60); }) == int(StopCode::Unimplemented),
@@ -510,10 +561,122 @@ int main(int, char** argv)
         Expect(tail && readFile(openHandle, 10, 5000) == 0xC0000011 && be32(ioStatus) == 0xC0000011 && be32(ioStatus + 4) == 0 &&
                    readFile(openHandle, 0, 9999) == 0 && readFile(0x1234, 4, 0) == 0xC0000008,
                "NtReadFile: 2 bytes at 4998, then END_OF_FILE {C0000011, 0}; zero length succeeds; no file INVALID_HANDLE");
+        // Asynchronous (Xenia xboxkrnl_io.cc:184-262): a file opened without FILE_SYNCHRONOUS_IO_*, an event: the read
+        // completes at once, io status {0, 4}, the event set, PENDING (0x103); at the end: END_OF_FILE, event set;
+        // no offset stops (7); an event handle that is no event INVALID_HANDLE; an APC stops (7).
         const uint32_t asyncHandle = create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x40) == 0 ? be32(fileOut) : 0;
-        Expect(asyncHandle && ExitCodeOf([&] { (void)readFile(asyncHandle, 4, 0); }) == int(StopCode::Unimplemented) &&
-                   ExitCodeOf([&] { (void)readFile(openHandle, 4, 0, 0x88); }) == int(StopCode::Unimplemented),
-               "NtReadFile: an asynchronous file or an event stops (7)");
+        const uint32_t eventHandle = CreateObject(ObjectType::Event, ArenaAlloc(base, 16), "");
+        const uint32_t eventBody = LookupHandle(eventHandle)->header;
+        base[eventBody] = 0, Store32(base, eventBody + 4, 0);  // a notification event, not signalled
+        const bool pending = readFile(asyncHandle, 4, 26, eventHandle) == 0x103 && base[readBuffer] == 'A' && be32(ioStatus) == 0 &&
+                             be32(ioStatus + 4) == 4 && be32(eventBody + 4) == 1;
+        Store32(base, eventBody + 4, 0);
+        const bool atEnd = readFile(asyncHandle, 4, 5000, eventHandle) == 0xC0000011 && be32(eventBody + 4) == 1;
+        Expect(asyncHandle && pending && atEnd && readFile(openHandle, 4, 0, openHandle) == 0xC0000008 &&
+                   ExitCodeOf([&] { (void)readFile(asyncHandle, 4, -2); }) == int(StopCode::Unimplemented),
+               "NtReadFile asynchronous: completes at once, {0, 4}, event set, PENDING; END_OF_FILE at the end; a non-event INVALID_HANDLE; no offset stops (7)");
+        PPCContext withApc{};
+        withApc.r3.u32 = openHandle, withApc.r5.u32 = 0x40001000, withApc.r7.u32 = ioStatus, withApc.r8.u32 = readBuffer, withApc.r9.u32 = 4;
+        Expect(ExitCodeOf([&] { imp("NtReadFile")(withApc, base); }) == int(StopCode::Unimplemented), "NtReadFile with an APC routine stops (7)");
+        // The loader (kernel/loader.h) with a synthetic module: image 94000000 (0x20000 bytes), code 94010000 (0x100),
+        // its function table after the image (94020000, 2 bytes per code byte); DllMain at 94010000, a helper at
+        // 94010010; a function slot at +0x100 (thunk 94010010) and a data import at +0x104 shared by name with the
+        // executable's (RecordDataImport). Its file Mod.xex on the disc: the XEX header above (0x140 bytes) + 0x40.
+        {
+            const std::string modules = disc + "/../modules";
+            mkdir(modules.c_str(), 0755), mkdir((modules + "/testmod").c_str(), 0755), mkdir((modules + "/testmod/survey").c_str(), 0755);
+            std::vector<uint8_t> moduleImage(0x20000);
+            for (size_t i = 0; i < moduleImage.size(); i++) moduleImage[i] = uint8_t(i * 7);
+            // Its XEX export table at +0x200 (xex2_info.h:614): image base 9401 (<< 16), 2 exports from ordinal 1:
+            // offsets 0x0010 (ordinal 1 -> 94010010) and 0x0000 (ordinal 2 -> 94010000).
+            const uint32_t exportWords[][2] = {{0x220, 0x9401}, {0x224, 2}, {0x228, 1}, {0x22C, 0x10}, {0x230, 0}};
+            for (const auto& w : exportWords)
+                for (int b = 0; b < 4; b++) moduleImage[w[0] + b] = uint8_t(w[1] >> (24 - 8 * b));
+            std::ofstream(modules + "/testmod/survey/image.bin", std::ios::binary).write(reinterpret_cast<const char*>(moduleImage.data()), long(moduleImage.size()));
+            std::vector<uint8_t> moduleFile = header;
+            moduleFile.resize(0x180, 0x5A);
+            std::ofstream(disc + "/Mod.xex", std::ios::binary).write(reinterpret_cast<const char*>(moduleFile.data()), long(moduleFile.size()));
+            RecordDataImport("TestData", 0x7E001230);
+            static const Section sections[] = {{0x94000000u, 0x94010000u, false}, {0x94010000u, 0x94010100u, true}};
+            static const ModuleImport imports[] = {{0x94000100u, false, 0x94010010u, "__imp__KeA"}, {0x94000104u, true, 0, "__imp__TestData"}};
+            static const PPCFuncMapping mappings[] = {{0x94010000u, ModuleDllMain}, {0x94010010u, ModuleHelper}, {0, nullptr}};
+            static ModuleImage images[2];
+            images[0] = ModuleImage{"testmod", "Mod.xex", 0x94000000u, 0x20000u, 0x94010000u, 0x94010000u, 0x100u,
+                                    Crc32(moduleImage.data(), moduleImage.size()), 0x140u, Crc32(moduleFile.data(), 0x140),
+                                    uint32_t(moduleFile.size()), Crc32(moduleFile.data(), moduleFile.size()), 0x94000200u,
+                                    sections, 2, imports, 2, mappings};
+            images[1] = images[0];
+            images[1].fileName = "Cars.bin", images[1].name = "badcrc";  // on the disc, but its CRC does not match
+            SetModuleImages(images, 2, modules.c_str());
+            auto load = [&](const char* name) {
+                PPCContext c{};
+                c.r3.u32 = guestString(name), c.r4.u32 = 9, c.r6.u32 = handleOut;
+                Store32(base, handleOut, 0xAAAAAAAA);
+                imp("XexLoadImage")(c, base);
+                return c.r3.u32;
+            };
+            const bool loadedOk = load("game:\\Mod.xex") == 0 && dllMainCalls == 1;
+            const uint32_t ldr = be32(handleOut);
+            Expect(loadedOk && ldr != 0 && dllMainArgs[0] == ldr && dllMainArgs[1] == 1 && dllMainArgs[2] == 0 &&
+                       base[ldr + 0x40] == 0 && base[ldr + 0x41] == 1 && be32(ldr + ldr::kImageBase) == 0x94000000u,
+                   "XexLoadImage(game:\\Mod.xex): loaded, DllMain(loader entry, PROCESS_ATTACH 1, 0) once, load count 1");
+            Expect(base[0x94000000u + 5] == uint8_t(35) && be32(0x94000100u) == 0x94010010u && be32(0x94000104u) == 0x7E001230u &&
+                       FindFunction(base, 0x94010010u) == ModuleHelper && FindFunction(base, 0x94010020u) == nullptr,
+                   "the module: image copied, function slot = thunk, data import shared with the executable, its table");
+            PPCContext indirect{};
+            PpcCallIndirect(indirect, base, 0x94010010u);
+            Expect(moduleHelperCalls == 1 && ExitCodeOf([&] { base[0x94010000u] = 1; }) == int(StopCode::GuestFault) &&
+                       ExitCodeOf([&] { base[0x94020000u] = 1; }) == int(StopCode::GuestFault),
+                   "an indirect call reaches the module's function; its code and table are read-only");
+            Expect(load("MOD") == 0 && be32(handleOut) == ldr && dllMainCalls == 1 && base[ldr + 0x41] == 2,
+                   "XexLoadImage(MOD) again: the same entry, no second DllMain, load count 2");
+            PPCContext byName{};
+            byName.r3.u32 = guestString("mod.xex"), byName.r4.u32 = handleOut;
+            imp("XexGetModuleHandle")(byName, base);
+            PPCContext section{};
+            section.r3.u32 = ldr, section.r4.u32 = guestString("dbgstr"), section.r5.u32 = fileInfo, section.r6.u32 = fileInfo + 4;
+            imp("XexGetModuleSection")(section, base);
+            Expect(byName.r3.u64 == 0 && be32(handleOut) == ldr && section.r3.u64 == 0xC0000225,
+                   "XexGetModuleHandle(mod.xex) gives its entry; XexGetModuleSection on it: no resources, STATUS_NOT_FOUND");
+            // XexGetProcedureAddress on the module (Xenia xex_module.cc:144): ordinal 1 -> 94010010, 2 -> 94010000;
+            // 3 (past the count) and 0 (below the base: 0xFFFF in 16 bits) DRIVER_ENTRYPOINT_NOT_FOUND with 0.
+            auto exportOf = [&](uint32_t ordinal) {
+                PPCContext c{};
+                c.r3.u32 = ldr, c.r4.u32 = ordinal, c.r5.u32 = fileInfo;
+                Store32(base, fileInfo, 0xAAAAAAAA);
+                imp("XexGetProcedureAddress")(c, base);
+                return c.r3.u32;
+            };
+            const bool ordinals = exportOf(1) == 0 && be32(fileInfo) == 0x94010010u && exportOf(2) == 0 && be32(fileInfo) == 0x94010000u;
+            Expect(ordinals && exportOf(3) == 0xC0000263 && be32(fileInfo) == 0 && exportOf(0) == 0xC0000263,
+                   "XexGetProcedureAddress(module, 1 / 2): its export table; 3 and 0 DRIVER_ENTRYPOINT_NOT_FOUND, 0");
+            Expect(load("game:\\Missing.xex") == 0xC000000F && be32(handleOut) == 0 &&
+                       ExitCodeOf([&] { (void)load("game:\\Media\\Empty.bin"); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)load("game:\\Media\\Cars.bin"); }) == int(StopCode::Setup) &&
+                       StderrOf([&] { (void)load("game:\\Media\\Cars.bin"); }).find("is not the file badcrc was translated from") != std::string::npos,
+                   "XexLoadImage: not on the disc NO_SUCH_FILE, handle 0; an untranslated file stops (7); a file whose CRC differs stops (9)");
+            ModuleImage outside = images[0];
+            outside.base = 0x70000000u;
+            ModuleImage unaligned = images[0];
+            unaligned.base = 0x94008000u;
+            Expect(ModuleFits(images[0]) && !ModuleFits(outside) && !ModuleFits(unaligned) && ModulesOverlap(0x9401F000u, 0x94030000u) &&
+                       !ModulesOverlap(0x94030000u, 0x94040000u) &&
+                       ExitCodeOf([&] { (void)MapModule(base, images[0], moduleImage, std::vector<uint8_t>(moduleFile.begin(), moduleFile.begin() + 0x140)); }) == int(StopCode::Setup),
+                   "ModuleFits: 80000000-A0000000, 64 KB aligned; a mapped span overlaps; mapping it again stops (9)");
+            dllMainResult = 0;
+            ModuleImage second = images[0];
+            second.base = 0x96000000u, second.entry = 0x96010000u, second.codeBase = 0x96010000u;
+            static const Section sections2[] = {{0x96000000u, 0x96010000u, false}, {0x96010000u, 0x96010100u, true}};
+            static const ModuleImport imports2[] = {{0x96000104u, true, 0, "__imp__Unknown"}};
+            static const PPCFuncMapping mappings2[] = {{0x96010000u, ModuleDllMain}, {0, nullptr}};
+            second.sections = sections2, second.imports = imports2, second.importCount = 1, second.mappings = mappings2;
+            Expect(ExitCodeOf([&] { (void)MapModule(base, second, moduleImage, std::vector<uint8_t>(moduleFile.begin(), moduleFile.begin() + 0x140)); }) == int(StopCode::Setup),
+                   "a module importing data the executable does not stops (9)");
+            second.importCount = 0;
+            images[1] = second, images[1].fileName = "Mod.xex", images[0].fileName = "Other.xex";
+            Expect(ExitCodeOf([&] { (void)load("game:\\Mod.xex"); }) == int(StopCode::Unimplemented), "a DllMain returning FALSE stops (7)");
+            dllMainResult = 1;
+        }
         symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
         Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup), "a symlink on the disc stops (9)");
         unlink((disc + "/Link").c_str());
@@ -546,9 +709,6 @@ int main(int, char** argv)
     imp("XexLoadImage")(li, base);
     Expect(firstLoad && li.r3.u64 == 0 && be32(handleOut) == xam && base[xam + 0x40] == 0 && base[xam + 0x41] == 2,
            "XexLoadImage(xam.xex): its loader entry, success, load count 1 then 2 (any case)");
-    const uint32_t facadeName = guestString("XMediaFacade_default.xex");
-    Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = facadeName, c.r6.u32 = handleOut; imp("XexLoadImage")(c, base); }) == int(StopCode::Unimplemented),
-           "XexLoadImage: a title module stops (7) until loading is implemented");
 
     // XexGetProcedureAddress(module, ordinal, out*) (Xenia xboxkrnl_modules.cc:160): xam ordinal 0xAFF is
     // XamPartyGetUserList (xam_table.inc:1686): a trampoline address, the same each time, outside the

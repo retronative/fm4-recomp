@@ -41,7 +41,8 @@ def survey(tmp, slots=None, size=len(IMAGE), declared=('__imp__KeA', '__imp__Xam
         {'library': 'xboxkrnl.exe', 'name': '__imp__KeData', 'ordinal': 3, 'address': 0x40000018, 'kind': 'variable'}]
     (s / 'report.json').write_text(json.dumps({'base': 0x40000000, 'size': size, 'entry': 0x40000100, 'import_slots': slots,
                                                'sections': [{'name': '.text', 'start': 0x40000100, 'end': 0x40000200, 'code': True}]}))
-    (p / 'ppc_config.h').write_text('#define PPC_IMAGE_BASE 0x40000000ull\n#define PPC_IMAGE_SIZE 0x200ull\n')
+    (p / 'ppc_config.h').write_text('#define PPC_IMAGE_BASE 0x40000000ull\n#define PPC_IMAGE_SIZE 0x200ull\n'
+                                    '#define PPC_CODE_BASE 0x40000100ull\n#define PPC_CODE_SIZE 0x100ull\n')
     (p / 'ppc_recomp_shared.h').write_text(''.join(f'PPC_EXTERN_FUNC({d});\n' for d in declared))
     return s, p, o
 
@@ -136,6 +137,28 @@ class Generate(unittest.TestCase):
         stubs = (self.t / 'out' / 'fm4_imports.cpp').read_text()
         self.assertEqual(stubs.count('PPC_FUNC('), 3)  # KeA once, XamB, NtOnly
         self.assertIn('PPC_FUNC(__imp__NtOnly) { (void)base; PpcImportStop("NtOnly", ctx); }', stubs)
+
+    def test_module_image(self):
+        # The module's ModuleImage: name, file name, base, size, entry, code range (ppc_config.h), CRC-32 of
+        # its image, header (the first 0x60 bytes) and whole file, its sections, its non-thunk import records
+        # (a function slot with its thunk, a variable), and its renamed function table.
+        slots = [{'library': 'xboxkrnl.exe', 'name': '__imp__KeA', 'ordinal': 1, 'address': 0x40000010, 'kind': 'function_slot'},
+                 {'library': 'xboxkrnl.exe', 'name': '__imp__KeA', 'ordinal': 0, 'address': 0x40000100, 'kind': 'thunk'},
+                 {'library': 'xboxkrnl.exe', 'name': '__imp__KeData', 'ordinal': 3, 'address': 0x40000018, 'kind': 'variable'}]
+        s, p, _ = survey(self.t / 'm', slots=slots, declared=('__imp__KeA',))
+        code, log = run(*survey(self.t), ['--module', 'facade', s, p, s.parent / 'default.xex'])
+        self.assertEqual(code, 0, log)
+        text = (self.t / 'out' / 'fm4_modules.h').read_text()
+        self.assertIn('extern PPCFuncMapping facade_PPCFuncMappings[];', text)
+        self.assertIn('    {0x40000100u, 0x40000200u, true},', text)
+        self.assertIn('    {0x40000010u, false, 0x40000100u, "__imp__KeA"},\n    {0x40000018u, true, 0x00000000u, "__imp__KeData"},', text)
+        whole = xex()
+        self.assertIn('    {"facade", "default.xex", 0x40000000u, 0x00000200u, 0x40000100u,\n'
+                      '     0x40000100u, 0x00000100u, 0x%08Xu, 0x00000060u,\n'
+                      '     0x%08Xu, 0x%08Xu, 0x%08Xu, 0x00000000u,\n'
+                      '     kfacadeSections, std::size(kfacadeSections),\n'
+                      '     kfacadeImports, std::size(kfacadeImports), facade_PPCFuncMappings},'
+                      % (zlib.crc32(IMAGE), zlib.crc32(whole[:0x60]), len(whole), zlib.crc32(whole)), text)
 
     def test_module_thunks_checked(self):
         extra = self.module(('__imp__KeA',))

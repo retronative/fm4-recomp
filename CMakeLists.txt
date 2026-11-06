@@ -32,7 +32,7 @@ set(FM4_GENERATED ${CMAKE_BINARY_DIR}/generated)
 set(FM4_GENERATOR_ARGS)
 set(FM4_GENERATOR_INPUTS ${FM4_SURVEY}/report.json ${FM4_SURVEY}/image.bin ${FM4_PPC}/ppc_config.h
     ${FM4_PPC}/ppc_recomp_shared.h ${FM4_XEX})
-set(FM4_GENERATED_FILES ${FM4_GENERATED}/fm4_image.h ${FM4_GENERATED}/fm4_imports.cpp)
+set(FM4_GENERATED_FILES ${FM4_GENERATED}/fm4_image.h ${FM4_GENERATED}/fm4_imports.cpp ${FM4_GENERATED}/fm4_modules.h)
 foreach(module IN LISTS FM4_MODULES)
   set(dir ${PROJECT_SOURCE_DIR}/game/modules/${module})
   if(NOT EXISTS ${dir}/ppc/ppc_config.h OR NOT EXISTS ${dir}/survey/report.json)

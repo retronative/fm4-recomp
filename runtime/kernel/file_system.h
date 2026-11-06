@@ -35,6 +35,12 @@ struct DiscEntry { std::string host; uint64_t size = 0; bool directory = false; 
 uint32_t DiscAttributes(const DiscEntry& entry);
 uint64_t DiscAllocationSize(const DiscEntry& entry);
 
+// No title update is installed: the translation is of the base default.xex, so update content (an .xexp
+// patch, media) would belong to another executable version. Without one, Xenia registers no "UPDATE:"
+// link (kernel_state.cc:482-510 ApplyTitleUpdate), so update: paths resolve to nothing and file calls
+// return NO_SUCH_FILE. ("update:" in any case, as links are matched.)
+bool TitleUpdatePath(std::string_view device);
+
 enum class Resolved { Found, NotFound, OtherDevice };
 // Resolves a guest path; `device` receives the path after canonicalization and links (for a stop line).
 Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& device);

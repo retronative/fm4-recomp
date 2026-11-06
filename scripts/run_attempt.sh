@@ -26,6 +26,7 @@ BIN="$ROOT/build/native/runtime/fm4recomp"
 IMAGE="$ROOT/game/survey/image.bin"
 XEX="$ROOT/game/files/default.xex"
 DISC="$ROOT/game/files"
+MODULES="$ROOT/game/modules"
 shasum -a 256 "$BIN" "$IMAGE" | sed "s|$ROOT/||" | tee "$OUT/binary.sha256"
 echo "audio: none linked in M2 (no SDL); the dummy-driver check does not apply" | tee "$OUT/audio.txt"
 export HOME="$ROOT/game/home"
@@ -40,7 +41,7 @@ for i in $(seq 1 "$RUNS"); do
     $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[launcher] deadline: process group killed\n"; exit 124 };
     alarm $deadline + 30; waitpid $pid, 0; alarm 0;
     my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-    "$DEADLINE" "$BIN" --image "$IMAGE" --xex "$XEX" --disc "$DISC" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
+    "$DEADLINE" "$BIN" --image "$IMAGE" --xex "$XEX" --disc "$DISC" --modules "$MODULES" --deadline "$DEADLINE" > "$OUT/run$i.out" 2> "$OUT/run$i.err" || status=$?
   echo "$status" > "$OUT/run$i.exit"
   echo "run $i: exit $status, $(grep -m1 '^\[stop ' "$OUT/run$i.err" || echo 'no stop line')"
 done
