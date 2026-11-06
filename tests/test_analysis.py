@@ -513,7 +513,48 @@ class Analysis(unittest.TestCase):
             r = self.switch_case("residual_stop_needs_a_plain_name", [], table_size=0,
                                  extra_config='residual_stops = [ %s ]\n' % bad)
             self.assertNotEqual(r.code, 0, bad)
-            self.assertIn("residual_stops needs one { address, name } per dispatch, name [A-Za-z0-9_]+", r.log, bad)
+            self.assertIn("residual_stops needs one { address, name[, cases] } per dispatch, name [A-Za-z0-9_]+", r.log, bad)
+
+    def test_guarded_residual(self):
+        """Patch 0036: a residual with verified cases compiles to a switch over exactly those cases:
+        each case first checks that the loaded target (CTR) is its case, any other index stops. The
+        table at T+8 holds T+0x10, T+0x18 (switch_case's layout); the switch is at T+4 on r3."""
+        r = self.switch_case("guarded_residual", [], table_size=0,
+                             extra_config='residual_stops = [ { address = 0x82001004, name = "guarded", cases = [ 0x82001010, 0x82001018 ] } ]\n')
+        self.assertEqual(r.code, 0, r.log[-2000:])
+        self.assertIn("NOTE: guarded residual guarded at 82001004: cases 0-1 (config residual_stops); any other index or target stops", r.log)
+        body = self.function_body(r, T)
+        self.assertIn('\tswitch (ctx.r3.u32) {\n\tcase 0:\n'
+                      '\t\tif (ctx.ctr.u32 != 0x82001010u) PpcResidualStop(0x82001004u, "guarded", ctx.r3.u32, uint32_t(ctx.lr));\n'
+                      '\t\tgoto loc_82001010;\n\tcase 1:\n'
+                      '\t\tif (ctx.ctr.u32 != 0x82001018u) PpcResidualStop(0x82001004u, "guarded", ctx.r3.u32, uint32_t(ctx.lr));\n'
+                      '\t\tgoto loc_82001018;\n\tdefault:\n'
+                      '\t\tPpcResidualStop(0x82001004u, "guarded", ctx.r3.u32, uint32_t(ctx.lr));\n\t}', body)
+        self.assertIn("loc_82001010:", body)
+        self.assertIn("loc_82001018:", body)
+
+    def test_guarded_residual_case_must_be_the_table_word(self):
+        """Patch 0036: case 1 listed as T+0x14, but table word 1 (at T+0xC) is T+0x18: fatal."""
+        r = self.switch_case("guarded_residual_case_must_be_the_table_word", [], table_size=0,
+                             extra_config='residual_stops = [ { address = 0x82001004, name = "g", cases = [ 0x82001010, 0x82001014 ] } ]\n')
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("guarded residual g at 82001004: case 1 (82001014) is not table word 1 at 8200100C", r.fatal)
+
+    def test_guarded_residual_case_inside_the_function(self):
+        """Patch 0036: a case outside the function is fatal even when it equals its table word
+        (table word 0 is T+0x10 inside; a 3-entry list reads word 2, the li at T+0x10, as a case)."""
+        r = self.switch_case("guarded_residual_case_inside_the_function", [], table_size=0,
+                             extra_config='residual_stops = [ { address = 0x82001004, name = "g", cases = [ 0x82001010, 0x82001018, 0x38600001 ] } ]\n')
+        self.assertNotEqual(r.code, 0)
+        self.assertIn("guarded residual g at 82001004: case 2 (38600001) is outside function 82001000", r.fatal)
+
+    def test_guarded_residual_cases_must_be_addresses(self):
+        """Patch 0036: an empty or non-numeric case list stops before analysis."""
+        for bad in ('cases = [ ]', 'cases = [ "x" ]'):
+            r = self.switch_case("guarded_residual_cases_must_be_addresses", [], table_size=0,
+                                 extra_config='residual_stops = [ { address = 0x82001004, name = "g", %s } ]\n' % bad)
+            self.assertNotEqual(r.code, 0, bad)
+            self.assertIn("residual_stops needs one { address, name[, cases] } per dispatch", r.log, bad)
 
     def test_switch_without_bound_is_fatal(self):
         """Patch 0025: a switch entry with no labels (no proven bound) is fatal."""

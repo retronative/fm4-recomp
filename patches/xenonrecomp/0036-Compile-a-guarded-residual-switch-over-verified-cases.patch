@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Thu, 05 Nov 2026 23:37:32 +0700
+Subject: [PATCH] Compile a guarded residual switch over verified cases
+
+FM4 Recomp (switch 0x82ADA478 under the valid-stream premise): a
+residual_stops entry may list cases = [ ... ]. Each case must equal the switch table's word at its
+index and lie inside the dispatch's function (otherwise FATAL); no case is inferred from the table.
+The dispatch compiles to a switch over exactly those indices; each case first checks that the
+loaded target (CTR) is that case, and every other index or target calls PpcResidualStop with the
+entry's name. The cases are jump labels of the function. Entries without cases keep patch 0035's
+unconditional stop. Our own code.
+---
+ XenonRecomp/recompiler.cpp        | 56 ++++++++++++++++++++++++++++++++++-----
+ XenonRecomp/recompiler_config.cpp | 16 +++++++++--
+ XenonRecomp/recompiler_config.h   | 14 ++++++++--
+ 3 files changed, 75 insertions(+), 11 deletions(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 2fbd976..428377b 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1074,15 +1074,53 @@ bool Recompiler::Recompile(
+             // past the proven bound cannot occur; if it did, stop rather than run on.
+             const auto stop = config.residualStops.find(base);
+             if (stop != config.residualStops.end() && !switchTable->second.labels.empty())
+-                Fatal(fmt::format("residual stop {} at {:X} names a switch table with a proven bound", stop->second, base));
++                Fatal(fmt::format("residual stop {} at {:X} names a switch table with a proven bound", stop->second.name, base));
+             if (switchTable->second.labels.empty() && stop != config.residualStops.end())
+             {
+                 // An accepted residual: the dispatch is not translated (no case is assumed from the
+                 // table); executing it stops in the runtime, which names it.
+-                if (residualStopsReached.insert(base).second)
+-                    fmt::println("NOTE: residual stop {} at {:X} (no proven bound; config residual_stops)", stop->second, base);
+-                println("\t// residual stop {}: switch table at {:X} has no proven bound (config residual_stops)", stop->second, base);
+-                println("\tPpcResidualStop(0x{:X}u, \"{}\", {}.u32, uint32_t(ctx.lr));", base, stop->second, r(switchTable->second.r));
++                const auto& name = stop->second.name;
++                const auto& cases = stop->second.cases;
++                const auto index = r(switchTable->second.r);
++                if (cases.empty())
++                {
++                    if (residualStopsReached.insert(base).second)
++                        fmt::println("NOTE: residual stop {} at {:X} (no proven bound; config residual_stops)", name, base);
++                    println("\t// residual stop {}: switch table at {:X} has no proven bound (config residual_stops)", name, base);
++                    println("\tPpcResidualStop(0x{:X}u, \"{}\", {}.u32, uint32_t(ctx.lr));", base, name, index);
++                }
++                else
++                {
++                    // FM4 Recomp (patch 0036): a guarded residual. A premise was accepted (e.g. valid
++                    // input data) under which the index stays below the number of listed cases; each case
++                    // must equal its table word and lie inside this function. Any other index, or a loaded
++                    // target that is not its case, stops by name.
++                    for (size_t i = 0; i < cases.size(); i++)
++                    {
++                        const auto* word = reinterpret_cast<const uint32_t*>(image.Find(switchTable->second.table + uint32_t(4 * i)));
++                        if (switchTable->second.table == 0 || word == nullptr || ByteSwap(*word) != cases[i])
++                            Fatal(fmt::format("guarded residual {} at {:X}: case {} ({:X}) is not table word {} at {:X}", name, base, i,
++                                cases[i], i, switchTable->second.table + uint32_t(4 * i)));
++                        if (cases[i] < fn.base || cases[i] >= fn.base + fn.size)
++                            Fatal(fmt::format("guarded residual {} at {:X}: case {} ({:X}) is outside function {:X}", name, base, i, cases[i], fn.base));
++                    }
++                    if (residualStopsReached.insert(base).second)
++                        fmt::println("NOTE: guarded residual {} at {:X}: cases 0-{} (config residual_stops); any other index or target stops",
++                            name, base, cases.size() - 1);
++                    println("\t// guarded residual {}: switch table at {:X} has no proven bound; cases 0-{} accepted under the",
++                        name, base, cases.size() - 1);
++                    println("\t// premise (config residual_stops); every other index or target stops");
++                    println("\tswitch ({}.u32) {{", index);
++                    for (size_t i = 0; i < cases.size(); i++)
++                    {
++                        println("\tcase {}:", i);
++                        println("\t\tif ({}.u32 != 0x{:X}u) PpcResidualStop(0x{:X}u, \"{}\", {}.u32, uint32_t(ctx.lr));", ctr(), cases[i], base, name, index);
++                        println("\t\tgoto loc_{:X};", cases[i]);
++                    }
++                    println("\tdefault:");
++                    println("\t\tPpcResidualStop(0x{:X}u, \"{}\", {}.u32, uint32_t(ctx.lr));", base, name, index);
++                    println("\t}}");
++                }
+                 switchTable = config.switchTables.end();
+                 break;
+             }
+@@ -3213,6 +3251,10 @@ bool Recompiler::Recompile(const Function& fn, uint32_t entry)
+             for (auto label : switchTable->second.labels)
+                 labels.emplace(label);
+         }
++        // FM4 Recomp (patch 0036): a guarded residual's cases are jump targets too.
++        if (auto residual = config.residualStops.find(addr); residual != config.residualStops.end())
++            for (auto label : residual->second.cases)
++                labels.emplace(label);
+ 
+         auto midAsmHook = config.midAsmHooks.find(addr);
+         if (midAsmHook != config.midAsmHooks.end())
+@@ -3657,10 +3699,10 @@ void Recompiler::Recompile(const std::filesystem::path& headerFilePath)
+     }
+ 
+     // The list is exact: every residual stop must be an unproven switch table this image dispatches through.
+-    for (const auto& [address, name] : config.residualStops)
++    for (const auto& [address, stop] : config.residualStops)
+     {
+         if (!residualStopsReached.count(address))
+-            Fatal(fmt::format("residual stop {} at {:X} was not reached: no unproven switch table there", name, address));
++            Fatal(fmt::format("residual stop {} at {:X} was not reached: no unproven switch table there", stop.name, address));
+     }
+ 
+     SaveCurrentOutData();
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index aba334c..24eb7cc 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -80,9 +80,21 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+                 // The name is written into a string literal and a log line: a plain identifier only.
+                 const bool plain = !name.empty() && std::all_of(name.begin(), name.end(),
+                     [](char c) { return std::isalnum((unsigned char)c) || c == '_'; });
+-                if (!address || !plain || !residualStops.emplace(*address, name).second)
++                RecompilerResidualStop stop{name, {}};
++                bool casesOk = true;
++                if (auto* cases = table ? (*table)["cases"].as_array() : nullptr)
+                 {
+-                    fmt::println("FATAL: residual_stops needs one {{ address, name }} per dispatch, name [A-Za-z0-9_]+");
++                    for (auto& value : *cases)
++                    {
++                        auto label = value.value<uint32_t>();
++                        casesOk = casesOk && label.has_value();
++                        stop.cases.push_back(label.value_or(0));
++                    }
++                    casesOk = casesOk && !stop.cases.empty();
++                }
++                if (!address || !plain || !casesOk || !residualStops.emplace(*address, std::move(stop)).second)
++                {
++                    fmt::println("FATAL: residual_stops needs one {{ address, name[, cases] }} per dispatch, name [A-Za-z0-9_]+, cases non-empty addresses");
+                     std::exit(EXIT_FAILURE);
+                 }
+             }
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 29e475b..2ca7432 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -11,6 +11,14 @@ struct RecompilerSwitchTable
+     uint32_t tableSize = 0;
+ };
+ 
++// A residual switch dispatch (residual_stops): its name, and the cases a guarded residual accepts
++// (case i = cases[i], each checked against the table word i and required inside its function).
++struct RecompilerResidualStop
++{
++    std::string name;
++    std::vector<uint32_t> cases;
++};
++
+ struct RecompilerMidAsmHook
+ {
+     std::string name;
+@@ -64,8 +72,10 @@ struct RecompilerConfig
+     uint32_t setJmpAddress = 0;
+     std::map<uint32_t, RecompilerRuntimeRoutine> runtimeRoutines;
+     // Table dispatches with no proven bound accepted as documented stops (bctr
+-    // address -> name): each compiles to a call to PpcResidualStop instead of a switch.
+-    std::map<uint32_t, std::string> residualStops;
++    // address -> name, and for a guarded residual the verified cases): each compiles to a call to
++    // PpcResidualStop instead of a switch, or (cases listed) to a switch over exactly those cases
++    // whose every other index or target calls PpcResidualStop.
++    std::map<uint32_t, RecompilerResidualStop> residualStops;
+     std::unordered_map<uint32_t, uint32_t> functions;
+     std::unordered_map<uint32_t, uint32_t> invalidInstructions;
+     std::unordered_map<uint32_t, RecompilerMidAsmHook> midAsmHooks;
+-- 
+fm4-recomp

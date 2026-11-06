@@ -35,13 +35,21 @@ longjmp_address = 0x82762A90
 # (XenonRecomp and scripts/validate.py check it).
 # 0x82ADA478 (function 0x82ADA340, HYPOTHESIS: a range-coder model's decode step): index = field +24
 # of the model (r3), no compare in the function. A hand analysis (reference/recompiler/unproven_switch_c.md)
-# argues +24 <= 11 from the frequency total (h0 <= 15161 after every rebuild), but rests on open
-# assumptions: no other writer of the model fields outside the four routines (only 0x82AD8000..
-# 0x82ADE000 scanned) and two unverified call-site indices (0x82AD8B10, 0x82ADC6BC). ReXGlue/ShiftGlue
-# and fm4-static-recomp have no proof for it either (references.md). M2 risk: the stop fires on every
+# argues +24 <= 11 from the frequency total (h0 <= 15161 after every rebuild) for well-formed streams
+# only: a second analysis (reference/recompiler/unproven_switch_d.md) found counterexamples for out-of-spec stream data (the symbol
+# count can pass its cap and a caller's store can reach the next model's +24; an unchecked header word
+# overruns the codec's model table). Other FM4 ports have no proof for it
+# either. M2 risk: the stop fires on every
 # execution of this dispatch, i.e. whenever this decoder runs (likely asset loading).
+# Valid streams are the compatibility premise for 0x82ADA478, so it is a
+# guarded residual (patch 0036): cases 0-11, each equal to its table word (0x82ADA47C + 4i; XenonRecomp
+# checks this) and inside the function; any other index, or a loaded target that is not its case, stops
+# by name. This does not protect against memory corruption by an earlier malformed stream (the
+# counterexamples in reference/recompiler/unproven_switch_d.md act before the dispatch).
 residual_stops = [
-    { address = 0x82ADA478, name = "range_model_decode_steps" },
+    { address = 0x82ADA478, name = "range_model_decode_steps", cases = [
+        0x82ADA664, 0x82ADA63C, 0x82ADA614, 0x82ADA5EC, 0x82ADA5C4, 0x82ADA59C,
+        0x82ADA574, 0x82ADA54C, 0x82ADA524, 0x82ADA4FC, 0x82ADA4D4, 0x82ADA4AC ] },
 ]
 
 # Zero padding between functions: the gap sweep skips it instead of starting a function on it.
