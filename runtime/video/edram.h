@@ -23,8 +23,12 @@
 //     Change (X render_target_cache.cc:1539-1699 ChangeOwnership) claims a tile range for a Key and emits a
 //     Transfer from every previous owner. FM4 Recomp reduction (unit 6b restores it): X's separate
 //     "host depth" owners (render_target_cache.h:629-660, for a depth target whose host encoding differs
-//     from the guest's) are not tracked; instead a transfer across aspects (colour <-> depth) or between the
-//     two depth formats is REFUSED (fail closed), which is exactly the case where X would need them.
+//     from the guest's) are not tracked; a transfer between the two depth formats is REFUSED (fail closed), and a
+//     colour -> depth transfer always converts the colour word's depth bits (X would use the host-depth owner's
+//     float32 where its 20e4 conversion equals those bits: vulkan_render_target_cache.cc:3741-4142; X consults the
+//     owners only for a depth destination, render_target_cache.cc:1553-1555). Depth -> colour is accepted (X
+//     kDepthToColor), colour -> depth too (X kColorToDepth; FM4's observed case is a draw that overwrites every
+//     transferred depth and stencil sample).
 //   - Bind (X render_target_cache.cc:574-1015 Update): the targets a draw uses, duplicate-base elimination,
 //     the tiles each claims (X's mrt_edram_used_range_clamp_to_min rule, .cc:164-175, 799-828) and the
 //     transfers. FM4 Recomp reduction: no DrawExtentEstimator (.cc:762-767); the caller passes the rows the
@@ -181,7 +185,7 @@ struct Key
 // The M4 whitelist: colour 8_8_8_8, 8_8_8_8_GAMMA, 2_10_10_10 and its _AS_10_10_10_10
 // variant (storage 0 and 2), 2_10_10_10_FLOAT and its _AS_16_16_16_16 variant (storage 3, 7e3: X xenos.h:394-404
 // GetStorageColorFormat, "the same packing and meaning of values ... without blending precision modifiers"); both
-// depth formats; 1x and 4x MSAA. False with the reason otherwise.
+// depth formats; 1x, 2x and 4x MSAA. False with the reason otherwise.
 bool SupportedKey(Key k, std::string& why);
 
 // ---- Ownership ----------------------------------------------------------------------------------------
@@ -219,8 +223,8 @@ public:
     // dest's addressing period (wrapping into the next, :1683-1697) become dest's; every tile that another
     // non-empty owner held is appended to `transfers` as a range from that owner (adjacent tiles with the
     // same owner coalesce, :1624-1632; an empty previous owner transfers nothing, :1599-1600).
-    // Refuses, changing nothing, a transfer across aspects or between the two depth formats (the header's
-    // reduction; unit 6b). `length` 0 does nothing. Precondition: start <= 2048 - (length != 0), length <= 2048.
+    // Refuses, changing nothing, a transfer between the two depth formats (the header's reduction; unit 6b). Depth ->
+    // colour and colour -> depth are accepted (the latter without X's host-depth owner: the header). `length` 0 does nothing. Precondition: start <= 2048 - (length != 0), length <= 2048.
     // `clearCutout` (a resolve clear's rectangle in dest's pixels, X .cc:1347-1359 passing &clear_rectangle):
     // a tile whose pixels lie entirely inside it is claimed but not transferred, since the clear overwrites it
     // (X :1601-1607 skips a range whose rectangles minus the cutout are empty, :338-420 + :422-498
@@ -307,6 +311,9 @@ struct ResolveInfo
 {
     bool ok = false;
     std::string refusal;
+    // ok and empty: the clamped rectangle has no area; Xenia copies and clears nothing (X vulkan_render_target_cache.cc:1051-1054
+    // "Nothing to copy/clear"; FM4's second HDR band). Nothing else of this ResolveInfo is filled in.
+    bool empty = false;
     uint32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // pixels of the source surface, multiples of 8 (x1, y1 exclusive)
     Msaa msaa = Msaa::X1;
     uint32_t pitchTilesAt32bpp = 0;
@@ -370,6 +377,64 @@ struct ResolvePlan
 // are [0, 1]; X xenos.cc:150-166 Float20e4To32 is monotonic in the 24-bit value, so that is depth bits >
 // 0xF00000); a clear Key outside the whitelist.
 ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info);
+
+// ---- Draw extent: the rows a draw can touch (X draw_extent_estimator.cc) ---------------------------------
+//
+// X render_target_cache.cc:757-767 binds with height_used = min(GetRenderTargetHeight, EstimateMaxY). The
+// result is Bind's `heightUsed`. Without it a clear draw (clip disabled, 8192x8192 scissor) claims every tile
+// up to the next surface's base: FM4's 4x fast clear of the 7e3 pass (depth
+// moved from tile 720 to 1024) then reached the old depth target's tiles 720-1023 and was refused.
+
+struct ExtentRegisters
+{
+    uint32_t surfaceInfo = 0;        // RB_SURFACE_INFO 0x2000 (msaa_samples: the top-left rule's rounding)
+    uint32_t windowOffset = 0;       // PA_SC_WINDOW_OFFSET 0x2080 (X registers.h:561-569: signed 15-bit y at bit 16)
+    uint32_t windowScissorTl = 0;    // PA_SC_WINDOW_SCISSOR_TL 0x2081 (bit 31 window_offset_disable)
+    uint32_t windowScissorBr = 0;    // PA_SC_WINDOW_SCISSOR_BR 0x2082 (x bits 0-13, y 16-29)
+    uint32_t screenScissorBr = 8192 | 8192u << 16;  // PA_SC_SCREEN_SCISSOR_BR 0x200F (signed 15-bit; D3D9 keeps 8192, X :318-320 comment)
+    uint32_t clipCntl = 0;           // PA_CL_CLIP_CNTL 0x2204 (clip_disable bit 16, X registers.h:502)
+    uint32_t suScModeCntl = 0;       // PA_SU_SC_MODE_CNTL 0x2205 (vtx_window_offset_enable bit 16)
+    uint32_t vteCntl = 0;            // PA_CL_VTE_CNTL 0x2206 (X registers.h:520-536: y scale ena bit 2, y offset ena bit 3, vtx_xy_fmt bit 8)
+    uint32_t vtxCntl = 0;            // PA_SU_VTX_CNTL 0x2302 (pix_center bit 0)
+    uint32_t vportYScale = 0, vportYOffset = 0;  // PA_CL_VPORT_YSCALE 0x2111, _YOFFSET 0x2112: float bits
+};
+
+// X draw_extent_estimator.cc:289-316 with its defaults (execute_unclipped_draw_vs_on_cpu true, :24-38;
+// _with_scissor false, :39-49): only a draw with clipping disabled AND a scissor whose right and bottom
+// (after the window offset, within the screen scissor) both reach 8192 has its vertices evaluated.
+bool NeedsVertexMaxY(const ExtentRegisters& r);
+
+// X draw_extent_estimator.cc:267-366 EstimateMaxY: the scissor's bottom (window offset unless disabled, the
+// screen scissor, >= 0); with clipping on, also the viewport's bottom (window offset if enabled, + 0.5 unless
+// pix_center, + y offset if enabled, + |y scale| if enabled else 1; truncated); with clipping off, also
+// `vertexMaxY` when NeedsVertexMaxY and the caller has it (nullptr: the scissor alone, X's result with the
+// estimation off).
+uint32_t EstimateMaxY(const ExtentRegisters& r, const uint32_t* vertexMaxY);
+
+// The exported position of one vertex (X draw_extent_estimator.cc:54-73 PositionYExportSink: y and w of
+// oPos). X runs the vertex shader on the CPU (ShaderInterpreter, :169-243); we have no interpreter, so the
+// caller supplies the positions (PassThroughPositions below for a shader that exports a fetched position).
+struct VertexPosition
+{
+    float y = 0, w = 1;
+};
+
+// X draw_extent_estimator.cc:199-264 after the shader: y / w unless vtx_xy_fmt (:212-217), the viewport's y
+// scale and offset when enabled (:146-152, :219), the maximum, to 16.8 fixed point (:246, ui/graphics_util.cc
+// FloatToD3D11Fixed16p8), + 0.5 unless pix_center (:253-255), + the window y offset when vtx_window_offset_enable
+// (:256-258), then the top-left rule: .5 exclusive at 1x, 1. exclusive with MSAA (:259-264). No vertex: 0
+// (X :81-83 with no indices; all killed: max_y stays -FLT_MAX, which saturates to 0). Point lists are not
+// modelled (X adds the point radius, :221-238): the caller keeps the scissor bound for them.
+uint32_t VertexMaxY(const ExtentRegisters& r, const VertexPosition* positions, size_t count);
+
+// For a vertex shader whose oPos is a vertex fetch's xyz with w = 1, unchanged (FM4's fast-clear VS
+// b6cb6460159a82b1): the y of each of
+// `vertices` vertices, read from `words` (the vertex window as 32-bit loads of guest memory in host order, as
+// the renderer copies it; the fetch constant's endian applied as X xenos.h:1070-1086 GpuSwap) at dword
+// `offsetDwords + 1` of each `strideDwords`-dword vertex, w = 1. False with a reason when the window is too short
+// or the position does not fit in the stride. Recognising such a shader is the caller's (shader translator's) job.
+bool PassThroughPositions(const uint32_t* words, size_t wordCount, uint32_t endian, uint32_t strideDwords, uint32_t offsetDwords, uint32_t vertices,
+                          std::vector<VertexPosition>& out, std::string& why);
 
 // ---- Helpers shared with the tests ----------------------------------------------------------------------
 

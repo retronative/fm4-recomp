@@ -2314,6 +2314,170 @@ void main()
 
 }  // namespace
 
+// FM4 Recomp: ShaderTranslation::PositionFetch (shader_glsl.h). A syntactic scan of the
+// microcode with ucode.h's decoders (Xenia 67f16c4e315f ucode.h layouts), independent of the GLSL emitter, so
+// that what it accepts is exactly the documented pattern and nothing the emitter would also accept.
+ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, size_t count, bool pixel)
+{
+    using namespace ucode;
+    ShaderTranslation::PositionFetch r;
+    const auto fail = [&](std::string why) { r = {}; r.why = std::move(why); return r; };
+    if (pixel)
+        return fail("a pixel shader has no position export");
+    if (!words || count == 0 || count % 3 != 0)
+        return fail("not whole 3-word slots");
+    // The instructions in execution order (straight-line control flow only).
+    struct Op
+    {
+        bool fetch;
+        const uint32_t* w;
+        uint32_t slot;
+    };
+    std::vector<Op> ops;
+    uint32_t firstInstruction = uint32_t(count / 3);
+    bool ended = false;
+    CfWords cf;
+    for (uint32_t i = 0; !ended && i / 2 < firstInstruction && ReadCf(words, uint32_t(count), i, cf); i++)
+    {
+        const CfOpcode op = CfOpcodeOf(cf);
+        if (!IsStraightLineCf(op))
+            return fail("control-flow instruction " + std::to_string(i) + " (opcode " + std::to_string(uint32_t(op)) + ") is not straight-line");
+        if (!IsExec(op))
+            continue;
+        const CfExec e = DecodeExec(cf);
+        firstInstruction = std::min(firstInstruction, e.address);
+        for (uint32_t k = 0; k < e.count; k++)
+        {
+            const uint32_t* w;
+            if (!ReadSlot(words, uint32_t(count), e.address + k, w))
+                return fail("exec " + std::to_string(i) + " addresses slot " + std::to_string(e.address + k) + " past the shader");
+            ops.push_back({IsFetch(e, k), w, e.address + k});
+        }
+        ended = op == CfOpcode::ExecEnd;
+    }
+    if (!ended)
+        return fail("no exec_end");
+    // The temps each instruction writes (bit per temp); any relative destination fails.
+    std::vector<uint64_t> writes(ops.size(), 0);
+    for (size_t n = 0; n < ops.size(); n++)
+    {
+        const uint32_t* w = ops[n].w;
+        const std::string at = " (slot " + std::to_string(ops[n].slot) + ")";
+        if (ops[n].fetch)
+        {
+            const uint32_t fop = FetchOpcodeOf(w);
+            if (fop == kSetTextureLod)
+                continue;
+            uint32_t dest = 0, swizzle = 0;
+            bool relative = false;
+            if (fop == kVertexFetch)
+            {
+                const VertexFetch f = DecodeVertexFetch(w);
+                dest = f.destReg, swizzle = f.destSwizzle, relative = f.destRelative;
+            }
+            else if (fop == kTextureFetch || fop == kGetTextureGradients)
+            {
+                const TextureFetch t = DecodeTextureFetch(w);
+                dest = t.destReg, swizzle = t.destSwizzle, relative = t.destRelative;
+            }
+            else
+                return fail("fetch opcode " + std::to_string(fop) + at + " is not modelled here");
+            bool any = false;
+            for (uint32_t c = 0; c < 4; c++)
+                any |= FetchDestSwizzle(swizzle, c) != FetchDestComponent::Keep;
+            if (any && relative)
+                return fail("a fetch writes a relatively addressed register" + at);
+            if (any)
+                writes[n] |= uint64_t(1) << (dest & 63);
+            continue;
+        }
+        const AluInstruction a = DecodeAlu(w);
+        if (!a.isExport && a.vectorMask != 0)
+        {
+            if (a.vectorDestRelative)
+                return fail("an ALU instruction writes a relatively addressed register" + at);
+            writes[n] |= uint64_t(1) << (a.vectorDest & 63);
+        }
+        if (!a.isExport && ScalarResultMask(a) != 0)
+        {
+            if (a.scalarDestRelative)
+                return fail("an ALU instruction writes a relatively addressed register" + at);
+            writes[n] |= uint64_t(1) << (a.scalarDest & 63);
+        }
+    }
+    // The one position export.
+    size_t exportAt = ops.size();
+    for (size_t n = 0; n < ops.size(); n++)
+    {
+        if (ops[n].fetch)
+            continue;
+        const AluInstruction a = DecodeAlu(ops[n].w);
+        if (!a.isExport || a.vectorDest != 62 || (a.vectorMask | a.scalarMask | Constant0Mask(a)) == 0)
+            continue;
+        if (exportAt != ops.size())
+            return fail("more than one instruction writes the position (export 62)");
+        exportAt = n;
+    }
+    if (exportAt == ops.size())
+        return fail("no instruction writes the position (export 62)");
+    const AluInstruction e = DecodeAlu(ops[exportAt].w);
+    const std::string eat = " (slot " + std::to_string(ops[exportAt].slot) + ")";
+    if (e.vectorOpcode != uint32_t(VectorOpcode::Max))
+        return fail("the position export is vector opcode " + std::to_string(e.vectorOpcode) + ", not MAXv (a move)" + eat);
+    if (e.vectorMask != 0xF || e.scalarMask != 0 || e.vectorClamp || e.predicated || e.vectorDestRelative)
+        return fail("the position export is not an unpredicated, unclamped xyzw vector write" + eat);
+    const AluSource& s1 = e.src[0];
+    const AluSource& s2 = e.src[1];
+    for (const AluSource* s : {&s1, &s2})
+    {
+        if (!s->isTemp || s->tempRelative || s->tempAbs || s->negate)
+            return fail("a position export source is not a plain temp (constant, relative, abs or negated)" + eat);
+        for (uint32_t c = 0; c < 4; c++)
+            if (SwizzleComponent(s->swizzle, c) != c)
+                return fail("a position export source is swizzled" + eat);
+    }
+    if (s1.tempIndex != s2.tempIndex)
+        return fail("the position export is max(r" + std::to_string(s1.tempIndex) + ", r" + std::to_string(s2.tempIndex) + "), not a move" + eat);
+    const uint32_t temp = s1.tempIndex;
+    // rN: written exactly once, by the fetch.
+    size_t fetchAt = ops.size();
+    for (size_t n = 0; n < ops.size(); n++)
+        if (writes[n] >> temp & 1)
+        {
+            if (fetchAt != ops.size())
+                return fail("r" + std::to_string(temp) + " is written more than once");
+            fetchAt = n;
+        }
+    if (fetchAt == ops.size() || fetchAt > exportAt)
+        return fail("r" + std::to_string(temp) + " is not written before the position export");
+    if (!ops[fetchAt].fetch || FetchOpcodeOf(ops[fetchAt].w) != kVertexFetch)
+        return fail("r" + std::to_string(temp) + " is written by an ALU or texture instruction, not a vertex fetch");
+    const VertexFetch f = DecodeVertexFetch(ops[fetchAt].w);
+    const std::string fat = " (slot " + std::to_string(ops[fetchAt].slot) + ")";
+    if (f.isMiniFetch || f.predicated)
+        return fail("the position's vertex fetch is a mini fetch or predicated" + fat);
+    if (f.srcReg != 0 || f.srcRelative || f.srcSwizzle != 0)
+        return fail("the position's vertex fetch is not indexed by r0.x" + fat);
+    for (size_t n = 0; n < fetchAt; n++)
+        if (writes[n] & 1)
+            return fail("r0 (the vertex index) is written before the position's vertex fetch" + fat);
+    if (f.format != uint32_t(VertexFormat::F32_32_32_FLOAT) && f.format != uint32_t(VertexFormat::F32_32_32_32_FLOAT))
+        return fail("the position's vertex fetch has format " + std::to_string(f.format) + " (57 or 38 only)" + fat);
+    if (FetchDestSwizzle(f.destSwizzle, 0) != FetchDestComponent::X || FetchDestSwizzle(f.destSwizzle, 1) != FetchDestComponent::Y ||
+        FetchDestSwizzle(f.destSwizzle, 2) != FetchDestComponent::Z || FetchDestSwizzle(f.destSwizzle, 3) != FetchDestComponent::One)
+        return fail("the position's vertex fetch swizzle is not x y z 1" + fat);
+    if (f.expAdjust != 0)
+        return fail("the position's vertex fetch has exp_adjust " + std::to_string(f.expAdjust) + fat);
+    if (f.stride == 0 || f.offset < 0 || uint32_t(f.offset) + 3 > f.stride)
+        return fail("the position's element (offset " + std::to_string(f.offset) + ", 3 dwords) does not fit stride " + std::to_string(f.stride) + fat);
+    r.valid = true;
+    r.slot = FetchConstantSlot(f);
+    r.strideDwords = f.stride;
+    r.offsetDwords = uint32_t(f.offset);
+    r.format = f.format;
+    return r;
+}
+
 bool TranslateShader(const uint32_t* words, size_t count, bool pixel, ShaderTranslation& out, std::string& error)
 {
     out = ShaderTranslation{};
@@ -2336,6 +2500,7 @@ bool TranslateShader(const uint32_t* words, size_t count, bool pixel, ShaderTran
             return false;
     }
     emit.Finish(analyses, out);
+    out.positionFetch = AnalyzePositionFetch(words, count, pixel);
     return true;
 }
 

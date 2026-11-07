@@ -6,8 +6,11 @@
 // RB_MODECONTROL 2208).
 #include "cp_trace.h"
 #include "graphics.h"
+#include "command_processor.h"
+#include "imports.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
@@ -87,6 +90,21 @@ void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t viz
                              ReadRegister(base, 0x2112), ReadRegister(base, 0x2113), ReadRegister(base, 0x2114)));
     // DRAW_INDX (the textured draws so far): texture fetch constants of slots 0-2 (6 dwords each at 4800 + 6 * slot, Xenia
     // FETCH_00_0; the pixel shaders FM4's first screens load use slots 0-2 at most, reference/gpu/texture.md).
+    // Clip-disabled draws with an 8192 x 8192 scissor (the fast clears whose extent Xenia's DrawExtentEstimator takes from the
+    // vertices, reference/gpu/edram_extent.md): vf0's first three vertices, 7 dwords each from the fetch constant's address
+    // (dword 0 bits 2-31, in dwords), as the guest stores them (big-endian words; the fetch's endian is dword 1 bits 0-1).
+    // Also every resolve (RB_MODECONTROL 6): Xenia takes the resolve rectangle from these vertices (draw_util.cc GetResolveInfo).
+    if ((((ReadRegister(base, 0x2204) >> 16 & 1) && ReadRegister(base, 0x2082) == 0x20002000) || (ReadRegister(base, 0x2208) & 7) == 6) &&
+        (ReadRegister(base, 0x4800) & 3) == 3)
+    {
+        const uint32_t address = ReadRegister(base, 0x4800) & ~3u, endian = ReadRegister(base, 0x4801) & 3;
+        const uint32_t guest = PhysicalToGuest(address);
+        int n = std::snprintf(text, sizeof text, "vf0 endian %u at %08X:", endian, address);
+        for (uint32_t i = 0; i < 21 && n < int(sizeof text) - 10; i++)
+            n += std::snprintf(text + n, sizeof text - n, " %08X", Load32(base, guest + 4 * i));
+        std::snprintf(text + n, sizeof text - n, "\n");
+        Line(text, int(std::strlen(text)));
+    }
     // Display gamma ramp registers (Xenia register_table.inc: DC_LUT_RW_MODE 1921, RW_INDEX 1922, SEQ_COLOR 1923, PWL_DATA 1924,
     // 30_COLOR 1925, WRITE_EN_MASK 1927, DC_LUTA_CONTROL 1930), at a few draws: whether FM4 programs a ramp.
     if (draw == 0 || draw == 1000 || draw == 10000 || draw == 20000)

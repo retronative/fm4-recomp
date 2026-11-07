@@ -26,6 +26,20 @@ void Check(VkResult result, const char* what)
 VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT types,
                                                    const VkDebugUtilsMessengerCallbackDataEXT* data, void*)
 {
+    // The one known false positive, matched exactly: MoltenVK 1.4.2 MVKPipeline.mm:1994-1995 (v1.4.2 tag) reports
+    // "Blending is enabled" for every colour attachment whose format Metal cannot blend, whether blendEnable is set or not.
+    // The renderer's R32_UINT attachment (the EDRAM resolve's sample dump, edram_vk.cpp) has blendEnable VK_FALSE. Logged
+    // once under another prefix (scripts/gpu_run.sh's check is not fooled into passing anything else) and not counted.
+    static constexpr const char* kMvkBlendFalsePositive =
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R32_UINT, which does not support it.";
+    if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && data && data->pMessageIdName && data->pMessage &&
+        !std::strcmp(data->pMessageIdName, "mvk-warn") && !std::strcmp(data->pMessage, kMvkBlendFalsePositive))
+    {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            std::fprintf(stderr, "[vulkan known false positive] mvk-warn: %s (MoltenVK 1.4.2 MVKPipeline.mm:1994; blendEnable is false)\n", data->pMessage);
+        return VK_FALSE;
+    }
     validationMessages++;
     std::fprintf(stderr, "[vulkan validation] severity %X type %X %s: %s\n", unsigned(severity), unsigned(types),
                  data && data->pMessageIdName ? data->pMessageIdName : "-", data && data->pMessage ? data->pMessage : "-");

@@ -10,6 +10,7 @@
 //   tests/run_edram_tests.sh
 #include "edram.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -137,7 +138,7 @@ void TestTileMath()
     std::string why;
     CHECK(SupportedKey(kAc, why) && SupportedKey(kAd, why) && SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k8_8_8_8), why));
     CHECK(SupportedKey(Key::Depth(0, 16, Msaa::X1, DepthFormat::D24S8), why));
-    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), why));
+    CHECK(SupportedKey(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), why));  // 2x (the local capture draw_bases2 (not distributed)'s HDR resolve)
     CONTROL(SupportedKey(k64, why));
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why) &&
           SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), why));  // storage 3 (7e3)
@@ -205,17 +206,25 @@ void TestOwnership()
     Ownership all;
     t.clear();
     CHECK(all.Change(kW, 0, 2048, t, why) && all.Count(kW) == 2048 && t.empty());
-    // Refusals change nothing: colour over depth tiles, depth over colour tiles, kD24S8 over kD24FS8 tiles.
+    // Colour over depth tiles is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913): accepted, one transfer
+    // from the depth key (on a copy, so the checks below see the map unchanged).
     const Ownership before = o;
+    Ownership overDepth = o;
     t.clear();
-    CONTROL(o.Change(Key::Color(720, 16, Msaa::X4, ColorFormat::k2_10_10_10), 16, 16, t, why));
-    CHECK(why.find("across aspects") != std::string::npos && t.empty());
-    CONTROL(o.Change(Key::Depth(0, 16, Msaa::X4, DepthFormat::D24FS8), 0, 8, t, why));
+    CHECK(overDepth.Change(Key::Color(720, 16, Msaa::X4, ColorFormat::k2_10_10_10), 16, 16, t, why) && t == T({{736, 752, kAd}}) &&
+          overDepth.At(736) == Key::Color(720, 16, Msaa::X4, ColorFormat::k2_10_10_10));
+    // Depth over colour tiles is X's kColorToDepth (vulkan_render_target_cache.cc:4904-4908): accepted (on a copy).
+    Ownership overColor = o;
+    t.clear();
+    CHECK(overColor.Change(Key::Depth(0, 16, Msaa::X4, DepthFormat::D24FS8), 0, 8, t, why) && t == T({{0, 8, kW}}));
+    // Refusals change nothing: kD24S8 over kD24FS8 tiles.
+    t.clear();
     CONTROL(o.Change(Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8), 16, 16, t, why));
     CHECK(why.find("between depth formats") != std::string::npos);
-    // A refusal in the wrapped extent leaves the first extent unchanged too.
-    CONTROL(o.Change(Key::Depth(2040, 16, Msaa::X1, DepthFormat::D24S8), 0, 16, t, why));
-    CHECK(o.At(2040) == before.At(2040) && o.At(0) == before.At(0) && t.empty());
+    // A refusal in the wrapped extent leaves the first extent unchanged too: base 2040, 760 tiles -> [2040, 2048) (kW
+    // colour: acceptable) and [0, 752), whose tiles 736-751 are kD24FS8 (kAd) under a kD24S8 claim.
+    CONTROL(o.Change(Key::Depth(2040, 16, Msaa::X1, DepthFormat::D24S8), 0, 760, t, why));
+    CHECK(o.At(2040) == before.At(2040) && o.At(0) == before.At(0) && t.empty() && why.find("between depth formats") != std::string::npos);
     // Preconditions (X :1543-1547).
     CONTROL(o.Change(kAc, 2048, 1, t, why));
     CONTROL(o.Change(kAc, 0, 2049, t, why));
@@ -228,6 +237,160 @@ void TestOwnership()
 // The resolve clear's cutout (X render_target_cache.cc:1347-1359, :1601-1607): a tile wholly inside the clear
 // rectangle is claimed but not transferred. Tile pixels from X :355-359: 1x tiles are 80x16, 4x tiles 40x8;
 // a 1x key of pitch 16 has rows of 16 tiles at y = 16 * row.
+// The draw extent (X draw_extent_estimator.cc; expected values by hand from its formulas, cited per line).
+ExtentRegisters ClearExtent()  // FM4's fast clear (the local capture draw_7e3_4 (not distributed), draw 27833)
+{
+    ExtentRegisters r;
+    r.surfaceInfo = kFm4Surface;           // 4x
+    r.windowScissorBr = 8192 | 8192u << 16;  // scissor_br 20002000
+    r.clipCntl = 0x00010000;               // clip_disable
+    r.suScModeCntl = 0x00010000;           // vtx_window_offset_enable (offset 0)
+    r.vteCntl = 0x00000300;                // vtx_xy_fmt, vtx_z_fmt; no viewport scale/offset
+    r.vtxCntl = 0x00000004;                // pix_center 0
+    r.vportYScale = 0xC3800000, r.vportYOffset = 0x43800000;  // -256, 256: in the registers, disabled by VTE
+    return r;
+}
+
+void TestExtent()
+{
+    // NeedsVertexMaxY (X :289-316): the clear needs vertices; a 1280x720 scissor or clipping on does not; a window
+    // offset moving the scissor below 8192 does not (X :279-283 adds it unless TL bit 31 disables it).
+    ExtentRegisters r = ClearExtent();
+    CHECK(NeedsVertexMaxY(r));
+    r.windowScissorBr = 1280 | 720u << 16;
+    CONTROL(NeedsVertexMaxY(r));
+    r = ClearExtent(), r.clipCntl = 0;
+    CONTROL(NeedsVertexMaxY(r));
+    r = ClearExtent(), r.windowOffset = 0x7FFFu << 16;  // y offset -1 (signed 15-bit): bottom 8191
+    CONTROL(NeedsVertexMaxY(r));
+    r.windowScissorTl = 1u << 31;  // offset disabled: 8192 again
+    CHECK(NeedsVertexMaxY(r));
+    r = ClearExtent(), r.screenScissorBr = 8192 | 4096u << 16;  // the screen scissor bounds the bottom (X :284-286)
+    CONTROL(NeedsVertexMaxY(r));
+
+    // EstimateMaxY with clipping off and no vertices: the scissor's bottom (X :287), 8192: the stop's height.
+    r = ClearExtent();
+    CHECK(EstimateMaxY(r, nullptr) == 8192);
+    // VertexMaxY (X :199-264): 4x, pix_center 0, no viewport, xy not divided by w. D3D's rectangle with the -0.5
+    // pixel offset (as its resolves, draw_util.cc:801-803): y up to 359.5 -> 16.8 fixed 92032, + 128 = 92160,
+    // + 255 (MSAA, X :262-263) = 92415, >> 8 = 360. Exactly 360.0: 92160 + 128 + 255 = 92543 >> 8 = 361 (the
+    // 1.-exclusive rule with MSAA). At 1x 360.0: 92288 + 127 = 92415 >> 8 = 360 (.5 exclusive).
+    const VertexPosition rect[3] = {{-0.5f, 1}, {-0.5f, 1}, {359.5f, 1}};
+    CHECK(VertexMaxY(r, rect, 3) == 360);
+    const VertexPosition exact[3] = {{0, 1}, {0, 1}, {360.0f, 1}};
+    CHECK(VertexMaxY(r, exact, 3) == 361);
+    ExtentRegisters one = r;
+    one.surfaceInfo = 0x14000500;
+    CHECK(VertexMaxY(one, exact, 3) == 360);
+    // 1x 1280x720 with -0.5: 719.5 -> 184192 + 128 + 127 = 184447 >> 8 = 720.
+    const VertexPosition full[3] = {{-0.5f, 1}, {-0.5f, 1}, {719.5f, 1}};
+    CHECK(VertexMaxY(one, full, 3) == 720);
+    // pix_center 1: no + 128: 359.5 -> 92032 + 255 = 92287 >> 8 = 360; 359.0 -> 91904 + 255 = 92159 >> 8 = 359.
+    ExtentRegisters pc = r;
+    pc.vtxCntl = 1;
+    const VertexPosition y359[1] = {{359.0f, 1}};
+    CHECK(VertexMaxY(pc, rect, 3) == 360 && VertexMaxY(pc, y359, 1) == 359);
+    // Window offset y 16 with vtx_window_offset_enable (X :256-258): 360 + 16 = 376.
+    ExtentRegisters wo = r;
+    wo.windowOffset = 16u << 16;
+    CHECK(VertexMaxY(wo, rect, 3) == 376);
+    wo.suScModeCntl = 0;
+    CHECK(VertexMaxY(wo, rect, 3) == 360);
+    // Divided by w unless vtx_xy_fmt (X :212-217): y 719, w 2 -> 359.5 -> 360.
+    ExtentRegisters dw = r;
+    dw.vteCntl = 0;
+    const VertexPosition homog[1] = {{719.0f, 2.0f}};
+    CHECK(VertexMaxY(dw, homog, 1) == 360);
+    // The viewport's y scale and offset when enabled (X :146-152, :219): y 0.5 * -360 + 360 = 180 -> 46080 + 128 +
+    // 255 = 46463 >> 8 = 181.
+    ExtentRegisters vp = r;
+    vp.vteCntl = 0x30C, vp.vportYScale = 0xC3B40000, vp.vportYOffset = 0x43B40000;
+    const VertexPosition half[1] = {{0.5f, 1}};
+    CHECK(VertexMaxY(vp, half, 1) == 181);
+    // No vertex / all negative: 0 (X :246, :261 max with 0).
+    CHECK(VertexMaxY(r, nullptr, 0) == 0);
+    const VertexPosition neg[1] = {{-10.0f, 1}};
+    CHECK(VertexMaxY(r, neg, 1) == 0);
+    // EstimateMaxY takes the vertex bound only when NeedsVertexMaxY: min(8192, 360) = 360; with a 1280x720 scissor
+    // the scissor's 720 stays (X :294-313 with _with_scissor false).
+    const uint32_t v360 = 360;
+    CHECK(EstimateMaxY(r, &v360) == 360);
+    ExtentRegisters sc = r;
+    sc.windowScissorBr = 1280 | 720u << 16;
+    CHECK(EstimateMaxY(sc, &v360) == 720);
+    // Clipping on: the viewport's bottom (X :318-363): 0.5 (pix_center 0) + 360 + |-360| = 720.5 -> 720 (truncated),
+    // at most the scissor; scale/offset disabled: 0.5 + 1 = 1.5 -> 1; window offset 16 enabled: 736.5 -> 736.
+    ExtentRegisters clip = r;
+    clip.clipCntl = 0, clip.vteCntl = 0x30C, clip.vportYScale = 0xC3B40000, clip.vportYOffset = 0x43B40000;
+    CHECK(EstimateMaxY(clip, nullptr) == 720 && EstimateMaxY(clip, &v360) == 720);
+    clip.windowScissorBr = 1280 | 700u << 16;
+    CHECK(EstimateMaxY(clip, nullptr) == 700);
+    clip.windowScissorBr = 8192 | 8192u << 16, clip.windowOffset = 16u << 16;
+    CHECK(EstimateMaxY(clip, nullptr) == 736);
+    clip.vteCntl = 0x300, clip.windowOffset = 0;
+    CHECK(EstimateMaxY(clip, nullptr) == 1);
+
+    // PassThroughPositions: three 7-dword vertices (FM4's clear VS reads xyz at dword 0, stride 7: NOTES.md §2), the
+    // guest's big-endian floats loaded little-endian, fetch endian 2 (k8in32) swaps them back.
+    std::vector<uint32_t> window(21, 0);
+    const float ys[3] = {-0.5f, -0.5f, 359.5f};
+    for (int v = 0; v < 3; v++)
+        window[size_t(v) * 7 + 0] = GuestFloat(639.5f), window[size_t(v) * 7 + 1] = GuestFloat(ys[v]);
+    std::vector<VertexPosition> pos;
+    std::string why;
+    CHECK(PassThroughPositions(window.data(), window.size(), 2, 7, 0, 3, pos, why) && pos.size() == 3 && pos[2].y == 359.5f && pos[0].y == -0.5f && pos[1].w == 1.0f);
+    CHECK(VertexMaxY(r, pos.data(), pos.size()) == 360);
+    // CONTROL: the wrong endian reads the byte-swapped bits (not 359.5).
+    CHECK(PassThroughPositions(window.data(), window.size(), 0, 7, 0, 3, pos, why));
+    CONTROL(pos[2].y == 359.5f);
+    // Refusals: the window one dword short of the third vertex's y (needs 2 * 7 + 0 + 2 = 16 dwords); xyz past the stride.
+    CONTROL(PassThroughPositions(window.data(), 15, 2, 7, 0, 3, pos, why));
+    CHECK(why.find("shorter") != std::string::npos);
+    CHECK(PassThroughPositions(window.data(), 16, 2, 7, 0, 3, pos, why));
+    CONTROL(PassThroughPositions(window.data(), window.size(), 2, 7, 5, 3, pos, why));
+    CONTROL(PassThroughPositions(window.data(), window.size(), 2, 0, 0, 3, pos, why));
+
+    // Draw 27833 through Bind. Before it: the old clear (colour 00020000 base 0, depth 000102D0 base 720, 360 rows)
+    // owns colour 0-719 and depth 720-1439.
+    Ownership o;
+    BindRegisters old;
+    old.surfaceInfo = kFm4Surface, old.modeControl = 4, old.colorMask = 0xFFFF, old.depthControl = 0x8777;
+    old.depthInfo = kFm4Depth, old.colorInfo[0] = kFm4Color;
+    CHECK(Bind(o, old, 360).ok && o.Count(kAc) == 720 && o.Count(kAd) == 720);
+    BindRegisters hdr = old;
+    hdr.colorInfo[0] = 0x00030000, hdr.depthInfo = 0x00010400;  // 7e3 at 0, D24FS8 at 1024
+    const Key kHc = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), kHd = Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8);
+    // The scissor's 8192 rows -> host height 1024 -> (1024 << 1) / 16 * 16 = 2048 tiles, bounded by the bases' distance
+    // (X render_target_cache.cc:819-857) to 1024: colour 0-1023 reaches the old depth key's 720-1023, now a depth ->
+    // colour transfer (X kDepthToColor); depth 1024-2047 (min(2048, 1024, 2048 - 1024)) takes 1024-1439 from the old key.
+    Ownership before = o;
+    Binding b = Bind(o, hdr, EstimateMaxY(ClearExtent(), nullptr));
+    CHECK(b.ok && b.transfers[1] == T({{0, 720, kAc}, {720, 1024, kAd}}) && b.transfers[0] == T({{1024, 1440, kAd}}) && o.Count(kAd) == 0 &&
+          o.Count(kHc) == 1024 && o.Count(kHd) == 1024);
+    o = before;
+    // With the vertex bound 360: (360 << 1) / 16 = 45 tile rows * 16 = 720 tiles; distance 1024; colour 0-719
+    // (min(720, 1024, 1024 - 0)), depth 1024-1743 (min(720, 1024, 2048 + 0 - 1024)); transfers: colour 0-719 from the
+    // old 2_10_10_10 key (same samples, storage 2 -> 3), depth 1024-1439 from the old depth key (same format).
+    b = Bind(o, hdr, EstimateMaxY(ClearExtent(), &v360));
+    CHECK(b.ok && b.color[0] == kHc && b.depth == kHd && b.lengthTiles[1] == 720 && b.lengthTiles[0] == 720);
+    CHECK(b.transfers[1] == T({{0, 720, kAc}}) && b.transfers[0] == T({{1024, 1440, kAd}}));
+    CHECK(o.Count(kHc) == 720 && o.Count(kHd) == 720 && o.At(1743) == kHd && o.At(1744).Empty() && o.At(720) == kAd && o.At(1023) == kAd);
+    // The 7e3 pass at 512 rows (the local capture draw_extent2 (not distributed), draw 25343's vf0: third vertex y 43FFC000 = 511.5):
+    // 511.5 -> 130944 + 128 + 255 = 131327 >> 8 = 512 rows -> (512 << 1) / 16 * 16 = 1024 tiles: colour 0-1023 with the
+    // depth -> colour transfer of 720-1023, depth 1024-2047.
+    o = before;
+    const uint32_t v512 = 512;
+    const VertexPosition r512[1] = {{511.5f, 1}};
+    CHECK(VertexMaxY(r, r512, 1) == 512);
+    b = Bind(o, hdr, EstimateMaxY(ClearExtent(), &v512));
+    CHECK(b.ok && b.transfers[1] == T({{0, 720, kAc}, {720, 1024, kAd}}) && b.transfers[0] == T({{1024, 1440, kAd}}));
+    // The reverse (the local capture draw_hdr4 (not distributed) draw 25372's shape): the old depth key back over 720-1439 takes 720-1023 from the
+    // 7e3 colour key (colour -> depth, X kColorToDepth) and 1024-1439 from the depth key at 1024 (X :1539-1699).
+    std::vector<Transfer> back;
+    std::string backWhy;
+    CHECK(o.Change(kAd, 0, 720, back, backWhy) && back == T({{720, 1024, kHc}, {1024, 1440, kHd}}) && o.Count(kAd) == 720 && o.Count(kHc) == 720);
+}
+
 void TestCutout()
 {
     std::vector<Transfer> t;
@@ -346,16 +509,20 @@ void TestBindFm4()
     CHECK(b.ok && b.depth.Empty() && b.color[0] == kCc && b.lengthTiles[1] == 720 && b.lengthTiles[0] == 0);
     CHECK(b.transfers[1] == T({{0, 112, kBc}, {112, 720, kAc}}) && b.transfers[0].empty());
     CHECK(o.Count(kCc) == 720 && o.Count(kAd) == 608 && o.Count(kBd) == 112);
-    // CONTROL: a colour-only draw of unknown height on a fresh map claims the whole EDRAM (X :847-857 with one
-    // target: min(2048, 4096 >> 1, 2048)); on this map that reaches the depth tiles and is refused (cross
-    // aspect), and the map is unchanged: the caller must pass the draw's rows (NOTES.md "Open questions").
+    // A colour-only draw of unknown height on a fresh map claims the whole EDRAM (X :847-857 with one target:
+    // min(2048, 4096 >> 1, 2048)); on this map that reaches the depth tiles, which now move to colour through depth ->
+    // colour transfers (X kDepthToColor) from both depth keys: the caller must still pass the draw's rows, or it moves
+    // every tile (NOTES.md "Open questions").
     Ownership fresh;
     b = Bind(fresh, c, kHeightUnknown);
     CHECK(b.ok && b.lengthTiles[1] == 2048 && fresh.Count(kCc) == 2048);
     const Ownership before = o;
     b = Bind(o, c, kHeightUnknown);
-    CONTROL(b.ok);
-    CHECK(b.refusal.find("across aspects") != std::string::npos && o.Count(kCc) == before.Count(kCc) && o.Count(kAd) == before.Count(kAd));
+    bool fromAd = false, fromBd = false;
+    for (const Transfer& t : b.transfers[1])
+        fromAd = fromAd || t.source == kAd, fromBd = fromBd || t.source == kBd;
+    CHECK(b.ok && fromAd && fromBd && o.Count(kCc) == 2048 && o.Count(kAd) == 0 && o.Count(kBd) == 0);
+    o = before;
     // Gamma and _AS_10_10_10_10 formats bind the storage key (KB rule): colour format 1 -> kCc, 10 -> kBc.
     c.colorInfo[0] = 0x00010000;
     b = Bind(o, c, 720);
@@ -435,11 +602,14 @@ void TestBindCases()
     r.colorInfo[0] = 0x00050000;  // k_16_16_16_16: 64 bpp, outside the whitelist
     b = Bind(o, r, 360);
     CONTROL(b.ok);
-    r = Fm4Bind();
-    r.surfaceInfo = 0x00010280;  // 2x MSAA
-    b = Bind(o, r, 360);
-    CONTROL(b.ok);
-    CHECK(b.refusal.find("2x MSAA") != std::string::npos);
+    {
+        // 2x MSAA binds (on a copy): pitch 640 at 2x is 640 / 80 = 8 tiles a row, 2x tiles are 80x8 pixels.
+        Ownership copy = o;
+        r = Fm4Bind();
+        r.surfaceInfo = 0x00010280;
+        b = Bind(copy, r, 360);
+        CHECK(b.ok && b.color[0] == Key::Color(0, 8, Msaa::X2, ColorFormat::k2_10_10_10));
+    }
     r = Fm4Bind();
     r.colorInfo[0] = 0x00040000;  // k_16_16: 32 bpp, outside the whitelist
     b = Bind(o, r, 360);
@@ -531,6 +701,23 @@ void TestTrace10()
     CHECK(i.destExtentLength == 3768320 && i.destBase == 0x00800000u);
     ResolvePlan p = PrepareResolve(o, i);
     CHECK(p.ok && p.copy && p.copySource == k1x2 && p.copyRect == Rect{0, 0, 1280, 720});
+    {
+        // FM4's second HDR band (the local capture draw_hdr3 (not distributed)): vertices y 511.5..719.5 under a 512-row scissor
+        // (02000500): X clamps to the scissor (draw_util.cc GetResolveInfo) -> y 512..512, nothing to copy or clear
+        // (X vulkan_render_target_cache.cc:1051-1054): decoded ok and empty, ownership unchanged.
+        ResolveRegisters band = rr;
+        band.windowScissorBr = 0x02000500;
+        const float second[6] = {-0.5f, 511.5f, 1279.5f, 511.5f, 1279.5f, 719.5f};
+        for (int k = 0; k < 6; k++)
+            band.vertexWords[k] = GuestFloat(second[k]);
+        const ResolveInfo e = DecodeResolve(band);
+        Ownership copy = o;
+        const ResolvePlan ep = PrepareResolve(copy, e);
+        CHECK(e.ok && e.empty && ep.ok && !ep.copy && copy.Count(k1x2) == o.Count(k1x2));
+        band.windowScissorBr = 0x02D00500;  // CONTROL: the full scissor keeps the band (y 512..720)
+        const ResolveInfo f = DecodeResolve(band);
+        CHECK(f.ok && !f.empty && f.y0 == 512 && f.y1 == 720);
+    }
     // The GAMMA draws (cp.txt:24931 first, 27669 last; triangle strips 00040086, 38 lines): colour 00010000 ->
     // the storage-0 1x key; a same-aspect format reinterpretation transfer of all 720 tiles from the storage-2
     // key (the GPU side's transfer draw, render_targets_vk.h §4), then the 38 resolves with colour 00000000.
@@ -726,7 +913,10 @@ void TestResolveDecode()
     r = Fm4Resolve();
     for (int k = 0; k < 6; k++)
         r.vertexWords[k] = GuestFloat(0.0f);
-    CHECK(refused(r, "empty"));
+    {
+        const ResolveInfo e = DecodeResolve(r);  // a zero-area rectangle: nothing to copy or clear, as X (not a refusal)
+        CHECK(e.ok && e.empty);
+    }
     r = Fm4Resolve(), r.copyControl = 1u << 20 | 4;  // depth source
     CHECK(refused(r, "depth resolve"));
     r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 3;  // array
@@ -735,8 +925,8 @@ void TestResolveDecode()
     CHECK(refused(r, "endian 4"));
     r = Fm4Resolve(), r.copyDestInfo = 2 | 32u << 7;  // k_16_16_16_16_FLOAT
     CHECK(refused(r, "texture format 32"));
-    r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 16;  // exp bias 1
-    CHECK(refused(r, "exponent bias 1"));
+    r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 16;  // exp bias 1: decoded (X's full resolve applies it)
+    CHECK(DecodeResolve(r).ok && DecodeResolve(r).destExpBias == 1);
     r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 13;  // signed fraction
     CHECK(refused(r, "number format 1"));
     r = Fm4Resolve(), r.copyDestPitch = 0 | 360u << 16;
@@ -751,8 +941,11 @@ void TestResolveDecode()
     r = Fm4Resolve(), r.colorInfo[0] = 0x000C0000;
     CHECK(DecodeResolve(r).ok && DecodeResolve(r).source == Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float));
     r.copyDestInfo = 2 | 7u << 7 | 0x3Fu << 16 | 1u << 24;
+    CHECK(DecodeResolve(r).ok && DecodeResolve(r).destExpBias == -1 && DecodeResolve(r).destSwap && DecodeResolve(r).destEndian == 2);
+    // A destination refusal still names the whole shape (here the 3D bit added).
+    r.copyDestInfo |= 1u << 3;
     CHECK(refused(r, "(RB_COLOR_INFO format 12, storage 3, 4x, sample select 6) to texture format 7 (number 0, exp bias -1, swap 1, endian 2, "
-                     "command 1): resolve destination exponent bias -1"));
+                     "command 1): a resolve into a 3D (array) destination"));
     // The accepted destination formats: 7 (k_2_10_10_10), 50 and 54 (the _AS_16_16_16_16 variants: xenos.h:607-608).
     for (uint32_t f : {7u, 50u, 54u})
     {
@@ -907,7 +1100,21 @@ struct ReplayState
     uint64_t clearTransfers[2] = {}, clearTransferTiles[2] = {};  // the resolve clears' transfers (0 colour, 1 depth)
     bool pending = false;  // a mode-6 draw waiting for its `resolve copy` line
     unsigned long long pendingDraw = 0;
+    // A pending bind whose extent needs its vertices waits for its `vf0` line (cp_trace.cpp: vf0's first three
+    // 7-dword vertices of a clip-disabled 8192x8192-scissor draw); `vf0Bound` counts the binds that used one.
+    bool awaitVf0 = false;
+    uint64_t vf0Bound = 0, crossAspect = 0, crossAspectTiles = 0;
+    std::vector<std::string> crossAspectLog;
+    uint64_t otherBase = 0, otherBaseTiles = 0;  // same-aspect transfers between keys of different bases
+    std::vector<std::string> otherBaseLog;       // the first 20
     ResolveRegisters pendingRegs;
+    // A mode-4/5 draw waiting for its `state` line (window offset, scissor TL, PA_SU_VTX_CNTL, viewport: the extent).
+    bool bindPending = false;
+    unsigned long long bindDraw = 0;
+    BindRegisters bindRegs;
+    ExtentRegisters bindExtent;
+    const uint32_t* vertexMaxY = nullptr;  // argv: the hypothesis for draws whose extent needs their vertices
+    uint64_t needVertices = 0, withState = 0, heightLimited = 0;
     struct Config
     {
         unsigned copyControl, destPitch, destInfo, depthClear, colorClear, colorClearLo, windowOffset, windowScissorTl, fetch1;
@@ -991,15 +1198,122 @@ bool FetchReadsResolve(uint32_t destFormat, uint32_t fetchFormat)
     return destFormat == fetchFormat;
 }
 
-int Replay(const char* path)
+// The deferred bind of a mode-4/5 draw: the height is EstimateMaxY (X draw_extent_estimator.cc:267-366) of the
+// draw line's clip/sumode/vte and, when it arrived, the state line's window offset, scissor TL, PA_SU_VTX_CNTL and
+// viewport; the vertex bound only from the command line's hypothesis (the trace has no vertex data).
+void ReplayBind(ReplayState& s, const uint32_t* vertexMaxY = nullptr)
+{
+    if (!s.bindPending)
+        return;
+    s.bindPending = false, s.awaitVf0 = false;
+    const ExtentRegisters& e = s.bindExtent;
+    const bool needs = NeedsVertexMaxY(e);
+    s.needVertices += needs;
+    s.vf0Bound += vertexMaxY != nullptr;
+    const uint32_t height = EstimateMaxY(e, vertexMaxY ? vertexMaxY : s.vertexMaxY);
+    s.heightLimited += height < ((e.windowScissorBr >> 16) & 0x3FFF);
+    const Binding b = Bind(s.o, s.bindRegs, height);
+    if (!b.ok)
+    {
+        s.refusals++, std::printf("draw %llu: bind refused (height %u%s): %s\n", s.bindDraw, height, needs ? ", extent needs the vertices" : "", b.refusal.c_str());
+        return;
+    }
+    if (!b.rasterizes)
+        s.noRaster++;
+    else if (b.depth.Empty() && b.color[0].Empty() && b.color[1].Empty() && b.color[2].Empty() && b.color[3].Empty())
+        s.unbound++;
+    else
+        s.bound++;
+    for (uint32_t i = 0; i < 5; i++)
+        for (const Transfer& t : b.transfers[i])
+        {
+            s.transferCount[i == 0]++, s.transferTiles[i == 0] += t.endTiles - t.startTiles;
+            const Key dest = i == 0 ? b.depth : b.color[i - 1];
+            if (t.source.IsDepth() != dest.IsDepth())
+            {
+                s.crossAspect++, s.crossAspectTiles += t.endTiles - t.startTiles;
+                char text[160];
+                std::snprintf(text, sizeof text, "draw %llu (height %u): tiles %u-%u from key %06X to key %06X", s.bindDraw, height, t.startTiles, t.endTiles - 1,
+                              t.source.packed, dest.packed);
+                s.crossAspectLog.push_back(text);
+            }
+            else if (t.source.Base() != dest.Base())  // same aspect, another base (MapEdramTexel's tile offset)
+            {
+                s.otherBase++, s.otherBaseTiles += t.endTiles - t.startTiles;
+                char text[200];
+                std::snprintf(text, sizeof text, "draw %llu (height %u): tiles %u-%u from key %06X (base %u, %ux) to key %06X (base %u, %ux)", s.bindDraw,
+                              height, t.startTiles, t.endTiles - 1, t.source.packed, t.source.Base(), 1u << uint32_t(t.source.MsaaMode()), dest.packed,
+                              dest.Base(), 1u << uint32_t(dest.MsaaMode()));
+                if (s.otherBaseLog.size() < 20)
+                    s.otherBaseLog.push_back(text);
+            }
+        }
+}
+
+int Replay(const char* path, const uint32_t* vertexMaxY)
 {
     FILE* f = std::fopen(path, "r");
     if (!f)
         return std::printf("cannot open %s\n", path), 2;
     ReplayState s;
+    s.vertexMaxY = vertexMaxY;
     char line[1024];
     while (std::fgets(line, sizeof line, f))
     {
+        if (std::strncmp(line, "state ", 6) == 0)
+        {
+            unsigned viz, vizq, outpath, interp, vsc, psc, wo, wst, vtx, sref, xs, xo, ys, yo, zs, zo;
+            if (std::sscanf(line, "state viz %x %x outpath %x interp %x vsconst %x psconst %x window %x %x vtxcntl %x stencilref %x vport %x %x %x %x %x %x", &viz,
+                            &vizq, &outpath, &interp, &vsc, &psc, &wo, &wst, &vtx, &sref, &xs, &xo, &ys, &yo, &zs, &zo) != 16)
+            {
+                s.unparsed++;
+                continue;
+            }
+            if (s.bindPending)
+            {
+                s.bindExtent.windowOffset = wo, s.bindExtent.windowScissorTl = wst, s.bindExtent.vtxCntl = vtx;
+                s.bindExtent.vportYScale = ys, s.bindExtent.vportYOffset = yo;
+                s.withState++;
+                if (NeedsVertexMaxY(s.bindExtent) && !s.vertexMaxY)
+                    s.awaitVf0 = true;  // bound at its vf0 line, or by the scissor at any other line
+                else
+                    ReplayBind(s);
+            }
+            continue;
+        }
+        if (std::strncmp(line, "vf0 ", 4) == 0)
+        {
+            // "vf0 endian E at ADDR: w0 .. w20": the words as the guest stores them (cp_trace.cpp Load32, big-endian); the
+            // renderer's vertex window holds the GPU's little-endian 32-bit loads of the same bytes, so each is swapped
+            // back before PassThroughPositions applies the fetch's endian (as draw_record.cpp's extent path does).
+            unsigned endian = 0, address = 0;
+            int at = 0;
+            std::vector<uint32_t> loads;
+            if (std::sscanf(line, "vf0 endian %u at %x:%n", &endian, &address, &at) == 2)
+                for (const char* p = line + at; loads.size() < 21;)
+                {
+                    char* next = nullptr;
+                    const unsigned long w = std::strtoul(p, &next, 16);
+                    if (next == p)
+                        break;
+                    loads.push_back(__builtin_bswap32(uint32_t(w)));
+                    p = next;
+                }
+            std::vector<VertexPosition> positions;
+            std::string why;
+            if (loads.size() != 21 || !PassThroughPositions(loads.data(), loads.size(), endian, 7, 0, 3, positions, why))
+            {
+                s.unparsed++;
+                continue;
+            }
+            if (s.bindPending && s.awaitVf0)
+            {
+                const uint32_t maxY = VertexMaxY(s.bindExtent, positions.data(), positions.size());
+                ReplayBind(s, &maxY);
+            }
+            continue;
+        }
+        ReplayBind(s);  // any other line ends the previous draw (trace10/12 have no state line)
         if (std::strncmp(line, "resolve copy ", 13) == 0)
         {
             unsigned cc, db, dp, di, dc, col, colLo, wo, wst, f0, f1, f2, f3, f4, f5;
@@ -1068,22 +1382,18 @@ int Replay(const char* path)
         BindRegisters r;
         r.surfaceInfo = surface, r.modeControl = mode, r.depthControl = depthCtl, r.colorMask = colorMask;
         r.depthInfo = depth, r.colorInfo[0] = color, r.colorInfo[1] = color1;
-        const Binding b = Bind(s.o, r, (scissor >> 16) & 0x3FFF);
-        if (!b.ok)
-        {
-            s.refusals++, std::printf("draw %llu: bind refused: %s\n", n, b.refusal.c_str());
-            continue;
-        }
-        if (!b.rasterizes)
-            s.noRaster++;
-        else if (b.depth.Empty() && b.color[0].Empty() && b.color[1].Empty() && b.color[2].Empty() && b.color[3].Empty())
-            s.unbound++;
-        else
-            s.bound++;
-        for (uint32_t i = 0; i < 5; i++)
-            for (const Transfer& t : b.transfers[i])
-                s.transferCount[i == 0]++, s.transferTiles[i == 0] += t.endTiles - t.startTiles;
+        s.bindRegs = r, s.bindDraw = n, s.bindPending = true;
+        s.bindExtent = ExtentRegisters{};
+        s.bindExtent.surfaceInfo = surface, s.bindExtent.windowScissorBr = scissor;
+        unsigned blend0, colorCtl, clip, sumode, vte;
+        // The draw line's tail (cp_trace.cpp: clip 2204, sumode 2205, vte 2206); trace10 lines have it too.
+        const char* tail = std::strstr(line, " blend0 ");
+        if (tail && std::sscanf(tail, " blend0 %x colorctl %x clip %x sumode %x vte %x", &blend0, &colorCtl, &clip, &sumode, &vte) == 5)
+            s.bindExtent.clipCntl = clip, s.bindExtent.suScModeCntl = sumode, s.bindExtent.vteCntl = vte;
+        // PA_SU_VTX_CNTL until a state line says otherwise: pix_center 0, as every traced draw has it (vtxcntl 00000004).
+        s.bindExtent.vtxCntl = 4;
     }
+    ReplayBind(s);
     std::fclose(f);
     for (const auto& c : s.configs)
     {
@@ -1120,6 +1430,19 @@ int Replay(const char* path)
                 (unsigned long long)s.resolveTransferTiles, (unsigned long long)s.clearTransfers[0], (unsigned long long)s.clearTransferTiles[0],
                 (unsigned long long)s.clearTransfers[1], (unsigned long long)s.clearTransferTiles[1], (unsigned long long)s.texLines, (unsigned long long)s.texHits,
                 (unsigned long long)s.texMismatches, (unsigned long long)s.refusals);
+    std::printf("extent: %llu draw(s) with a state line, %llu bound below their scissor by EstimateMaxY, %llu whose extent needs their vertices "
+                "(clip disabled, 8192x8192 scissor; vertex bound %s)\n",
+                (unsigned long long)s.withState, (unsigned long long)s.heightLimited, (unsigned long long)s.needVertices,
+                s.vertexMaxY ? (std::to_string(*s.vertexMaxY) + " rows (hypothesis from the command line)").c_str() : "unknown: the scissor's");
+    std::printf("vertices: %llu bind(s) bounded by their vf0 line (VertexMaxY of PassThroughPositions, stride 7, position at dword 0); "
+                "%llu cross-aspect (depth <-> colour) transfer(s), %llu tiles\n",
+                (unsigned long long)s.vf0Bound, (unsigned long long)s.crossAspect, (unsigned long long)s.crossAspectTiles);
+    for (const std::string& l : s.crossAspectLog)
+        std::printf("  cross-aspect %s\n", l.c_str());
+    std::printf("bases: %llu same-aspect transfer(s) between keys of different bases, %llu tiles (first %zu listed)\n", (unsigned long long)s.otherBase,
+                (unsigned long long)s.otherBaseTiles, s.otherBaseLog.size());
+    for (const std::string& l : s.otherBaseLog)
+        std::printf("  other-base %s\n", l.c_str());
     return (s.refusals || s.texMismatches) ? 1 : 0;
 }
 
@@ -1128,12 +1451,18 @@ int Replay(const char* path)
 int main(int argc, char** argv)
 {
     if (argc > 1)
-        return Replay(argv[1]);
+    {
+        // test_edram <cp.txt> [--vertex-max-y=N]: N stands in for VertexMaxY of every draw that needs its vertices.
+        uint32_t vertexMaxY = 0;
+        const bool hypothesis = argc > 2 && std::sscanf(argv[2], "--vertex-max-y=%u", &vertexMaxY) == 1;
+        return Replay(argv[1], hypothesis ? &vertexMaxY : nullptr);
+    }
     TestRegisters();
     TestTileMath();
     TestRangeRectangles();
     TestOwnership();
     TestCutout();
+    TestExtent();
     TestBindFm4();
     TestBindCases();
     TestTrace10();

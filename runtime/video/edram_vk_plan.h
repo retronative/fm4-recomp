@@ -44,6 +44,14 @@ enum class TransferKind
     Refused,
     Color,  // one colour draw per destination sample (sample masks), source sampled with texelFetch
     Depth,  // depth (gl_FragDepth) + 8 stencil-bit draws per destination sample
+    // X kDepthToColor (vulkan_render_target_cache.cc:176-177, :4910-4913): one colour draw per destination sample, the
+    // source's depth and stencil aspects sampled, packed into the guest's 32-bit depth/stencil word, unpacked as colour.
+    DepthToColor,
+    // X kColorToDepth + kColorToStencilBit (vulkan_render_target_cache.cc:170-171, :178-180, :4904-4908): the colour sample
+    // packed to the guest's 32-bit word (X :3385-3586), its bits 8-31 the 20e4 depth (X :3736-3741, :4120-4124
+    // Depth20e4To32), bits 0-7 the stencil, written bit by bit (X :4156-4180). As Depth, one draw per destination sample,
+    // with the 40-sample column swap (:2916-2936). FM4 Recomp reduction: no host-depth owner (edram.cpp Ownership::Change).
+    ColorToDepth,
 };
 
 // What the unit does for a transfer `source` -> `dest` (both Keys of the same tiles). Accepted: colour 4x -> 1x and
@@ -51,11 +59,31 @@ enum class TransferKind
 // goes through the 32-bit packing when the formats differ: 4x s2 -> 1x s0 and 1x s0 -> 4x s2 each 38 times per 400
 // swaps); colour between any two of storage 0, 2 and 3 (7e3) at 4x -> 1x, 1x -> 4x, or an unchanged sample count
 // when the formats differ (a format-only reinterpretation through the 32-bit packing, X :3387-3700; not traced yet:
-// FM4's 7e3 scene shares base 0 with the 2_10_10_10 targets, NOTES.md); depth 1x -> 4x of the same format.
-// Everything else is refused with its name: a key as its own source, a transfer between keys of different bases or
-// pitches (never observed; the texel mapping below assumes equal ones), 2x MSAA, depth 4x -> 1x, a depth format
-// change or an aspect change (edram::Ownership::Change already refuses those two).
+// FM4's 7e3 scene shares base 0 with the 2_10_10_10 targets); depth 1x -> 4x of the same format.
+// Any bases (MapEdramTexel's tile offset; observed: the 1x kD24FS8 key at 720 -> the 4x
+// kD24FS8 key at 1024). Everything else is refused with its name: a key as its own source, a transfer between keys
+// of different pitches (never observed; the texel mapping assumes equal pitches), 2x MSAA, depth 4x -> 1x, a depth
+// format change or a colour -> depth change (edram::Ownership::Change already refuses those two).
+// Depth -> colour (DepthToColor; observed: tiles 720-1023 of the 1x kD24FS8
+// key at base 720, which the front-buffer resolve's depth clear last claimed, move to the 4x 7e3 colour key at base
+// 0): accepted from a 1x kD24FS8 source into a 1x or 4x colour key of storage 0, 2 or 3 with the same pitch, at any
+// bases (MapCrossAspectTexel). Refused by name: a 4x depth source (needs multisampled depth and stencil sampling;
+// never observed), a kD24S8 source (X's RoundEven(depth * 0xFFFFFF) path, :3593-3604; never observed).
 TransferKind ClassifyTransfer(edram::Key source, edram::Key dest, std::string& why);
+
+// The guest's 32-bit depth/stencil word from the host's float depth and 8-bit stencil (X :3605-3617): kD24FS8 depth
+// through PreClampedDepthTo20e4 (X spirv_shader_translator_rb.cc:236-326) with X's defaults round_to_nearest_even =
+// depth_float24_round = false (render_target_cache.cc:46) and remap_from_0_to_0_5 = false (FM4 Recomp difference: X
+// passes true because it stores guest depth halved, :5357-5359; this renderer stores it unhalved, edram_vk_plan.h
+// DecodeDepthClear), at bits 8-31, the stencil at bits 0-7. `depth` in [0, 1] (a D32 attachment clamps to the viewport).
+uint32_t Depth32To20e4(float depth);
+uint32_t PackDepthStencilWord(float depth, uint32_t stencil);
+// The other way (ColorToDepth): the depth a colour word becomes in a kD24FS8 target, Float20e4To32(word >> 8) (X
+// spirv_shader_translator_rb.cc:328+ Depth20e4To32 with remap_to_0_to_0_5 false: this renderer stores guest depth
+// unhalved, edram_vk_plan.h DecodeDepthClear; X passes true at vulkan_render_target_cache.cc:4121-4123), and its
+// stencil, word & 0xFF (X :4145-4152, :4157-4170).
+float ColorWordDepth(uint32_t word);
+constexpr uint32_t ColorWordStencil(uint32_t word) { return word & 0xFF; }
 
 // The source texel of a destination sample (X vulkan_render_target_cache.cc:2597-2601 "First sample bit at 4x
 // with Vulkan standard locations - horizontal sample. Second sample bit - vertical sample"; same bpp 4x -> 1x
@@ -66,6 +94,21 @@ struct SourceTexel
     uint32_t x = 0, y = 0, sample = 0;
 };
 SourceTexel MapTransferTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Msaa source, edram::Msaa dest);
+
+// The source texel of a depth -> colour destination sample, X's full mapping (vulkan_render_target_cache.cc:2516-2577
+// the destination pixel split into its 32bpp tile and tile-relative pixel; :2857-2864 and :2823-2828 the 1x -> 4x
+// samples-to-pixels rule on the tile-relative pixel; :2916-2936 the 40-sample column swap between colour and depth,
+// half = 80 >> (1 + source 4x); :2938-2954 the source tile = destination tile + (destination base - source base),
+// modulo 2048). The same layout as X shaders/edram.xesli:23-59 XeEdramOffsetInts (a depth tile's x moved by half the
+// tile width). Equal pitches (ClassifyTransfer). The GLSL kTransferDepthToColor XeCrossAspectPixel is the same.
+SourceTexel MapCrossAspectTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
+
+// Every transfer's source texel (MapCrossAspectTexel is this): the same tile split, MSAA rule and tile offset for all
+// modes (X vulkan_render_target_cache.cc:2516-2577, :2779-2864, :2938-2954: one path whatever TransferMode, the
+// address push constant carrying the destination-relative source tile offset), the 40-sample column swap only between
+// colour and depth (:2916). With equal bases it equals MapTransferTexel (80x16 / 40x8 tiles keep the parity of x and y).
+// Equal pitches (ClassifyTransfer). The GLSL XeSourcePixel / XeSourceSample (edram_vk.cpp) are the same arithmetic.
+SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
 
 // The 32-bit guest word of a colour as a format-changing transfer packs it (X :3402-3449 for 8_8_8_8:
 // uint(v * 255 + 0.5) per component, R in bits 0-7; :3467-3490 for 2_10_10_10: rgb * 1023, a * 3, R in bits 0-9;
@@ -133,5 +176,56 @@ bool ResolveToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, cons
 // resolve is always X's full converting one (draw_util.cc:1312-1347, shaders/resolve.xesli), not implemented in M4.
 // Every refusal names the copy's shape (source storage, MSAA, sample select, destination format, bias, swap, endian).
 bool ResolveConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, std::string& why);
+
+// ---- The full (converting) resolve: X draw_util.cc:1305-1345 GetCopyShader, shaders/resolve_full_32bpp.xesli ----------
+//
+// X takes its fast (bit-copy) shader only when there is no exponent bias, one sample is selected and the formats are
+// bitwise equivalent (draw_util.cc:1312-1318); everything else goes through the full shader: per sample unpack the
+// EDRAM word to float (resolve.xesli:273-321 XeResolveUnpack32bpp4Samples: 8_8_8_8 / 2_10_10_10 UNORM, 7e3 through
+// pixel_formats.xesli:328-349 XeUnpackR10G10B10A2Float), sum the selected samples (resolve.xesli:632-694: the first
+// sample XeResolveFirstSampleIndex :206-216; k01 / k23 add the next sample row (+80 ints: the guest sample with y + 1),
+// k0123 also the next sample column (+1 int) and its next row), multiply by dest_exp_bias_factor = 2^bias (:131-133)
+// halved once for k01 / k23 and twice for k0123 (:651, :670), swap red and blue (.bgra, :699-704), pack to the
+// destination format (pixel_formats.xesli:200-256 XePack32bpp4Pixels: :116-125 saturate, * 255 or 1023 / 3, + 0.5,
+// truncate), endian swap (resolve_full_32bpp.xesli:62-65), store at the tiled address (resolve.xesli:161-184).
+
+// FM4 Recomp's fast path (ResolveToGuest): a 1x source, sample k0, no bias, bitwise-equivalent formats.
+bool ResolveUsesFastPath(const edram::ResolveInfo& info, uint32_t sourceStorage);
+
+// The guest sample index of host sample `host` of an image of `msaa` (and its inverse, the same function): 4x: X's host
+// sample bit 0 is horizontal, bit 1 vertical (vulkan_render_target_cache.cc:2597-2598), the guest's bit 1 horizontal,
+// bit 0 vertical (shaders/edram.xesli:27-33) -> guest = (host & 1) << 1 | host >> 1; native 2x: "top is 1 in Vulkan,
+// bottom is 0" (:2599-2600) and guest sample 0 is the top (edram.xesli:32-33) -> guest = host ^ 1; 1x: 0.
+uint32_t GuestSampleOfHost(edram::Msaa msaa, uint32_t host);
+
+// The sample dump's layout (edram_vk.cpp kResolveDump, then vkCmdCopyImageToBuffer, tightly packed): the rectangle's
+// `width` x `height` pixels, guest sample g of pixel (x, y) at word (y + height * (g >> 1)) * (width * columns) +
+// x + width * (g & 1); columns = 2 for 2x and 4x (else 1), rows = 2 for 4x (else 1). A 1x copy of a storage 0 / 2 host
+// image (whose words are the guest's) has the same layout.
+struct DumpLayout
+{
+    uint32_t width = 0, height = 0, samples = 1, columns = 1, rows = 1;
+    constexpr size_t Word(uint32_t x, uint32_t y, uint32_t g) const
+    {
+        return (size_t(y) + size_t(height) * (g >> 1)) * (size_t(width) * columns) + x + size_t(width) * (g & 1);
+    }
+};
+DumpLayout DumpLayoutFor(edram::Msaa msaa, uint32_t width, uint32_t height);
+
+// The guest samples the resolve reads and how they are summed (resolve.xesli:206-216, :632-694); false for a sample the
+// source does not have (DecodeResolve sanitizes, draw_util.cc:495-545). `count` 1, 2 or 4, `indices` in summation order.
+bool ResolveSamples(const edram::ResolveInfo& info, uint32_t indices[4], uint32_t& count);
+
+// One destination word (before the endian swap) from the guest words of one pixel's samples, indexed by guest sample.
+uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* samplesByGuestIndex);
+
+// The checks of the full path that do not need the words: storage 0, 2 or 3; destination format 6, 7, 50, 54 (the 32bpp
+// formats DecodeResolve accepts; XePack32bpp4Pixels :205-220); the selected samples exist; a non-empty rectangle whose base
+// is its extent's start. Refusals name the copy's shape.
+bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, std::string& why);
+// Every pixel of the rectangle from `words` (DumpLayoutFor(info.msaa, ...)) into `dest` as ResolveToGuest does; nothing
+// written on a refusal.
+bool ResolveConvertToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
+                           std::string& why);
 
 }  // namespace runtime::video

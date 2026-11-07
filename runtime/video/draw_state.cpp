@@ -358,6 +358,24 @@ struct Decoder
             return Refuse("RB_SURFACE_INFO " + Hex(si) + " RB_COLOR_INFO " + Hex(ci) + " RB_DEPTH_INFO " + Hex(di) + ": the render target has no rows");
         // An empty scissor gives a target height of 0: a defined draw that covers nothing (X draw_util.h:282-283), not a refusal.
         t.targetHeight = std::min(t.edramRows, d.scissor.y + d.scissor.height);
+        // FM4 Recomp: Xenia binds with min(height, EstimateMaxY) (X render_target_cache.cc:757-767,
+        // draw_extent_estimator.cc:267-366). The registers it reads are recorded here; a draw whose extent needs its
+        // vertices keeps the scissor bound above and the renderer lowers it (draw_record.h BoundTargetHeight), since the
+        // vertex data is guest memory this pure decode does not read. The viewport bound of clipped draws is not applied
+        // (unchanged behaviour; in the traced draws it never lowers a draw below its scissor).
+        edram::ExtentRegisters& e = d.extent;
+        e.surfaceInfo = si;
+        e.windowOffset = Reg(xr::kPaScWindowOffset);
+        e.windowScissorTl = Reg(xr::kPaScWindowScissorTl);
+        e.windowScissorBr = Reg(xr::kPaScWindowScissorBr);
+        e.screenScissorBr = Reg(xr::kPaScScreenScissorBr);
+        e.clipCntl = Reg(xr::kPaClClipCntl);
+        e.suScModeCntl = Reg(xr::kPaSuScModeCntl);
+        e.vteCntl = Reg(xr::kPaClVteCntl);
+        e.vtxCntl = Reg(xr::kPaSuVtxCntl);
+        e.vportYScale = Reg(xr::kPaClVportXScale + 2);   // PA_CL_VPORT_YSCALE 0x2111
+        e.vportYOffset = Reg(xr::kPaClVportXScale + 3);  // PA_CL_VPORT_YOFFSET 0x2112
+        d.extentNeedsVertices = edram::NeedsVertexMaxY(e);
         return true;
     }
 

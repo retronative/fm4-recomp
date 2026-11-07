@@ -103,4 +103,18 @@ void FillXeSystem(const std::vector<VertexWindow>& windows, const HostViewport& 
 // the 8 bool and 32 loop dwords (both stages get the same).
 void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes]);
 
+// ---- The draw extent from the vertices (FM4 Recomp) -----------------------------------------
+
+// The rows the EDRAM bind may claim for this draw (edram::Bind's heightUsed): d.target.targetHeight, lowered to
+// min(edramRows, edram::EstimateMaxY(d.extent, &vertexMaxY)) when d.extentNeedsVertices (X render_target_cache.cc:
+// 757-767; draw_extent_estimator.cc:199-264) and the vertex shader's position is a plain vertex fetch
+// (ShaderTranslation::positionFetch). The positions are read from `window`, the guest memory of that fetch's slot
+// as 32-bit loads (`windowDwords` long, from the fetch constant's address; the bytes the renderer copies), at each
+// guest index the draw references (`indices`: every index of Direct, else its index list) with the slot's
+// `endian` (edram::PassThroughPositions, w = 1). When the vertices are needed but the shader does not qualify, the
+// window is null or too short, `height` stays the scissor bound (today's behaviour: the bind may then refuse) and
+// `note` says why, for the stop line. Returns true when the vertex bound was applied.
+bool BoundTargetHeight(const DrawState& d, const shader::ShaderTranslation& vs, const uint32_t* window, size_t windowDwords, uint32_t endian,
+                       const HostIndices& indices, uint32_t& height, std::string& note);
+
 }  // namespace runtime::video

@@ -139,7 +139,31 @@ struct ShaderTranslation
                                              // ascending (see bindings 2/3)
     std::vector<uint32_t> loopConstants;     // distinct loop constants (0-31) read by loops,
                                              // ascending (see bindings 2/3)
+    // FM4 Recomp: whether the vertex shader's position (oPos, export 62) is exactly one
+    // vertex fetch's xyz with w = 1, unmodified, so the host can read each vertex's position from the fetch's
+    // data without running the shader (runtime/video/edram.h PassThroughPositions, Xenia's DrawExtentEstimator
+    // runs the shader on the CPU instead). Fail closed: `valid` only when all of these hold, else `why` names
+    // the first that does not:
+    //   - a vertex shader whose control flow is straight-line (nop, exec, exec_end, alloc only);
+    //   - exactly one ALU instruction writes export 62, and it is MAXv (vector opcode 2) with both sources
+    //     the same temp rN, identity swizzle, no negate, no abs, no relative addressing, no clamp, not
+    //     predicated, vector write mask xyzw and scalar mask 0 (max(rN, rN) = rN: the compiler's move);
+    //   - rN is written by exactly one instruction in the program: a full (not mini) vertex fetch before that
+    //     export, not predicated, indexed by r0.x (the vertex index; r0 not written before it), format
+    //     k_32_32_32_FLOAT (57) or k_32_32_32_32_FLOAT (38), destination swizzle x y z 1, exp_adjust 0, and an
+    //     element (offset, offset + 3) within its stride;
+    //   - no instruction of the program writes a register through relative addressing.
+    struct PositionFetch
+    {
+        bool valid = false;
+        uint32_t slot = 0;                       // the vertex fetch constant (0-95)
+        uint32_t strideDwords = 0, offsetDwords = 0, format = 0;
+        std::string why;                         // the first unmet condition when !valid
+    } positionFetch;
 };
+
+// The PositionFetch analysis alone (TranslateShader runs it on every vertex shader it accepts).
+ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, size_t count, bool pixel);
 
 // `words` are host-order (already byte-swapped). Returns false with `error` set on anything
 // outside the supported subset; `out` is then unspecified.

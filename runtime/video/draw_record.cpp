@@ -240,4 +240,45 @@ void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes])
     std::memcpy(out + kConstantsLoopOffset, d.loopConstants, sizeof d.loopConstants);
 }
 
+bool BoundTargetHeight(const DrawState& d, const shader::ShaderTranslation& vs, const uint32_t* window, size_t windowDwords, uint32_t endian,
+                       const HostIndices& indices, uint32_t& height, std::string& note)
+{
+    height = d.target.targetHeight;
+    note.clear();
+    if (!d.extentNeedsVertices)
+        return false;
+    const shader::ShaderTranslation::PositionFetch& p = vs.positionFetch;
+    if (!p.valid)
+        return note = "the extent needs the vertices (clipping off, 8192 scissor) but the vertex shader's position is not a plain vertex fetch: " + p.why,
+               false;
+    if (window == nullptr)
+        return note = "the extent needs the vertices but vertex fetch slot " + std::to_string(p.slot) + " has no data window", false;
+    std::vector<edram::VertexPosition> positions, one;
+    std::string why;
+    const auto add = [&](uint32_t index) {
+        const size_t at = size_t(index) * p.strideDwords;
+        if (at >= windowDwords || !edram::PassThroughPositions(window + at, windowDwords - at, endian, p.strideDwords, p.offsetDwords, 1, one, why))
+        {
+            note = "the extent needs vertex " + std::to_string(index) + " of slot " + std::to_string(p.slot) + ", outside its " +
+                   std::to_string(windowDwords) + "-dword window" + (why.empty() ? std::string() : ": " + why);
+            return false;
+        }
+        positions.push_back(one[0]);
+        return true;
+    };
+    if (indices.kind == HostIndices::Kind::Direct)
+    {
+        for (uint32_t i = 0; i < indices.vertexCount; i++)
+            if (!add(i))
+                return false;
+    }
+    else
+        for (const uint32_t index : indices.indices)
+            if (!add(index))
+                return false;
+    const uint32_t vertexMaxY = edram::VertexMaxY(d.extent, positions.data(), positions.size());
+    height = std::min(d.target.edramRows, edram::EstimateMaxY(d.extent, &vertexMaxY));
+    return true;
+}
+
 }  // namespace runtime::video

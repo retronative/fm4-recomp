@@ -86,7 +86,8 @@ private:
 // The formats the first screens sample: k_8 (2),
 // k_8_8_8_8_AS_16_16_16_16 (50), k_DXT1_AS_16_16_16_16 (51). texture_info.cpp also maps 6, 18 and 54 (the
 // same host formats as 50 / 51, and A2B10G10R10); each joins this list when a run first needs it.
-constexpr bool ObservedFormat(uint32_t format) { return format == 2 || format == 50 || format == 51; }
+// 54 (k_2_10_10_10_AS_16_16_16_16): the HDR resolve's destination at 1BB71000, sampled from draw 27039 (the local capture draw_c2d1 (not distributed)).
+constexpr bool ObservedFormat(uint32_t format) { return format == 2 || format == 50 || format == 51 || format == 54; }
 
 // VkComponentMapping {R, G, B, A}: what a view may use without imageViewFormatSwizzle (the portability
 // subset's VkImageViewCreateInfo rule: with the feature VK_FALSE every component must be the identity

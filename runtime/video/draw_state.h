@@ -27,6 +27,7 @@
 // stencil, so they are classified NoWrite from RB_COLOR_MASK and RB_DEPTHCONTROL before the
 // render target is validated (a pitch-0 surface is refused only for a draw that writes).
 #pragma once
+#include "edram.h"
 #include "shader/shader_glsl.h"
 #include <cstdint>
 #include <string>
@@ -217,7 +218,8 @@ struct RenderTarget
     uint32_t depthBase = 0;    // RB_DEPTH_INFO bits 0-10, tiles
     uint32_t depthFormat = 0;  // bit 16: 0 D24S8, 1 D24FS8 (xenos.h:406-409)
     uint32_t pitchTiles = 0;   // the surface's width in tiles
-    uint32_t edramRows = 0, targetHeight = 0;
+    uint32_t edramRows = 0, targetHeight = 0;  // targetHeight: the scissor bound; FM4 Recomp: the renderer lowers
+                                           // it with the vertices when extentNeedsVertices (draw_record.h BoundTargetHeight)
     bool colorWritten = false, depthWritten = false;  // which surfaces this draw touches (NoWrite: neither)
 };
 
@@ -342,6 +344,13 @@ struct DrawState
     uint32_t loopConstants[32] = {};        // SHADER_CONSTANT_LOOP_00.. (xe_loop)
     std::vector<uint32_t> vsLoopRegisters, psLoopRegisters;  // the loop registers each stage reads (gpu/loop_work.h LoopWorkAllowed)
     uint64_t pixelInvocations = 0;          // the scissor's area (loop_work.h PixelInvocations; the same rule, from the decoded scissor)
+
+    // FM4 Recomp: the registers of Xenia's DrawExtentEstimator (edram.h ExtentRegisters) and
+    // whether this draw's extent needs its vertices (edram::NeedsVertexMaxY: clipping off and an 8192 scissor, X
+    // draw_extent_estimator.cc:289-316). When it does, RenderTarget::targetHeight is the scissor bound (Xenia with the
+    // estimation off) and the renderer lowers it with the vertices (draw_record.h BoundTargetHeight) before the bind.
+    edram::ExtentRegisters extent;
+    bool extentNeedsVertices = false;
 };
 
 // Reads register `index` (host order) as the command processor holds it (kernel/graphics.h ReadRegister).

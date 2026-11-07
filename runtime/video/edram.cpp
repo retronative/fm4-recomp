@@ -7,6 +7,7 @@
 #include "edram.h"
 #include "front_buffer.h"  // TiledOffset: X texture_util.cc:443-459 GetTiledOffset2D (reviewed)
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 
@@ -39,8 +40,8 @@ bool SupportedKey(Key k, std::string& why)
 {
     if (k.Empty() || k.PitchTilesAt32bpp() == 0)
         return Refuse(why, "a render target without a pitch");
-    if (k.MsaaMode() == Msaa::X2)
-        return Refuse(why, "2x MSAA is not supported in M4 (only 1x and 4x; NOTES.md)");
+    // 2x: a pixel is 1x2 samples (X render_target_cache.cc:591-592, shaders/edram.xesli:27-33); FM4's HDR resolve reads
+    // its 4x 7e3 target as a 1280-wide 2x surface.
     if (k.IsDepth())
         return true;  // kD24S8 and kD24FS8
     switch (ColorFormat(k.Format()))
@@ -137,10 +138,15 @@ bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Tr
             const Key o = At(t);
             if (o.Empty() || o == dest)
                 continue;
-            if (o.IsDepth() != dest.IsDepth())
-                return Refuse(refusal, "tile " + std::to_string(t) + " would transfer across aspects (" + (o.IsDepth() ? "depth" : "colour") + " -> " +
-                                           (dest.IsDepth() ? "depth" : "colour") + "): not modelled (unit 6b)");
-            if (dest.IsDepth() && o.Format() != dest.Format())
+            // Depth -> colour is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913) and needs no host-depth
+            // owner: X tracks those only for a depth destination (render_target_cache.cc:1553-1555, :1606-1609).
+            // Colour -> depth is X's kColorToDepth (vulkan_render_target_cache.cc:4904-4908) with, for kD24FS8 on a float32
+            // host, the range's host-depth owner as a second source (render_target_cache.cc:1553-1555, :1606-1611): X writes
+            // that owner's float32 depth where its 20e4 conversion equals the colour word's depth bits, else the 20e4 bits
+            // converted (vulkan_render_target_cache.cc:3741-4142). FM4 Recomp reduction (unit 6b restores it): no host-depth
+            // owners, always the converted bits. That differs from X only where the colour still holds the very depth bits
+            // the old depth target had, and then only below the 20e4 quantum (edram_vk_plan.h ColorToDepth).
+            if (dest.IsDepth() && o.IsDepth() && o.Format() != dest.Format())
                 return Refuse(refusal, "tile " + std::to_string(t) + " would transfer between depth formats (" + std::to_string(o.Format()) + " -> " +
                                            std::to_string(dest.Format()) + "): not modelled (unit 6b)");
         }
@@ -407,8 +413,11 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         return refuse("resolve region " + std::to_string(x0) + " <= x < " + std::to_string(x1) + " is outside the surface pitch " + std::to_string(surface.pitch));
     if (y1 - y0 > int32_t(kMaxResolveSize))  // :886-892: X clamps and logs; refused here
         return refuse("resolve region is taller than " + std::to_string(kMaxResolveSize));
-    if (x0 >= x1 || y0 >= y1)  // :895-901
-        return refuse("resolve region is empty (" + std::to_string(x0) + "," + std::to_string(y0) + " - " + std::to_string(x1) + "," + std::to_string(y1) + ")");
+    if (x0 >= x1 || y0 >= y1)  // :895-901; nothing to copy or clear (X vulkan_render_target_cache.cc:1051-1054)
+    {
+        info.ok = true, info.empty = true;
+        return info;
+    }
     info.x0 = uint32_t(x0), info.y0 = uint32_t(y0), info.x1 = uint32_t(x1), info.y1 = uint32_t(y1);
     const uint32_t widthDiv8 = uint32_t(x1 - x0) >> 3, heightDiv8 = uint32_t(y1 - y0) >> 3;  // :903-906
 
@@ -477,8 +486,8 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 50, 54 are)");
     if (destNumber != 0)
         return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
-    if (info.destExpBias != 0)
-        return refuse(shape + "resolve destination exponent bias " + std::to_string(info.destExpBias) + " is not supported in M4");
+    // An exponent bias is X's full (converting) resolve's dest_exp_bias_factor (shaders/resolve.xesli:131-133), applied by
+    // edram_vk_plan.cpp ResolveConvertToGuest; the range is the field's (6-bit signed, -32..31).
     if (info.destPitch == 0)
         return refuse(shape + "resolve destination pitch is 0");
     if (info.command == CopyCommand::Raw)
@@ -525,6 +534,11 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
     auto refuse = [&](std::string why) { plan.ok = false, plan.refusal = std::move(why); return plan; };
     if (!info.ok)
         return refuse("resolve not decoded: " + info.refusal);
+    if (info.empty)  // nothing to copy or clear: ownership unchanged (X vulkan_render_target_cache.cc:1051-1054)
+    {
+        plan.ok = true;
+        return plan;
+    }
 
     // The copy reads one host target, info.source, which first takes over the span's tiles (the header's note:
     // X dumps every owner into its EDRAM buffer instead, render_target_cache.cc:1074-1159). A tile no target
@@ -636,6 +650,95 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
     }
     plan.ok = true;
     return plan;
+}
+
+// ---- Draw extent (X draw_extent_estimator.cc) ---------------------------------------------------------------
+
+namespace {
+
+float FloatBits(uint32_t bits)
+{
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+// X draw_extent_estimator.cc:273-287 (bottom) and :303-308 (right): the window scissor's edge, + the window offset
+// unless window_offset_disable, at most the screen scissor's edge.
+int32_t ScissorEdge(const ExtentRegisters& r, bool y)
+{
+    int32_t edge = int32_t((r.windowScissorBr >> (y ? 16 : 0)) & 0x3FFF);
+    if (!(r.windowScissorTl >> 31))
+        edge += SignedField(r.windowOffset, y ? 16 : 0, 15);
+    return std::min(edge, SignedField(r.screenScissorBr, y ? 16 : 0, 15));
+}
+
+}  // namespace
+
+bool NeedsVertexMaxY(const ExtentRegisters& r)
+{
+    return ((r.clipCntl >> 16) & 1) && ScissorEdge(r, true) >= int32_t(kMaxSurfacePitch) && ScissorEdge(r, false) >= int32_t(kMaxSurfacePitch);
+}
+
+uint32_t EstimateMaxY(const ExtentRegisters& r, const uint32_t* vertexMaxY)
+{
+    uint32_t maxY = uint32_t(std::max(ScissorEdge(r, true), int32_t(0)));  // :287
+    if ((r.clipCntl >> 16) & 1)  // :289-317
+    {
+        if (vertexMaxY && NeedsVertexMaxY(r))
+            maxY = std::min(maxY, *vertexMaxY);
+        return maxY;
+    }
+    // :318-363, the sums in X's order: window offset, half pixel, y offset, |y scale| (1 when disabled).
+    float bottom = 0.0f;
+    if ((r.suScModeCntl >> 16) & 1)
+        bottom += float(SignedField(r.windowOffset, 16, 15));
+    if (!(r.vtxCntl & 1))
+        bottom += 0.5f;
+    if ((r.vteCntl >> 3) & 1)
+        bottom += FloatBits(r.vportYOffset);
+    bottom += ((r.vteCntl >> 2) & 1) ? std::fabs(FloatBits(r.vportYScale)) : 1.0f;
+    return uint32_t(std::min(float(maxY), std::max(0.0f, bottom)));  // :362, NaN and < 0 to 0
+}
+
+uint32_t VertexMaxY(const ExtentRegisters& r, const VertexPosition* positions, size_t count)
+{
+    const float yScale = ((r.vteCntl >> 2) & 1) ? FloatBits(r.vportYScale) : 1.0f;   // :147-149
+    const float yOffset = ((r.vteCntl >> 3) & 1) ? FloatBits(r.vportYOffset) : 0.0f;  // :150-152
+    float maxY = -FLT_MAX;
+    for (size_t i = 0; i < count; i++)
+    {
+        float y = positions[i].y;
+        if (!((r.vteCntl >> 8) & 1))  // :212-217
+            y /= positions[i].w;
+        y = y * yScale + yOffset;      // :219
+        maxY = std::max(maxY, y);      // :240-242: NaN keeps the previous value
+    }
+    int32_t fixed = FloatToFixed16p8(maxY);  // :246
+    if (!(r.vtxCntl & 1))                     // :253-255
+        fixed += 128;
+    if ((r.suScModeCntl >> 16) & 1)           // :256-258
+        fixed += SignedField(r.windowOffset, 16, 15) * 256;
+    const uint32_t msaa = (r.surfaceInfo >> 16) & 3;
+    return (uint32_t(std::max(int32_t(0), fixed)) + (msaa == 0 ? 127u : 255u)) >> 8;  // :259-264
+}
+
+bool PassThroughPositions(const uint32_t* words, size_t wordCount, uint32_t endian, uint32_t strideDwords, uint32_t offsetDwords, uint32_t vertices,
+                          std::vector<VertexPosition>& out, std::string& why)
+{
+    out.clear();
+    if (strideDwords == 0 || offsetDwords + 3 > strideDwords)
+        return Refuse(why, "a position xyz at dword " + std::to_string(offsetDwords) + " does not fit a " + std::to_string(strideDwords) + "-dword vertex");
+    if (endian > 3)
+        return Refuse(why, "vertex fetch endian " + std::to_string(endian) + " is not a 32-bit swap");
+    if (vertices == 0)
+        return true;
+    if (size_t(vertices - 1) * strideDwords + offsetDwords + 2 > wordCount)
+        return Refuse(why, "the vertex window (" + std::to_string(wordCount) + " dwords) is shorter than " + std::to_string(vertices) + " vertices of " +
+                               std::to_string(strideDwords) + " dwords");
+    for (uint32_t v = 0; v < vertices; v++)
+        out.push_back({FloatBits(GpuSwap32(words[size_t(v) * strideDwords + offsetDwords + 1], endian)), 1.0f});
+    return true;
 }
 
 }  // namespace runtime::video::edram

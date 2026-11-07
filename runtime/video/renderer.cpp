@@ -97,7 +97,7 @@ std::optional<GlslangCompiler> compiler;
 std::optional<ShaderCache> shaders;
 std::optional<PipelineCache> pipelines;
 ShaderClass allowedClasses = kClassStraight;
-const EdramHooks* edram = nullptr;
+const EdramHooks* edramHooks = nullptr;
 const TextureHooks* textures = nullptr;
 struct FramebufferKey
 {
@@ -248,8 +248,8 @@ void RetireSlot(uint32_t s)
     Require(guard->Retire(s));
     // The EDRAM unit's read-back resolves of this submission into guest memory (render_hooks.h EdramHooks::retired),
     // before the pending ranges are declared complete.
-    if (edram != nullptr)
-        if (std::string error; !edram->retired(error))
+    if (edramHooks != nullptr)
+        if (std::string error; !edramHooks->retired(error))
             Stop(StopCode::Unimplemented, "renderer: resolve read-back: %s", error.c_str());
     GuestWritesRetired();  // the resolves recorded into it wrote guest memory (guest_writes.h; unit 4's one slot)
     Slot& slot = slots[s];
@@ -433,9 +433,9 @@ void Shutdown()
     for (auto& [key, fb] : framebuffers)  // before the render passes and the EDRAM unit's views they reference
         vkDestroyFramebuffer(dev.device, fb, nullptr);
     framebuffers.clear();
-    if (edram != nullptr)  // its images, views and pipelines: after the framebuffers over its views, before the device
-        edram->shutdown();
-    edram = nullptr;
+    if (edramHooks != nullptr)  // its images, views and pipelines: after the framebuffers over its views, before the device
+        edramHooks->shutdown();
+    edramHooks = nullptr;
     pipelines.reset();  // pipelines, render passes, modules, layouts
     shaders.reset();
     compiler.reset();
@@ -538,7 +538,7 @@ uint64_t Allocate(Slot& s, uint64_t draw, uint64_t bytes, bool uniform, const ch
 
 gpu::SubmissionGate& Submissions() { return gate; }
 bool Enabled() { return enabled; }
-void SetEdramHooks(const EdramHooks* hooks) { edram = hooks; }
+void SetEdramHooks(const EdramHooks* hooks) { edramHooks = hooks; }
 void SetTextureHooks(const TextureHooks* hooks) { textures = hooks; }
 
 bool Initialize(const Options& o)
@@ -675,9 +675,9 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     case DrawKind::Refused:
         Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, d.error.c_str());
     case DrawKind::Resolve:  // RB_MODECONTROL 6: the EDRAM unit's (render_hooks.h)
-        if (edram == nullptr)
+        if (edramHooks == nullptr)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: a resolve (RB_MODECONTROL 6) without an EDRAM unit", (unsigned long long)draw);
-        if (!edram->resolve(OpenSlot(0), base, d, draw, error))
+        if (!edramHooks->resolve(OpenSlot(0), base, d, draw, error))
             Stop(StopCode::Unimplemented, "renderer: draw %llu: resolve: %s", (unsigned long long)draw, error.c_str());
         resolvesSinceSwap++;
         // Every resolve completes before the next draw records: that draw's texture loads read guest memory on
@@ -718,13 +718,46 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     PipelineCache::Entry pipeline;
     RequireDraw(draw, pipelines->Get(key, *vs, *vsVariant, *ps, *psVariant, pipeline));
     // 6. The render target (the EDRAM unit's images) and its framebuffer.
-    if (edram == nullptr)
+    if (edramHooks == nullptr)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: a draw into a render target without an EDRAM unit", (unsigned long long)draw);
     Slot& slot = slots[0];
+    // The vertex windows (their guest bytes are copied into the ring at step 7). One window must sit in one view.
+    std::vector<VertexWindow> windows;
+    uint32_t vertexDwords = 0;
+    PlanVertexWindows(d, indices.highIndex, windows, vertexDwords);
+    const auto windowBytes = [&](const VertexWindow& w) -> const uint8_t* {
+        uint32_t guest = 0, guestEnd = 0;
+        if (!runtime::PhysicalToGuest(w.physical, guest) || !runtime::PhysicalToGuest(w.physical + w.dwords * 4 - 1, guestEnd) || guestEnd - guest != w.dwords * 4 - 1)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: vertex fetch slot %u (%08X, %u dwords) is not in one view", (unsigned long long)draw, w.slot,
+                 w.physical, w.dwords);
+        return base + guest;
+    };
+    // FM4 Recomp: the rows the bind may claim (X render_target_cache.cc:757-767, EstimateMaxY).
+    // A draw whose extent needs its vertices (clipping off, 8192 scissor: FM4's fast clears) is bounded by its exported
+    // positions when its vertex shader's position is a plain vertex fetch (draw_record.h BoundTargetHeight); otherwise
+    // the scissor bound stands and a bind refusal names why the vertices were not used.
+    RenderTarget target = d.target;
+    std::string extentNote;
+    if (d.extentNeedsVertices)
+    {
+        const VertexWindow* positionWindow = nullptr;
+        for (const VertexWindow& w : windows)
+            if (vs->t.positionFetch.valid && w.slot == vs->t.positionFetch.slot && w.dwords != 0)
+                positionWindow = &w;
+        std::vector<uint32_t> loads;
+        if (positionWindow != nullptr)
+        {
+            loads.resize(positionWindow->dwords);
+            std::memcpy(loads.data(), windowBytes(*positionWindow), loads.size() * 4);  // the GPU's 32-bit loads (little-endian host)
+        }
+        BoundTargetHeight(d, vs->t, positionWindow ? loads.data() : nullptr, loads.size(), positionWindow ? positionWindow->endian : 0, indices,
+                          target.targetHeight, extentNote);
+    }
     const VkCommandBuffer c = OpenSlot(0);
     HostTargets targets;
-    if (!edram->acquireTargets(c, d.target, key.colorUsed != 0, key.depthUsed != 0, targets, error))
-        Stop(StopCode::Unimplemented, "renderer: draw %llu: render target: %s", (unsigned long long)draw, error.c_str());
+    if (!edramHooks->acquireTargets(c, target, key.colorUsed != 0, key.depthUsed != 0, targets, error))
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: render target: %s%s%s", (unsigned long long)draw, error.c_str(), extentNote.empty() ? "" : " (",
+             extentNote.empty() ? "" : (extentNote + ")").c_str());
     if (targets.samples != key.samples)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: the EDRAM unit returned %u-sample images for a %u-sample target", (unsigned long long)draw,
              targets.samples, key.samples);
@@ -738,15 +771,12 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // rows edram::Bind claimed (X render_target_cache.cc:757-767, :819-857). FM4's D3D fast clears have an 8192-row
     // scissor over a 360-row 4x surface whose host image is 1024 rows: the host scissor stops at
     // the claimed rows, never past the image.
-    const uint32_t scissorBottom = std::max(d.target.targetHeight, d.scissor.y);
+    const uint32_t scissorBottom = std::max(target.targetHeight, d.scissor.y);
     if (targets.width < d.scissor.x + d.scissor.width || targets.height < scissorBottom || targets.width == 0 || targets.height == 0)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: the %ux%u host target does not cover the scissor (%u, %u, %ux%u; rows to %u)",
              (unsigned long long)draw, targets.width, targets.height, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, scissorBottom);
     const VkFramebuffer framebuffer = Framebuffer(pipeline.renderPass, targets, key.colorUsed != 0, key.depthUsed != 0);
-    // 7. The uploads into the slot's ring (pipeline_key.h D9).
-    std::vector<VertexWindow> windows;
-    uint32_t vertexDwords = 0;
-    PlanVertexWindows(d, indices.highIndex, windows, vertexDwords);
+    // 7. The uploads into the slot's ring (pipeline_key.h D9); the windows were planned before the bind.
     const uint64_t systemAt = Allocate(slot, draw, kSystemBytes, true, "XeSystem");
     const uint64_t vsConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XeVsConstants");
     const uint64_t psConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XePsConstants");
@@ -763,13 +793,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     {
         if (w.dwords == 0)
             continue;
-        // A plain CPU read of guest memory, as the present path (the guarded read is unit 7). Both ends
-        // of the window must sit in one view.
-        uint32_t guest = 0, guestEnd = 0;
-        if (!runtime::PhysicalToGuest(w.physical, guest) || !runtime::PhysicalToGuest(w.physical + w.dwords * 4 - 1, guestEnd) || guestEnd - guest != w.dwords * 4 - 1)
-            Stop(StopCode::Unimplemented, "renderer: draw %llu: vertex fetch slot %u (%08X, %u dwords) is not in one view", (unsigned long long)draw, w.slot,
-                 w.physical, w.dwords);
-        std::memcpy(ring + vertexAt + uint64_t(w.baseDword) * 4, base + guest, size_t(w.dwords) * 4);
+        // A plain CPU read of guest memory, as the present path (the guarded read is unit 7).
+        std::memcpy(ring + vertexAt + uint64_t(w.baseDword) * 4, windowBytes(w), size_t(w.dwords) * 4);
     }
     if (!indices.indices.empty())
         std::memcpy(ring + indexAt, indices.indices.data(), indices.indices.size() * 4);

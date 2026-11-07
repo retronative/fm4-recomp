@@ -30,7 +30,7 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
     const std::string where = std::string(d.info.name) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) + " at " + Hex(d.base.physical);
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 50, 51) this unit was checked for";
+        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 50, 51, 54) this unit was checked for";
         return p;
     }
     if (d.levelCount != 1)  // every observed constant has one level (mip address 0); DrawState samples base maps only

@@ -42,6 +42,8 @@ bool Has(const std::string& s, const char* what) { return s.find(what) != std::s
 //  U       06024802 0C261002 002CE27F 01281400 00000003 00000200: pitch 0x18 << 5 = 768, k_8 at 0C261000, 640x360
 //          (0x27F + 1, (0x2CE27F >> 13) + 1 = 0x168), as Y otherwise.
 const uint32_t kUi[6] = {1u << 31 | 0x0A0048FEu, 0x11A8F073u, 0x0059E4FFu, 0x01280D10u, 0x00000003u, 0x00000A00u};
+// The HDR resolve's destination as the next draws sample it (the local capture draw_c2d1 (not distributed) draw 27039 tex 0).
+const uint32_t kHdr[6] = {1u << 31 | 0x0A004802u, 0x1BB710B6u, 0x0059E4FFu, 0x01282C14u, 0x00000003u, 0x00000200u};
 const uint32_t kComp[6] = {1u << 31 | 0x0A0248FEu, 0x13F2B0B2u, 0x0059E4FFu, 0x01000C14u, 0x00000000u, 0x00000200u};
 const uint32_t kY[6] = {0x0A024802u, 0x0C180002u, 0x0059E4FFu, 0x01281400u, 0x00000003u, 0x00000200u};
 const uint32_t kU[6] = {0x06024802u, 0x0C261002u, 0x002CE27Fu, 0x01281400u, 0x00000003u, 0x00000200u};
@@ -147,6 +149,14 @@ void TestObservedConstants()
     Expect(cs.magFilter == vk::kFilterNearest && cs.minFilter == vk::kFilterNearest && cs.maxLod == 0.25f && cs.addressModeU == vk::kAddressClampToEdge,
            "composite sampler: point/point, base map, clamp to edge");
 
+    // kHdr by hand (Xenia xe_gpu_texture_fetch_t, xenos.h:1206-1307): dword 0 type 2, signs (bits 2-9) 0 -> unsigned, no
+    // gamma; tiled (bit 31), pitch bits 22-30 = 40 -> 1280. dword 1: format 0x36 = 54, endian (0xB6 >> 6) & 3 = 2 (8in32),
+    // base 1BB71000. dword 2: width 0x4FF + 1 = 1280, height 0x2CF + 1 = 720. dword 3 swizzle bits 1-12 = 0x60A: x 2 (Z),
+    // y 1 (Y), z 0 (X), w 3 (W) -> B G R A, the resolve's red/blue swap. Staging: 1280 x 720 x 4 = 3,686,400 bytes.
+    const PreparedTexture hdr = m.Prepare(kHdr, shader, false, kFull);
+    Expect(hdr.entry != nullptr && hdr.plan.stagingBytes == 3686400 && !hdr.binding.gamma &&
+               Components(hdr.binding, vk::kSwizzleB, vk::kSwizzleG, vk::kSwizzleR, vk::kSwizzleA),
+           "HDR resolve texture: k_2_10_10_10_AS_16_16_16_16 (54) 1280x720 8in32 at 1BB71000, B G R A, no gamma, 3,686,400 bytes");
     const PreparedTexture y = m.Prepare(kY, shader, false, kFull);
     const PreparedTexture u = m.Prepare(kU, shader, false, kFull);
     Expect(y.entry != nullptr && y.plan.stagingBytes == 921600 && u.entry != nullptr && u.plan.stagingBytes == 230400,
