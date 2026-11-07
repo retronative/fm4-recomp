@@ -34,6 +34,7 @@
 #include "kernel/objects.h"
 #include "kernel/threads.h"
 #include <atomic>
+#include <sys/mman.h>
 #include <chrono>
 #include <thread>
 #include <algorithm>
@@ -244,6 +245,29 @@ int main(int, char** argv)
     Expect(base[PPC_IMAGE_BASE] == 0x12, "a read-only page is still readable");
     Expect(ExitCodeOf([&] { *(volatile uint8_t*)(base + PPC_IMAGE_BASE) = 1; }) == int(StopCode::GuestFault),
            "a write to a read-only guest page stops (5)");
+    // M4 unit 7: the write-watch hook (guest_memory.h SetGuestWriteFaultHook), each case in a child. A hook
+    // that owns the read-only page makes its host page writable and returns true: the store completes and
+    // nothing stops. A hook that declines leaves the stop unchanged (the control).
+    static uint8_t* hookBase = nullptr;
+    static std::atomic<int> hookCalls{0};
+    hookBase = base;
+    Expect(ExitCodeOf([&] {
+               SetGuestWriteFaultHook([](uint32_t guest) {
+                   hookCalls++;
+                   if ((guest & ~0xFFFu) != uint32_t(PPC_IMAGE_BASE))
+                       return false;
+                   const uint64_t host = uint64_t(getpagesize());
+                   return mprotect(hookBase + (guest & ~(host - 1)), host, PROT_READ | PROT_WRITE) == 0;
+               });
+               *(volatile uint8_t*)(base + PPC_IMAGE_BASE + 1) = 0x9A;
+               _exit(base[PPC_IMAGE_BASE + 1] == 0x9A && base[PPC_IMAGE_BASE] == 0x12 && hookCalls == 1 ? 0 : 1);
+           }) == 0,
+           "a write fault the hook owns resumes: the store completes once, no stop");
+    Expect(ExitCodeOf([&] {
+               SetGuestWriteFaultHook([](uint32_t) { return false; });
+               *(volatile uint8_t*)(base + PPC_IMAGE_BASE) = 1;
+           }) == int(StopCode::GuestFault),
+           "CONTROL: a write fault the hook declines still stops (5)");
     Expect(ExitCodeOf([] { __builtin_trap(); }) == int(StopCode::Trap), "a translated trap stops (10)");
     Expect(ExitCodeOf([&] { PpcImportStop("KeTest", ctx); }) == int(StopCode::Import), "an import stub stops (3)");
     Expect(ExitCodeOf([&] { PpcResidualStop(0x1234, "test", 13, 0x5678); }) == int(StopCode::Residual), "a residual stop stops (4)");

@@ -155,9 +155,20 @@ VulkanDevice CreateVulkanDevice(bool validation)
     features.pNext = portabilityOffered ? &portability : nullptr;
     vkGetPhysicalDeviceFeatures2(d.gpu, &features);
     d.textureCompressionBC = features.features.textureCompressionBC == VK_TRUE;
+    // Pipeline features the renderer uses when offered: a feature a pipeline relies on must be enabled here, not only
+    // supported (VUID-VkPipelineRasterizationStateCreateInfo-depthClampEnable-00782).
+    d.depthClamp = features.features.depthClamp == VK_TRUE;
+    d.independentBlend = features.features.independentBlend == VK_TRUE;
+    // Required: every translated vertex shader stores to binding 5 (XeErrors, shader_glsl.cpp kVertexHeader), which needs
+    // vertexPipelineStoresAndAtomics (VUID-RuntimeSpirv-NonWritable-06341).
+    if (features.features.vertexPipelineStoresAndAtomics != VK_TRUE)
+        Stop(StopCode::Setup, "vulkan: the device lacks vertexPipelineStoresAndAtomics, which the translated vertex shaders need (XeErrors)");
     d.imageViewFormatSwizzle = portabilityOffered && portability.imageViewFormatSwizzle == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
     enabledFeatures.textureCompressionBC = d.textureCompressionBC ? VK_TRUE : VK_FALSE;
+    enabledFeatures.depthClamp = d.depthClamp ? VK_TRUE : VK_FALSE;
+    enabledFeatures.independentBlend = d.independentBlend ? VK_TRUE : VK_FALSE;
+    enabledFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
     VkPhysicalDevicePortabilitySubsetFeaturesKHR enabledPortability{};
     enabledPortability.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR;
     enabledPortability.imageViewFormatSwizzle = d.imageViewFormatSwizzle ? VK_TRUE : VK_FALSE;
@@ -179,8 +190,8 @@ VulkanDevice CreateVulkanDevice(bool validation)
     vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
     // The formats the first screens need, as the device reports them:
     // S sampled, C colour attachment, D depth/stencil attachment, B blit destination, T transfer destination (optimal tiling).
-    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, imageViewFormatSwizzle %s (portability subset %s)\n",
-                 d.textureCompressionBC ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
+    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s (portability subset %s)\n",
+                 d.textureCompressionBC ? "yes" : "NO", d.depthClamp ? "yes" : "NO", d.independentBlend ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
     static constexpr struct { VkFormat format; const char* name; } kFormats[] = {
         {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1_RGBA_UNORM (Xenos DXT1)"}, {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM (k_8_8_8_8)"},
         {VK_FORMAT_R8_UNORM, "R8_UNORM (k_8)"}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, "A2B10G10R10_UNORM (2_10_10_10 targets, format 54 front buffer)"},

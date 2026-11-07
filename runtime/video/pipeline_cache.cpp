@@ -284,7 +284,12 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
     VkPipelineInputAssemblyStateCreateInfo assembly{};
     assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     assembly.topology = HostTopology(key.topology);
-    assembly.primitiveRestartEnable = key.primitiveRestart ? VK_TRUE : VK_FALSE;
+    // Metal cannot disable primitive restart on strips (MoltenVK 1.4.2 warns VK_ERROR_FEATURE_NOT_PRESENT: the local capture
+    // draw_branch1 (not distributed)), so strip pipelines always enable it. Exact: restart fires only on index 0xFFFFFFFF, and no host index can
+    // be that value (guest restart is refused, draw_record.cpp; indices are masked to 24 bits; auto-index draws are non-indexed
+    // or use generated small indices). Lists keep it off, as Vulkan requires.
+    const bool strip = assembly.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || assembly.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
+    assembly.primitiveRestartEnable = (key.primitiveRestart || strip) ? VK_TRUE : VK_FALSE;
     VkPipelineViewportStateCreateInfo viewport{};
     viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewport.viewportCount = viewport.scissorCount = 1;  // dynamic

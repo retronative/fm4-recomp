@@ -19,7 +19,10 @@
 //                                          word (front_buffer.h swizzle evidence). X canary :1598-1601 writes
 //                                          VK_FORMAT_A8B8G8R8_UNORM_PACK32 here (a 4x8 format): recorded as a
 //                                          discrepancy, not followed.
-//      colour 3/12, 4-7, 14, 15             refused in M4 (edram.h SupportedKey; X :1602-1626 for later)
+//      colour storage 3 (2_10_10_10_FLOAT, VK_FORMAT_R16G16B16A16_SFLOAT (X :1601-1603, the host-render-target path;
+//        _AS_16_16_16_16; 7e3)           exact 7e3 storage is X's pixel-shader-interlock path only): rounded to 7e3
+//                                          only when a transfer packs it (edram_vk_plan.h Float32To7e3)
+//      colour 4-7, 14, 15                   refused in M4 (edram.h SupportedKey; X :1604-1626 for later)
 //      depth kD24S8                         VK_FORMAT_D24_UNORM_S8_UINT when vkGetPhysicalDeviceFormatProperties
 //                                          reports DEPTH_STENCIL_ATTACHMENT | SAMPLED for it (X :266-274,
 //                                          :1581-1588), else VK_FORMAT_D32_SFLOAT_S8_UINT. MVK maps it to
@@ -38,6 +41,7 @@
 //    the same format is the same bytes in the same layout, so its transfer is a plain copy (or nothing, if one
 //    image serves both Keys); under (a) it is a resolve-like draw each way. (a) is faithful to the console's
 //    coverage; (b) supersamples. Recommendation: (a) for M4, (b) measured at M5 against the console frames.
+//    IMPLEMENTED (edram_vk.cpp): (a).
 // 3. Render passes and framebuffers are cached by key (X vulkan_render_target_cache.h:38-90 RenderPassKey:
 //    samples, which of depth + 4 colour are used, their formats; :436-460 FramebufferKey: the render pass and the
 //    attachments' views; maps :877-880). A draw whose Binding keys equal the open pass's continues it; otherwise
@@ -56,6 +60,11 @@
 //                                             Compute cannot write multisampled images on Metal, so no compute
 //                                             transfer into a 4x target. Colour -> depth and depth-format changes
 //                                             are refused by the CPU model in M4 (unit 6b).
+//    IMPLEMENTED (edram_vk.cpp, edram_vk_plan.h ClassifyTransfer): only the observed transfers, all as draws: colour
+//    4x <-> 1x of storage 0/2 (UNORM views, the 32-bit packing when the formats differ, as X does for these formats:
+//    GetColorOwnershipTransferVulkanFormat returns the UNORM format for them, :1647-1651), depth 1x -> 4x (float
+//    copied, stencil bit by bit after a stencil clear: no VK_EXT_shader_stencil_export, no sampleRateShading; a 4x
+//    destination is drawn once per sample with a sample mask). No vkCmdCopyImage, no integer views.
 // 5. Clears (edram::ResolveClear): vkCmdClearAttachments with the rectangle inside a pass on that target (X
 //    :5340-5366), the depth value decoded as X does (kD24S8: UNorm24To32(bits >> 8); kD24FS8: Float20e4To32
 //    (bits >> 8) * 0.5), the stencil = bits & 0xFF. A clear draw by the title (D3D's fast clear) is
@@ -76,6 +85,8 @@
 //      fallback  (if the import fails on this device, UNRESOLVED until unit 4's device log): vkCmdCopyImageToBuffer
 //                into a staging buffer, a bounded wait, then the CPU tiles into guest memory with TiledOffset
 //                and marks it written. Rejected as the default (ForzaRecomp L T4: ~5 ms a resolve) but exact.
+//                IMPLEMENTED FIRST (edram_vk.cpp Resolve/Retired, edram_vk_plan.h ResolveToGuest): bitwise-equivalent
+//                destinations of a 1x source only; the renderer submits and retires the slot after each resolve.
 // 7. Present continues unchanged: VdSwap's XE_SWAP names the front buffer's physical address; Present
 //    (renderer.cpp) reads it from guest memory under the GPU guard and detiles it (front_buffer.h). A resolve
 //    that writes the front buffer through 6 is what makes the first drawn frame appear; no resolve-to-texture

@@ -4,6 +4,7 @@
 // The XMA decoder's registers, context array and imports (xma.h). Register handling after Xenia xenia-canary
 // 67f16c4e315f apu/xma_decoder.cc, xma_context.cc.
 #include "xma.h"
+#include "graphics.h"
 #include "imports.h"
 #include "virtual_memory.h"
 #include <cstdio>
@@ -223,7 +224,8 @@ void Report(const char* when)
 
 }  // namespace runtime::xma
 
-// recomp/mmio.h: device accesses. Addresses outside the XMA block are plain guest memory, as the unmarked macros.
+// recomp/mmio.h: device accesses. Addresses outside the XMA block are plain guest memory, as the unmarked macros; a
+// store to a DC_LUT register of the GPU also updates the gamma ramp (graphics.h OnGammaRampRegisterWritten).
 uint32_t PpcMmioLoad32(uint8_t* base, uint32_t address)
 {
     if (address - runtime::xma::kRegisterBase < runtime::xma::kRegisterBytes)
@@ -236,4 +238,7 @@ void PpcMmioStore32(uint8_t* base, uint32_t address, uint32_t value)
     if (address - runtime::xma::kRegisterBase < runtime::xma::kRegisterBytes)
         return runtime::xma::StoreRegister(base, address, value);
     *reinterpret_cast<volatile uint32_t*>(base + address) = __builtin_bswap32(value);
+    // The GPU's 64 KB register window (graphics.h): a store to a DC_LUT register also runs the gamma ramp's state machine.
+    if (address - runtime::gpu::kRegisterBase < 0x10000 && !(address & 3))
+        runtime::gpu::OnGammaRampRegisterWritten(base, (address - runtime::gpu::kRegisterBase) / 4, value, runtime::gpu::LutWriter::Cpu);
 }

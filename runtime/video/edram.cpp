@@ -47,9 +47,8 @@ bool SupportedKey(Key k, std::string& why)
     {
     case ColorFormat::k8_8_8_8:
     case ColorFormat::k2_10_10_10:
-        return true;  // the storage formats of 0, 1, 2 and 10
     case ColorFormat::k2_10_10_10_Float:
-        return Refuse(why, "colour format 2_10_10_10_FLOAT (7e3; storage of 3 and 12) is not supported in M4");
+        return true;  // the storage formats of 0, 1, 2, 10 and of 3, 12 (7e3: X xenos.h:394-404)
     case ColorFormat::k16_16:
     case ColorFormat::k16_16_Float:
     case ColorFormat::k32_Float:
@@ -460,22 +459,30 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     info.destSwap = (r.copyDestInfo >> 24) & 1;
     const uint32_t destNumber = (r.copyDestInfo >> 13) & 7;
     info.destPitch = r.copyDestPitch & 0x3FFF, info.destHeight = (r.copyDestPitch >> 16) & 0x3FFF;
+    // Every destination-side refusal names the whole copy, so one stop records its complete shape (a 7e3 source's
+    // resolve is always a converting one, X xenos.h:616-641, and its destination is not traced yet: NOTES.md).
+    const std::string shape = "resolve of colour " + std::to_string(srcSelect) + " (RB_COLOR_INFO format " + std::to_string(color.format) + ", storage " +
+                              std::to_string(info.source.Format()) + ", " + std::to_string(1u << uint32_t(info.msaa)) + "x, sample select " +
+                              std::to_string(uint32_t(info.sampleSelect)) + ") to texture format " + std::to_string(info.destFormat) + " (number " +
+                              std::to_string(destNumber) + ", exp bias " + std::to_string(info.destExpBias) + ", swap " +
+                              std::to_string(int(info.destSwap)) + ", endian " + std::to_string(info.destEndian) + ", command " + std::to_string(command) +
+                              "): ";
     if ((r.copyDestInfo >> 3) & 1)
-        return refuse("a resolve into a 3D (array) destination is not supported in M4");
+        return refuse(shape + "a resolve into a 3D (array) destination is not supported in M4");
     if (info.destEndian > 3)
-        return refuse("resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
+        return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
     // 32 bpp destinations only; bitwise-equivalent to the accepted sources (X xenos.h:616-641) or the
     // 8_8_8_8 <-> 2_10_10_10 unorm conversion that FM4's menus may use (HYPOTHESIS, NOTES.md).
     if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54)
-        return refuse("resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 50, 54 are)");
+        return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 50, 54 are)");
     if (destNumber != 0)
-        return refuse("resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
+        return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
     if (info.destExpBias != 0)
-        return refuse("resolve destination exponent bias " + std::to_string(info.destExpBias) + " is not supported in M4");
+        return refuse(shape + "resolve destination exponent bias " + std::to_string(info.destExpBias) + " is not supported in M4");
     if (info.destPitch == 0)
-        return refuse("resolve destination pitch is 0");
+        return refuse(shape + "resolve destination pitch is 0");
     if (info.command == CopyCommand::Raw)
-        return refuse("resolve copy command raw (0) has not been observed; convert (1) only in M4");
+        return refuse(shape + "resolve copy command raw (0) has not been observed; convert (1) only in M4");
     // :1146-1178 with bpp_log2 2: the base granularity is 32x32 texels (X xenos.h:1188-1195), so the copy's
     // origin is the 32x32 tile of (x0, y0) and the offset within it; the extent is X texture_util.h:297-303
     // GetTiledAddressLowerBound2D to texture_util.cc:490-518 GetTiledAddressUpperBound2D (+ 0x400 << 2).

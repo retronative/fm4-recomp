@@ -271,10 +271,14 @@
 //     saturates, as the 8-bit target would); w is unchanged. Xenia does the same in its
 //     host-render-target path and notes the hardware encodes after blending, so blending with
 //     a gamma target operates on encoded values here: APPROXIMATE.
-//     Colour 0: with XE_COLOR0_7E3 defined (a k_2_10_10_10_FLOAT target), RGB are clamped to
-//     [0, 31.875] and alpha to [0, 1], NaN and -0 to 0 (REFERENCE_DERIVED: Xenia's
-//     render_target_cache.cc clamps shader output for these targets, so blending sees clamped
-//     values; the guards keep NaN and -0 out, which Xenia's NClamp may not).
+//     Colour 0: with XE_COLOR0_7E3 defined (a k_2_10_10_10_FLOAT or _AS_16_16_16_16 target), RGB
+//     are clamped to [0, 31.875] and alpha to [0, 1], NaN and -0 to 0 (REFERENCE_DERIVED: the
+//     bounds are Xenia's for these formats, render_target_cache.cc:240-244 GetPSIColorFormatInfo,
+//     which clamps blending sources on its pixel-shader-interlock path only; Xenia's host-render-
+//     target path does not clamp in the shader, spirv_shader_translator_rb.cc:1390-1440, and only
+//     clamps when a transfer packs 7e3. Clamping here, before blending, is an FM4 Recomp choice:
+//     APPROXIMATE against both Xenia's host path and the hardware, which stores the blended result
+//     as 7e3. The guards keep NaN and -0 out, which NClamp may not).
 //   Predicate p0 (one bit per invocation, emitted as `bool xe_p0`). PRED_SETEs: p0 = a == 0
 //     (ordered: NaN gives 0), result 0.0 where p0 is set else 1.0; PRED_SETNEs: p0 = a != 0 (true
 //     for NaN, [X]'s OpFUnordNotEqual), result likewise; a = component (3 + swz[6:7]) & 3 of src3.

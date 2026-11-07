@@ -57,7 +57,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
 
 // Writes a register as the command processor does: scratch registers enabled in SCRATCH_UMSK are also written
 // big-endian to SCRATCH_ADDR + 4 n (Xenia command_processor.cc:448-459); a write to COHER_STATUS_HOST sets its
-// status bit 31 (:465-467).
+// status bit 31 (:465-467); a write to DC_LUT_RW_INDEX..DC_LUT_30_COLOR runs the gamma ramp's state machine (:469-574,
+// graphics.h OnGammaRampRegisterWritten).
 void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value);
 
 // The ring (VdInitializeRingBuffer, VdEnableRingBufferRPtrWriteBack; Xenia command_processor.cc:340-358): the

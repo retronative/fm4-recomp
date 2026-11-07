@@ -27,7 +27,11 @@ FILE* Open()
     {
         opened = true;
         if (const char* path = std::getenv("FM4_CP_TRACE"); path != nullptr && *path != '\0')
+        {
             file = std::fopen(path, "w");
+            if (file != nullptr)  // line-buffered: a stop _exits without flushing, and the failing draw's lines must survive
+                std::setvbuf(file, nullptr, _IOLBF, 1 << 16);
+        }
     }
     return capped ? nullptr : file;
 }
@@ -83,6 +87,12 @@ void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t viz
                              ReadRegister(base, 0x2112), ReadRegister(base, 0x2113), ReadRegister(base, 0x2114)));
     // DRAW_INDX (the textured draws so far): texture fetch constants of slots 0-2 (6 dwords each at 4800 + 6 * slot, Xenia
     // FETCH_00_0; the pixel shaders FM4's first screens load use slots 0-2 at most, reference/gpu/texture.md).
+    // Display gamma ramp registers (Xenia register_table.inc: DC_LUT_RW_MODE 1921, RW_INDEX 1922, SEQ_COLOR 1923, PWL_DATA 1924,
+    // 30_COLOR 1925, WRITE_EN_MASK 1927, DC_LUTA_CONTROL 1930), at a few draws: whether FM4 programs a ramp.
+    if (draw == 0 || draw == 1000 || draw == 10000 || draw == 20000)
+        Line(text, std::snprintf(text, sizeof text, "dclut draw %llu mode %08X index %08X seq %08X pwl %08X c30 %08X wen %08X ctl %08X\n",
+                                 (unsigned long long)draw, ReadRegister(base, 0x1921), ReadRegister(base, 0x1922), ReadRegister(base, 0x1923),
+                                 ReadRegister(base, 0x1924), ReadRegister(base, 0x1925), ReadRegister(base, 0x1927), ReadRegister(base, 0x1930)));
     // Resolves (RB_MODECONTROL 2208 = 6): RB_COPY_CONTROL 2318, RB_COPY_DEST_BASE 2319, RB_COPY_DEST_PITCH 231A, RB_COPY_DEST_INFO
     // 231B, RB_COPY_DEST_OFFSET 231D..231F, PA_SC_WINDOW_OFFSET 2080 / WINDOW_SCISSOR_TL 2081, and fetch constant 0 (the
     // resolve's destination texture; reference/gpu/edram.md: these were in no trace before).

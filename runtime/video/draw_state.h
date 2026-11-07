@@ -297,7 +297,11 @@ struct Program
     uint32_t paramGenPos = 0;             // SQ_CONTEXT_MISC bits 8-15
     bool scOutputScreenXy = false;        // SQ_CONTEXT_MISC bit 1
     uint32_t sampleControl = 0;           // SQ_CONTEXT_MISC bits 2-3 (xenos.h:846-850)
-    uint32_t paramShade = 0, samplingPattern = 0;  // SQ_INTERPOLATOR_CNTL bits 0-15, 16-31
+    // SQ_INTERPOLATOR_CNTL bits 0-15 (flat shading per interpolator), 16-31 (centroid / centre per interpolator, X
+    // registers.h:220-223). Recorded, not applied (APPROXIMATE): Xenia never reads param_shade (FM4 sets 00010001 on
+    // every UI draw, trace13; the decoder logs the first non-zero value once); Xenia uses sampling_pattern for
+    // centroid interpolation on multisampled targets (vulkan_pipeline_cache.cc:190-195), which is not modelled.
+    uint32_t paramShade = 0, samplingPattern = 0;
     uint32_t vsConstBase = 0, vsConstSize = 0, psConstBase = 0, psConstSize = 0;  // SQ_VS_CONST / SQ_PS_CONST bits 0-8, 12-20
 };
 

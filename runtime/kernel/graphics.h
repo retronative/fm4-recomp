@@ -5,6 +5,7 @@
 // Vd* imports set up. Design: reference/gpu/gpu_path.md; semantics from Xenia xenia-canary 67f16c4e315f
 // (src/xenia/gpu/graphics_system.cc, register_table.inc).
 #pragma once
+#include "gamma_ramp.h"
 #include <cstdint>
 
 namespace runtime::gpu {
@@ -30,6 +31,18 @@ namespace reg { constexpr uint32_t kCpRbWptr = 0x1C5, kScratchUmsk = 0x1DC, kScr
 void InitializeRegisters(uint8_t* base);
 uint32_t ReadRegister(const uint8_t* base, uint32_t index);
 void WriteRegister(uint8_t* base, uint32_t index, uint32_t value);
+
+// The display gamma ramp (gamma_ramp.h), as Xenia's command processor keeps it beside the register file
+// (command_processor.cc:83-100, :469-574). Called after register `index` (DC_LUT_RW_INDEX..DC_LUT_30_COLOR, otherwise
+// nothing) was written with `value`: runs the state machine on the register file's DC_LUT_RW_MODE, DC_LUT_WRITE_EN_MASK
+// and DC_LUT_RW_INDEX (which it updates). Xenia runs it for the command processor's register writes only
+// (CommandProcessor::WriteRegister :589-606; its MMIO handler, graphics_system.cc:235-251, stores the value without
+// it); here a CPU device store (recomp/mmio.h) runs it too, since both reach the same hardware register, and each
+// path is counted so a run shows which one FM4 uses. A data write in the other RW_MODE stops (7), naming it.
+enum class LutWriter { CommandProcessor, Cpu };
+void OnGammaRampRegisterWritten(uint8_t* base, uint32_t index, uint32_t value, LutWriter writer);
+struct GammaRampView { gamma::Ramp ramp; uint64_t cpWrites = 0, cpuWrites = 0; };
+GammaRampView CurrentGammaRamp();
 
 // The engines (VdInitializeEngines): HLE; the runtime's command processor is the engine, so the microcode
 // the guest passes is recorded but not run.

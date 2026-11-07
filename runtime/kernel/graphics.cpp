@@ -105,6 +105,34 @@ void WriteRegister(uint8_t* base, uint32_t index, uint32_t value) { Store32(base
 Engines& EngineState() { return engines; }
 
 namespace {
+std::mutex rampLock;
+gamma::Ramp ramp = gamma::DefaultRamp();
+uint64_t rampCpWrites = 0, rampCpuWrites = 0;
+}  // namespace
+
+void OnGammaRampRegisterWritten(uint8_t* base, uint32_t index, uint32_t value, LutWriter writer)
+{
+    if (!gamma::IsStateRegister(index))
+        return;
+    std::lock_guard guard(rampLock);
+    (writer == LutWriter::Cpu ? rampCpuWrites : rampCpWrites)++;
+    const uint32_t mode = ReadRegister(base, gamma::reg::kRwMode), enable = ReadRegister(base, gamma::reg::kWriteEnMask);
+    const uint32_t before = ReadRegister(base, gamma::reg::kRwIndex);
+    uint32_t rwIndex = before;
+    if (gamma::OnRegisterWritten(ramp, index, value, mode, enable, rwIndex) == gamma::Write::ModeMismatch)
+        Stop(StopCode::Unimplemented, "GPU: DC_LUT register %X written with %08X while DC_LUT_RW_MODE is %08X (Xenia asserts "
+             "against it, command_processor.cc:477/513/548; not modelled)", index, value, mode);
+    if (rwIndex != before)
+        WriteRegister(base, gamma::reg::kRwIndex, rwIndex);
+}
+
+GammaRampView CurrentGammaRamp()
+{
+    std::lock_guard guard(rampLock);
+    return {ramp, rampCpWrites, rampCpuWrites};
+}
+
+namespace {
 const char* gpuStopPath = nullptr;
 }  // namespace
 void SetGpuStopPath(const char* path) { gpuStopPath = path; }

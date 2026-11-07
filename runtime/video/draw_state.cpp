@@ -5,6 +5,7 @@
 // "FR" is ForzaRecomp runtime/gpu/render.cpp (facts and simplifications, re-derived here).
 #include "draw_state.h"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdio>
 
@@ -278,9 +279,21 @@ struct Decoder
         const uint32_t interp = Reg(xr::kSqInterpolatorCntl);  // X registers.h:217-227
         p.paramShade = interp & 0xFFFF;
         p.samplingPattern = interp >> 16;
-        const uint32_t used = in.ps->interpolatorCount >= 16 ? 0xFFFF : (1u << in.ps->interpolatorCount) - 1;
-        if (p.paramShade & used)
-            return Refuse("SQ_INTERPOLATOR_CNTL " + Hex(interp) + ": flat shading (param_shade) of an interpolator the pixel shader reads is not modelled");
+        // param_shade (flat shading per interpolator) is recorded, not refused: Xenia 67f16c4 never reads it (no use in
+        // draw_util.cc, spirv_shader_translator.cc, vulkan_command_processor.cc, vulkan_pipeline_cache.cc,
+        // texture_cache.cc, primitive_processor.cc; registers.h:220 only defines it), and FM4 sets 00010001 on every UI
+        // draw (CP trace13). APPROXIMATE: a flat interpolator is
+        // interpolated smoothly here, as in Xenia. Logged once (the decoder's only side effect).
+        // sampling_pattern IS read by Xenia: centroid interpolation per interpolator when the target is multisampled and
+        // SQ_CONTEXT_MISC sc_sample_cntl is 2 (vulkan_pipeline_cache.cc:190-195, xenos.h:862-874
+        // GetInterpolatorSamplingPattern). Recorded here and not applied (APPROXIMATE; on a 1X target it has no effect).
+        if (p.paramShade != 0)
+        {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true))
+                std::fprintf(stderr, "[draw] SQ_INTERPOLATOR_CNTL %08X: param_shade %04X recorded, not applied (Xenia ignores it; APPROXIMATE)\n",
+                             interp, p.paramShade);
+        }
         const uint32_t vsc = Reg(xr::kSqVsConst), psc = Reg(xr::kSqPsConst);  // X registers.h:229-252
         p.vsConstBase = vsc & 0x1FF, p.vsConstSize = (vsc >> 12) & 0x1FF;
         p.psConstBase = psc & 0x1FF, p.psConstSize = (psc >> 12) & 0x1FF;

@@ -5,18 +5,21 @@
 // no Vulkan, no guest memory, no translator run (the ShaderTranslation inputs are plain structs
 // filled by hand). Expected values are computed by hand from Xenia 67f16c4e315f's definitions
 // (registers.h, xenos.h, draw_util.cc; "X file:line") in the comment next to each check, never from
-// the decoder. Register values marked OBSERVED are FM4's own, from the local capture trace10 (not distributed) (a
-// headless run to swap 400; the CP trace logs, per draw, RB_SURFACE_INFO, RB_COLOR_INFO,
-// RB_DEPTH_INFO, RB_COLOR1_INFO, RB_MODECONTROL, PA_SC_WINDOW_SCISSOR_BR, VGT_DRAW_INITIATOR,
-// RB_COLOR_MASK, RB_DEPTHCONTROL, RB_BLENDCONTROL0, RB_COLORCONTROL, PA_CL_CLIP_CNTL,
-// PA_SU_SC_MODE_CNTL, PA_CL_VTE_CNTL and SQ_PROGRAM_CNTL), cited by line: 3 (draw 0, the first of
-// the 48 zero-surface point draws), 61 (draw 50, a point draw on the 4X target; 9648 such), 55
-// (draw 48, a clear; 1590), 267 (draw 226, a UI quad list; 357), 24971 (draw 19559, a UI rect
-// list; 38), 24931 (draw 19530, a triangle strip into a gamma target; 38), 269 (draw 227, a
-// resolve; 396). Every other register (PA_CL_VPORT_*, PA_SC_WINDOW_OFFSET and _SCISSOR_TL,
-// RB_STENCILREFMASK, RB_ALPHA_REF, RB_BLEND_*, the fetch constants, VGT_DMA_*) is not traced:
-// those values are CONSTRUCTED from the Direct3D 9 conventions or ForzaRecomp's observations
-// (milestones/M3-runtime.md), as each fixture says.
+// the decoder. Register values marked OBSERVED are FM4's own, from the local capture trace13 (not distributed) (a
+// headless run to swap 400; the CP trace logs, per draw, a `draw` line with RB_SURFACE_INFO,
+// RB_COLOR_INFO, RB_DEPTH_INFO, RB_COLOR1_INFO, RB_MODECONTROL, PA_SC_WINDOW_SCISSOR_BR,
+// VGT_DRAW_INITIATOR, RB_COLOR_MASK, RB_DEPTHCONTROL, RB_BLENDCONTROL0, RB_COLORCONTROL,
+// PA_CL_CLIP_CNTL, PA_SU_SC_MODE_CNTL, PA_CL_VTE_CNTL, SQ_PROGRAM_CNTL and a `state` line with the
+// viz-query token, PA_SC_VIZ_QUERY, VGT_OUTPUT_PATH_CNTL, SQ_INTERPOLATOR_CNTL, SQ_VS_CONST,
+// SQ_PS_CONST, PA_SC_WINDOW_OFFSET, PA_SC_WINDOW_SCISSOR_TL, PA_SU_VTX_CNTL, RB_STENCILREFMASK and
+// PA_CL_VPORT_XSCALE..ZOFFSET), cited by the `draw` line: 3 (draw 0, the first of the 48
+// zero-surface point draws), 670 (draw 304, a point draw on the 4X target; 9456 such), 662 (draw
+// 302, a clear; 1576), 601 (draw 276, a UI quad list; 355), 45817 (draw 19501, a UI rect list;
+// 39), 45744 (draw 19472, a triangle strip into a gamma target; 39), 607 (draw 277, a resolve;
+// 394). Every targeted draw has viz token 0, PA_SC_VIZ_QUERY 0, VGT_OUTPUT_PATH_CNTL 0, window
+// offset and scissor TL 0. Not traced (RB_ALPHA_REF, RB_BLEND_*, the fetch constants, VGT_DMA_*):
+// CONSTRUCTED from the Direct3D 9 conventions or ForzaRecomp's observations (milestones/
+// M3-runtime.md), as each fixture says.
 // "CONTROL" names a negative control: a wrong state that must be refused, with its register named.
 //
 //   tests/run_draw_state_tests.sh
@@ -63,8 +66,10 @@ struct File
     {
         regs[xr::kPaScScreenScissorBr] = 0x20002000;  // 8192 x 8192: Direct3D 9 never uses the screen scissor (X draw_util.cc:681-682)
         regs[xr::kVgtMaxVtxIndx] = 0xFFFFFF;
-        regs[xr::kSqPsConst] = 0x000FF100;  // base 256, size 255 (bits 0-8, 12-20; X registers.h:242-252)
-        regs[xr::kSqVsConst] = 0x000FF000;  // base 0, size 255
+        regs[xr::kSqPsConst] = 0x000FF100;  // OBSERVED (trace13 every targeted draw) psconst 000FF100: base 256, size 255 (bits 0-8, 12-20; X registers.h:242-252)
+        regs[xr::kSqVsConst] = 0x000FF000;  // OBSERVED vsconst 000FF000: base 0, size 255
+        regs[xr::kSqInterpolatorCntl] = 0x00010001;  // OBSERVED interp 00010001 on 21,372 of 21,648 draws: param_shade bit 0, sampling_pattern bit 0 (recorded, not applied)
+        regs[xr::kPaSuVtxCntl] = 4;  // OBSERVED vtxcntl 00000004 (points, clears, strips, resolves): pix_center 0 (half pixel), round_mode 2
     }
 };
 
@@ -107,7 +112,7 @@ File RectClear()
     f[xr::kVgtDrawInitiator] = 0x00030088;     // OBSERVED initiator: rect list (8), auto index (2 << 6 = 0x80), 3 indices
     f[xr::kRbColorMask] = 0xFFFF;              // OBSERVED colormask 0000FFFF: every component of colour 0-3 (only colour 0 is decoded)
     f[xr::kRbDepthControl] = 0x8777;           // OBSERVED depthctl 00008777: stencil on (bit 0), z on (1), z write (2), zfunc 7 (bits 4-6), stencilfunc 7 (8-10), zpass replace 2 (14-16)
-    f[xr::kRbStencilRefMask] = 0x00FFFF01;     // CONSTRUCTED: ref 1, mask FF, write mask FF
+    f[xr::kRbStencilRefMask] = 0x00FF0000;     // OBSERVED (trace13 line 663) stencilref 00FF0000: ref 0, compare mask 0, write mask FF (the clear writes stencil 0)
     f[xr::kRbBlendControl0] = 0x00010001;      // OBSERVED blend0 00010001: one / zero / add, colour and alpha: no blending
     f[xr::kRbColorControl] = 0;                // OBSERVED colorctl 00000000
     f[xr::kPaClClipCntl] = 0x00010000;         // OBSERVED clip 00010000: clip_disable (bit 16), dx_clip_space_def clear: screen-space draw (X draw_util.cc:248-271)
@@ -128,9 +133,11 @@ File RectClear()
 // at tile 0 with D24FS8 at 720, scissor 1280 x 720, a 32-vertex auto-indexed quad list, depth test off, alpha
 // blending src alpha / inv src alpha, the alpha test enabled with function ALWAYS, back faces culled with
 // clockwise fronts, MSAA and window offset enabled, every viewport scale and offset enabled with vtx_w0_fmt.
-// Not traced, CONSTRUCTED: the Direct3D 9 viewport for 1280 x 720 at depth 0..1 (PA_CL_VPORT x scale 640,
-// x offset 640, y scale -360, y offset 360, z scale 1, z offset 0), the blend constants, the fetch constants
-// (a linear k_8_8_8_8 and a tiled gamma DXT1, formats FR saw on the welcome screen).
+// trace13 (line 602, the `state` line of the same draw): the viewport PA_CL_VPORT x scale 640, x offset 640, y scale
+// -360, y offset 360, **z scale -1, z offset 1** (a reversed depth range: Direct3D 9 MinZ 1, MaxZ 0), PA_SU_VTX_CNTL 5
+// (pix_center 1: no half-pixel offset; round_mode 2), RB_STENCILREFMASK 00FFFF00, SQ_INTERPOLATOR_CNTL 00010001.
+// Not traced, CONSTRUCTED: the blend constants, the fetch constants (a linear k_8_8_8_8 and a tiled gamma DXT1,
+// formats FR saw on the welcome screen).
 File UiQuad()
 {
     File f;
@@ -150,12 +157,14 @@ File UiQuad()
     f[xr::kPaSuScModeCntl] = 0x00018006;       // OBSERVED sumode: cull back (bit 1), front is CW (bit 2), msaa_enable (15), vtx_window_offset_enable (16)
     f[xr::kPaClClipCntl] = 0x00080000;         // OBSERVED clip: dx_clip_space_def, clipping on
     f[xr::kPaClVteCntl] = 0x43F;               // OBSERVED vte: every scale and offset enabled (bits 0-5), vtx_w0_fmt (bit 10)
-    f[xr::kPaClVportXScale + 0] = F(640.0f);   // CONSTRUCTED (PA_CL_VPORT_* are not traced)
+    f[xr::kPaClVportXScale + 0] = F(640.0f);   // OBSERVED vport 44200000 44200000 C3B40000 43B40000 BF800000 3F800000 (trace13 line 602)
     f[xr::kPaClVportXScale + 1] = F(640.0f);
     f[xr::kPaClVportXScale + 2] = F(-360.0f);
     f[xr::kPaClVportXScale + 3] = F(360.0f);
-    f[xr::kPaClVportXScale + 4] = F(1.0f);
-    f[xr::kPaClVportXScale + 5] = F(0.0f);
+    f[xr::kPaClVportXScale + 4] = F(-1.0f);
+    f[xr::kPaClVportXScale + 5] = F(1.0f);
+    f[xr::kPaSuVtxCntl] = 5;                   // OBSERVED vtxcntl 00000005: pix_center 1 (no half pixel), round_mode 2
+    f[xr::kRbStencilRefMask] = 0x00FFFF00;     // OBSERVED stencilref 00FFFF00: ref 0, compare mask FF, write mask FF (stencil is off)
     f[xr::kSqProgramCntl] = 0x10010001;        // OBSERVED program: vs_num_reg 1, ps_num_reg 0, vs_resource (bit 16), ps_export_mode 2 (bits 27-30)
     f[xr::kFetchConstants + 0] = 0x1B480003;   // CONSTRUCTED vertex slot 0 (words 0-1): type 3, address 0x1B480000
     f[xr::kFetchConstants + 1] = (40u << 2);   // 40 words, endian 0
@@ -293,10 +302,12 @@ void TestRectClear()
     // Depth/stencil 0x8777 with RB_STENCILREFMASK 00FFFF01.
     const DepthStencil& s = d.depthStencil;
     Expect(s.stencilEnable && s.zEnable && s.zWriteEnable && s.zFunc == 7 && !s.backfaceEnable, "depth: on, write, always; stencil on");
-    Expect(s.front.func == 7 && s.front.fail == 0 && s.front.zPass == 2 && s.front.zFail == 0 && s.front.ref == 1 && s.front.compareMask == 0xFF &&
+    // RB_STENCILREFMASK 00FF0000 (X registers.h:767-777): ref bits 0-7 = 0, compare mask bits 8-15 = 0, write mask bits 16-23 = FF.
+    Expect(s.front.func == 7 && s.front.fail == 0 && s.front.zPass == 2 && s.front.zFail == 0 && s.front.ref == 0 && s.front.compareMask == 0 &&
                s.front.writeMask == 0xFF,
-           "stencil front: always, keep, replace, keep, ref 1, masks FF");
-    Expect(s.back.func == 7 && s.back.zPass == 2 && s.back.ref == 1, "stencil back = front when backface_enable is 0");
+           "stencil front: always, keep, replace, keep, ref 0, compare mask 0, write mask FF");
+    Expect(s.back.func == 7 && s.back.zPass == 2 && s.back.ref == 0 && s.back.writeMask == 0xFF, "stencil back = front when backface_enable is 0");
+    Expect(d.program.paramShade == 1 && d.program.samplingPattern == 1, "interp 00010001 recorded: param_shade 1, sampling_pattern 1");
     Expect(!d.blend.enabled && d.blend.srcColor == 1 && d.blend.dstColor == 0 && d.blend.colorOp == 0, "blend 00010001: disabled");
     Expect(!d.alphaTest.enabled, "alpha test off");
     Expect(d.colorWriteMask == 0xF, "colour mask F");
@@ -373,10 +384,13 @@ void TestRectClear()
     CONTROL(Decode(g, vs, ps), "vertex export mode 4");
     g = RectClear(), g[xr::kSqProgramCntl] = 1u << 31;  // gen_index_vtx
     CONTROL(Decode(g, vs, ps), "index generation");
+    // SQ_INTERPOLATOR_CNTL is recorded, never refused (Xenia does not read it; FM4 sets 00010001 on every UI draw).
     g = RectClear(), g[xr::kSqInterpolatorCntl] = 0x1;  // flat interpolator 0, which the PS reads
-    CONTROL(Decode(g, vs, ps), "flat shading");
-    g = RectClear(), g[xr::kSqInterpolatorCntl] = 0x2;  // flat interpolator 1: not read (PS reads 1)
-    Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "flat shading of an unread interpolator is accepted");
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.program.paramShade == 1 && d.program.samplingPattern == 0, "flat shading of a read interpolator is accepted and recorded");
+    g = RectClear(), g[xr::kSqInterpolatorCntl] = 0xFFFF0002;  // flat interpolator 1 (not read), every sampling bit
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.program.paramShade == 2 && d.program.samplingPattern == 0xFFFF, "SQ_INTERPOLATOR_CNTL FFFF0002 recorded");
     g = RectClear(), g[xr::kSqVsConst] = 1;
     CONTROL(Decode(g, vs, ps), "SQ_VS_CONST");
     g = RectClear();
@@ -494,14 +508,24 @@ void TestTextured()
            "1280 x 720 at 1X: 720 rows");
     Expect(d.scissor.x == 0 && d.scissor.y == 0 && d.scissor.width == 1280 && d.scissor.height == 720, "scissor 1280 x 720");
     // Viewport: all enables set, D3D9 values; + 0.5; clipping with dx clip space.
+    // vport (observed): x 640 / 640, y -360 / 360, z scale -1 / offset 1; vtxcntl 5: pix_center 1, so no half pixel (X draw_util.cc:329-332).
     Expect(d.viewport.scale[0] == 640 && d.viewport.offset[0] == 640 && d.viewport.scale[1] == -360 && d.viewport.offset[1] == 360 &&
-               d.viewport.scale[2] == 1 && d.viewport.offset[2] == 0 && d.viewport.offsetAddXy[0] == 0.5f && !d.viewport.clipDisabled && d.viewport.dxClipSpace,
-           "viewport 1280 x 720 D3D9 values");
-    // Fold for the 1280 x 720 target: x scale 640 * 2 / 1280 = 1, offset (640.5) * 2 / 1280 - 1 = 1 / 1280; y scale -1, offset 1 / 720;
-    // z: dx clip space -> range offset..offset + scale = 0..1, ndc z untouched (X draw_util.cc:437-441).
+               d.viewport.scale[2] == -1 && d.viewport.offset[2] == 1 && d.viewport.offsetAddXy[0] == 0 && d.viewport.offsetAddXy[1] == 0 &&
+               !d.viewport.clipDisabled && d.viewport.dxClipSpace,
+           "viewport 1280 x 720 D3D9 values, reversed z, pixel centres");
+    // Fold for the 1280 x 720 target: x scale 640 * 2 / 1280 = 1, offset 640 * 2 / 1280 - 1 = 0; y scale -1, offset 360 * 2 / 720 - 1 = 0;
+    // z: dx clip space -> near = offset = 1, far = offset + scale = 0 (X draw_util.cc:437-441, :508-509): a reversed range kept as is
+    // (Vulkan permits minDepth > maxDepth; Xenia swaps it for Direct3D 12 only, :513-517), ndc z untouched.
     const HostViewport h = FoldViewport(d.viewport, 1280, 720);
-    Expect(Near(h.scale[0], 1) && Near(h.offset[0], 1.0f / 1280) && Near(h.scale[1], -1) && Near(h.offset[1], 1.0f / 720), "fold 1280x720: unit scales, half-pixel offsets");
-    Expect(h.scale[2] == 1 && h.offset[2] == 0 && h.zMin == 0 && h.zMax == 1, "fold: dx clip space z 0..1");
+    Expect(h.scale[0] == 1 && h.offset[0] == 0 && h.scale[1] == -1 && h.offset[1] == 0, "fold 1280x720: unit scales, no half-pixel offset");
+    Expect(h.scale[2] == 1 && h.offset[2] == 0 && h.zMin == 1 && h.zMax == 0, "fold: dx clip space, reversed depth range 1..0");
+    {
+        // The same with pix_center 0 (vtxcntl 4): + 0.5 pixel -> x offset 1 / 1280, y offset 1 / 720.
+        File c = Textured();
+        c[xr::kPaSuVtxCntl] = 4;
+        const HostViewport hc = FoldViewport(Decode(c, vs, ps).viewport, 1280, 720);
+        Expect(Near(hc.offset[0], 1.0f / 1280) && Near(hc.offset[1], 1.0f / 720), "fold with pix_center 0: half-pixel offsets");
+    }
     // The OpenGL-style clip space (dx_clip_space_def 0) with z scale 0.5, offset 0.5: range 0..1 and ndc z * 0.5 + 0.5 (:442-494).
     GuestViewport gl = d.viewport;
     gl.dxClipSpace = false, gl.scale[2] = 0.5f, gl.offset[2] = 0.5f;
@@ -666,50 +690,81 @@ void TestTextured()
     CONTROL(Decode(g, vs, ps, 0x10, 0), "draw opcode 00000010");
 }
 
-// The remaining distinct states of trace10 (OBSERVED; the untraced registers as the fixtures above).
+// Every distinct `draw` + `state` combination of trace13 (13 of them, OBSERVED; the `state` line follows each `draw`
+// line) decodes to Draw, NoWrite or Resolve. The fixtures above carry the three most common; the rest are here, each
+// named by the line of its first `draw`.
 void TestObservedStates()
 {
     const ShaderTranslation vs = Vs({0}, {5}, {5}, 1), ps = Ps(1);
-    // Line 272, draw 228 (9491 such): the point draw on the 1X surface, colorctl 87000007 (alpha-to-mask offsets, test off,
-    // its enable bit 4 clear): NoWrite before any of that is looked at.
+    // Line 612, draw 278 (9449 such): the point draw on the 1X surface, colorctl 87000007 (alpha-to-mask offsets, test off,
+    // its enable bit 4 clear), stencilref 00FFFF00, the reversed viewport z (-1 / 1): NoWrite before any of that is looked at.
+    // Lines 111 (216 such, interp 0) and 45690 (24, interp 00010001, z 1 / 0) differ only in those recorded registers.
     File p = PointDraw();
     p[xr::kRbSurfaceInfo] = 0x14000500, p[xr::kRbColorInfo] = 0x00020000, p[xr::kRbDepthInfo] = 0x000102D0;
-    p[xr::kRbBlendControl0] = 0x00010001, p[xr::kRbColorControl] = ((0x87u << 24) | 7);
-    Expect(Decode(p, Vs(), Ps(0)).kind == DrawKind::NoWrite, "line 272: point draw on the 1X surface is NoWrite");
-    // Line 24971, draw 19559 (38 such): the UI rect list, initiator 00180088 = rect list (8), auto, 24 indices.
+    p[xr::kRbBlendControl0] = 0x00010001, p[xr::kRbColorControl] = ((0x87u << 24) | 7), p[xr::kRbStencilRefMask] = 0x00FFFF00;
+    p[xr::kPaClVportXScale + 4] = F(-1.0f), p[xr::kPaClVportXScale + 5] = F(1.0f);
+    Expect(Decode(p, Vs(), Ps(0)).kind == DrawKind::NoWrite, "line 612: point draw on the 1X surface is NoWrite");
+    p[xr::kSqInterpolatorCntl] = 0, p[xr::kRbSurfaceInfo] = 0x0A020280, p[xr::kRbColorControl] = 0, p[xr::kRbStencilRefMask] = 0x00FF0000;
+    p[xr::kPaClVportXScale + 4] = F(1.0f), p[xr::kPaClVportXScale + 5] = F(0.0f);
+    Expect(Decode(p, Vs(), Ps(0)).kind == DrawKind::NoWrite, "line 111: 4X point draw with interp 0 is NoWrite");
+    // Line 103, draw 48 (12 such): the clear with interp 0 (the first clears of a run, before SQ_INTERPOLATOR_CNTL is set).
+    File c = RectClear();
+    c[xr::kSqInterpolatorCntl] = 0;
+    DrawState d = Decode(c, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.program.paramShade == 0, "line 103: clear with interp 0 is Draw");
+    // Line 45817, draw 19501 (39 such): the UI rect list, initiator 00180088 = rect list (8), auto, 24 indices; otherwise the quad's state
+    // (line 601: vtxcntl 5, stencilref 00FFFF00, z -1 / 1, interp 00010001).
     File r = UiQuad();
     r[xr::kVgtDrawInitiator] = 0x00180088;
-    DrawState d = Decode(r, vs, ps);
+    d = Decode(r, vs, ps);
     Expect(d.kind == DrawKind::Draw && d.hostPrimitive == HostPrimitive::RectList && d.indices.count == 24 && !d.indices.indexed && d.systemFlags == 4,
-           "line 24971: UI rect list, 24 auto indices, xe_flags 4");
-    // Line 24931, draw 19530 (38 such): a 4-vertex triangle strip into the k_8_8_8_8_GAMMA target (color 00010000), no blending
+           "line 45817: UI rect list, 24 auto indices, xe_flags 4");
+    Expect(d.depthStencil.front.ref == 0 && d.depthStencil.front.compareMask == 0xFF && d.depthStencil.front.writeMask == 0xFF && !d.depthStencil.stencilEnable,
+           "line 45817: stencilref 00FFFF00 decoded (ref 0, masks FF), stencil off");
+    Expect(d.program.paramShade == 1 && d.program.samplingPattern == 1 && d.program.vsConstBase == 0 && d.program.psConstBase == 256 &&
+               d.program.vsConstSize == 255 && d.program.psConstSize == 255,
+           "line 45817: interp 00010001, vsconst 000FF000, psconst 000FF100 recorded");
+    // Line 45744, draw 19472 (39 such): a 4-vertex triangle strip into the k_8_8_8_8_GAMMA target (color 00010000), no blending
     // (00010001), colorctl 87000007, clip 00090000 (clip_disable and dx_clip_space_def), sumode 00018000 (msaa, window offset),
     // vte 00000400 (no viewport scale or offset: identity; vtx_w0_fmt), program 10010401 (vs 1, ps_num_reg 4, vs_resource,
-    // ps_export_mode 2), depthctl 00700730.
+    // ps_export_mode 2), depthctl 00700730, vtxcntl 4 (half pixel), stencilref 00FFFF00, vport z 1 / 0 (unused: vte enables 0).
     File s = UiQuad();
     s[xr::kVgtDrawInitiator] = 0x00040086, s[xr::kRbColorInfo] = 0x00010000, s[xr::kRbBlendControl0] = 0x00010001;
     s[xr::kRbColorControl] = ((0x87u << 24) | 7), s[xr::kPaClClipCntl] = 0x00090000, s[xr::kPaSuScModeCntl] = 0x00018000;
-    s[xr::kPaClVteCntl] = 0x400, s[xr::kSqProgramCntl] = 0x10010401;
+    s[xr::kPaClVteCntl] = 0x400, s[xr::kSqProgramCntl] = 0x10010401, s[xr::kPaSuVtxCntl] = 4;
+    s[xr::kPaClVportXScale + 4] = F(1.0f), s[xr::kPaClVportXScale + 5] = F(0.0f);
     d = Decode(s, vs, ps);
-    Expect(d.kind == DrawKind::Draw && d.error.empty(), "line 24931: triangle strip into the gamma target: Draw");
+    Expect(d.kind == DrawKind::Draw && d.error.empty(), "line 45744: triangle strip into the gamma target: Draw");
     if (d.kind != DrawKind::Draw)
         std::printf("  (%s)\n", d.error.c_str());
     Expect(d.hostPrimitive == HostPrimitive::TriangleStrip && d.indices.count == 4 && d.target.colorFormat == 1 && !d.blend.enabled && !d.alphaTest.enabled,
-           "line 24931: strip of 4, k_8_8_8_8_GAMMA, no blend, no alpha test");
+           "line 45744: strip of 4, k_8_8_8_8_GAMMA, no blend, no alpha test");
     Expect(!d.cullBack && !d.cullFront && d.msaaEnable && d.viewport.clipDisabled && d.viewport.dxClipSpace && d.systemFlags == 4 &&
                d.viewport.scale[0] == 1 && d.viewport.scale[1] == 1 && d.viewport.offset[1] == 0 && d.viewport.offsetAddXy[0] == 0.5f,
-           "line 24931: no culling, clipping disabled, identity viewport with the half pixel, xe_flags 4");
+           "line 45744: no culling, clipping disabled, identity viewport with the half pixel, xe_flags 4");
     Expect(d.program.vsNumReg == 1 && d.program.psNumReg == 4 && d.program.vsResource && d.program.psExportMode == 2, "program 10010401");
     // With clipping disabled the fold passes z through and the identity viewport maps pixels to the 1280 x 720 target.
     const HostViewport h = FoldViewport(d.viewport, 1280, 720);
     Expect(Near(h.scale[0], 2.0f / 1280) && Near(h.offset[0], 1.0f / 1280 - 1.0f) && h.scale[2] == 1 && h.offset[2] == 0 && h.zMin == 0 && h.zMax == 1,
-           "line 24931: screen-space fold");
-    // Line 269, draw 227 (396 such): mode 6 with the clear's packet on the 1X surface, program 00010002: a resolve, decoded elsewhere.
+           "line 45744: screen-space fold");
+    // Line 607, draw 277 (394 such; 45750: 39 with colour 0 and z 1 / 0; 45685: 1): mode 6 with the clear's packet on the 1X
+    // surface, program 00010002, vtxcntl 4, interp 00010001, z -1 / 1: a resolve, decoded elsewhere.
     File q = UiQuad();
     q[xr::kRbModeControl] = 6, q[xr::kVgtDrawInitiator] = 0x00030088, q[xr::kRbColorInfo] = 0x00020000, q[xr::kRbDepthControl] = 0;
     q[xr::kRbBlendControl0] = 0x00010001, q[xr::kRbColorControl] = ((0x87u << 24) | 7), q[xr::kPaClClipCntl] = 0x00010000, q[xr::kPaSuScModeCntl] = 0x00010000;
-    q[xr::kPaClVteCntl] = 0x300, q[xr::kSqProgramCntl] = 0x00010002;
-    Expect(Decode(q, vs, ps).kind == DrawKind::Resolve, "line 269: mode 6 is a resolve");
+    q[xr::kPaClVteCntl] = 0x300, q[xr::kSqProgramCntl] = 0x00010002, q[xr::kPaSuVtxCntl] = 4;
+    Expect(Decode(q, vs, ps).kind == DrawKind::Resolve, "line 607: mode 6 is a resolve");
+    q[xr::kRbColorInfo] = 0, q[xr::kPaClVportXScale + 4] = F(1.0f), q[xr::kPaClVportXScale + 5] = F(0.0f);
+    Expect(Decode(q, vs, ps).kind == DrawKind::Resolve, "line 45750: mode 6 with colour 0 is a resolve");
+    // The reversed depth range of the UI draws through the fold with clipping: a viewport z scale -1, offset 1 folds to
+    // zMin 1, zMax 0 whether or not the depth test is on (X draw_util.cc:437-441, :508-509; kept reversed).
+    File u = UiQuad();
+    GuestViewport gv = Decode(u, vs, ps).viewport;
+    HostViewport hr = FoldViewport(gv, 1280, 720);
+    Expect(hr.zMin == 1 && hr.zMax == 0 && hr.scale[2] == 1 && hr.offset[2] == 0, "UI viewport z -1 / 1: reversed range 1..0, ndc z untouched");
+    gv.dxClipSpace = false;  // the -W..W form of the same registers: near = 1 - (-1) = 2 -> 1, far = 1 + (-1) = 0
+    hr = FoldViewport(gv, 1280, 720);
+    Expect(hr.zMin == 1 && hr.zMax == 0 && hr.scale[2] == 0.5f && hr.offset[2] == 0.5f, "the same in -W..W clip space: saturated 1..0");
 }
 
 }  // namespace

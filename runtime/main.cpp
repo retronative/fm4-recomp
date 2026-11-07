@@ -194,6 +194,7 @@ int main(int argc, char** argv)
     const auto header = ReadChecked(xexPath, fm4::kHeaderSize, fm4::kHeaderCrc32, false);
 
     base = runtime::ReserveGuestMemory();
+    video.guestBase = base;  // the EDRAM unit's resolve writes (video/renderer.h Options::guestBase)
     runtime::InitializeHeaps(base);  // the guest's virtual and physical heaps (kernel/virtual_memory.h)
     runtime::gpu::InitializeRegisters(base);  // the GPU register page (kernel/graphics.h)
     runtime::CommitGuestMemory(base, fm4::kImageBase, fm4::kImageSize);

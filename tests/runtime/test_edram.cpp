@@ -139,7 +139,9 @@ void TestTileMath()
     CHECK(SupportedKey(Key::Depth(0, 16, Msaa::X1, DepthFormat::D24S8), why));
     CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), why));
     CONTROL(SupportedKey(k64, why));
-    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why));
+    CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why) &&
+          SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), why));  // storage 3 (7e3)
+    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16), why));
     CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why));
     CONTROL(SupportedKey(Key{}, why));
 }
@@ -439,10 +441,27 @@ void TestBindCases()
     CONTROL(b.ok);
     CHECK(b.refusal.find("2x MSAA") != std::string::npos);
     r = Fm4Bind();
-    r.colorInfo[0] = 0x00030000;  // 7e3 float
+    r.colorInfo[0] = 0x00040000;  // k_16_16: 32 bpp, outside the whitelist
     b = Bind(o, r, 360);
     CONTROL(b.ok);
     CHECK(o.Count(kAd) == before.Count(kAd) && o.Count(kAc) == before.Count(kAc));
+
+    // 7e3 (formats 3 and 12, storage 3: X xenos.h:394-404). ForzaRecomp OBSERVED FM4's first 7e3 draw as a 640x360 4x
+    // clear into RB_COLOR_INFO 0x00030000, base 0 like the 2_10_10_10 scene target kAc: after
+    // the scene binding, the 7e3 key takes tiles 0-719 from kAc (X ChangeOwnership, render_target_cache.cc:1539-1699);
+    // the depth key is unchanged, so nothing moves there. Format 12 is the same key (no transfer).
+    const Key k7e3 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float);  // 0 | 16 << 11 | 2 << 19 | 3 << 22 = 0xD08000
+    CHECK(k7e3.packed == 0xD08000u && k7e3.Width() == 640 && k7e3.Height() == 1024 && !k7e3.Is64bpp());
+    Ownership h;
+    CHECK(Bind(h, Fm4Bind(), 360).ok);
+    r = Fm4Bind();
+    r.colorInfo[0] = 0x00030000;
+    b = Bind(h, r, 360);
+    CHECK(b.ok && b.color[0] == k7e3 && b.transfers[1] == T({{0, 720, kAc}}) && b.depth == kAd && b.transfers[0].empty() && h.Count(k7e3) == 720);
+    r.colorInfo[0] = 0x000C0000;
+    b = Bind(h, r, 360);
+    CHECK(b.ok && b.color[0] == k7e3 && b.transfers[1].empty());
+    CONTROL(b.ok && b.color[0] == Key::Color(0, 16, Msaa::X4, ColorFormat(12)));  // 12 is never a key's format
 }
 
 // The configurations our disc uses, OBSERVED in the local capture trace10 (not distributed) (a headless run to swap 400, the CP
@@ -555,8 +574,8 @@ void TestTrace10()
     r.depthControl = 0x1;
     b = Bind(o, r, 360);
     CHECK(b.ok && b.depth == kAd);
-    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 3-9,
-    // 11-15 at the 4x pitch; 2x MSAA; the 1x pitch with 64 bpp).
+    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 4-9,
+    // 11, 13-15 at the 4x pitch; 2x MSAA; the 1x pitch with 64 bpp); 3 and 12 (7e3, storage 3) are accepted.
     for (uint32_t f = 3; f <= 15; f++)
     {
         if (f == 10)
@@ -565,7 +584,10 @@ void TestTrace10()
         r.surfaceInfo = 0x14000500, r.modeControl = 4, r.colorMask = 0xF, r.depthControl = 0x8777;
         r.depthInfo = kFm4Depth, r.colorInfo[0] = f << 16;
         Ownership scratch;
-        CONTROL(Bind(scratch, r, 720).ok);
+        if (f == 3 || f == 12)
+            CHECK(Bind(scratch, r, 720).ok);
+        else
+            CONTROL(Bind(scratch, r, 720).ok);
     }
     std::string why;
     CHECK(SupportedKey(kAc, why) && SupportedKey(kAd, why) && SupportedKey(k1x2, why) && SupportedKey(k1x0, why));
@@ -723,6 +745,14 @@ void TestResolveDecode()
     CHECK(refused(r, "64 bpp"));
     r = Fm4Resolve(), r.colorInfo[0] = 0x00080000;  // unknown source format
     CHECK(refused(r, "unknown"));
+    // A 7e3 source (format 12 keys storage 3) decodes; ForzaRecomp's OBSERVED FM4 menu resolve shape (its
+    // tests/video/test_renderer.cpp:1210-1215, a HYPOTHESIS for our disc): 4x, k0123, into k_2_10_10_10 (7) with exp bias
+    // -1 (bits 16-21 = 0x3F), swap, endian 2. The refusal names the whole shape (one stop records it all).
+    r = Fm4Resolve(), r.colorInfo[0] = 0x000C0000;
+    CHECK(DecodeResolve(r).ok && DecodeResolve(r).source == Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float));
+    r.copyDestInfo = 2 | 7u << 7 | 0x3Fu << 16 | 1u << 24;
+    CHECK(refused(r, "(RB_COLOR_INFO format 12, storage 3, 4x, sample select 6) to texture format 7 (number 0, exp bias -1, swap 1, endian 2, "
+                     "command 1): resolve destination exponent bias -1"));
     // The accepted destination formats: 7 (k_2_10_10_10), 50 and 54 (the _AS_16_16_16_16 variants: xenos.h:607-608).
     for (uint32_t f : {7u, 50u, 54u})
     {

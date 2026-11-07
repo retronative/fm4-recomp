@@ -179,7 +179,9 @@ struct Key
 };
 
 // The M4 whitelist: colour 8_8_8_8, 8_8_8_8_GAMMA, 2_10_10_10 and its _AS_10_10_10_10
-// variant (storage 0 and 2); both depth formats; 1x and 4x MSAA. False with the reason otherwise.
+// variant (storage 0 and 2), 2_10_10_10_FLOAT and its _AS_16_16_16_16 variant (storage 3, 7e3: X xenos.h:394-404
+// GetStorageColorFormat, "the same packing and meaning of values ... without blending precision modifiers"); both
+// depth formats; 1x and 4x MSAA. False with the reason otherwise.
 bool SupportedKey(Key k, std::string& why);
 
 // ---- Ownership ----------------------------------------------------------------------------------------

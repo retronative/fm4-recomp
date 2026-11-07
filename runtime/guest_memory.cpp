@@ -5,8 +5,10 @@
 // Taken from ForzaRecomp runtime/guest_memory.cpp (GPL-3.0-or-later, same owner), reviewed and re-tested here.
 // FM4 Recomp changes: M3: MapPhysicalMemory from ForzaRecomp guest_memory.cpp (macOS branch only);
 // ForzaRecomp's later OnTrap filter (symbol name) is not taken: our trap stop stays for every trap.
+// M4 unit 7: OnFault asks the write-watch hook first (SetGuestWriteFaultHook; texture_NOTES.md §5 step 1).
 #include "guest_memory.h"
 #include "stops.h"
+#include <atomic>
 #include <csignal>
 #include <cstdlib>
 #include <mach/mach.h>
@@ -18,6 +20,7 @@ namespace {
 
 uint8_t* guestBase = nullptr;
 DescribeAddress describeAddress = nullptr;
+std::atomic<WriteFaultHook> writeFaultHook{nullptr};
 
 void OnFault(int signal, siginfo_t* info, void*)
 {
@@ -29,6 +32,8 @@ void OnFault(int signal, siginfo_t* info, void*)
         return;
     }
     const auto guest = uint32_t(address - start);
+    if (const WriteFaultHook hook = writeFaultHook.load(std::memory_order_acquire); hook != nullptr && hook(guest))
+        return;  // a watched page, writable again: the store re-runs
     const char* what = describeAddress ? describeAddress(guest) : nullptr;
     StopFromSignal(StopCode::GuestFault, "guest access to unmapped or read-only %08X%s%s", guest, what ? ": " : "", what ? what : "");
 }
@@ -94,6 +99,8 @@ void InstallGuestFaultHandler(uint8_t* base, DescribeAddress describe)
     sigaction(SIGTRAP, &action, nullptr);
     sigaction(SIGILL, &action, nullptr);
 }
+
+void SetGuestWriteFaultHook(WriteFaultHook hook) { writeFaultHook.store(hook, std::memory_order_release); }
 
 void ProtectGuestMemoryReadOnly(uint8_t* base, uint64_t guest, uint64_t size)
 {

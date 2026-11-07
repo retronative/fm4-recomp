@@ -112,6 +112,7 @@ void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     if (index == reg::kCoherStatusHost)
         value |= 1u << 31;  // the status bit (command_processor.cc:465-467)
     WriteRegister(base, index, value);
+    OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);  // DC_LUT_* only (command_processor.cc:469-574)
     if (index >= reg::kScratchReg0 && index < reg::kScratchReg0 + 8 &&
         (ReadRegister(base, reg::kScratchUmsk) >> (index - reg::kScratchReg0) & 1))
         Store32(base, PhysicalToGuest(ReadRegister(base, reg::kScratchAddr) + 4 * (index - reg::kScratchReg0)), value);

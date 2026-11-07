@@ -47,6 +47,9 @@ struct Options
     // shaders this run may create pipelines for. A never-seen class runs first in its own approved run.
     const char* shaderClasses = nullptr;
     const char* shaderDumpDir = nullptr;  // getenv("FM4_SHADER_DUMP"): the translated GLSL beside the CP's .bin dumps (shader_cache.h)
+    // main.cpp's writable guest memory base (runtime::ReserveGuestMemory), required in present mode: the EDRAM unit
+    // writes resolved rectangles into guest memory through it (edram_vk.h), never through the CP's const base.
+    uint8_t* guestBase = nullptr;
 };
 
 // The EDRAM unit's and the texture unit's hooks (render_hooks.h), registered before the title runs. Without

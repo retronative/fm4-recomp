@@ -36,6 +36,8 @@ struct VulkanDevice
     // what is absent): BC1-3 sampling (MoltenVK: MTLDevice.supportsBCTextureCompression) and image-view component
     // swizzles (VK_KHR_portability_subset imageViewFormatSwizzle).
     bool textureCompressionBC = false;
+    bool depthClamp = false;        // PA_CL_CLIP_CNTL clip_disable pipelines (pipeline_cache.cpp)
+    bool independentBlend = false;
     bool imageViewFormatSwizzle = false;
 };
 

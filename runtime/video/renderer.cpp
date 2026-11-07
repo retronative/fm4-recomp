@@ -26,12 +26,15 @@
 #include "capture_store.h"
 #include "draw_record.h"
 #include "draw_state.h"
+#include "edram_vk.h"
 #include "front_buffer.h"
 #include "gpu_guard.h"
+#include "guest_writes.h"
 #include "pipeline_cache.h"
 #include "png.h"
 #include "shader_cache.h"
 #include "shader_class.h"
+#include "texture_vk.h"
 #include "vulkan_device.h"
 #include "kernel/graphics.h"
 #include "kernel/virtual_memory.h"
@@ -243,6 +246,12 @@ VkCommandBuffer OpenSlot(uint32_t s)
 void RetireSlot(uint32_t s)
 {
     Require(guard->Retire(s));
+    // The EDRAM unit's read-back resolves of this submission into guest memory (render_hooks.h EdramHooks::retired),
+    // before the pending ranges are declared complete.
+    if (edram != nullptr)
+        if (std::string error; !edram->retired(error))
+            Stop(StopCode::Unimplemented, "renderer: resolve read-back: %s", error.c_str());
+    GuestWritesRetired();  // the resolves recorded into it wrote guest memory (guest_writes.h; unit 4's one slot)
     Slot& slot = slots[s];
     slot.open = false;
     for (const auto& [offset, draw] : slot.errorDwords)
@@ -254,6 +263,17 @@ void RetireSlot(uint32_t s)
                                           "bit 1: a 16-bit float with exponent 31)", (unsigned long long)draw, error);
     }
     slot.errorDwords.clear();
+}
+
+// The open slot's recorded work, submitted and confirmed complete (a bounded wait), so that guest memory
+// holds what it wrote (resolves) before the CPU reads it. Nothing to do when the slot is not open.
+void FlushSlot(uint32_t s)
+{
+    if (!slots[s].open)
+        return;
+    Check(vkEndCommandBuffer(slots[s].commands), "vkEndCommandBuffer");
+    Require(guard->Submit(s));
+    RetireSlot(s);  // confirmed completion, then the draws' xe_error dwords
 }
 
 // The display image (already in TRANSFER_DST_OPTIMAL after `written`) -> the readback buffer, made
@@ -303,6 +323,37 @@ void Capture(uint64_t id, const char* what)
         Stop(StopCode::Setup, "renderer: capture of %s: %s", what, error.c_str());
     std::fprintf(stderr, "[gpu] %s captured: %s (ring %zu files, %llu bytes)\n", what, captures->PathOf(id).c_str(), captures->Count(),
                  (unsigned long long)captures->Bytes());
+}
+
+// The display gamma ramp, applied on the CPU to the detiled front buffer before the upload, so the display image and the
+// capture show what the TV would. Xenia applies the PWL ramp to a 2_10_10_10 front buffer at every swap, the guest's
+// ramp or its default (vulkan/vulkan_command_processor.cc IssueSwap, use_pwl_gamma_ramp; shaders/apply_gamma_pwl.xesli;
+// kernel/gamma_ramp.h), assuming an increment of 8 (apply_gamma_pwl.xesli:78-80, DC_LUTA_CONTROL 3; 0 before the guest
+// writes it, register_table.inc:470-478): any other DC_LUTA_CONTROL stops. The ramp is logged when it changes.
+uint64_t loggedRampDigest = 0;
+bool rampLogged = false;
+void ApplyDisplayGamma(const uint8_t* base, uint32_t* pixels, size_t count, uint64_t swap)
+{
+    namespace gamma = runtime::gpu::gamma;
+    const uint32_t control = runtime::gpu::ReadRegister(base, gamma::reg::kLutaControl);
+    if (control != 0 && control != 3)
+        Stop(StopCode::Unimplemented, "renderer: swap %llu: DC_LUTA_CONTROL %08X (only 0 or 3, the PWL increment 8 Xenia assumes)",
+             (unsigned long long)swap, control);
+    const runtime::gpu::GammaRampView v = runtime::gpu::CurrentGammaRamp();
+    const uint64_t digest = gamma::PwlDigest(v.ramp.pwl);
+    if (!rampLogged || digest != loggedRampDigest)
+    {
+        static const uint64_t defaultDigest = gamma::PwlDigest(gamma::DefaultRamp().pwl);
+        const char* kind = gamma::IsD3dLinearPwl(v.ramp.pwl) ? "Direct3D 9 linear" : digest == defaultDigest ? "Xenia's default" : "title";
+        const gamma::PwlEntry* r = &v.ramp.pwl[0][0];
+        std::fprintf(stderr, "[gpu] display gamma ramp: PWL, 128 entries, digest %016llX (%s), from swap %llu; DC_LUTA_CONTROL %08X; "
+                     "red base/delta at 00 %04X/%04X, 01 %04X/%04X, 40 %04X/%04X, 7E %04X/%04X, 7F %04X/%04X; ramp-state writes: %llu "
+                     "by the command processor, %llu by CPU stores\n",(unsigned long long)digest, kind, (unsigned long long)swap, control,
+                     r[0].base, r[0].delta, r[3].base, r[3].delta, r[0x40 * 3].base, r[0x40 * 3].delta, r[0x7E * 3].base, r[0x7E * 3].delta,
+                     r[0x7F * 3].base, r[0x7F * 3].delta, (unsigned long long)v.cpWrites, (unsigned long long)v.cpuWrites);
+        loggedRampDigest = digest, rampLogged = true;
+    }
+    gamma::ApplyPwlToFrame(pixels, count, v.ramp.pwl);
 }
 
 void CreateResources()
@@ -355,7 +406,9 @@ void CreateResources()
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         Check(vkCreateFence(dev.device, &fence, nullptr, &s.fence), "vkCreateFence");
         // Unit 8: the ring (uniform, storage and index data) and the descriptor pool, persistent per slot.
-        s.ring = MakeBuffer(kRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        // Unit 7: also the staging source of texture uploads (vkCmdCopyBufferToImage, texture_vk.cpp).
+        s.ring = MakeBuffer(kRingBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         s.allocator.emplace(kRingBytes, uniformAlign, storageAlign);
         const VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
@@ -380,9 +433,14 @@ void Shutdown()
     for (auto& [key, fb] : framebuffers)  // before the render passes and the EDRAM unit's views they reference
         vkDestroyFramebuffer(dev.device, fb, nullptr);
     framebuffers.clear();
+    if (edram != nullptr)  // its images, views and pipelines: after the framebuffers over its views, before the device
+        edram->shutdown();
+    edram = nullptr;
     pipelines.reset();  // pipelines, render passes, modules, layouts
     shaders.reset();
     compiler.reset();
+    textures = nullptr;
+    ShutdownTextureUnit();  // views, samplers, images: every submission that used them is confirmed complete (above)
     for (Slot& s : slots)
     {
         vkDestroyDescriptorPool(dev.device, s.descriptors, nullptr);
@@ -510,16 +568,29 @@ bool Initialize(const Options& o)
     // screens blend with src alpha / inv src alpha only).
     compiler.emplace();
     shaders.emplace(*compiler, o.shaderDumpDir);
-    VkPhysicalDeviceFeatures deviceFeatures;
-    vkGetPhysicalDeviceFeatures(dev.gpu, &deviceFeatures);
+    // The features enabled at vkCreateDevice (vulkan_device.cpp), never merely the supported ones.
     PipelineDeviceFeatures features;
-    features.depthClamp = deviceFeatures.depthClamp == VK_TRUE;
+    features.depthClamp = dev.depthClamp;
     features.constantAlphaColorBlendFactors = false;
-    features.independentBlend = deviceFeatures.independentBlend == VK_TRUE;
+    features.independentBlend = dev.independentBlend;
     KeyResult created;
     pipelines.emplace(dev.device, features, allowedClasses, created);
     if (!created)
         Stop(StopCode::Setup, "renderer: %s", created.reason.c_str());
+    SetTextureHooks(InitializeTextureUnit(dev));  // unit 7 (texture_vk.h)
+    // The EDRAM unit (edram_vk.h): its transfer shaders through the same compiler, its resolve writes through main.cpp's
+    // writable guest base, each recorded resolve reported to the texture unit (guest_writes.h MarkGuestWritten). Present
+    // mode only: the self-check draws nothing and keeps its device work unchanged.
+    if (o.mode == Mode::Present)
+    {
+        if (o.guestBase == nullptr)
+            Stop(StopCode::Setup, "renderer: present mode needs the writable guest base (Options::guestBase)");
+        std::string edramError;
+        const EdramHooks* hooks = InitializeEdramVk(dev, *compiler, o.guestBase, MarkGuestWritten, edramError);
+        if (hooks == nullptr)
+            Stop(StopCode::Setup, "renderer: EDRAM unit: %s", edramError.c_str());
+        SetEdramHooks(hooks);
+    }
     enabled = true;
     return true;
 }
@@ -539,14 +610,9 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     if (!runtime::PhysicalToGuest(f.physical, guest))
         Stop(StopCode::Unimplemented, "renderer: swap %llu: front buffer %08X is in no view", (unsigned long long)swap, f.physical);
     // The frame's recorded work (draws, and the resolves that write guest memory, render_hooks.h) must
-    // complete before the front buffer is read: submit and retire the open slot first. Two bounded waits
-    // per swap in unit 4's one slot; unit 7's GPU-guarded page read makes this ordering automatic.
-    if (slots[0].open)
-    {
-        Check(vkEndCommandBuffer(slots[0].commands), "vkEndCommandBuffer");
-        Require(guard->Submit(0));
-        RetireSlot(0);  // confirmed completion, then the draws' xe_error dwords
-    }
+    // complete before the front buffer is read: submit and retire the open slot first (FlushSlot; the
+    // resolves already flushed their own work). Bounded waits only, in unit 4's one slot.
+    FlushSlot(0);
     // A plain CPU read while the title may still write the buffer: the guarded read
     // (write watch, external host memory) is unit 7.
     Transient staging = MakeBuffer(VkDeviceSize(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -556,6 +622,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     if (f.swapRedBlue)
         for (size_t i = 0; i < size_t(width) * height; i++)
             linear[i] = SwapRedBlue1010102(linear[i]);
+    ApplyDisplayGamma(base, linear, size_t(width) * height, swap);
     const VkCommandBuffer c = OpenSlot(0);  // a fresh recording: the frame's draws completed above
     if (!guard->Hold(0, staging))
         Stop(StopCode::Setup, "renderer: the staging buffer cannot be held (slot not idle)");
@@ -570,10 +637,11 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     RetireSlot(0);  // one bounded wait per swap: the one-frame throttle (execution model §2); then the draws' xe_error dwords
     Capture(swap, "front buffer");
     std::fprintf(stderr, "[gpu] swap %llu presented offscreen; since the last swap: %llu draw(s) rendered, %llu no-write draw(s) %s, %llu resolve(s), "
-                         "%llu shader load(s); %llu bytes of the slot's ring used\n",
+                         "%llu shader load(s); %llu bytes of the slot's ring used; %s\n",
                  (unsigned long long)swap, (unsigned long long)drawsSinceSwap, (unsigned long long)noWriteSinceSwap,
                  kNoWriteDraws == NoWriteDraws::Skip ? "recorded as nothing (draw_record.h kNoWriteDraws)" : "(none allowed)",
-                 (unsigned long long)resolvesSinceSwap, (unsigned long long)shadersSinceSwap, (unsigned long long)slots[0].allocator->Used());
+                 (unsigned long long)resolvesSinceSwap, (unsigned long long)shadersSinceSwap, (unsigned long long)slots[0].allocator->Used(),
+                 TextureUnitSummary().c_str());
     drawsSinceSwap = shadersSinceSwap = noWriteSinceSwap = resolvesSinceSwap = 0;
 }
 
@@ -612,6 +680,11 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         if (!edram->resolve(OpenSlot(0), base, d, draw, error))
             Stop(StopCode::Unimplemented, "renderer: draw %llu: resolve: %s", (unsigned long long)draw, error.c_str());
         resolvesSinceSwap++;
+        // Every resolve completes before the next draw records: that draw's texture loads read guest memory on
+        // the CPU (trace11 samples the video resolve's destination in the same frame). Unconditional, so the
+        // order does not depend on the EDRAM unit calling MarkGuestWritten (which only moves the watch's
+        // sequences and arms texture_upload.h's pending refusal). Unit 4: one bounded wait per resolve.
+        FlushSlot(0);
         return;
     case DrawKind::NoWrite:  // the one policy switch (draw_record.h kNoWriteDraws; decision pending)
         if (kNoWriteDraws == NoWriteDraws::Stop)
@@ -661,9 +734,14 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     if (key.depthUsed && (targets.depth == VK_NULL_HANDLE || targets.depthFormat != HostDepthFormat(key.depthFormat)))
         Stop(StopCode::Unimplemented, "renderer: draw %llu: the EDRAM unit's depth view is missing or of format %d (expected %d)", (unsigned long long)draw,
              int(targets.depthFormat), int(HostDepthFormat(key.depthFormat)));
-    if (targets.width < d.scissor.x + d.scissor.width || targets.height < d.scissor.y + d.scissor.height || targets.width == 0 || targets.height == 0)
-        Stop(StopCode::Unimplemented, "renderer: draw %llu: the %ux%u host target does not cover the scissor (%u, %u, %ux%u)", (unsigned long long)draw,
-             targets.width, targets.height, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height);
+    // The rows the draw can touch: the scissor's bottom within the surface's EDRAM rows (draw_state.h targetHeight), the
+    // rows edram::Bind claimed (X render_target_cache.cc:757-767, :819-857). FM4's D3D fast clears have an 8192-row
+    // scissor over a 360-row 4x surface whose host image is 1024 rows: the host scissor stops at
+    // the claimed rows, never past the image.
+    const uint32_t scissorBottom = std::max(d.target.targetHeight, d.scissor.y);
+    if (targets.width < d.scissor.x + d.scissor.width || targets.height < scissorBottom || targets.width == 0 || targets.height == 0)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the %ux%u host target does not cover the scissor (%u, %u, %ux%u; rows to %u)",
+             (unsigned long long)draw, targets.width, targets.height, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, scissorBottom);
     const VkFramebuffer framebuffer = Framebuffer(pipeline.renderPass, targets, key.colorUsed != 0, key.depthUsed != 0);
     // 7. The uploads into the slot's ring (pipeline_key.h D9).
     std::vector<VertexWindow> windows;
@@ -746,7 +824,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u is sampled but was not decoded", (unsigned long long)draw, s);
         VkImageView view = VK_NULL_HANDLE;
         VkSampler sampler = VK_NULL_HANDLE;
-        if (!textures->bind(c, *t, view, sampler, error) || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE)
+        const TextureBindContext context{c, base, slot.ring.buffer, static_cast<uint8_t*>(slot.ring.mapped), &*slot.allocator};
+        if (!textures->bind(context, *t, view, sampler, error) || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u: %s", (unsigned long long)draw, s, error.empty() ? "no view or sampler" : error.c_str());
         images.push_back({sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
         VkWriteDescriptorSet w{};
@@ -772,7 +851,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     const HostViewport hv = FoldViewport(d.viewport, targets.width, targets.height);
     const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.height), hv.zMin, hv.zMax};
     vkCmdSetViewport(c, 0, 1, &viewport);
-    const VkRect2D scissor{{int32_t(d.scissor.x), int32_t(d.scissor.y)}, {d.scissor.width, d.scissor.height}};
+    const VkRect2D scissor{{int32_t(d.scissor.x), int32_t(d.scissor.y)}, {d.scissor.width, scissorBottom - d.scissor.y}};
     vkCmdSetScissor(c, 0, 1, &scissor);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.ref);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, d.depthStencil.back.ref);
