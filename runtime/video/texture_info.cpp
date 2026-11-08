@@ -141,7 +141,9 @@ bool HostFormatFor(uint32_t format, HostFormat& out)
     case 6: case 50: out = {vk::kFormatR8G8B8A8Unorm, kSwizzleRGBA, false}; return true;      // k_8_8_8_8 (+ AS_16_16_16_16)
     case 18: case 51: out = {vk::kFormatBc1RgbaUnormBlock, kSwizzleRGBA, true}; return true;  // k_DXT1 (+ AS_16_16_16_16)
     case 54: out = {vk::kFormatA2B10G10R10UnormPack32, kSwizzleRGBA, false}; return true;    // k_2_10_10_10_AS_16_16_16_16
-    case 36: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, true}; return true;            // k_32_FLOAT :275-279 (R32_SFLOAT, RRRR)
+    case 20: case 53: out = {vk::kFormatBc3UnormBlock, kSwizzleRGBA, true}; return true;      // k_DXT4_5 :196-200, k_DXT4_5_AS_16_16_16_16 :350-354 (BC3, 128bpb load)
+    case 36: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, true, true}; return true;      // k_32_FLOAT :275-279 (R32_SFLOAT, RRRR)
+    case 23: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, false, true, true}; return true; // k_24_8_FLOAT :210-213 (depth float load)
     default: out = {}; return false;
     }
 }
@@ -270,8 +272,8 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
     }
     // The number-format bit (dword 3 bit 0): Xenia 67f16c4 declares it (xenos.h:1274) but neither its texture cache nor its
     // shader translator reads it; for float data it has no meaning (FM4's k_32_FLOAT luminance texture sets it), so it is
-    // ignored for float formats only (HostFormat::signIgnored) and still refused for normalized ones.
-    if (f.numFormat != 0 && !host.signIgnored)
+    // ignored for float formats only (HostFormat::floatData) and still refused for normalized ones.
+    if (f.numFormat != 0 && !host.floatData)
     {
         Refuse(b, "integer number format (dword 3 bit 0) is not supported");
         return b;

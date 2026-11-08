@@ -31,6 +31,7 @@ namespace {
 struct StatusError { uint32_t status, error; };
 constexpr StatusError kStatusErrors[] = {
     {0x00000103, 0x3E5},  // PENDING -> ERROR_IO_PENDING (:34)
+    {1u << 31 | 0x6, 0x12},  // NO_MORE_FILES (0x8000_0006) -> ERROR_NO_MORE_FILES (:76)
     {0xC0000003, 0x57},  // INVALID_INFO_CLASS -> ERROR_INVALID_PARAMETER (:171)
     {0xC0000004, 0x18},  // INFO_LENGTH_MISMATCH -> ERROR_BAD_LENGTH (:172)
     {0xC0000008, 0x06},  // INVALID_HANDLE -> ERROR_INVALID_HANDLE (:176)

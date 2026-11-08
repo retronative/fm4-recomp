@@ -29,6 +29,7 @@ check "the recompiler is running" '(^|/)(XenonRecomp|XenonAnalyse)( |$)'
 check "a ForzaRecomp binary is running (never run alongside it)" '/forzarecomp[^ ]*/build/[^ ]*'
 check "an FM4 Recomp binary is running" "$ROOT/build/[^ ]*"
 check "a headless Chrome is running (another project's GPU work)" 'Chrome.*--headless'
+check "a ReCarbon game build is running (another game: never run alongside it)" 'ReCarbon\.app/Contents/MacOS/|/recarbon[^ ]*/build/[^ ]*/(ReCarbon|recarbon)( |$)'
 if [ "${1:-}" = --gpu ] && [ -e "$ROOT/research/GPU_STOP" ]; then
   echo "preflight: BUSY: research/GPU_STOP is set: no GPU run until the owner removes it" >&2
   sed 's/^/  /' "$ROOT/research/GPU_STOP" >&2 || true

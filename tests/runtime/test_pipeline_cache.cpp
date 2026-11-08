@@ -291,7 +291,8 @@ void TestRefusals()
         {"edram_mode copy", [](DrawStateView& s) { s.rbModeControl = 6; }, "edram_mode 6"},
         {"MSAA 2x", [](DrawStateView& s) { s.rbSurfaceInfo |= 1u << 16; }, "msaa_samples 1"},
         {"MSAA 4x", [](DrawStateView& s) { s.rbSurfaceInfo |= 2u << 16; }, "msaa_samples 2"},
-        {"colour format 4 (16_16)", [](DrawStateView& s) { s.rbColorInfo[0] = 4u << 16; }, "colour format 4"},
+        {"colour format 4 (16_16) without its bias 5", [](DrawStateView& s) { s.rbColorInfo[0] = 4u << 16; }, "colour exponent bias 0"},
+        {"colour format 0 with bias 5", [](DrawStateView& s) { s.rbColorInfo[0] = 5u << 20; }, "colour exponent bias 5"},
         {"colour format 5 (16_16_16_16)", [](DrawStateView& s) { s.rbColorInfo[0] = 5u << 16; }, "colour format 5"},
         {"colour format 10", [](DrawStateView& s) { s.rbColorInfo[0] = 10u << 16; }, "colour format 10"},
         {"blend factor 2", [](DrawStateView& s) { s.rbBlendControl[0] = 0x00010002; }, "blend factor 2"},
@@ -331,6 +332,10 @@ void TestRefusals()
                 Expect(false, "a mapped colour format is accepted");
         }
         Expect(true, "colour formats 0, 1, 2, 3, 7, 14, 15 are accepted");
+        // FM4 Recomp: 16_16 with exponent bias 5 (RB_COLOR_INFO 00540340): bits 16-19 = 4, bits 20-25 = 5.
+        DrawStateView w = base;
+        w.rbColorInfo[0] = 0x00540340;
+        Expect(DerivePipelineKey(w, vs, ps, 0, 0, k).ok && k.color[0].format == 4, "colour format 4 (16_16) with exponent bias 5 is accepted");
     }
 }
 

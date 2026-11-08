@@ -272,6 +272,15 @@ void TestPointDraws()
     g[xr::kPaScWindowScissorBr] = 0x20002000;
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::DepthOnly && d.colorWriteMask == 0 && d.target.depthWritten && !d.target.colorWritten, "mode 5 with a depth write: DepthOnly, colour mask forced 0");
+    // FM4 Recomp: RB_COLORCONTROL 8700000C (alpha test bit 3 on, func 4 GREATER) on the kDepth clear of FM4's welcome screen
+    // (the local capture glow (not distributed)): no alpha test in mode 5 (Xenia uses no pixel shader there); the same state in mode 4 keeps it.
+    g[xr::kRbColorControl] = 1u << 31 | 0x0700000C;  // 8700000C
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::DepthOnly && !d.alphaTest.enabled, "mode 5 (kDepth) with RB_COLORCONTROL 8700000C: no alpha test");
+    g[xr::kRbModeControl] = 4;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.alphaTest.enabled && d.alphaTest.func == 4, "CONTROL-PAIR: mode 4 with the same RB_COLORCONTROL: alpha test GREATER");
+    g[xr::kRbModeControl] = 5, g[xr::kRbColorControl] = 0;
     // Mode 6 is a resolve, handed off; modes 0-3 and 7 are refused.
     g[xr::kRbModeControl] = 6;
     Expect(Decode(g, vs, ps).kind == DrawKind::Resolve, "mode 6: Resolve");
@@ -353,6 +362,14 @@ void TestRectClear()
     CONTROL(Decode(g, vs, ps), "colour format 15");
     g = RectClear(), g[xr::kRbColorInfo] = 0x00120000;  // exp bias 1 (bits 20-25)
     CONTROL(Decode(g, vs, ps), "exponent bias");
+    // FM4 Recomp: 16_16 (format 4) with exponent bias 5, FM4's RB_COLOR_INFO 00540340 = base 0x340
+    // (832), format (0x00540340 >> 16) & 0xF = 4, bias (0x00540340 >> 20) & 0x3F = 5.
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00540340;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 4 && d.target.colorExpBias == 5 && d.target.colorBase == 832,
+           "colour format 4 (16_16) with exponent bias 5 decodes: storage 4, base 832");
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00040000;  // 16_16 with bias 0: the host scale would not be 1
+    CONTROL(Decode(g, vs, ps), "(16_16 takes 5)");
     g = RectClear(), g[xr::kRbColorInfo] = 0x00020800;  // base bit 11
     CONTROL(Decode(g, vs, ps), "colour base bit 11");
     g = RectClear(), g[xr::kRbDepthInfo] = 0x00010000;  // depth at tile 0 = the colour base, both written
@@ -608,8 +625,8 @@ void TestTextured()
     CONTROL(Decode(g, vs, ps), "type 0 is not a texture");
     g = Textured(), word(g, 1, 1) = 0x00000086;  // base 0
     CONTROL(Decode(g, vs, ps), "base address 0");
-    g = Textured(), word(g, 1, 1) = 0x1B600094;  // format 20 (DXT4_5)
-    CONTROL(Decode(g, vs, ps), "texture format 20");
+    g = Textured(), word(g, 1, 1) = 0x1B600093;  // format 19 (DXT2_3; 20 and 53, DXT4_5, are modelled)
+    CONTROL(Decode(g, vs, ps), "texture format 19");
     g = Textured(), word(g, 1, 5) = 0x400;  // dimension 2 (3D) while the shader fetches 2D
     CONTROL(Decode(g, vs, ps), "the shader fetches dimension 1");
     g = Textured(), word(g, 1, 1) = 0x1B600486;  // stacked

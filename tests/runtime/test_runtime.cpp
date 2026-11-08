@@ -12,10 +12,12 @@
 // check, CRC-32, big-endian slot writes, the checked indirect call and the guest fault stop.
 // Each stopping case runs in a child process and must end with its stop's exit code.
 #include "guest_memory.h"
+#include <csetjmp>
 #include "indirect.h"
 #include "kernel/arena.h"
 #include "kernel/file_system.h"
 #include "kernel/content.h"
+#include "kernel/exports.h"
 #include "kernel/audio.h"
 #include "kernel/xma.h"
 #include "kernel/stfs.h"
@@ -58,7 +60,7 @@ void PpcMmioStore32(uint8_t* base, uint32_t address, uint32_t value);
 #include <unistd.h>
 
 PPCFuncMapping PPCFuncMappings[] = {{0, nullptr}};  // the tests link no translation
-PPC_EXTERN_FUNC(PpcRuntime_switch_fiber);    // defined by runtime/stops.cpp
+PPC_EXTERN_FUNC(PpcRuntime_switch_fiber);    // defined by runtime/kernel/fibers.cpp
 PPC_EXTERN_FUNC(__imp__ExTerminateThread);
 PPC_EXTERN_FUNC(__imp__KeQueryPerformanceFrequency);
 PPC_EXTERN_FUNC(__imp__KeGetCurrentProcessType);
@@ -163,6 +165,65 @@ PPC_FUNC(XapiStartup) { (void)base; threadSaw = ctx.r3.u32 ^ ctx.r4.u32; ctx.r3.
 std::atomic<uint32_t> audioArgument{0};
 PPC_FUNC(AudioCallback) { audioArgument = runtime::Load32(base, ctx.r3.u32); }  // callback(wrapped argument)
 PPC_FUNC(Terminating) { (void)ctx, (void)base; runtime::ExitCurrentGuestThread(0x55); }
+// A XamTaskSchedule work routine stand-in: callback(message), message = {XOVERLAPPED*}: completes it with {0, 0, 7}
+// through XMsgCompleteIORequest from its own guest thread, as FM4's aggregate-enumeration routine does.
+std::atomic<uint32_t> taskSaw{0};
+// OBJECT_TYPE procedure stand-ins for ObCreateObject's title-defined types: allocate(size) from the kernel arena (0 when
+// typeAllocFails), free(block) and close(object, handle count) recorded.
+uint32_t typeAllocSize = 0, typeFreed = 0, typeClosedObject = 0, typeClosedCount = 0;
+bool typeAllocFails = false;
+PPC_FUNC(TypeAllocate) { typeAllocSize = ctx.r3.u32; ctx.r3.u64 = typeAllocFails ? 0 : runtime::ArenaAlloc(base, ctx.r3.u32); }
+PPC_FUNC(TypeFree) { (void)base; typeFreed = ctx.r3.u32; }
+PPC_FUNC(TypeClose) { (void)base; typeClosedObject = ctx.r3.u32, typeClosedCount = ctx.r4.u32; }
+PPC_FUNC(TaskBody)
+{
+    taskSaw = ctx.r3.u32;
+    PPCContext c{};
+    c.r3.u32 = runtime::Load32(base, ctx.r3.u32), c.r4.u32 = 0, c.r5.u32 = 0, c.r6.u32 = 7;
+    runtime::FindImport("XMsgCompleteIORequest")(c, base);
+}
+// A fiber's start stand-in (the translated function at its block's LR): records what it starts with, then switches
+// back to the fiber in `fiberBack` three times: first with r14 clobbered, then after checking r14 survived its own
+// suspension, then it ends the thread.
+struct FiberSeen { uint64_t r1, r3, r4, r5, r6, r7, r31, f14, lr; uint32_t cr, kthreadFiber, pcrBase, pcrEnd, round; bool resumedIntact; };
+FiberSeen fiberSeen{};
+uint32_t fiberBack = 0;
+PPC_FUNC(FiberStart)
+{
+    fiberSeen = {ctx.r1.u64, ctx.r3.u64, ctx.r4.u64, ctx.r5.u64, ctx.r6.u64, ctx.r7.u64, ctx.r31.u64, ctx.f14.u64, ctx.lr,
+                 uint32_t(ctx.cr0.lt) << 3 | uint32_t(ctx.cr0.gt) << 2 | uint32_t(ctx.cr0.eq) << 1 | ctx.cr0.so,
+                 runtime::Load32(base, runtime::Load32(base, ctx.r13.u32 + 0x100) + 0x164), runtime::Load32(base, ctx.r13.u32 + 0x70),
+                 runtime::Load32(base, ctx.r13.u32 + 0x74), uint32_t(ctx.fpscr.loadFromHost()), false};
+    ctx.r14.u64 = 0xAAAA0014, ctx.lr = 0x9000ABC0, ctx.r3.u64 = fiberBack;
+    PpcRuntime_switch_fiber(ctx, base);
+    fiberSeen.resumedIntact = ctx.r14.u64 == 0xAAAA0014 && ctx.lr == 0x9000ABC0;
+    ctx.r3.u64 = fiberBack;
+    PpcRuntime_switch_fiber(ctx, base);
+    runtime::ExitCurrentGuestThread(0x66);
+}
+// setjmp/longjmp in XenonRecomp's emitted shape (recompiler.cpp printFunctionCall): JumpSetter calls "setjmp" on
+// jumpBuffer and, on its first return, JumpDeep, which clobbers r1 and r14 and longjmps with jumpValue.
+uint32_t jumpBuffer = 0;
+int32_t jumpValue = 0;
+std::vector<int64_t> jumpReturns;
+PPC_FUNC(JumpDeep)
+{
+    (void)base;
+    ctx.r1.u64 = 0x1111, ctx.r14.u64 = 0x2222, ctx.r3.u64 = jumpBuffer, ctx.r4.s64 = jumpValue;
+    longjmp(PpcJumpBuffer(ctx.r3.u32), ctx.r4.s32);
+}
+PPC_FUNC(JumpSetter)
+{
+    PPCContext env{};
+    PPCRegister temp{};
+    env = ctx;
+    temp.s64 = setjmp(PpcJumpBuffer(ctx.r3.u32));
+    if (temp.s64 != 0) ctx = env;
+    ctx.r3 = temp;
+    jumpReturns.push_back(ctx.r3.s64);
+    if (ctx.r3.s64 == 0)
+        JumpDeep(ctx, base);
+}
 PPC_FUNC(TerminatingThroughImport);
 // A synthetic title module's functions (loader tests): its DllMain records its arguments and returns
 // dllMainResult; a helper reached by an indirect call.
@@ -296,8 +357,24 @@ int main(int, char** argv)
     Expect(report == "[hang] thread KTHREAD 7E000100: lr=40001234 ctr=40005678 r1=70001000 r3=00000003 r4=00000000 r5=00000000 r6=00000006\n" &&
                StderrOf([] { ReportGuestContexts(); }).find("7E000100") == std::string::npos,
            "the hang report prints each registered guest thread's lr, ctr, r1, r3-r6; unregistered threads disappear");
-    Expect(ExitCodeOf([] { (void)PpcJumpBuffer(0x40002000); }) == int(StopCode::Unimplemented), "setjmp/longjmp stops until M3 (7)");
-    Expect(ExitCodeOf([&] { PpcRuntime_switch_fiber(ctx, base); }) == int(StopCode::Unimplemented), "a fiber switch stops until M3 (7)");
+    {
+        // setjmp/longjmp as XenonRecomp emits them (recompiler.cpp printFunctionCall; the guest routines' contract: C
+        // setjmp returns 0 first, then longjmp's value, 1 for 0; r1, r14-r31 and the rest of the context as at the setjmp):
+        // JumpSetter's setjmp returns 0, JumpDeep clobbers r1/r14 and longjmps with 5 -> the setjmp returns 5 with the
+        // context restored; longjmp(0) returns 1; two guest buffers keep two host buffers; a null jmp_buf stops (5).
+        jumpBuffer = 0x40002000, jumpValue = 5, jumpReturns.clear();
+        PPCContext j{};
+        j.r1.u64 = 0x70001000, j.r14.u64 = 0x14, j.r3.u64 = jumpBuffer;
+        JumpSetter(j, base);
+        const bool five = jumpReturns == std::vector<int64_t>{0, 5} && j.r3.s64 == 5 && j.r1.u64 == 0x70001000 && j.r14.u64 == 0x14;
+        jumpValue = 0, jumpReturns.clear();
+        j.r3.u64 = jumpBuffer;
+        JumpSetter(j, base);
+        const bool one = jumpReturns == std::vector<int64_t>{0, 1};
+        const bool distinct = &PpcJumpBuffer(0x40002000) != &PpcJumpBuffer(0x40002100) && &PpcJumpBuffer(0x40002000) == &PpcJumpBuffer(0x40002000);
+        Expect(five && one && distinct && ExitCodeOf([] { (void)PpcJumpBuffer(0); }) == int(StopCode::GuestFault),
+               "setjmp/longjmp: 0 then longjmp's value (0 -> 1), context as at the setjmp, one host buffer per guest buffer; null stops (5)");
+    }
     Expect(ExitCodeOf([&] { PpcRuntime_restore_context(ctx, base); }) == int(StopCode::Unimplemented), "a context restore stops until M3 (7)");
 
     // ---- M3 unit A: arena, thread state, module, data exports, RtlImageXexHeaderField, critical
@@ -434,6 +511,129 @@ int main(int, char** argv)
         link.r3.u64 = 1;
         imp("NetDll_XNetGetEthernetLinkStatus")(link, base);
         Expect(up && link.r3.u64 == 0, "offline networking: XNetStartupEx(1, 13-byte params, 0x20511C00) = 0, recorded; the link reports none (0)");
+        {
+            // NetDll_XNetRandom(caller, buffer*, length): 0; 20 bytes written (two calls differ: the chance two random 20-byte
+            // draws are equal is 2^-160), the byte after them untouched; caller 2 stops (7).
+            const uint32_t rnd = ArenaAlloc(base, 48);
+            std::memset(base + rnd, 0xBB, 48);
+            auto random = [&](uint32_t at) { PPCContext c{}; c.r3.u64 = 1, c.r4.u32 = at, c.r5.u32 = 20; imp("NetDll_XNetRandom")(c, base); return c.r3.u32; };
+            const bool drawn = random(rnd) == 0 && random(rnd + 24) == 0 && std::memcmp(base + rnd, base + rnd + 24, 20) != 0 && base[rnd + 20] == 0xBB &&
+                               base[rnd + 44] == 0xBB;
+            Expect(drawn && ExitCodeOf([&] { PPCContext c{}; c.r3.u64 = 2, c.r4.u32 = rnd, c.r5.u32 = 4; imp("NetDll_XNetRandom")(c, base); }) ==
+                                int(StopCode::Unimplemented),
+                   "NetDll_XNetRandom: 0, the requested bytes from the host CSPRNG (two draws differ), nothing past them; caller 2 stops (7)");
+        }
+        {
+            // XeCryptShaInit/Update/Final (Xenia xboxkrnl_crypt.cc:90-146) against FIPS 180 published vectors: SHA-1("") =
+            // da39a3ee..., SHA-1("abc") = a9993e36..., SHA-1 of the 56-byte "abcdbcde...nopq" (two padded blocks) = 84983e44...
+            // Updates split the input (1 + 2; 1 + 54 + 1); the count at +0 is big-endian bytes (56); a 8-byte output leaves the
+            // byte after it untouched; the state's words become the digest's.
+            const uint32_t sha = ArenaAlloc(base, 0x58), msg = ArenaAlloc(base, 64), digestAt = ArenaAlloc(base, 24);
+            auto shaCall = [&](const char* name, uint32_t r4 = 0, uint32_t r5 = 0) { PPCContext c{}; c.r3.u32 = sha, c.r4.u32 = r4, c.r5.u32 = r5; imp(name)(c, base); };
+            auto digestOf = [&](const char* text, std::initializer_list<uint32_t> parts, uint32_t outSize = 20) {
+                std::memcpy(base + msg, text, std::strlen(text));
+                std::memset(base + digestAt, 0xEE, 24);
+                shaCall("XeCryptShaInit");
+                uint32_t at = 0;
+                for (const uint32_t n : parts)
+                    shaCall("XeCryptShaUpdate", msg + at, n), at += n;
+                const uint32_t count = be32(sha);
+                shaCall("XeCryptShaFinal", digestAt, outSize);
+                std::string hex;
+                char b[4];
+                for (uint32_t i = 0; i < 20; i++)
+                    std::snprintf(b, sizeof b, "%02x", base[digestAt + i]), hex += b;
+                return std::make_pair(hex, count);
+            };
+            const auto empty = digestOf("", {});
+            const auto abc = digestOf("abc", {1, 2});
+            const bool wordsKept = be32(sha + 4) == 0xa9993e36 && be32(sha + 0x14) == 0x9cd0d89d;
+            const auto two = digestOf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", {1, 54, 1});
+            const auto shortOut = digestOf("abc", {3}, 8);
+            Expect(empty.first == "da39a3ee5e6b4b0d3255bfef95601890afd80709" && abc.first == "a9993e364706816aba3e25717850c26c9cd0d89d" && wordsKept &&
+                       two.first == "84983e441c3bd26ebaae4aa1f95129e5e54670f1" && two.second == 56 &&
+                       shortOut.first.substr(0, 16) == "a9993e364706816a" && shortOut.first.substr(16, 2) == "ee",
+                   "XeCryptSha Init/Update/Final: FIPS 180 vectors (\"\", \"abc\", the 56-byte two-block message) over split updates; "
+                   "count in bytes; output truncated to its size; final words kept in the state");
+        }
+        {
+            // XeCryptSha256Init/Update/Final (Xenia xboxkrnl_crypt.cc:172-225) against FIPS 180 published vectors: "" = e3b0c442...,
+            // "abc" = ba7816bf..., the 56-byte two-block message = 248d6a61...; split updates; count 56; the digest is also copied
+            // to the state's block (+0x24); a 16-byte output leaves the byte after it untouched.
+            const uint32_t sha = ArenaAlloc(base, 0x64), msg = ArenaAlloc(base, 64), digestAt = ArenaAlloc(base, 40);
+            auto call = [&](const char* name, uint32_t r4 = 0, uint32_t r5 = 0) { PPCContext c{}; c.r3.u32 = sha, c.r4.u32 = r4, c.r5.u32 = r5; imp(name)(c, base); };
+            auto hexAt = [&](uint32_t at, uint32_t n) {
+                std::string hex;
+                char b[4];
+                for (uint32_t i = 0; i < n; i++)
+                    std::snprintf(b, sizeof b, "%02x", base[at + i]), hex += b;
+                return hex;
+            };
+            auto digestOf = [&](const char* text, std::initializer_list<uint32_t> parts, uint32_t outSize = 32) {
+                std::memcpy(base + msg, text, std::strlen(text));
+                std::memset(base + digestAt, 0xEE, 40);
+                call("XeCryptSha256Init");
+                uint32_t at = 0;
+                for (const uint32_t n : parts)
+                    call("XeCryptSha256Update", msg + at, n), at += n;
+                const uint32_t count = be32(sha);
+                call("XeCryptSha256Final", digestAt, outSize);
+                return std::make_pair(hexAt(digestAt, 33), count);
+            };
+            const auto empty = digestOf("", {});
+            const auto abc = digestOf("abc", {2, 1});
+            const bool inState = hexAt(sha + 0x24, 32) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+            const auto two = digestOf("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", {30, 25, 1});
+            const auto shortOut = digestOf("abc", {3}, 16);
+            Expect(empty.first == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855ee" &&
+                       abc.first == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015adee" && inState &&
+                       two.first == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1ee" && two.second == 56 &&
+                       shortOut.first.substr(0, 34) == "ba7816bf8f01cfea414140de5dae2223ee",
+                   "XeCryptSha256 Init/Update/Final: FIPS 180 vectors over split updates; count in bytes; digest also in the state's block; "
+                   "output truncated to its size");
+        }
+        {
+            // XeKeysObscureKey / XeKeysAesCbcUsingKey (Xenia xboxkrnl_crypt.cc:632-665; compatibility policy:
+            // the all-zero obfuscation key) against published vectors. NIST AESAVS (zero key): KAT 0^16 -> 66e94bd4...,
+            // GFSbox f34481ec... -> 0336763e.... SP 800-38A F.2.1/F.2.2 (CBC-AES128, key 2b7e1516..., IV 000102...0f): two
+            // blocks 6bc1bee2..., ae2d8a57... <-> 7649abac..., 5086cb9b...; the feed ends as the last ciphertext block.
+            const uint32_t buf = ArenaAlloc(base, 32), key = ArenaAlloc(base, 16), feed = ArenaAlloc(base, 16), data = ArenaAlloc(base, 48);
+            auto hexAt = [&](uint32_t at, uint32_t n) {
+                std::string hex;
+                char b[4];
+                for (uint32_t i = 0; i < n; i++)
+                    std::snprintf(b, sizeof b, "%02x", base[at + i]), hex += b;
+                return hex;
+            };
+            auto put = [&](uint32_t at, const char* hex) {
+                for (size_t i = 0; hex[2 * i]; i++)
+                    base[at + i] = uint8_t(std::stoul(std::string(hex + 2 * i, 2), nullptr, 16));
+            };
+            auto obscure = [&](uint32_t in, uint32_t out) { PPCContext c{}; c.r3.u32 = in, c.r4.u32 = out; imp("XeKeysObscureKey")(c, base); return c.r3.u32; };
+            auto cbc = [&](uint32_t size, bool encrypt) {
+                PPCContext c{};
+                c.r3.u32 = key, c.r4.u32 = data, c.r5.u32 = size, c.r6.u32 = data, c.r7.u32 = feed, c.r8.u32 = encrypt;
+                imp("XeKeysAesCbcUsingKey")(c, base);
+                return c.r3.u32;
+            };
+            std::memset(base + buf, 0, 32);
+            const bool kat = obscure(buf, buf + 16) == 0 && hexAt(buf + 16, 16) == "66e94bd4ef8a2c3b884cfa59ca342b2e";
+            put(buf, "f34481ec3cc627bacd5dc3fb08f273e6");
+            const bool gfsbox = obscure(buf, buf) == 0 && hexAt(buf, 16) == "0336763e966d92595a567cc9ce537f5e";  // in place
+            put(buf, "2b7e151628aed2a6abf7158809cf4f3c");
+            obscure(buf, key);
+            const char* plain = "6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51";
+            const char* cipher = "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2";
+            put(data, plain), std::memset(base + data + 32, 0xEE, 16), put(feed, "000102030405060708090a0b0c0d0e0f");
+            const bool enc = cbc(32, true) == 0 && hexAt(data, 32) == cipher && hexAt(feed, 16) == "5086cb9b507219ee95db113a917678b2" &&
+                             base[data + 32] == 0xEE;
+            put(feed, "000102030405060708090a0b0c0d0e0f");
+            const bool dec = cbc(32, false) == 0 && hexAt(data, 32) == plain && hexAt(feed, 16) == "5086cb9b507219ee95db113a917678b2";
+            Expect(kat && gfsbox && enc && dec && ExitCodeOf([&] { cbc(8, true); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { obscure(0, buf); }) == int(StopCode::Unimplemented),
+                   "XeKeysObscureKey: AES-128 ECB under the zero key (AESAVS KAT, GFSbox, in place); XeKeysAesCbcUsingKey: SP 800-38A "
+                   "CBC encrypt and decrypt in place, feed = last ciphertext; a partial block or a null pointer stops (7)");
+        }
         Expect(ExitCodeOf([&] { PPCContext c = net; c.r3.u64 = 2; imp("NetDll_XNetStartupEx")(c, base); }) == int(StopCode::Unimplemented) &&
                    ExitCodeOf([&] { base[netParams] = 12; PPCContext c = net; imp("NetDll_XNetStartupEx")(c, base); }) == int(StopCode::Unimplemented),
                "offline networking: caller 2, or a parameter block of size 12, stops (7)");
@@ -1344,7 +1544,8 @@ int main(int, char** argv)
     // (:185), C00000BA -> 5 (:354); 0 and a customer code (bit 29: 0x2000ABCD) unchanged; HRESULT 8007:0057 -> 0x57;
     // 0xD0000034 (bits 28-29 cleared: C0000034) -> 2; 0xC0010005 -> 5; an unlisted status stops (7).
     auto dosError = [&](uint32_t status) { PPCContext c{}; c.r3.u64 = status; imp("RtlNtStatusToDosError")(c, base); return c.r3.u32; };
-    Expect(dosError(0xC0000034) == 2 && dosError(0x103) == 0x3E5 && dosError(0xC0000011) == 0x26 && dosError(0xC00000BA) == 5 && dosError(0) == 0 &&
+    // NO_MORE_FILES (bit 31 | 6) -> ERROR_NO_MORE_FILES 0x12 (:76).
+    Expect(dosError(0xC0000034) == 2 && dosError(0x103) == 0x3E5 && ExitCodeOf([&] { _exit(int(dosError(1u << 31 | 6))); }) == 0x12 && dosError(0xC0000011) == 0x26 && dosError(0xC00000BA) == 5 && dosError(0) == 0 &&
                ExitCodeOf([&] { _exit(dosError(0x2000ABCD) == 0x2000ABCD ? 0 : 1); }) == 0 &&
                ExitCodeOf([&] { _exit(int(dosError((0x8007u << 16) | 0x57))); }) == 0x57 &&
                ExitCodeOf([&] { _exit(int(dosError(0xD0000034))); }) == 2 && ExitCodeOf([&] { _exit(int(dosError(0xC0010005))); }) == 5 &&
@@ -1432,7 +1633,8 @@ int main(int, char** argv)
         }
         // Its disc map (survey/gdfx.py's format: path, sector, size, attributes in hex): Media is a directory (0x90) of
         // 0x800 bytes at sector 0x20; Cars.bin 5000 = 0x1388 bytes at sector 0x30; Empty.bin; Mod.xex (the loader test).
-        std::ofstream(disc + "/../disc_map.tsv") << "Media\t20\t800\t90\nMedia/Cars.bin\t30\t1388\t80\nMedia/Empty.bin\t31\t0\t80\n"
+        // In GDFX tree order, not byte order: Empty.bin before Cars.bin (NtQueryDirectoryFile lists in this order).
+        std::ofstream(disc + "/../disc_map.tsv") << "Media\t20\t800\t90\nMedia/Empty.bin\t31\t0\t80\nMedia/Cars.bin\t30\t1388\t80\n"
                                                     "Mod.xex\t40\t180\t80\nPkg.xmplr\t50\t7000\t80\n";
         MountDisc(disc, disc + "/../disc_map.tsv");
     gpu::InitializeRegisters(base);
@@ -1498,6 +1700,62 @@ int main(int, char** argv)
                    create("game:\\Media", kReadAccess, 1, 0x60) == 0xC00000BA && create("game:\\Media", kReadAccess, 1, 0x20) == 0 &&
                    create("game:\\Media\\Cars.bin", kReadAccess, 3, 0x60) == 0 && create("game:\\x", kReadAccess, 1, 0x60, 0) == 0xC000000D,
                "NtCreateFile: missing NO_SUCH_FILE {.., FILE_DOES_NOT_EXIST 5}, handle -1; a directory as a non-directory FILE_IS_A_DIRECTORY; OPEN_IF of an existing file opens; no attributes INVALID_PARAMETER");
+        {
+            // Xenia's wildcard rules (base/filesystem_wildcard.cc), by hand: "a?c" = "a" from the start, one character,
+            // "c" to the end; "abc" = "abc" from the start to the end; '*' only separates; any case; "" matches all.
+            Expect(WildcardMatch("*", "x.bin") && WildcardMatch("a?c", "AbC") && !WildcardMatch("a?c", "abcd") && WildcardMatch("*.xex", "default.XEX") &&
+                       !WildcardMatch("*.xex", "default.xexp") && WildcardMatch("abc", "ABC") && !WildcardMatch("abc", "abcd") &&
+                       !WildcardMatch("abc", "xabc") && WildcardMatch("", "anything") && WildcardMatch("c*", "Cars.bin") && !WildcardMatch("c*", "xc"),
+                   "WildcardMatch: Xenia's rules (first run from the start, last to the end, '?' one character each, any case)");
+            Expect(ValidGuestPath("*.bin", true) && ValidGuestPath("c*", true) && ValidGuestPath("??.x", true) && !ValidGuestPath("*s.bin", true) &&
+                       !ValidGuestPath("*.bin") && !ValidGuestPath("a?b") && !ValidGuestPath("a|b", true),
+                   "ValidGuestPath: * and ? only in a pattern, where '*' must be followed by '.' or end it (Xenia IsValidPath)");
+            // NtQueryDirectoryFile(handle, event, APC, APC context, io status*, info*, length, ANSI name*, restart (stack +0x54)).
+            const uint32_t dirInfo = ArenaAlloc(base, 0x100), pattern = ArenaAlloc(base, 8);
+            auto qdir = [&](uint32_t handle, const char* name, uint32_t restart = 0, uint32_t length = 0x100, uint32_t event = 0) {
+                for (uint32_t i = 0; i < 0x100; i += 4) Store32(base, dirInfo + i, 0xAAAAAAAA);
+                Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                if (name != nullptr)
+                    Store32(base, pattern, uint32_t(std::strlen(name)) << 16 | uint32_t(std::strlen(name) + 1)), Store32(base, pattern + 4, guestString(name));
+                Store32(base, stack + 0x54, restart);
+                PPCContext c{};
+                c.r1.u32 = stack, c.r3.u32 = handle, c.r4.u32 = event, c.r7.u32 = ioStatus, c.r8.u32 = dirInfo, c.r9.u32 = length;
+                c.r10.u32 = name != nullptr ? pattern : 0;
+                imp("NtQueryDirectoryFile")(c, base);
+                return c.r3.u32;
+            };
+            auto entryName = [&] { return std::string(reinterpret_cast<const char*>(base + dirInfo + 0x40), be32(dirInfo + 0x3C)); };
+            const bool dirOpened = create("game:\\Media", 0x00100001, 1, 0x21) == 0;
+            const uint32_t media = be32(fileOut);
+            // Empty.bin first (tree order): index 1, four 1970 times, size 0, allocation 0, 0x80 + read-only; io status {0, length}.
+            const bool first = qdir(media, "*") == 0 && entryName() == "Empty.bin" && be32(dirInfo) == 0 && be32(dirInfo + 4) == 1 &&
+                               be64(dirInfo + 8) == 116444736000000000ull && be64(dirInfo + 0x20) == 116444736000000000ull && be64(dirInfo + 0x28) == 0 &&
+                               be64(dirInfo + 0x30) == 0 && be32(dirInfo + 0x38) == 0x81 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 0x100;
+            // Then Cars.bin: index 2, size 5000, allocation 6144; then NO_MORE_FILES (bit 31 | 6) with io status {status, 0}.
+            const bool second = qdir(media, nullptr) == 0 && entryName() == "Cars.bin" && be32(dirInfo + 4) == 2 && be64(dirInfo + 0x28) == 5000 &&
+                                be64(dirInfo + 0x30) == 6144;
+            const bool done = qdir(media, nullptr) == (1u << 31 | 6) && be32(ioStatus) == (1u << 31 | 6) && be32(ioStatus + 4) == 0;
+            Expect(dirOpened && first && second && done && qdir(media, nullptr, 1) == 0 && entryName() == "Empty.bin",
+                   "NtQueryDirectoryFile(game:\\Media, \"*\"): Empty.bin then Cars.bin in tree order, their records as Xenia's, then NO_MORE_FILES; restart from the start");
+            // "????.BIN" = four characters skipped, then ".bin" found anywhere after them that ends the name (Xenia's '?' rule
+            // does not anchor the next run): Empty.bin (".bin" at 5) and Cars.bin (at 4) both match. "c*": Cars.bin only.
+            Expect(qdir(media, "????.BIN") == 0 && entryName() == "Empty.bin" && qdir(media, nullptr) == 0 && entryName() == "Cars.bin" &&
+                       qdir(media, "c*") == 0 && entryName() == "Cars.bin" && qdir(media, nullptr) == (1u << 31 | 6) &&
+                       qdir(media, "x*") == 0xC000000F && qdir(media, "*s.bin") == 0xC000000D,
+                   "NtQueryDirectoryFile: a name restarts with its pattern (Xenia's '?' rule unanchored); no match NO_SUCH_FILE; '*' not before '.' INVALID_PARAMETER");
+            Expect(qdir(media, "*", 0, 71) == 0xC0000004 && qdir(media, "Empty.bin", 0, 72) == 0xC000000F && be32(ioStatus + 4) == 0 &&
+                       qdir(0x12345678, "*") == 0xC000000F &&
+                       ExitCodeOf([&] { (void)qdir(media, "*", 0, 0x100, 0x1234); }) == int(StopCode::Unimplemented),
+                   "NtQueryDirectoryFile: length < 72 INFO_LENGTH_MISMATCH; a name past the buffer NO_SUCH_FILE; no file handle NO_SUCH_FILE; an event stops (7)");
+            const bool rootOpened = create("game:\\", 0x00100001, 1, 0x21) == 0;
+            const uint32_t root = be32(fileOut);
+            const bool rootList = qdir(root, "*") == 0 && entryName() == "Media" && be32(dirInfo + 0x38) == 0x91 && be64(dirInfo + 0x28) == 0x800 &&
+                                  qdir(root, nullptr) == 0 && entryName() == "Mod.xex" && qdir(root, nullptr) == 0 && entryName() == "Pkg.xmplr" &&
+                                  qdir(root, nullptr) == (1u << 31 | 6);
+            Expect(rootOpened && rootList && create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x60) == 0 &&
+                       qdir(be32(fileOut), "*") == 0xC000000F,
+                   "NtQueryDirectoryFile(game:\\): Media (0x91, size 0x800), Mod.xex, Pkg.xmplr; a file has no children (NO_SUCH_FILE)");
+        }
         // No hard disk: FM4's open of \Device\Harddisk0\partition0 (access C0100000 =
         // GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE) gives STATUS_OBJECT_NAME_NOT_FOUND (C0000034), handle -1, io
         // status {C0000034, FILE_DOES_NOT_EXIST 5}; NtOpenFile the same. A name that only starts like the device
@@ -1602,6 +1860,26 @@ int main(int, char** argv)
             Expect(mounted && again && closeRoot.r3.u64 == 0 && ResolveGuestPath("pkgroot:\\a.bin", none, dev) == Resolved::OtherDevice,
                    "XamContentOpenFile: a disc package mounted read-only as a root (files 81, directories 10, reads across blocks); "
                    "mounting twice stops (7); XamContentClose unmounts");
+        }
+        {
+            // XamShowDeviceSelectorUI(user, content type, flags, total (qword), DWORD* device, XOVERLAPPED*) (Xenia xam_ui.cc:525-537:
+            // device 1 = DummyDeviceId::HDD, success; headless dispatch completes the XOVERLAPPED and returns ERROR_IO_PENDING).
+            // FM4's call (the local capture input_a1 (not distributed)): user 0, content type 0, flags 1, device at r7, XOVERLAPPED at r8.
+            const uint32_t dev = ArenaAlloc(base, 4), sel = ArenaAlloc(base, 0x1C);
+            auto selector = [&](uint32_t devicePtr, uint32_t overlappedPtr) {
+                StoreBigEndian32(base, dev, 0xAAAAAAAA);
+                PPCContext c{};
+                c.r3.u32 = 0, c.r4.u32 = 0, c.r5.u32 = 1, c.r6.u64 = 0, c.r7.u32 = devicePtr, c.r8.u32 = overlappedPtr;
+                imp("XamShowDeviceSelectorUI")(c, base);
+                return c.r3.u32;
+            };
+            const bool sync = selector(dev, 0) == 0 && be32(dev) == 1;
+            std::memset(base + sel, 0, 0x1C);
+            const bool async = selector(dev, sel) == 0x3E5 && be32(dev) == 1 && be32(sel) == 0 && be32(sel + 4) == 0 && be32(sel + 0x18) == 0;
+            const bool nullStops = ExitCodeOf([&] { (void)selector(0, 0); }) == int(StopCode::Unimplemented);
+            Expect(sync && async && nullStops,
+                   "XamShowDeviceSelectorUI: device 1 (the only storage device), 0 without an XOVERLAPPED; with one: completed (result 0, "
+                   "extended error 0, length 0) and ERROR_IO_PENDING; a null device pointer stops (7)");
         }
         // NtReadFile(handle, event, APC, context, io status*, buffer*, length, offset*) (Xenia xboxkrnl_io.cc:184,
         // disc_image_file.cc:26), on the synchronous Cars.bin. Byte i is 'A' + i % 26: offset 30 -> 'E' (30 % 26 = 4),
@@ -1821,9 +2099,305 @@ int main(int, char** argv)
             std::ofstream(typeDir + "/save0001.xcontent", std::ios::binary) << record;
             const bool listed = create(1, 1) == 0 && enumerate() == 0 && be32(got) == 1 && be32(items) == 1 && be32(items + 4) == 1 &&
                                 std::memcmp(base + items + 0x108, "save0001", 8) == 0 && enumerate() == 0x12;
-            Expect(empty && listed && create(2, 1) == ((1u << 31) | (7u << 16) | 0x57) && be32(sizeOut) == 0 &&
-                       ExitCodeOf([&] { (void)create(0, 2); }) == int(StopCode::Unimplemented),
-                   "saved content: empty at first (NO_MORE_FILES); a stored record is enumerated once; device 2 E_INVALIDARG; type 2 stops (7)");
+            // Marketplace content (type 2, Xenia xbox.h:357): the user-data store holds none: NO_MORE_FILES, 0 items; the saved
+            // record above is not listed under it (per-type directories). Type 3 (publisher) still stops (7).
+            const bool market = create(0, 2) == 0 && be32(sizeOut) == 0x604 && enumerate() == 0x12 && be32(got) == 0;
+            Expect(empty && listed && market && create(2, 1) == ((1u << 31) | (7u << 16) | 0x57) && be32(sizeOut) == 0 &&
+                       ExitCodeOf([&] { (void)create(0, 3); }) == int(StopCode::Unimplemented),
+                   "saved content: empty at first (NO_MORE_FILES); a stored record is enumerated once; marketplace content (type 2) "
+                   "is the empty list; device 2 E_INVALIDARG; type 3 stops (7)");
+            // XamContentCreateEx(user, root, XCONTENT_DATA*, flags, disposition*, license*, cache, size, XOVERLAPPED* (stack
+            // +0x54)) (Xenia xam_content.cc:124-243): FM4's OPEN_EXISTING (flags 0x813, & 0xF = 3) of a saved game that is not
+            // stored: PATH_NOT_FOUND (3); with an XOVERLAPPED: IO_PENDING (0x3E5), completion {FUNCTION_FAILED 0x65B, length 0,
+            // extended error HRESULT_FROM_WIN32(3) = bit 31 | 0x70003}, disposition zeroed. Stored content, a creating
+            // disposition, another type or an unsafe file name stop (7).
+            const uint32_t contentData = ArenaAlloc(base, 0x134), rootName = guestString("save"), ov = ArenaAlloc(base, 0x1C),
+                           disposition = ArenaAlloc(base, 4), ccStack = ArenaAlloc(base, 0x60);
+            auto contentCreate = [&](const char* name, uint32_t flags, bool withOverlapped, uint32_t type = 1) {
+                std::memset(base + contentData, 0, 0x134);
+                Store32(base, contentData, 1), Store32(base, contentData + 4, type);
+                std::memcpy(base + contentData + 0x108, name, std::strlen(name));
+                for (uint32_t i = 0; i < 0x1C; i += 4) Store32(base, ov + i, 0);
+                Store32(base, disposition, 0xAAAAAAAA);
+                Store32(base, ccStack + 0x54, withOverlapped ? ov : 0);
+                PPCContext c{};
+                c.r1.u32 = ccStack, c.r3.u32 = 0, c.r4.u32 = rootName, c.r5.u32 = contentData, c.r6.u32 = flags, c.r7.u32 = disposition;
+                imp("XamContentCreateEx")(c, base);
+                return c.r3.u32;
+            };
+            const bool absentSync = contentCreate("absent01", 0x813, false) == 3 && be32(disposition) == 0xAAAAAAAA;
+            const bool absentAsync = contentCreate("absent01", 0x813, true) == 0x3E5 && be32(ov) == 0x65B && be32(ov + 4) == 0 &&
+                                     be32(ov + 0x18) == (1u << 31 | 0x70003) && be32(disposition) == 0;
+            mkdir((typeDir + "/save0001").c_str(), 0755);
+            const bool stops = ExitCodeOf([&] { (void)contentCreate("absent01", 0x812, false); }) == int(StopCode::Unimplemented) &&
+                               ExitCodeOf([&] { (void)contentCreate("absent01", 0x813, false, 2); }) == int(StopCode::Unimplemented) &&
+                               ExitCodeOf([&] { (void)contentCreate("..", 0x813, false); }) == int(StopCode::Unimplemented) &&
+                               ExitCodeOf([&] { (void)contentCreate("a/b", 0x813, false); }) == int(StopCode::Unimplemented);
+            rmdir((typeDir + "/save0001").c_str());
+            Expect(absentSync && absentAsync && stops,
+                   "XamContentCreateEx(OPEN_EXISTING, absent saved game): PATH_NOT_FOUND, or IO_PENDING with {FUNCTION_FAILED, 0, 80070003}; "
+                   "CREATE_ALWAYS, type 2, \"..\" and \"a/b\" stop (7)");
+            // CREATE_NEW (flags 0x811) of an absent item (Xenia content_manager.cc:215-239): with an XOVERLAPPED IO_PENDING and
+            // {0, extended 0, length 1 (created)}; its directory and its record (the 0x134 bytes as passed) exist; "save:\\" is
+            // a writable root directory (0x10) until XamContentClose. Again: ALREADY_EXISTS (0xB7). A root name already open:
+            // ALREADY_EXISTS and nothing created.
+            auto cleanItem = [&](const char* name) {
+                unlink((typeDir + "/" + name + ".xcontent").c_str());
+                rmdir((typeDir + "/" + name).c_str());
+            };
+            auto closeRoot = [&](const char* root) {
+                PPCContext c{};
+                c.r3.u32 = guestString(root);
+                imp("XamContentClose")(c, base);
+                return c.r3.u32;
+            };
+            cleanItem("created1"), cleanItem("created2");
+            const bool created = contentCreate("created1", 0x811, true) == 0x3E5 && be32(ov) == 0 && be32(ov + 4) == 1 && be32(ov + 0x18) == 0;
+            struct stat itemInfo;
+            const bool onHost = stat((typeDir + "/created1").c_str(), &itemInfo) == 0 && S_ISDIR(itemInfo.st_mode);
+            std::ifstream recordIn(typeDir + "/created1.xcontent", std::ios::binary);
+            const std::string recordBytes((std::istreambuf_iterator<char>(recordIn)), std::istreambuf_iterator<char>());
+            const bool recordOk = recordBytes.size() == 0x134 && std::memcmp(recordBytes.data(), base + contentData, 0x134) == 0;
+            const bool mounted = query("save:\\") == 0 && be32(info + 48) == 0x10 && ContentRootMounted("SAVE");
+            const bool rootBusy = contentCreate("created2", 0x811, false) == 0xB7 && stat((typeDir + "/created2").c_str(), &itemInfo) != 0;
+            // NtCreateFile in the writable root (Xenia virtual_file_system.cc:181-329): FM4's OPEN_IF (3) with read/write access
+            // (C0100080) creates an empty file (FILE_CREATED 2), then opens it (FILE_OPENED 1); CREATE (2) of it
+            // OBJECT_NAME_COLLISION (C0000035, FILE_EXISTS 4); OPEN (1) of a missing file or anything under a missing
+            // directory NO_SUCH_FILE (FILE_DOES_NOT_EXIST 5, handle -1); FILE_DIRECTORY_FILE (1) creates a directory;
+            // OVERWRITE_IF (5) empties a file (FILE_OVERWRITTEN 3).
+            auto ntCreate = [&](const char* path, uint32_t access, uint32_t disposition, uint32_t options) {
+                setPath(path);
+                Store32(base, fileOut, 0xAAAAAAAA), Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                Store32(base, stack + 0x54, options);
+                PPCContext c{};
+                c.r1.u32 = stack, c.r3.u32 = fileOut, c.r4.u32 = access, c.r5.u32 = attrs, c.r6.u32 = ioStatus, c.r8.u32 = 0x80, c.r9.u32 = 1,
+                c.r10.u32 = disposition;
+                imp("NtCreateFile")(c, base);
+                return c.r3.u32;
+            };
+            constexpr uint32_t kReadWrite = (1u << 31) | (1u << 30) | 0x00100000u | 0x80u;
+            const std::string itemDir = typeDir + "/created1";
+            const bool madeFile = ntCreate("save:\\Profile", kReadWrite, 3, 0x60) == 0 && be32(ioStatus + 4) == 2 && be32(fileOut) != 0xFFFFFFFF &&
+                                  stat((itemDir + "/Profile").c_str(), &itemInfo) == 0 && S_ISREG(itemInfo.st_mode) && itemInfo.st_size == 0;
+            const auto profileObject = LookupHandle(be32(fileOut));
+            const OpenFile* profile = profileObject ? FindOpenFile(profileObject->header) : nullptr;
+            const bool handleOk = profile != nullptr && profile->entry.writable && profile->entry.size == 0;
+            const bool reopened = ntCreate("SAVE:\\profile", kReadWrite, 3, 0x60) == 0 && be32(ioStatus + 4) == 1;
+            const bool collision = ntCreate("save:\\Profile", kReadWrite, 2, 0x60) == 0xC0000035 && be32(ioStatus + 4) == 4 && be32(fileOut) == 0xFFFFFFFF;
+            const bool missing = ntCreate("save:\\missing", kReadWrite, 1, 0x60) == 0xC000000F && be32(ioStatus + 4) == 5 &&
+                                 ntCreate("save:\\nodir\\x", kReadWrite, 3, 0x60) == 0xC000000F && be32(ioStatus + 4) == 5;
+            const bool madeDir = ntCreate("save:\\Sub", kReadWrite, 2, 0x21) == 0 && be32(ioStatus + 4) == 2 &&
+                                 stat((itemDir + "/Sub").c_str(), &itemInfo) == 0 && S_ISDIR(itemInfo.st_mode);
+            std::ofstream(itemDir + "/Profile") << "data";
+            const bool emptied = ntCreate("save:\\Profile", kReadWrite, 5, 0x60) == 0 && be32(ioStatus + 4) == 3 &&
+                                 stat((itemDir + "/Profile").c_str(), &itemInfo) == 0 && itemInfo.st_size == 0;
+            Expect(madeFile && handleOk && reopened && collision && missing && madeDir && emptied,
+                   "NtCreateFile in a writable content root: OPEN_IF creates (2) then opens (1), any case; CREATE collides (C0000035, 4); "
+                   "missing file or parent NO_SUCH_FILE (5); a directory is created; OVERWRITE_IF empties (3)");
+            // NtWriteFile(handle, event, APC, APC context, io status*, buffer*, length, offset*) (Xenia xboxkrnl_io.cc:354): on the
+            // synchronous handle just opened: "hello" at the position (0) -> io {0, 5}; "XY" at offset 1 -> "hXYlo", position
+            // 1 + 2 = 3; "!" at the position -> "hXY!o". A write ending past the 512 MB quota (offset 0x2000_0000) DISK_FULL
+            // (C000007F), io {status, 0}, the file unchanged; a bad handle INVALID_HANDLE (C0000008); a disc file stops (7).
+            {
+                const uint32_t h = be32(fileOut), wbuf = ArenaAlloc(base, 8), woff = ArenaAlloc(base, 8);
+                auto write = [&](uint32_t handle, const char* text, int64_t offset) {
+                    std::memcpy(base + wbuf, text, std::strlen(text));
+                    Store32(base, woff, uint32_t(uint64_t(offset) >> 32)), Store32(base, woff + 4, uint32_t(offset));
+                    Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r7.u32 = ioStatus, c.r8.u32 = wbuf, c.r9.u32 = uint32_t(std::strlen(text)), c.r10.u32 = offset < 0 ? 0 : woff;
+                    imp("NtWriteFile")(c, base);
+                    return c.r3.u32;
+                };
+                auto hostText = [&] {
+                    std::ifstream in(itemDir + "/Profile", std::ios::binary);
+                    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                };
+                const bool first = write(h, "hello", -1) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 5 && hostText() == "hello";
+                const bool atOffset = write(h, "XY", 1) == 0 && hostText() == "hXYlo";
+                const bool atPosition = write(h, "!", -1) == 0 && hostText() == "hXY!o";
+                const bool full = write(h, "z", 0x20000000) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 0 && hostText() == "hXY!o";
+                const bool badHandle = write(0x12345678, "z", -1) == 0xC0000008 && be32(ioStatus) == 0xC0000008;
+                const bool discOpened = ntCreate("game:\\Media\\Cars.bin", kReadAccess, 1, 0x60) == 0;
+                const uint32_t discHandle = be32(fileOut);
+                // NtFlushBuffersFile(handle, io status*) (Xenia xboxkrnl_io.cc:590): success, io {0, 0}, for the written file and
+                // the read-only disc file; a handle that is no file stops (7).
+                auto flush = [&](uint32_t handle) {
+                    Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r4.u32 = ioStatus;
+                    imp("NtFlushBuffersFile")(c, base);
+                    return c.r3.u32;
+                };
+                const bool flushed = flush(h) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 0 && hostText() == "hXY!o";
+                Expect(flushed && discOpened && flush(be32(fileOut)) == 0 && ExitCodeOf([&] { (void)flush(0x12345678); }) == int(StopCode::Unimplemented),
+                       "NtFlushBuffersFile: success with io {0, 0} for a written and a read-only file; a non-file handle stops (7)");
+                Expect(first && atOffset && atPosition && full && badHandle && discOpened &&
+                           ExitCodeOf([&] { (void)write(discHandle, "z", 0); }) == int(StopCode::Unimplemented),
+                       "NtWriteFile: at the position, at an offset (the position follows), quota DISK_FULL with nothing written, "
+                       "bad handle INVALID_HANDLE, a disc file stops (7)");
+                // NtSetInformationFile FileEndOfFileInformation (20) (Xenia xboxkrnl_io_info.cc:227-231, XFile::SetLength): the
+                // file "hXY!o" set to 3 bytes -> "hXY", then to 6 -> "hXY" + 3 zeros, io {0, 8}; past the quota DISK_FULL with
+                // io {C000007F, 8} and nothing changed; 7 bytes INFO_LENGTH_MISMATCH; a disc file stops (7).
+                const uint32_t eof = ArenaAlloc(base, 8);
+                auto setLength = [&](uint32_t handle, uint64_t length, uint32_t infoLength = 8) {
+                    Store32(base, eof, uint32_t(length >> 32)), Store32(base, eof + 4, uint32_t(length));
+                    Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r4.u32 = ioStatus, c.r5.u32 = eof, c.r6.u32 = infoLength, c.r7.u32 = 20;
+                    imp("NtSetInformationFile")(c, base);
+                    return c.r3.u32;
+                };
+                const bool cut = setLength(h, 3) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 8 && hostText() == "hXY";
+                const bool grown = setLength(h, 6) == 0 && hostText() == std::string("hXY\0\0\0", 6);
+                const bool tooBig = setLength(h, 0x20000000) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 8 &&
+                                    hostText() == std::string("hXY\0\0\0", 6);
+                // FileAllocationInformation (19) (Xenia :222-226, ignored): 6 or 64 bytes on the 6-byte file: success {0, 8}, the
+                // file unchanged; 2 bytes (below its size; NT would cut it) stops (7).
+                auto setAllocation = [&](uint32_t handle, uint64_t length) {
+                    Store32(base, eof, uint32_t(length >> 32)), Store32(base, eof + 4, uint32_t(length));
+                    Store32(base, ioStatus, 0xAAAAAAAA), Store32(base, ioStatus + 4, 0xAAAAAAAA);
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r4.u32 = ioStatus, c.r5.u32 = eof, c.r6.u32 = 8, c.r7.u32 = 19;
+                    imp("NtSetInformationFile")(c, base);
+                    return c.r3.u32;
+                };
+                const bool allocated = setAllocation(h, 6) == 0 && setAllocation(h, 64) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 8 &&
+                                       hostText() == std::string("hXY\0\0\0", 6);
+                Expect(allocated && ExitCodeOf([&] { (void)setAllocation(h, 2); }) == int(StopCode::Unimplemented),
+                       "NtSetInformationFile(allocation): at or above the size success {0, 8}, file unchanged; below it stops (7)");
+                // FileDispositionInformation (13, 1 byte) then NtClose: a marked saved-content file is removed from the host when
+                // the handle closes (NT; Xenia ignores the mark), io {0, 0}; 0 bytes INFO_LENGTH_MISMATCH; a disc file stops (7).
+                auto dispose = [&](uint32_t handle, uint8_t flag, uint32_t infoLength = 1) {
+                    base[eof] = flag;
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r4.u32 = ioStatus, c.r5.u32 = eof, c.r6.u32 = infoLength, c.r7.u32 = 13;
+                    imp("NtSetInformationFile")(c, base);
+                    return c.r3.u32;
+                };
+                const bool unmarked = dispose(h, 1) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 0 && dispose(h, 0) == 0;
+                struct stat profileInfo;
+                PPCContext keep{};
+                keep.r3.u32 = ntCreate("save:\\Profile", kReadWrite, 1, 0x60) == 0 ? be32(fileOut) : 0;
+                imp("NtClose")(keep, base);
+                const bool keptAfterUnmark = stat((itemDir + "/Profile").c_str(), &profileInfo) == 0;
+                const bool marked = dispose(h, 1) == 0 && dispose(h, 1, 0) == 0xC0000004;
+                PPCContext closeIt{};
+                closeIt.r3.u32 = h;
+                imp("NtClose")(closeIt, base);
+                const bool removed = closeIt.r3.u32 == 0 && stat((itemDir + "/Profile").c_str(), &profileInfo) != 0;
+                Expect(unmarked && keptAfterUnmark && marked && removed && ExitCodeOf([&] { (void)dispose(discHandle, 1); }) == int(StopCode::Unimplemented),
+                       "NtSetInformationFile(disposition) + NtClose: a marked saved-content file is deleted on close (an unmarked one is kept); "
+                       "0 bytes INFO_LENGTH_MISMATCH; a disc file stops (7)");
+                Expect(cut && grown && tooBig && setLength(h, 3, 7) == 0xC0000004 &&
+                           ExitCodeOf([&] { (void)setLength(discHandle, 1); }) == int(StopCode::Unimplemented),
+                       "NtSetInformationFile(end of file): cut and zero-extended on the host, io {0, 8}; past the quota DISK_FULL, "
+                       "unchanged; 7 bytes INFO_LENGTH_MISMATCH; a disc file stops (7)");
+            }
+            {
+                // XamContentFlush(root, XOVERLAPPED*) (Xenia xam_content.cc:278-288): 0, or IO_PENDING with {0, 0}; the root's
+                // host files are fsynced (any case of the name); an unknown root stops (7).
+                auto flush = [&](const char* root, uint32_t overlapped) {
+                    PPCContext c{};
+                    c.r3.u32 = guestString(root), c.r4.u32 = overlapped;
+                    imp("XamContentFlush")(c, base);
+                    return c.r3.u32;
+                };
+                std::memset(base + ov, 0xAA, 0x1C), std::memset(base + ov + 0x08, 0, 0x10);
+                const bool flushed = flush("SAVE", 0) == 0 && flush("save", ov) == 0x3E5 && be32(ov) == 0 && be32(ov + 0x18) == 0;
+                Expect(flushed && ExitCodeOf([&] { (void)flush("nosuch", 0); }) == int(StopCode::Unimplemented),
+                       "XamContentFlush: a mounted save root flushed: 0, or IO_PENDING completed {0, 0}; an unknown root stops (7)");
+            }
+            unlink((itemDir + "/Profile").c_str()), rmdir((itemDir + "/Sub").c_str());
+            const bool closed = closeRoot("save") == 0 && !ContentRootMounted("save");
+            const bool again = contentCreate("created1", 0x811, false) == 0xB7;
+            Expect(created && onHost && recordOk && mounted && rootBusy && closed && again,
+                   "XamContentCreateEx(CREATE_NEW): created, recorded as passed and mounted writable (save:\\ 0x10) until closed; "
+                   "again ALREADY_EXISTS; a busy root ALREADY_EXISTS with nothing created");
+            // OPEN_EXISTING (0x813) of the stored item (Xenia xam_content.cc:168-174, content_manager.cc:242-265): with an
+            // XOVERLAPPED IO_PENDING, completion {0, length 2 (open), extended 0}, the license mask 0; the stored directory is
+            // mounted writable again (a file written before the close is there); while mounted, the root is busy: ALREADY_EXISTS.
+            {
+                std::ofstream(typeDir + "/created1/Kept", std::ios::binary) << "kept";
+                const uint32_t license = ArenaAlloc(base, 4);
+                Store32(base, license, 0xAAAAAAAA);
+                Store32(base, ccStack + 0x54, ov);
+                PPCContext c{};
+                std::memset(base + contentData, 0, 0x134);
+                Store32(base, contentData, 1), Store32(base, contentData + 4, 1), std::memcpy(base + contentData + 0x108, "created1", 8);
+                for (uint32_t i = 0; i < 0x1C; i += 4) Store32(base, ov + i, 0);
+                c.r1.u32 = ccStack, c.r4.u32 = rootName, c.r5.u32 = contentData, c.r6.u32 = 0x813, c.r7.u32 = disposition, c.r8.u32 = license;
+                imp("XamContentCreateEx")(c, base);
+                DiscEntry kept;
+                std::string keptDevice;
+                const bool opened = c.r3.u32 == 0x3E5 && be32(ov) == 0 && be32(ov + 4) == 2 && be32(ov + 0x18) == 0 && be32(license) == 0 &&
+                                    ContentRootMounted("save") && ResolveGuestPath("save:\\KEPT", kept, keptDevice) == Resolved::Found &&
+                                    kept.size == 4;
+                const bool busy = contentCreate("created1", 0x813, false) == 0xB7;
+                const bool reclosed = closeRoot("save") == 0;
+                unlink((typeDir + "/created1/Kept").c_str());
+                Expect(opened && busy && reclosed, "XamContentCreateEx(OPEN_EXISTING, stored saved game): opened and mounted writable "
+                                                   "(IO_PENDING, {0, length 2 open}, license 0; its files there); a busy root ALREADY_EXISTS");
+            }
+            // XamContentGetDeviceData(id, data*) (Xenia xam_content_device.cc:113): device 1: {1, HDD 1, total 512 MB = 0x2000_0000,
+            // free = total - stored bytes, "Dummy HDD" UTF-16BE}; the stored record above (0x134 bytes) is counted; device 2
+            // DEVICE_NOT_CONNECTED (0x48F) with nothing written.
+            {
+                const uint32_t deviceData = ArenaAlloc(base, 0x50);
+                for (uint32_t i = 0; i < 0x50; i += 4) Store32(base, deviceData + i, 0xAAAAAAAA);
+                auto deviceDataOf = [&](uint32_t id) { PPCContext c{}; c.r3.u32 = id, c.r4.u32 = deviceData; imp("XamContentGetDeviceData")(c, base); return c.r3.u32; };
+                const bool other = deviceDataOf(2) == 0x48F && be32(deviceData) == 0xAAAAAAAA;
+                const uint64_t used = ContentBytesUsed();
+                const bool ok = deviceDataOf(1) == 0 && be32(deviceData) == 1 && be32(deviceData + 4) == 1 && be64(deviceData + 8) == 0x20000000ull &&
+                                be64(deviceData + 16) == 0x20000000ull - used && used >= 0x134 && base[deviceData + 24] == 0 && base[deviceData + 25] == 'D' &&
+                                base[deviceData + 24 + 2 * 8 + 1] == 'D' && be32(deviceData + 24 + 2 * 9) == 0 && be32(deviceData + 0x4C) == 0;
+                Expect(other && ok, "XamContentGetDeviceData: device 1 {1, HDD, 512 MB total, quota minus stored free, \"Dummy HDD\"}; device 2 DEVICE_NOT_CONNECTED");
+            }
+            // XamContentGetDeviceState(id, XOVERLAPPED*) (Xenia xam_content_device.cc:78-99): device 1 present, 0; device 2
+            // DEVICE_NOT_CONNECTED (0x48F). With an XOVERLAPPED: ERROR_IO_PENDING (0x3E5), result 0 / extended 0 for device 1,
+            // result FUNCTION_FAILED (0x65B) / extended 0x48F for device 2, length 0.
+            {
+                const uint32_t ov = ArenaAlloc(base, 0x1C);
+                auto state = [&](uint32_t id, uint32_t overlapped) {
+                    std::memset(base + ov, 0xAA, 0x1C), std::memset(base + ov + 0x08, 0, 0x10);  // no event, no completion routine
+                    PPCContext c{};
+                    c.r3.u32 = id, c.r4.u32 = overlapped;
+                    imp("XamContentGetDeviceState")(c, base);
+                    return c.r3.u32;
+                };
+                const bool sync = state(1, 0) == 0 && state(2, 0) == 0x48F;
+                const bool asyncOk = state(1, ov) == 0x3E5 && be32(ov) == 0 && be32(ov + 4) == 0 && be32(ov + 0x18) == 0;
+                const bool asyncNo = state(2, ov) == 0x3E5 && be32(ov) == 0x65B && be32(ov + 4) == 0 && be32(ov + 0x18) == 0x48F;
+                Expect(sync && asyncOk && asyncNo, "XamContentGetDeviceState: device 1 present (0), device 2 DEVICE_NOT_CONNECTED; with an "
+                                                   "XOVERLAPPED: IO_PENDING, completed {0, 0} or {FUNCTION_FAILED, extended 0x48F}, length 0");
+            }
+            {
+                // XamContentDelete(user, XCONTENT_DATA*, XOVERLAPPED*) (Xenia xam_content.cc:409-423, content_manager.cc:318-332):
+                // open (mounted) ACCESS_DENIED (5); closed: 0, its directory (with a file) and record gone; again FILE_NOT_FOUND (2);
+                // with an XOVERLAPPED IO_PENDING and {2, extended 2, length 0xFFFFFFFF} (CompleteOverlappedImmediate); type 2 stops (7).
+                auto del = [&](const char* name, uint32_t overlapped, uint32_t type = 1) {
+                    std::memset(base + contentData, 0, 0x134);
+                    Store32(base, contentData, 1), Store32(base, contentData + 4, type);
+                    std::memcpy(base + contentData + 0x108, name, std::strlen(name));
+                    PPCContext c{};
+                    c.r4.u32 = contentData, c.r5.u32 = overlapped;
+                    imp("XamContentDelete")(c, base);
+                    return c.r3.u32;
+                };
+                std::ofstream(typeDir + "/created1/Inner", std::ios::binary) << "x";
+                const bool open = contentCreate("created1", 0x813, false) == 0 && del("created1", 0) == 5;
+                const bool closedAgain = closeRoot("save") == 0;
+                struct stat gone;
+                const bool deleted = del("created1", 0) == 0 && stat((typeDir + "/created1").c_str(), &gone) != 0 &&
+                                     stat((typeDir + "/created1.xcontent").c_str(), &gone) != 0;
+                for (uint32_t i = 0; i < 0x1C; i += 4) Store32(base, ov + i, 0);
+                const bool absent = del("created1", 0) == 2 && del("created1", ov) == 0x3E5 && be32(ov) == 2 && be32(ov + 0x18) == 2 &&
+                                    be32(ov + 4) == 0xFFFFFFFF;
+                Expect(open && closedAgain && deleted && absent && ExitCodeOf([&] { (void)del("created1", 0, 2); }) == int(StopCode::Unimplemented),
+                       "XamContentDelete: open ACCESS_DENIED; closed: deleted with its files and record; again FILE_NOT_FOUND (overlapped "
+                       "IO_PENDING, {2, 2, FFFFFFFF}); type 2 stops (7)");
+            }
+            cleanItem("created1"), cleanItem("created2");
         }
         symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
         // The stop must be the symlink check's own: a link missing from the disc map also stops (9), with another message
@@ -1919,6 +2493,133 @@ int main(int, char** argv)
            "XexGetModuleSection: a 9-character name or a prefix is STATUS_NOT_FOUND, nothing written");
     Expect(moduleSection(0x1234, "dbgstr") == 0xC0000008 && moduleSection(m.ldr, "dbgstr") == 0xC0000008,
            "XexGetModuleSection: a handle that is no loaded module is STATUS_INVALID_HANDLE");
+    {
+        // XamUserCreateAchievementEnumerator(title, user, xuid, flags, offset, count, size*, handle*) (Xenia xam_user.cc:577-749,
+        // xdbf_utils.{h,cc}) on a hand-built title: execution info (00040006, title id 4D530910) and the resource "4D530910"
+        // holding an XDBF {2 entries: XSTC (skipped), XACH with 2 achievements: (63, image 54, 15 G, flags 9), (72, image 15,
+        // 20 G, flags 0xA)}. Count 1 per call: size 36; XamEnumerate gives X_ACHIEVEMENT_DETAILS {id, 0, 0, 0, image,
+        // gamerscore, 0, 0, flags} once each, then NO_MORE_FILES (0x12). Count 0 or user 4: INVALID_PARAMETER (0x57);
+        // strings (flags 1) or another XUID stop (7).
+        std::vector<uint8_t> xdbf;
+        auto be = [&](uint32_t v, int n) { for (int i = n - 1; i >= 0; i--) xdbf.push_back(uint8_t(v >> (8 * i))); };
+        be(0x58444246, 4), be(0x10000, 4), be(2, 4), be(2, 4), be(1, 4), be(1, 4);
+        be(1, 2), be(0, 4), be(0x58535443, 4), be(0, 4), be(16, 4);       // XSTC at content +0, 16 bytes
+        be(1, 2), be(0, 4), be(0x58414348, 4), be(16, 4), be(86, 4);      // XACH at content +16, 14 + 2 x 0x24
+        be(0, 4), be(0, 4);                                               // the free entry
+        be(0x58535443, 4), be(1, 4), be(4, 4), be(1, 4);                  // XSTC
+        be(0x58414348, 4), be(1, 4), be(86, 4), be(2, 2);                 // XACH header
+        be(63, 2), be(1, 2), be(2, 2), be(3, 2), be(54, 4), be(15, 2), be(0, 2), be(9, 4), be(0, 4), be(0, 4), be(0, 4), be(0, 4);
+        be(72, 2), be(4, 2), be(5, 2), be(6, 2), be(15, 4), be(20, 2), be(0, 2), be(0xA, 4), be(0, 4), be(0, 4), be(0, 4), be(0, 4);
+        const uint32_t xdbfAt = ArenaAlloc(base, uint32_t(xdbf.size()));
+        std::memcpy(base + xdbfAt, xdbf.data(), xdbf.size());
+        std::vector<uint8_t> titleHeader(0x80, 0);
+        auto putT = [&](uint32_t at, uint32_t v) { for (int i = 0; i < 4; i++) titleHeader[at + i] = uint8_t(v >> (24 - 8 * i)); };
+        titleHeader[0] = 'X', titleHeader[1] = 'E', titleHeader[2] = 'X', titleHeader[3] = '2';
+        putT(0x10, 0x80), putT(0x14, 2), putT(0x18, 0x00040006), putT(0x1C, 0x40), putT(0x20, 0x000002FF), putT(0x24, 0x60);
+        putT(0x4C, 0x4D530910);
+        putT(0x60, 0x14), std::memcpy(&titleHeader[0x64], "4D530910", 8), putT(0x6C, xdbfAt), putT(0x70, uint32_t(xdbf.size()));
+        SetExecutableModule(CreateModule(base, titleHeader, 0x40000000, 0x40001000));
+        const uint32_t achSize = ArenaAlloc(base, 4), achHandle = ArenaAlloc(base, 4), achBuf = ArenaAlloc(base, 40), achGot = ArenaAlloc(base, 4);
+        auto createAch = [&](uint32_t user, uint32_t xuid, uint32_t flags, uint32_t count) {
+            PPCContext c{};
+            c.r4.u32 = user, c.r5.u32 = xuid, c.r6.u32 = flags, c.r8.u32 = count, c.r9.u32 = achSize, c.r10.u32 = achHandle;
+            imp("XamUserCreateAchievementEnumerator")(c, base);
+            return c.r3.u32;
+        };
+        auto enumerateAch = [&]() {
+            std::memset(base + achBuf, 0xEE, 40);
+            PPCContext c{};
+            c.r3.u32 = be32(achHandle), c.r5.u32 = achBuf, c.r6.u32 = 36, c.r7.u32 = achGot;
+            imp("XamEnumerate")(c, base);
+            return c.r3.u32;
+        };
+        const bool created = createAch(0, 0, 0, 1) == 0 && be32(achSize) == 36;
+        const bool first = enumerateAch() == 0 && be32(achGot) == 1 && be32(achBuf) == 63 && be32(achBuf + 4) == 0 && be32(achBuf + 12) == 0 &&
+                           be32(achBuf + 16) == 54 && be32(achBuf + 20) == 15 && be32(achBuf + 24) == 0 && be32(achBuf + 28) == 0 &&
+                           be32(achBuf + 32) == 9 && base[achBuf + 36] == 0xEE;
+        const bool second = enumerateAch() == 0 && be32(achBuf) == 72 && be32(achBuf + 16) == 15 && be32(achBuf + 20) == 20 && be32(achBuf + 32) == 0xA;
+        const bool done = enumerateAch() == 0x12 && be32(achGot) == 0;
+        const bool invalid = createAch(0, 0, 0, 0) == 0x57 && createAch(4, 0, 0, 1) == 0x57;
+        Expect(created && first && second && done && invalid && ExitCodeOf([&] { (void)createAch(0, 0, 1, 1); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)createAch(0, 0x1234, 0, 1); }) == int(StopCode::Unimplemented),
+               "XamUserCreateAchievementEnumerator: the title XDBF's XACH entries as 36-byte details (none unlocked), one per call, then "
+               "NO_MORE_FILES; count 0 / user 4 INVALID_PARAMETER; strings or another XUID stop (7)");
+        {
+            // XamContentAggregateCreateEnumerator(xuid, device, type, 0, handle*) (Xenia xam_content_aggregate.cc:84-145), resolved
+            // as xam ordinal 0x279 (Xenia xam_table.inc:430): with a stored saved game "agg01", every stored record
+            // (ListContent) comes back once per XamEnumerate as 0x138 bytes = the record + this title's id (4D530910), then
+            // NO_MORE_FILES; a null handle pointer or device 2 E_INVALIDARG (80070057); type 3 stops (7).
+            const SystemExport* aggregate = FindSystemExport("xam.xex", 0x279);
+            ContentData agg{};
+            agg[3] = 1, agg[7] = 1;
+            std::memcpy(agg.data() + 0x108, "agg01", 5);
+            const bool made = CreateContent(agg, "aggroot") == 0 && UnmountContentRoot("aggroot");
+            const std::vector<ContentData> stored = ListContent(1);
+            const uint32_t aggHandle = ArenaAlloc(base, 4), aggBuf = ArenaAlloc(base, 0x140), aggGot = ArenaAlloc(base, 4);
+            auto createAgg = [&](uint32_t device, uint32_t type, uint32_t handleOut) {
+                PPCContext c{};
+                c.r3.u64 = 0xE000000000000001ull, c.r4.u32 = device, c.r5.u32 = type, c.r7.u32 = handleOut;
+                imp("XamContentAggregateCreateEnumerator")(c, base);
+                return c.r3.u32;
+            };
+            bool all = aggregate && std::strcmp(aggregate->name, "XamContentAggregateCreateEnumerator") == 0 && made &&
+                       createAgg(1, 1, aggHandle) == 0 && !stored.empty();
+            for (size_t i = 0; all && i < stored.size(); i++)
+            {
+                PPCContext c{};
+                c.r3.u32 = be32(aggHandle), c.r5.u32 = aggBuf, c.r6.u32 = 0x138, c.r7.u32 = aggGot;
+                imp("XamEnumerate")(c, base);
+                all = c.r3.u32 == 0 && be32(aggGot) == 1 && std::memcmp(base + aggBuf, stored[i].data(), 0x134) == 0 && be32(aggBuf + 0x134) == 0x4D530910;
+            }
+            PPCContext last{};
+            last.r3.u32 = be32(aggHandle), last.r5.u32 = aggBuf, last.r6.u32 = 0x138, last.r7.u32 = aggGot;
+            imp("XamEnumerate")(last, base);
+            const bool invalid = createAgg(1, 1, 0) == ((1u << 31) | (7u << 16) | 0x57) && createAgg(2, 1, aggHandle) == ((1u << 31) | (7u << 16) | 0x57);
+            // XamGetPrivateEnumStructureFromHandle (Xenia xam_enum.cc:107-124): its X_KENUMERATOR (open message +4 = 0x2000E,
+            // "XEN\0" + handle at +0x18); a bad handle STATUS_INVALID_HANDLE. XamGetExecutionId (Xenia xam_info.cc:267-283):
+            // the execution info (title id at +0xC). XAM app 0xFE message 0x2000E (Xenia apps/xam_app.cc:29-71) through
+            // XMsgInProcessCall on a fresh aggregate enumerator: {user, 0, extra*, buffer*, 512, 0, length*, 0}: each call 0,
+            // length 1, the buffer zeroed then the record + title id; after the last one 80070012; a null buffer 80070057.
+            const uint32_t aggHandle2 = ArenaAlloc(base, 4), objOut = ArenaAlloc(base, 4), infoOut = ArenaAlloc(base, 4), msg = ArenaAlloc(base, 0x20),
+                           mbuf = ArenaAlloc(base, 512), mlen = ArenaAlloc(base, 4);
+            const bool second = createAgg(1, 1, aggHandle2) == 0;  // agg01 is still stored
+            PPCContext priv{};
+            priv.r3.u32 = be32(aggHandle2), priv.r4.u32 = objOut;
+            imp("XamGetPrivateEnumStructureFromHandle")(priv, base);
+            const uint32_t obj = be32(objOut);
+            PPCContext badPriv{};
+            badPriv.r3.u32 = 0x12345678, badPriv.r4.u32 = objOut;
+            imp("XamGetPrivateEnumStructureFromHandle")(badPriv, base);
+            const bool structure = priv.r3.u32 == 0 && be32(obj + 4) == 0x2000E && be32(obj + 0x18) == 0x58454E00 && be32(obj + 0x1C) == be32(aggHandle2) &&
+                                   badPriv.r3.u32 == 0xC0000008;
+            PPCContext exec{};
+            exec.r3.u32 = infoOut;
+            imp("XamGetExecutionId")(exec, base);
+            const bool executionId = exec.r3.u32 == 0 && be32(be32(infoOut) + 0xC) == 0x4D530910;
+            auto enumMessage = [&](uint32_t buffer) {
+                std::memset(base + msg, 0, 0x20), std::memset(base + mbuf, 0xEE, 512), Store32(base, mlen, 0);
+                Store32(base, msg + 8, obj + 0x18), Store32(base, msg + 12, buffer), Store32(base, msg + 16, 512), Store32(base, msg + 24, mlen);
+                PPCContext c{};
+                c.r3.u32 = 0xFE, c.r4.u32 = 0x2000E, c.r5.u32 = msg;
+                imp("XMsgInProcessCall")(c, base);
+                return c.r3.u32;
+            };
+            const std::vector<ContentData> listed2 = ListContent(1);
+            bool messages = second && !listed2.empty();
+            for (size_t i = 0; messages && i < listed2.size(); i++)
+                messages = enumMessage(mbuf) == 0 && be32(mlen) == 1 && std::memcmp(base + mbuf, listed2[i].data(), 0x134) == 0 &&
+                           be32(mbuf + 0x134) == 0x4D530910 && base[mbuf + 0x138] == 0 && base[mbuf + 511] == 0;
+            messages = messages && enumMessage(mbuf) == ((1u << 31) | (7u << 16) | 0x12) && be32(mlen) == 0 && enumMessage(0) == ((1u << 31) | (7u << 16) | 0x57);
+            Expect(structure && executionId && messages,
+                   "XamGetPrivateEnumStructureFromHandle: the X_KENUMERATOR (0x2000E, XEN, handle); bad handle INVALID_HANDLE; "
+                   "XamGetExecutionId: the execution info; XAM 0x2000E: one record + title id per call (length 1), then NO_MORE_FILES; null buffer E_INVALIDARG");
+            DeleteContent(agg);
+            Expect(all && last.r3.u32 == 0x12 && invalid && ExitCodeOf([&] { (void)createAgg(1, 3, aggHandle); }) == int(StopCode::Unimplemented),
+                   "XamContentAggregateCreateEnumerator (xam 0x279): stored records + title id, one per call, then NO_MORE_FILES; "
+                   "null handle or device 2 E_INVALIDARG; type 3 stops (7)");
+        }
+        SetExecutableModule(res);
+    }
     const uint32_t xamLdr = SystemModule(base, "xam.xex");
     Expect(ExitCodeOf([&] { (void)moduleSection(xamLdr, "dbgstr"); }) == int(StopCode::Unimplemented),
            "XexGetModuleSection on a system module stops (7)");
@@ -2172,6 +2873,106 @@ int main(int, char** argv)
            "TLS: template copied, the rest of the data and the slots zero");
     Expect(t.stackBase - t.stackLimit == 0x10000 && t.kthread - t.tls >= 0x40 && t.pcr - t.kthread >= kKthreadSize,
            "stack size; TLS, KTHREAD and PCR do not overlap");
+    {
+        // The fiber switch (runtime/kernel/fibers.cpp) against the guest routine's contract (FM4 image,
+        // the local capture fiber (not distributed); Xenia KeSetCurrentStackPointers, xboxkrnl_threading.cc:275-298):
+        // a new fiber (a block as CreateFiber writes it: +4/+8 stack top, +12 limit, +48 r1, +288 r31, +28 LR, plus CR
+        // +296, FPSCR +304, f14 +424) starts at its LR with those registers, r3 = its sp, r4 = KTHREAD, r5-r7 = the stack
+        // fields; KTHREAD +0x164 = the target; KTHREAD +0xD0/+0x5C/+0x60 and PCR +0x70/+0x74 = its stack fields. Switching
+        // back resumes the root after its switch with its r14/r31/CR/LR as before, and the fiber's block holds what it
+        // stored (r14 at +152, LR at +28, r1 at +48). A fiber ending the thread rethrows on the root.
+        const uint32_t root = ArenaAlloc(base, 0xA50), fiber = ArenaAlloc(base, 0xA50);
+        PPCContext mk{};
+        mk.r3.u64 = 0x4000;
+        imp("MmCreateKernelStack")(mk, base);
+        const uint32_t top = mk.r3.u32;
+        Store32(base, root + 4, t.stackBase), Store32(base, root + 8, t.stackBase), Store32(base, root + 12, t.stackLimit);
+        Store32(base, fiber + 4, top), Store32(base, fiber + 8, top), Store32(base, fiber + 12, top - 0x4000);
+        Store32(base, fiber + 48, 0), Store32(base, fiber + 52, top - 80);
+        Store32(base, fiber + 288, 0), Store32(base, fiber + 292, 0x12345678);   // r31
+        Store32(base, fiber + 28, PPC_CODE_BASE + 0x40);                          // LR
+        Store32(base, fiber + 296, 0x20000000);                                   // CR: cr0.eq
+        Store32(base, fiber + 304, 0), Store32(base, fiber + 308, 1);             // FPSCR: round toward zero
+        Store32(base, fiber + 424, 0x3FF00000), Store32(base, fiber + 428, 0);   // f14 = 1.0
+        PPC_LOOKUP_FUNC(base, PPC_CODE_BASE + 0x40) = FiberStart;
+        Store32(base, t.kthread + kthread::kFiber, root);
+        fiberBack = root;
+        PPCContext f{};
+        f.r13.u64 = t.pcr, f.r1.u64 = t.stackBase - 0x100, f.r14.u64 = 0x55550014, f.r31.u64 = 0x77770031, f.lr = 0x90001230, f.cr6.lt = 1;
+        f.fpscr.storeFromGuest(0);
+        f.r3.u64 = fiber;
+        PpcRuntime_switch_fiber(f, base);
+        const FiberSeen s = fiberSeen;
+        const bool started = s.r1 == top - 80 && s.r3 == top - 80 && s.r4 == t.kthread && s.r5 == top && s.r6 == top && s.r7 == top - 0x4000 &&
+                             s.r31 == 0x12345678 && s.f14 == 0x3FF0000000000000ull && s.lr == PPC_CODE_BASE + 0x40 && s.cr == 0b0010 &&
+                             s.kthreadFiber == fiber && s.pcrBase == top && s.pcrEnd == top - 0x4000 && s.round == 1;
+        const bool rootBack = f.r14.u64 == 0x55550014 && f.r31.u64 == 0x77770031 && f.lr == 0x90001230 && f.cr6.lt == 1 &&
+                              f.r1.u64 == t.stackBase - 0x100 && f.fpscr.loadFromHost() == 0 && be32(t.kthread + kthread::kFiber) == root &&
+                              be32(t.pcr + pcr::kStackBase) == t.stackBase && be32(t.kthread + 0xD0) == t.stackBase;
+        const bool stored = be32(fiber + 152 + 4) == 0xAAAA0014 && be32(fiber + 28) == 0x9000ABC0 && be32(root + 52) == t.stackBase - 0x100 &&
+                            be32(root + 152 + 17 * 8 + 4) == 0x77770031 && be32(root + 296) == 0x00000080;
+        f.r3.u64 = fiber;
+        PpcRuntime_switch_fiber(f, base);
+        const bool resumed = fiberSeen.resumedIntact && f.r14.u64 == 0x55550014;
+        // DeleteFiber of a suspended fiber (the local capture delete_fiber (not distributed)): MmDeleteKernelStack(block +4, +12) forgets
+        // it and releases its guest stack (Xenia xboxkrnl_memory.cc:730-739: SUCCESS; again: UNSUCCESSFUL); a new fiber
+        // at the same block address then starts afresh on its new stack.
+        const uint32_t second = ArenaAlloc(base, 0xA50);
+        auto prepare = [&](uint32_t b) {
+            PPCContext c{};
+            c.r3.u64 = 0x4000;
+            imp("MmCreateKernelStack")(c, base);
+            const uint32_t st = c.r3.u32;
+            std::memset(base + b, 0, 0xA50);
+            Store32(base, b + 4, st), Store32(base, b + 8, st), Store32(base, b + 12, st - 0x4000), Store32(base, b + 52, st - 80);
+            Store32(base, b + 28, PPC_CODE_BASE + 0x40);
+            return st;
+        };
+        auto deleteStack = [&](uint32_t top, uint32_t limit) { PPCContext c{}; c.r3.u32 = top, c.r4.u32 = limit; imp("MmDeleteKernelStack")(c, base); return c.r3.u32; };
+        const uint32_t top2 = prepare(second);
+        f.r3.u64 = second;
+        PpcRuntime_switch_fiber(f, base);  // starts, then switches back
+        const bool firstRun = fiberSeen.r1 == top2 - 80;
+        const bool deleted = deleteStack(top2, top2 - 0x4000) == 0 && !InGuestStack(top2 - 1) && deleteStack(top2, top2 - 0x4000) == 0xC0000001;
+        const uint32_t top3 = prepare(second);
+        fiberSeen = {};
+        f.r3.u64 = second;
+        PpcRuntime_switch_fiber(f, base);
+        const bool afresh = firstRun && deleted && fiberSeen.r1 == top3 - 80 && fiberSeen.r3 == top3 - 80 && f.r14.u64 == 0x55550014;
+        Expect(afresh, "DeleteFiber: MmDeleteKernelStack releases the stack (0; again C0000001) and forgets its fiber; a new fiber at "
+                       "the same block starts afresh");
+        // ConvertFiberToThread then ConvertThreadToFiber on the root (FM4's own routines): KTHREAD
+        // +0x164 names a new block whose +4/+8/+12 are the KTHREAD's stack fields (+0xD0/+0x5C/+0x60). Switching from it
+        // resumes the suspended fiber, which switches back to the new block (the root's stack, its registers intact). A
+        // block whose stack fields are not the thread's still stops (7).
+        const uint32_t root2 = ArenaAlloc(base, 0xA50), bogus = ArenaAlloc(base, 0xA50);
+        std::memset(base + root2, 0, 0xA50), std::memset(base + bogus, 0, 0xA50);
+        Store32(base, root2 + 4, be32(t.kthread + 0xD0)), Store32(base, root2 + 8, be32(t.kthread + kthread::kStackBase));
+        Store32(base, root2 + 12, be32(t.kthread + kthread::kStackLimit));
+        std::memcpy(base + bogus, base + root2, 16), Store32(base, bogus + 8, be32(root2 + 8) - 0x1000);
+        const bool mismatchStops = ExitCodeOf([&] {
+            Store32(base, t.kthread + kthread::kFiber, bogus);
+            PPCContext g = f;
+            g.r3.u64 = second;
+            PpcRuntime_switch_fiber(g, base);
+        }) == int(StopCode::Unimplemented);
+        Store32(base, t.kthread + kthread::kFiber, root2);
+        fiberBack = root2, fiberSeen.resumedIntact = false;
+        f.r3.u64 = second;
+        PpcRuntime_switch_fiber(f, base);
+        const bool reconverted = fiberSeen.resumedIntact && be32(t.kthread + kthread::kFiber) == root2 && f.r14.u64 == 0x55550014 &&
+                                 f.r1.u64 == t.stackBase - 0x100 && be32(root2 + 52) == t.stackBase - 0x100;
+        Expect(mismatchStops && reconverted, "fiber switch after ConvertFiberToThread/ConvertThreadToFiber: the new block names the "
+                                             "running stack (a suspended fiber resumes and returns to it); a block not describing "
+                                             "the thread's stack stops (7)");
+        f.r3.u64 = fiber;
+        bool ended = false;
+        try { PpcRuntime_switch_fiber(f, base); } catch (...) { ended = true; }
+        Expect(started && rootBack && stored && resumed && ended,
+               "fiber switch: a new fiber starts at its block's LR with the block's registers and stack fields (KTHREAD, PCR); "
+               "the root resumes with its registers; blocks hold the stored r1/LR/CR/r14-r31; a fiber resumes intact; ending the thread on a fiber rethrows on the root");
+        Store32(base, t.kthread + kthread::kFiber, 0);
+    }
     PPCContext self{};
     self.r13.u64 = t.pcr;
     __imp__KeGetCurrentProcessType(self, base);
@@ -2297,6 +3098,121 @@ int main(int, char** argv)
     Expect(threadSaw == 0x1234 && be32(k + kthread_state::kExitStatus) == 0x77 && base[k + kthread_state::kTerminated] == 1 &&
            be32(k + kthread::kThreadId) == id && be32(k + 4) == 1, "a raw thread runs start(context); its result is the exit status");
     {
+        // ObCreateObject(type*, 0, 124, object*) on a title-defined OBJECT_TYPE {allocate, free, close, 0, 0, 0, 'Nuio'} (FM4's
+        // NUI type, the local capture menu5 (not distributed)): allocate gets 0x18 + 124; object* = block + 0x18 (Xenia X_OBJECT_HEADER: pointer
+        // count 1 at block +0, type at body - 8), zeroed. The body as a KEVENT (type 1) takes KeSetEvent. ObOpenObjectByPointer
+        // (Xenia xboxkrnl_ob.cc:57-70): a handle; handle count 1, pointer count 2; ObReferenceObjectByHandle with this type
+        // gives the body, with ExEventObjectType a type mismatch. NtClose: close(object, 1), handle count 0, pointer count 1;
+        // ObDereferenceObject: free(block); again: stops (5). A failing allocate: C000009A, object* 0; attributes stop (7);
+        // ObOpenObjectByPointer of an unknown pointer: C0000001.
+        PPC_LOOKUP_FUNC(base, uint32_t(PPC_CODE_BASE) + 0x60) = TypeAllocate;
+        PPC_LOOKUP_FUNC(base, uint32_t(PPC_CODE_BASE) + 0x64) = TypeFree;
+        PPC_LOOKUP_FUNC(base, uint32_t(PPC_CODE_BASE) + 0x68) = TypeClose;
+        const uint32_t otype = ArenaAlloc(base, 0x1C), objOut = ArenaAlloc(base, 4), hOut = ArenaAlloc(base, 4), refOut = ArenaAlloc(base, 4);
+        Store32(base, otype, uint32_t(PPC_CODE_BASE) + 0x60), Store32(base, otype + 4, uint32_t(PPC_CODE_BASE) + 0x64),
+            Store32(base, otype + 8, uint32_t(PPC_CODE_BASE) + 0x68), Store32(base, otype + 0x18, 0x4E75696F);
+        auto obCreate = [&](uint32_t attributes) {
+            PPCContext c{};
+            c.r3.u32 = otype, c.r4.u32 = attributes, c.r5.u32 = 124, c.r6.u32 = objOut;
+            imp("ObCreateObject")(c, base);
+            return c.r3.u32;
+        };
+        const bool created = obCreate(0) == 0 && typeAllocSize == 0x18 + 124;
+        const uint32_t body = be32(objOut), oblock = body - 0x18;
+        bool zero = true;
+        for (uint32_t i = 0; i < 124; i++) zero = zero && base[body + i] == 0;
+        const bool header = be32(oblock) == 1 && be32(oblock + 4) == 0 && be32(body - 8) == otype && zero;
+        base[body] = 1, Store32(base, body + 8, body + 8), Store32(base, body + 12, body + 8);  // a synchronization KEVENT
+        PPCContext set{};
+        set.r3.u32 = body, set.r4.u32 = 1;
+        imp("KeSetEvent")(set, base);
+        const bool signalled = be32(body + 4) == 1;
+        PPCContext open{};
+        open.r3.u32 = body, open.r4.u32 = hOut;
+        imp("ObOpenObjectByPointer")(open, base);
+        const bool opened = open.r3.u32 == 0 && be32(hOut) != 0 && be32(oblock + 4) == 1 && be32(oblock) == 2;
+        auto reference = [&](uint32_t typeAddress) {
+            PPCContext c{};
+            c.r3.u32 = be32(hOut), c.r4.u32 = typeAddress, c.r5.u32 = refOut;
+            imp("ObReferenceObjectByHandle")(c, base);
+            return c.r3.u32;
+        };
+        // FM4 Recomp: the reference by handle counts (Xenia RetainHandle): pointer count 3, a mismatch adds none; the
+        // caller's ObDereferenceObject takes it back to 2 and the object stays alive.
+        const bool referenced = reference(otype) == 0 && be32(refOut) == body && be32(oblock) == 3 &&
+                                reference(DataImportValue("ExEventObjectType")) == 0xC0000024 && be32(oblock) == 3;
+        PPCContext release{};
+        release.r3.u32 = body;
+        imp("ObDereferenceObject")(release, base);
+        const bool released = be32(oblock) == 2 && typeFreed != oblock && reference(otype) == 0 && be32(oblock) == 3;
+        imp("ObDereferenceObject")(release, base);
+        PPCContext closeIt{};
+        closeIt.r3.u32 = be32(hOut);
+        imp("NtClose")(closeIt, base);
+        const bool closedOk = closeIt.r3.u32 == 0 && typeClosedObject == body && typeClosedCount == 1 && be32(oblock + 4) == 0 && be32(oblock) == 1;
+        PPCContext deref{};
+        deref.r3.u32 = body;
+        imp("ObDereferenceObject")(deref, base);
+        const bool freed = typeFreed == oblock;
+        typeAllocFails = true;
+        const bool failed = obCreate(0) == 0xC000009A && be32(objOut) == 0;
+        typeAllocFails = false;
+        PPCContext unknown{};
+        unknown.r3.u32 = otype, unknown.r4.u32 = hOut;
+        imp("ObOpenObjectByPointer")(unknown, base);
+        Expect(created && header && signalled && opened && referenced && released && closedOk && freed && failed && unknown.r3.u32 == 0xC0000001 &&
+                   ExitCodeOf([&] { PPCContext c = deref; imp("ObDereferenceObject")(c, base); }) == int(StopCode::GuestFault) &&
+                   ExitCodeOf([&] { (void)obCreate(0x1234); }) == int(StopCode::Unimplemented),
+               "ObCreateObject (title type): allocate(0x18 + size), header pointer count 1 and type, zeroed body (a KEVENT here); "
+               "ObOpenObjectByPointer: handle, counts 1/2; reference by its type counts (3), its dereference returns it (2); NtClose: close(object, 1); last dereference: free(block); "
+               "allocate failure C000009A; unknown pointer C0000001; a dead object or attributes stop");
+    }
+    {
+        // InterlockedPopEntrySList / InterlockedFlushSList (Xenia xboxkrnl_threading.cc:1549-1596; X_SLIST_HEADER {next, depth
+        // u16, sequence u16}): list A -> B, depth 2, sequence 7: pop gives A, header {B, 1, 7}; pop gives B, {0, 0, 7}; pop of the
+        // empty list 0, header unchanged. Flush of {A, 2, 9} gives A and zeroes the header. An unaligned header stops (7).
+        const uint32_t sl = ArenaAlloc(base, 8, 8), ea = ArenaAlloc(base, 8), eb = ArenaAlloc(base, 8);
+        Store32(base, ea, eb), Store32(base, eb, 0);
+        Store32(base, sl, ea), Store32(base, sl + 4, (2u << 16) | 7);
+        auto slist = [&](const char* name, uint32_t header) { PPCContext c{}; c.r3.u32 = header; imp(name)(c, base); return c.r3.u32; };
+        const bool popA = slist("InterlockedPopEntrySList", sl) == ea && be32(sl) == eb && be32(sl + 4) == ((1u << 16) | 7);
+        const bool popB = slist("InterlockedPopEntrySList", sl) == eb && be32(sl) == 0 && be32(sl + 4) == 7;
+        const bool empty = slist("InterlockedPopEntrySList", sl) == 0 && be32(sl + 4) == 7;
+        Store32(base, sl, ea), Store32(base, sl + 4, (2u << 16) | 9);
+        const bool flushed = slist("InterlockedFlushSList", sl) == ea && be32(sl) == 0 && be32(sl + 4) == 0;
+        Expect(popA && popB && empty && flushed && ExitCodeOf([&] { (void)slist("InterlockedPopEntrySList", sl + 4); }) == int(StopCode::Unimplemented),
+               "InterlockedPopEntrySList: first entry, next/depth-1/sequence kept; empty: 0; InterlockedFlushSList: the list, header zeroed; unaligned stops (7)");
+    }
+    {
+        // XamTaskSchedule(callback, message, 0, handle*) (Xenia xam_task.cc:48-86): the callback runs on a new guest thread
+        // with the message; it completes the request with XMsgCompleteIORequest (Xenia xam_msg.cc:104-111: exactly
+        // {result 0, extended 0, length 7}, the event set) while this thread waits in XamGetOverlappedResult(ov, len*, 1)
+        // on the XOVERLAPPED's event (Xenia xam_msg.cc:113-136): 0, length 7. Optional args stop (7).
+        PPC_LOOKUP_FUNC(base, uint32_t(PPC_CODE_BASE) + 0x50) = TaskBody;
+        const uint32_t evOut = ArenaAlloc(base, 4), task = ArenaAlloc(base, 0x20), tov = ArenaAlloc(base, 0x1C), tHandle = ArenaAlloc(base, 4),
+                       tLen = ArenaAlloc(base, 4);
+        PPCContext ev{};
+        ev.r3.u32 = evOut, ev.r5.u32 = 0, ev.r6.u32 = 0;
+        imp("NtCreateEvent")(ev, base);
+        std::memset(base + tov, 0, 0x1C);
+        Store32(base, tov, 0x3E5), Store32(base, tov + 0xC, be32(evOut));
+        Store32(base, task, tov);
+        PPCContext sched{};
+        sched.r3.u32 = uint32_t(PPC_CODE_BASE) + 0x50, sched.r4.u32 = task, sched.r6.u32 = tHandle;
+        imp("XamTaskSchedule")(sched, base);
+        const auto taskThread = LookupHandle(be32(tHandle));
+        PPCContext wait{};
+        wait.r3.u32 = tov, wait.r4.u32 = tLen, wait.r5.u32 = 1;
+        imp("XamGetOverlappedResult")(wait, base);
+        if (taskThread)
+            WaitForEvent(base, taskThread->header);
+        Expect(sched.r3.u32 == 0 && taskThread && taskThread->type == ObjectType::Thread && wait.r3.u32 == 0 && be32(tLen) == 7 &&
+                   be32(tov) == 0 && be32(tov + 0x18) == 0 && taskSaw == task &&
+                   ExitCodeOf([&] { PPCContext c = sched; c.r3.u32 = uint32_t(PPC_CODE_BASE) + 0x50, c.r5.u32 = tLen; imp("XamTaskSchedule")(c, base); }) == int(StopCode::Unimplemented),
+               "XamTaskSchedule: callback(message) on a guest thread; XMsgCompleteIORequest completes {0, 0, 7} and sets the event; "
+               "XamGetOverlappedResult waits on it: 0, length 7; optional args stop (7)");
+    }
+    {
         // Timers (kernel/imports_timer.cpp; Xenia xboxkrnl_threading.cc:798-877): FM4's call NtCreateTimer(handle*, 0, 1)
         // gives a synchronization timer (dispatcher type 9), unsignalled; NtSetTimerEx with a relative due time of
         // -200000 (20 ms in 100 ns units) signals it, and a wait (1 s limit) consumes it (auto-reset, type 9);
@@ -2373,6 +3289,31 @@ int main(int, char** argv)
                    ExitCodeOf([&] { PPCContext c = nuiRelease; c.r3.u32 = 0xFE, c.r4.u32 = 0x0002A009; imp("XMsgStartIORequest")(c, base); }) ==
                        int(StopCode::Unimplemented),
                "XMsgStartIORequest: XAM 0002A005 and 0002A006 (Kinect requests) E_FAIL; 0002A009 still stops (7)");
+        {
+            // XMsgCancelIORequest(XOVERLAPPED*, wait) (Xenia xam_msg.cc:89-101: 0): a completed request (result 0) -> 0; a
+            // request still marked ERROR_IO_PENDING (never left by this runtime) stops (7). FM4: (overlapped, wait 1).
+            const uint32_t done = ArenaAlloc(base, 0x1C);
+            std::memset(base + done, 0, 0x1C);
+            PPCContext cancel{};
+            cancel.r3.u32 = done, cancel.r4.u32 = 1;
+            imp("XMsgCancelIORequest")(cancel, base);
+            const bool completed = cancel.r3.u32 == 0;
+            StoreBigEndian32(base, done, 0x3E5);
+            Expect(completed && ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = done, c.r4.u32 = 1; imp("XMsgCancelIORequest")(c, base); }) ==
+                                    int(StopCode::Unimplemented),
+                   "XMsgCancelIORequest: a completed request -> 0; one still pending stops (7)");
+        }
+        {
+            // XamVoiceCreate(user, flags, DWORD* voice) (Xenia xam_voice.cc:26-32): voice zeroed, ERROR_ACCESS_DENIED (5); null out stops (7).
+            const uint32_t voice = ArenaAlloc(base, 4);
+            StoreBigEndian32(base, voice, 0xAAAAAAAA);
+            PPCContext vc{};
+            vc.r3.u32 = 0, vc.r4.u32 = 0xF, vc.r5.u32 = voice;
+            imp("XamVoiceCreate")(vc, base);
+            Expect(vc.r3.u32 == 5 && be32(voice) == 0 &&
+                       ExitCodeOf([&] { PPCContext c{}; c.r4.u32 = 0xF; imp("XamVoiceCreate")(c, base); }) == int(StopCode::Unimplemented),
+                   "XamVoiceCreate: no voice device: handle 0, ERROR_ACCESS_DENIED; a null output stops (7)");
+        }
         PPCContext nui8 = nuiRelease;
         nui8.r3.u32 = 0xFE, nui8.r4.u32 = 0x0002A008;
         imp("XMsgStartIORequest")(nui8, base);
@@ -2380,6 +3321,147 @@ int main(int, char** argv)
         nui7.r3.u32 = 0xFE, nui7.r4.u32 = 0x0002A007;
         imp("XMsgStartIORequest")(nui7, base);
         Expect(nui8.r3.u32 == ((1u << 31) | 0x4005) && nui7.r3.u32 == ((1u << 31) | 0x4005), "XMsgStartIORequest: XAM 0002A007 and 0002A008 (Kinect requests) E_FAIL");
+        {
+            // XGI (app 0xFB, Xenia apps/xgi_app.cc:34-56): XGIUserSetContextEx 000B0006 {user, 0, 0, 0, context id, value} (24
+            // bytes) and XGIUserSetPropertyEx 000B0007 {user, ..., id +16, size +20, value* +24}: 0; with an XOVERLAPPED
+            // (Xenia xam_msg.cc:62-65): ERROR_IO_PENDING, completed {0, 0} (CompleteOverlappedImmediate), last error 0. User 4
+            // or a 20-byte context record stops (7); another XGI message (000B0008, achievements) still stops (7).
+            const uint32_t rec = ArenaAlloc(base, 32), val = ArenaAlloc(base, 8), xov = ArenaAlloc(base, 0x1C);
+            auto xgi = [&](uint32_t message, uint32_t user, uint32_t length, uint32_t overlapped) {
+                std::memset(base + rec, 0, 32);
+                Store32(base, rec, user), Store32(base, rec + 16, 0x0F), Store32(base, rec + 20, message == 0x000B0007 ? 4 : 3);
+                Store32(base, rec + 24, val), Store32(base, val, 0x12345678);
+                std::memset(base + xov, 0xAA, 0x1C), std::memset(base + xov + 0x08, 0, 0x10);
+                PPCContext c{};
+                c.r13.u64 = t.pcr;
+                c.r3.u32 = 0xFB, c.r4.u32 = message, c.r5.u32 = overlapped, c.r6.u32 = rec, c.r7.u32 = length;
+                imp("XMsgStartIORequest")(c, base);
+                return c.r3.u32;
+            };
+            const bool context = xgi(0x000B0006, 0, 24, 0) == 0 && xgi(0x000B0006, 0, 0, 0) == 0;
+            const bool property = xgi(0x000B0007, 0, 28, 0) == 0;
+            const bool pending = xgi(0x000B0006, 1, 24, xov) == 0x3E5 && be32(xov) == 0 && be32(xov + 0x18) == 0 && be32(xov + 4) == 0;
+            Expect(context && property && pending && ExitCodeOf([&] { (void)xgi(0x000B0006, 4, 24, 0); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)xgi(0x000B0006, 0, 20, 0); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)xgi(0x000B0008, 0, 8, 0); }) == int(StopCode::Unimplemented),
+                   "XGI SetContextEx / SetPropertyEx: kept, 0; with an XOVERLAPPED IO_PENDING completed {0, 0}; user 4, a 20-byte "
+                   "record or achievements (000B0008) stop (7)");
+        }
+        {
+            // Runtime-local UDP sockets, no link (offline-sockets compatibility policy). Expected values from
+            // WinSock (winsock2.h / winerror.h codes: WSA_OPERATION_ABORTED 995, WSA_IO_INCOMPLETE 996, WSA_IO_PENDING
+            // 997, WSAEFAULT 10014, WSAEINVAL 10022, WSAENOTSOCK 10038, WSAEADDRINUSE 10048, WSAENETUNREACH 10051;
+            // SOL_SOCKET 0xFFFF, SO_BROADCAST 0x20, SO_SNDBUF 0x1001, SO_RCVBUF 0x1002), Xenia xam_net.cc layouts
+            // (XSOCKADDR_IN big-endian family/port/address; XWSAOVERLAPPED event at +16), NT statuses (STATUS_PENDING
+            // 0x103, STATUS_CANCELLED 0xC0000120) and FM4's callers (reference/kernel/offline_sockets.md): every call FM4 makes
+            // succeeds locally, a receive stays pending (never WSAEWOULDBLOCK or WSAECONNRESET: FM4 fails or spins on
+            // those), a send fails WSAENETUNREACH, closesocket aborts the pending receive and sets its event; no host
+            // socket descriptor appears at any point.
+            auto hostSockets = [] {
+                int n = 0;
+                struct stat st;
+                for (int fd = 0; fd < 4096; fd++)
+                    if (fstat(fd, &st) == 0 && S_ISSOCK(st.st_mode))
+                        n++;
+                return n;
+            };
+            const int socketsBefore = hostSockets();
+            auto lastError = [&] { PPCContext c{}; c.r13.u64 = t.pcr; imp("NetDll_WSAGetLastError")(c, base); return c.r3.u32; };
+            auto call = [&](const char* name, std::initializer_list<uint32_t> args, uint32_t stack = 0) {
+                PPCContext c{};
+                c.r13.u64 = t.pcr, c.r1.u64 = stack;
+                PPCRegister* regs[] = {&c.r3, &c.r4, &c.r5, &c.r6, &c.r7, &c.r8, &c.r9, &c.r10};
+                unsigned i = 0;
+                for (const uint32_t a : args)
+                    regs[i++]->u64 = a;
+                imp(name)(c, base);
+                return c.r3.u32;
+            };
+            const uint32_t addr = ArenaAlloc(base, 16), addr2 = ArenaAlloc(base, 16), name = ArenaAlloc(base, 20), len = ArenaAlloc(base, 4),
+                           val = ArenaAlloc(base, 4), ov = ArenaAlloc(base, 20), evOut = ArenaAlloc(base, 4), frame = ArenaAlloc(base, 0x70),
+                           bufs = ArenaAlloc(base, 8), got = ArenaAlloc(base, 4);
+            PPCContext ev{};
+            ev.r3.u32 = evOut, ev.r5.u32 = 0, ev.r6.u32 = 1;  // a notification event, initially set
+            imp("NtCreateEvent")(ev, base);
+            const uint32_t evHeader = LookupHandle(be32(evOut))->header;
+            // FM4's probe (TRACE.md, probe): socket(2, 2, 0) then closesocket.
+            const uint32_t probe = call("NetDll_socket", {1, 2, 2, 0});
+            const bool probed = probe != 0 && probe != 0xFFFFFFFF && call("NetDll_closesocket", {1, probe}) == 0 &&
+                                call("NetDll_closesocket", {1, probe}) == 0xFFFFFFFF && lastError() == 10038;
+            // Session socket (TRACE.md, session socket): UDP 17, SO_BROADCAST 1, SO_SNDBUF 0, SO_RCVBUF; getsockopt; bind 2302; getsockname.
+            const uint32_t s = call("NetDll_socket", {1, 2, 2, 17}), vdp = call("NetDll_socket", {1, 2, 2, 254});
+            StoreBigEndian32(base, val, 1);
+            const bool broadcast = call("NetDll_setsockopt", {1, s, 0xFFFF, 0x20, val, 4}) == 0;
+            StoreBigEndian32(base, val, 0);
+            const bool sndbuf = call("NetDll_setsockopt", {1, s, 0xFFFF, 0x1001, val, 4}) == 0;
+            StoreBigEndian32(base, len, 4), StoreBigEndian32(base, val, 0xAAAAAAAA);
+            const bool rcvDefault = call("NetDll_getsockopt", {1, s, 0xFFFF, 0x1002, val, len}) == 0 && be32(val) == 8192 && be32(len) == 4;
+            StoreBigEndian32(base, val, 0x10000);
+            const bool rcvSet = call("NetDll_setsockopt", {1, s, 0xFFFF, 0x1002, val, 4}) == 0 && (StoreBigEndian32(base, val, 0), true) &&
+                                call("NetDll_getsockopt", {1, s, 0xFFFF, 0x1002, val, len}) == 0 && be32(val) == 0x10000 &&
+                                (StoreBigEndian32(base, val, 0), true) && call("NetDll_getsockopt", {1, s, 0xFFFF, 0x1001, val, len}) == 0 && be32(val) == 0;
+            const bool shortOpt = call("NetDll_setsockopt", {1, s, 0xFFFF, 0x20, val, 2}) == 0xFFFFFFFF && lastError() == 10014;
+            std::memset(base + addr, 0, 16), std::memset(base + addr2, 0, 16);
+            base[addr + 1] = 2, base[addr + 2] = 0x08, base[addr + 3] = 0xFE;  // AF_INET, port 2302 (0x08FE), 0.0.0.0
+            base[addr2 + 1] = 2;                                                // AF_INET, port 0
+            const bool unboundName = (StoreBigEndian32(base, len, 16), call("NetDll_getsockname", {1, s, name, len})) == 0xFFFFFFFF && lastError() == 10022;
+            const bool bound = call("NetDll_bind", {1, s, addr, 20}) == 0;
+            const bool rebind = call("NetDll_bind", {1, s, addr, 16}) == 0xFFFFFFFF && lastError() == 10022;
+            const bool inUse = call("NetDll_bind", {1, vdp, addr, 16}) == 0xFFFFFFFF && lastError() == 10048;
+            const bool ephemeral = call("NetDll_bind", {1, vdp, addr2, 16}) == 0 && (StoreBigEndian32(base, len, 16), call("NetDll_getsockname", {1, vdp, name, len})) == 0 &&
+                                   base[name + 2] == 0xC0 && base[name + 3] == 0x00;  // 49152
+            std::memset(base + name, 0xAA, 20), StoreBigEndian32(base, len, 20);
+            const bool sockName = call("NetDll_getsockname", {1, s, name, len}) == 0 && base[name] == 0 && base[name + 1] == 2 && base[name + 2] == 0x08 &&
+                                  base[name + 3] == 0xFE && be32(name + 4) == 0 && be32(name + 8) == 0 && be32(name + 12) == 0 && be32(len) == 16 &&
+                                  base[name + 16] == 0xAA;
+            // Overlapped receive (TRACE.md, receive): SOCKET_ERROR, WSA_IO_PENDING, Internal STATUS_PENDING, event reset.
+            std::memset(base + ov, 0, 20), StoreBigEndian32(base, ov + 16, be32(evOut));
+            StoreBigEndian32(base, frame + 0x54, ov), StoreBigEndian32(base, frame + 0x5C, 0);
+            StoreBigEndian32(base, got, 0x5555);
+            const bool pending = call("NetDll_WSARecvFrom", {1, s, bufs, 1, got, val, name, len}, frame) == 0xFFFFFFFF && lastError() == 997 &&
+                                 be32(ov) == 0x103 && be32(ov + 4) == 0 && be32(evHeader + 4) == 0 && be32(got) == 0x5555;
+            const bool incomplete = call("NetDll_WSAGetOverlappedResult", {1, s, ov, got, 0, val}) == 0 && lastError() == 996;
+            // Send (TRACE.md, send): SOCKET_ERROR, WSAENETUNREACH, `sent` untouched.
+            StoreBigEndian32(base, frame + 0x54, 0);
+            const bool unreachable = call("NetDll_WSASendTo", {1, s, bufs, 1, got, 0, name, 16}, frame) == 0xFFFFFFFF && lastError() == 10051 &&
+                                     be32(got) == 0x5555;
+            const bool shut = call("NetDll_shutdown", {1, s, 0}) == 0 && call("NetDll_shutdown", {1, s, 3}) == 0xFFFFFFFF && lastError() == 10022;
+            // closesocket aborts the receive: STATUS_CANCELLED, event set; the result: FALSE, WSA_OPERATION_ABORTED, once.
+            const bool closed = call("NetDll_closesocket", {1, s}) == 0 && be32(ov) == 0xC0000120 && be32(evHeader + 4) == 1;
+            const bool aborted = call("NetDll_WSAGetOverlappedResult", {1, s, ov, got, 0, val}) == 0 && lastError() == 995 && be32(got) == 0;
+            const bool portFree = (call("NetDll_closesocket", {1, vdp}), true) && (s != vdp);
+            const uint32_t again = call("NetDll_socket", {1, 2, 2, 17});
+            const bool rebound = call("NetDll_bind", {1, again, addr, 16}) == 0 && call("NetDll_closesocket", {1, again}) == 0;
+            const bool notSock = call("NetDll_bind", {1, s, addr, 16}) == 0xFFFFFFFF && lastError() == 10038 &&
+                                 call("NetDll_WSASendTo", {1, s, bufs, 1, got, 0, name, 16}, frame) == 0xFFFFFFFF && lastError() == 10038;
+            const bool strict =
+                ExitCodeOf([&] { (void)call("NetDll_socket", {2, 2, 2, 17}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { (void)call("NetDll_socket", {1, 2, 1, 0}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { (void)call("NetDll_socket", {1, 2, 2, 6}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); (void)call("NetDll_setsockopt", {1, x, 0xFFFF, 0x4, val, 4}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); (void)call("NetDll_setsockopt", {1, x, 6, 1, val, 4}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); (void)call("NetDll_bind", {1, x, addr2, 16});
+                                 StoreBigEndian32(base, frame + 0x54, 0); (void)call("NetDll_WSARecvFrom", {1, x, bufs, 1, got, val, name, len}, frame); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); (void)call("NetDll_bind", {1, x, addr2, 16});
+                                 StoreBigEndian32(base, frame + 0x54, ov), StoreBigEndian32(base, frame + 0x5C, 0x1234);
+                                 (void)call("NetDll_WSARecvFrom", {1, x, bufs, 1, got, val, name, len}, frame); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); (void)call("NetDll_bind", {1, x, addr2, 16});
+                                 StoreBigEndian32(base, frame + 0x54, ov), StoreBigEndian32(base, frame + 0x5C, 0);
+                                 (void)call("NetDll_WSARecvFrom", {1, x, bufs, 1, got, val, name, len}, frame);
+                                 (void)call("NetDll_WSAGetOverlappedResult", {1, x, ov, got, 1, val}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { (void)call("NetDll_WSAGetOverlappedResult", {1, s, ov + 4, got, 0, val}); }) == int(StopCode::Unimplemented) &&
+                ExitCodeOf([&] { const uint32_t x = call("NetDll_socket", {1, 2, 2, 0}); StoreBigEndian32(base, frame + 0x54, ov);
+                                 (void)call("NetDll_WSASendTo", {1, x, bufs, 1, got, 0, name, 16}, frame); }) == int(StopCode::Unimplemented);
+            Expect(probed && broadcast && sndbuf && rcvDefault && rcvSet && shortOpt && unboundName && bound && rebind && inUse && ephemeral &&
+                       sockName && pending && incomplete && unreachable && shut && closed && aborted && portFree && rebound && notSock && strict &&
+                       hostSockets() == socketsBefore,
+                   "NetDll sockets (local, no link): socket/closesocket (a second close WSAENOTSOCK), set/getsockopt SOL_SOCKET "
+                   "broadcast/sndbuf/rcvbuf (default 8192; short WSAEFAULT), bind (2302; again WSAEINVAL; held WSAEADDRINUSE; "
+                   "port 0 -> 49152), getsockname (unbound WSAEINVAL; 16 bytes), WSARecvFrom pending (997, STATUS_PENDING, event "
+                   "reset), WSAGetOverlappedResult 996 then 995 after closesocket (STATUS_CANCELLED, event set), WSASendTo "
+                   "WSAENETUNREACH, shutdown 0/WSAEINVAL; caller 2, TCP, other protocols/options, blocking/completion/waiting/"
+                   "unknown-overlapped receives and overlapped sends stop (7); no host socket");
+        }
         // XMsgInProcessCall: XLiveBase (FC) 00058004 with FM4's size 0: logon id 0 (no LIVE logon), 0; XMP through the
         // same call; an unknown XLiveBase message stops (7).
         StoreBigEndian32(base, outs, 0xAAAAAAAA);
@@ -2515,8 +3597,34 @@ int main(int, char** argv)
         imp("XamFree")(freeCall, base);
         Expect(alloc.r3.u64 == 0 && zeroed && LookupHeap(xamBlock) == VirtualHeap(4096) && freeCall.r3.u64 == 0 &&
                    ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = xamBlock; imp("XamFree")(c, base); }) == int(StopCode::Unimplemented) &&
-                   ExitCodeOf([&] { PPCContext c = alloc; c.r3.u64 = 0x10000000; imp("XamAlloc")(c, base); }) == int(StopCode::Unimplemented),
-               "XamAlloc(0, 0x2E6C): a zeroed writable xamBlock in the 4 KB virtual heap; XamFree releases it once; another heap's flags stop (7)");
+                   ExitCodeOf([&] { PPCContext c = alloc; c.r3.u64 = 0x00000001; imp("XamAlloc")(c, base); }) == int(StopCode::Unimplemented),
+               "XamAlloc(0, 0x2E6C): a zeroed writable xamBlock in the 4 KB virtual heap; XamFree releases it once; an unknown flag bit stops (7)");
+        {
+            // XamAlloc(0x10000000 = heap 1, 48) (FM4's task block; Xenia xam_info.cc:361-382 serves every heap from one system
+            // heap): a zeroed block in the 4 KB virtual heap, 0; XamFree releases it.
+            PPCContext heap1 = alloc;
+            heap1.r3.u64 = 0x10000000, heap1.r4.u64 = 48;
+            imp("XamAlloc")(heap1, base);
+            const uint32_t block1 = be32(blockOut);
+            PPCContext free1{};
+            free1.r3.u32 = block1;
+            imp("XamFree")(free1, base);
+            Expect(heap1.r3.u64 == 0 && block1 != 0 && LookupHeap(block1) == VirtualHeap(4096) && free1.r3.u64 == 0,
+                   "XamAlloc(heap 1 = 0x10000000, 48): allocated from the same heap (Xenia), freed");
+        }
+        {
+            // MmCreateKernelStack(size, 0) (Xenia xboxkrnl_memory.cc:713-728): the top of a fresh stack in 0x70000000-0x7F000000
+            // whose `size` bytes below the top are usable (zeroed) and whose top is not (the guard above); two stacks are
+            // disjoint; a non-zero second argument stops (7).
+            auto kernelStack = [&](uint32_t size, uint32_t r4) { PPCContext c{}; c.r3.u32 = size, c.r4.u32 = r4; imp("MmCreateKernelStack")(c, base); return c.r3.u32; };
+            const uint32_t a = kernelStack(0x8000, 0), b = kernelStack(0x4000, 0);
+            const bool inRange = a >= 0x70000000u && a < 0x7F000000u && b >= 0x70000000u && b < 0x7F000000u;
+            const bool usable = InGuestStack(a - 1) && InGuestStack(a - 0x8000) && !InGuestStack(a) && base[a - 1] == 0 && base[a - 0x8000] == 0 &&
+                                InGuestStack(b - 0x4000) && !InGuestStack(b);
+            const bool disjoint = b - 0x4000 >= a || a - 0x8000 >= b;
+            Expect(inRange && usable && disjoint && ExitCodeOf([&] { (void)kernelStack(0x4000, 1); }) == int(StopCode::Unimplemented),
+                   "MmCreateKernelStack: the top of a zeroed stack of the requested size with a guard above; two stacks disjoint; r4 != 0 stops (7)");
+        }
         // XMA registers and contexts (kernel/xma.h). Register r is at 7FEA0000 + 4r (Xenia xma_decoder.cc:114); a
         // store's value is as PPC_STORE_U32 takes it, so the device word bit i (context i) is stored as bswap(1 << i).
         const uint32_t plain = ArenaAlloc(base, 16);
@@ -2877,6 +3985,18 @@ int main(int, char** argv)
     Expect(sem.r3.u64 == 0xC000000D, "a count above the limit is an invalid parameter");
     Expect(reference(semaphore, 0x7F048000) == 0 && reference(semaphore, 0x7F040000) == 0xC0000024,
            "ObReferenceObjectByHandle: a semaphore matches the semaphore type, not the event type");
+    {
+        // FM4 Recomp: a timer (no ExTimerObjectType import: the executable cannot hold its type) referenced with an
+        // imported type (the event type) is a mismatch, out cleared; with an address no import or title type has, it
+        // stops.
+        const uint32_t timer = CreateObject(ObjectType::Timer, ev + 64, "");
+        StoreBigEndian32(base, ev + 40, 0xDEADBEEF);
+        Expect(reference(timer, 0x7F040000) == 0xC0000024 && be32(ev + 40) == 0,
+               "ObReferenceObjectByHandle: a timer with the event type: type mismatch, out cleared");
+        Expect(reference(timer, 0) == 0 && be32(ev + 40) == ev + 64, "a timer with no type check gives the timer");
+        Expect(ExitCodeOf([&] { reference(timer, 0x7F0FF000); }) == int(StopCode::Unimplemented),
+               "a timer against an unknown type address stops (7)");
+    }
     PPCContext clock{};
     clock.r3.u64 = ev + 56;
     __imp__KeQuerySystemTime(clock, base);

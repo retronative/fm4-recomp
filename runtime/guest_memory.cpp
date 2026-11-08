@@ -12,6 +12,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <sys/ucontext.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -22,7 +24,7 @@ uint8_t* guestBase = nullptr;
 DescribeAddress describeAddress = nullptr;
 std::atomic<WriteFaultHook> writeFaultHook{nullptr};
 
-void OnFault(int signal, siginfo_t* info, void*)
+void OnFault(int signal, siginfo_t* info, void* context)
 {
     const auto address = reinterpret_cast<uintptr_t>(info->si_addr);
     const auto start = reinterpret_cast<uintptr_t>(guestBase);
@@ -35,7 +37,13 @@ void OnFault(int signal, siginfo_t* info, void*)
     if (const WriteFaultHook hook = writeFaultHook.load(std::memory_order_acquire); hook != nullptr && hook(guest))
         return;  // a watched page, writable again: the store re-runs
     const char* what = describeAddress ? describeAddress(guest) : nullptr;
-    StopFromSignal(StopCode::GuestFault, "guest access to unmapped or read-only %08X%s%s", guest, what ? ": " : "", what ? what : "");
+    // The host pc and lr (arm64 x30) and the executable's load address: `atos -o <binary> -l <image> <pc> <lr>` on the
+    // run's binary names the translated function (sub_<guest address>) that faulted and its caller.
+    const auto* uc = static_cast<const ucontext_t*>(context);
+    const uintptr_t pc = uc ? uintptr_t(uc->uc_mcontext->__ss.__pc) : 0, lr = uc ? uintptr_t(uc->uc_mcontext->__ss.__lr) : 0;
+    StopFromSignal(StopCode::GuestFault, "guest access to unmapped or read-only %08X%s%s (host pc %#lx lr %#lx, image %#lx)", guest,
+                   what ? ": " : "", what ? what : "", (unsigned long)pc, (unsigned long)lr,
+                   (unsigned long)reinterpret_cast<uintptr_t>(_dyld_get_image_header(0)));
 }
 
 void OnTrap(int signal, siginfo_t* info, void*)

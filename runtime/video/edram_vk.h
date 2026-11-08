@@ -41,4 +41,21 @@ using ResolveWriteObserver = void (*)(uint32_t physical, uint32_t bytes);
 const EdramHooks* InitializeEdramVk(const VulkanDevice& device, SpirvCompiler& compiler, uint8_t* guestBase, ResolveWriteObserver observer,
                                     std::string& error);
 
+
+// The isolated GPU check of the 4x -> 2x depth transfer (renderer.cpp RunSelfCheck with FM4_SELFCHECK_EDRAM=depth4x2x;
+// expectations edram_vk_plan.h DepthSelfCheck*): RecordDepthSelfCheck records into `commands`, after InitializeEdramVk,
+// an upload of known depth and stencil into the 1x kD24FS8 key at base 1024 (16 tiles a row, 1280 wide, 32 rows),
+// its transfer into the 4x key 708400 and from there into the 2x key 688400 (tiles 1024-1055), and the depth dump of
+// both (640x16 and 1280x16 pixels, every guest sample) into the staging buffer. After that submission is confirmed
+// complete, VerifyDepthSelfCheck compares every dumped word with its expectation.
+constexpr uint32_t kDepthSelfCheckWidth = 1280, kDepthSelfCheckRows1x = 32;
+constexpr uint64_t kDepthSelfCheckDump4x = 1ull << 20, kDepthSelfCheckDump2x = 2ull << 20;  // staging offsets (the upload is below 1 MiB)
+struct DepthSelfCheckResult
+{
+    uint64_t checked4x = 0, checked2x = 0, mismatches4x = 0, mismatches2x = 0;
+    std::string first;  // the first mismatch, if any
+};
+bool RecordDepthSelfCheck(VkCommandBuffer commands, std::string& error);
+DepthSelfCheckResult VerifyDepthSelfCheck();
+
 }  // namespace runtime::video

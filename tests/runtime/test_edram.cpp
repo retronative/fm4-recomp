@@ -142,7 +142,8 @@ void TestTileMath()
     CONTROL(SupportedKey(k64, why));
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why) &&
           SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), why));  // storage 3 (7e3)
-    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16), why));
+    CHECK(SupportedKey(Key::Color(832, 16, Msaa::X1, ColorFormat::k16_16), why));  // FM4 Recomp: observed in FM4
+    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_Float), why));
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why));  // 32_FLOAT (the local capture draw_loop1 (not distributed) draw 22725)
     CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_32_Float), why));  // 64 bpp: refused by name
     CHECK(why.find("64 bpp") != std::string::npos);
@@ -613,7 +614,7 @@ void TestBindCases()
         CHECK(b.ok && b.color[0] == Key::Color(0, 8, Msaa::X2, ColorFormat::k2_10_10_10));
     }
     r = Fm4Bind();
-    r.colorInfo[0] = 0x00040000;  // k_16_16: 32 bpp, outside the whitelist
+    r.colorInfo[0] = 0x00060000;  // k_16_16_FLOAT: 32 bpp, outside the whitelist (FM4 Recomp: k_16_16, 4, is accepted)
     b = Bind(o, r, 360);
     CONTROL(b.ok);
     CHECK(o.Count(kAd) == before.Count(kAd) && o.Count(kAc) == before.Count(kAc));
@@ -763,8 +764,8 @@ void TestTrace10()
     r.depthControl = 0x1;
     b = Bind(o, r, 360);
     CHECK(b.ok && b.depth == kAd);
-    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 4-9,
-    // 11, 13-15 at the 4x pitch; 2x MSAA; the 1x pitch with 64 bpp); 3 and 12 (7e3, storage 3) are accepted.
+    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 5-9,
+    // 11, 13, 15 at the 4x pitch; 2x MSAA; the 1x pitch with 64 bpp); 3 and 12 (7e3, storage 3), 4 (16_16, FM4 Recomp) and 14 are accepted.
     for (uint32_t f = 3; f <= 15; f++)
     {
         if (f == 10)
@@ -773,7 +774,7 @@ void TestTrace10()
         r.surfaceInfo = 0x14000500, r.modeControl = 4, r.colorMask = 0xF, r.depthControl = 0x8777;
         r.depthInfo = kFm4Depth, r.colorInfo[0] = f << 16;
         Ownership scratch;
-        if (f == 3 || f == 12 || f == 14)
+        if (f == 3 || f == 4 || f == 12 || f == 14)
             CHECK(Bind(scratch, r, 720).ok);
         else
             CONTROL(Bind(scratch, r, 720).ok);

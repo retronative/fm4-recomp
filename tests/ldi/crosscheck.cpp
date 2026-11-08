@@ -8,9 +8,13 @@
 // uncompressed size: an independent oracle (the CRC is computed here, IEEE 802.3 polynomial).
 //
 //   crosscheck <zip> [<zip> ...]
+//
+// LDI_EXTRACT=<dir> (opt-in) with LDI_EXTRACT_SUFFIX=<suffix>: each verified entry whose name ends in the suffix is
+// also written to <dir>/<zip path with '/' as '_'>/<entry name> (game bytes: a research/ folder, never committed).
 #include "ldi_mspack.h"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -74,7 +78,21 @@ int main(int argc, char** argv)
                 produced += u, p += c;
             }
             entries++, bytes += usize;
-            if (!ok || produced != usize || Crc32(out.data(), out.size()) != crc)
+            const bool verified = ok && produced == usize && Crc32(out.data(), out.size()) == crc;
+            static const char* extract = std::getenv("LDI_EXTRACT");
+            static const std::string suffix = std::getenv("LDI_EXTRACT_SUFFIX") ? std::getenv("LDI_EXTRACT_SUFFIX") : "";
+            if (verified && extract && !suffix.empty() && name.size() >= suffix.size() &&
+                name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                std::string folder = argv[a];
+                for (char& ch : folder)
+                    if (ch == '/')
+                        ch = '_';
+                const std::filesystem::path path = std::filesystem::path(extract) / folder / name;
+                std::filesystem::create_directories(path.parent_path());
+                std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
+            }
+            if (!verified)
             {
                 failures++;
                 std::printf("FAIL %s %s: %s (%u of %u bytes, CRC %08X want %08X)\n", argv[a], name.c_str(), error.c_str(), produced, usize,

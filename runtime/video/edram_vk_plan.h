@@ -149,7 +149,9 @@ float Float7e3To32(uint32_t f10);
 
 // X vulkan_render_target_cache.cc:5366-5395: storage 0: byte j / 255; storage 2: 10-bit j / 1023, alpha bits 30-31 / 3;
 // storage 3: 7e3 j (Float7e3To32, the shader form: X :5388 calls the CPU xenos.cc form, whose mantissa shift is wrong,
-// see above), alpha bits 30-31 / 3. Every value is exact in R16G16B16A16_SFLOAT. False for another storage format.
+// see above), alpha bits 30-31 / 3. Every value is exact in R16G16B16A16_SFLOAT. FM4 Recomp: storage 4 (16_16): each signed
+// half s as s / 32767 into R16G16_SNORM, exact for s >= -32767; false for a half of 0x8000 (X clears the raw bits through
+// R16G16_UINT, :5393-5404). False for another storage format.
 bool DecodeColorClear(uint32_t value, uint32_t storage, float rgba[4]);
 // Storage 14 (32_FLOAT) clears through its R32_UINT view with the raw word (X vulkan_render_target_cache.cc:5417-5421
 // "Using uint for proper denormal and NaN handling"); false for every other storage (they use DecodeColorClear).
@@ -225,6 +227,18 @@ struct DumpLayout
     }
 };
 DumpLayout DumpLayoutFor(edram::Msaa msaa, uint32_t width, uint32_t height);
+
+// The isolated GPU check of the 4x -> 2x depth transfer (renderer.cpp RunSelfCheck with FM4_SELFCHECK_EDRAM=depth4x2x):
+// the 1x kD24FS8 key at base 1024, 16 tiles a row, holds at pixel (x, row) a known depth (k / 8192, exact in 20e4) and
+// stencil; it is transferred into the 4x key 708400 and from there into the 2x key 688400 (same base and pitch, so the
+// same EDRAM samples). The expectations come from the EDRAM sample layout alone (X shaders/edram.xesli:23-33: a 1x pixel
+// is one EDRAM sample, 4x pixel (x, y) host sample h is (2x + (h & 1), 2y + (h >> 1)), 2x pixel (x, y) guest sample g is
+// (x, 2y + g)), not from MapTransferTexel: each guest sample's word (PackDepthStencilWord, kD24FS8) as the depth dump reads it.
+float DepthSelfCheckDepth(uint32_t x, uint32_t row);
+uint32_t DepthSelfCheckStencil(uint32_t x, uint32_t row);
+uint32_t DepthSelfCheckWord(uint32_t x, uint32_t row);  // the 1x pixel's word
+uint32_t DepthSelfCheckExpected4x(uint32_t x, uint32_t y, uint32_t guestSample);
+uint32_t DepthSelfCheckExpected2x(uint32_t x, uint32_t y, uint32_t guestSample);
 
 // The guest samples the resolve reads and how they are summed (resolve.xesli:206-216, :632-694); false for a sample the
 // source does not have (DecodeResolve sanitizes, draw_util.cc:495-545). `count` 1, 2 or 4, `indices` in summation order.

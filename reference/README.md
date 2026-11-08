@@ -14,6 +14,7 @@ local and not distributed: they hold data derived from the game.
 | Recompiler | [unproven_switch_c.md](recompiler/unproven_switch_c.md), [unproven_switch_d.md](recompiler/unproven_switch_d.md) | The two bounded analyses of the 0x82ADA478 dispatch |
 | Kernel | [xam_ordinals.md](kernel/xam_ordinals.md) | xam ordinals FM4 resolves at run time |
 | Kernel | [audio.md](kernel/audio.md) | The audio render client and output |
+| Kernel | [offline_sockets.md](kernel/offline_sockets.md) | Runtime-local sockets: what FM4's callers need |
 | GPU | [gpu_path.md](gpu/gpu_path.md) | VdInitializeEngines to the first VdSwap |
 | GPU | [edram.md](gpu/edram.md), [edram_extent.md](gpu/edram_extent.md), [edram_xaspect.md](gpu/edram_xaspect.md) | The EDRAM render-target model, the draw extent, depth/colour transfers |
 | GPU | [texture.md](gpu/texture.md) | The texture cache's CPU side and the fetch constants FM4 uses |

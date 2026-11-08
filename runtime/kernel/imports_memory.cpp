@@ -11,6 +11,7 @@
 // Xenia's zero-unless-MEM_NOZERO rule for every page that was not committed before.
 #include "imports.h"
 #include "arena.h"
+#include "fibers.h"
 #include "virtual_memory.h"
 #include <mutex>
 #include <set>
@@ -237,10 +238,11 @@ GUEST_IMPORT(XamAlloc, "REFERENCE_DERIVED: Xenia xam_info.cc:361-382 XamAllocImp
 {
     // (flags, size, block*): a zeroed block of `size` bytes, 0. Xenia allocates from its system heap; here the block
     // is whole pages of the 4 KB virtual heap (a freeable allocation; pages are zeroed when committed, which also
-    // satisfies flag 00100000, "no zeroing needed"). The flags' top 4 bits select one of XAM's heaps (Xenia's note);
-    // only flags 0 and 00100000 are modelled, others, a zero size or a full heap stop (7).
+    // satisfies flag 00100000, "no zeroing needed"). The flags' top 4 bits select one of XAM's heaps (Xenia's note); Xenia
+    // serves every heap from its one system heap, and so does this (FM4's task blocks use heap 1). Any
+    // other flag bit, a zero size or a full heap stop (7).
     const uint32_t flags = ctx.r3.u32, size = ctx.r4.u32, out = ctx.r5.u32;
-    if ((flags & ~0x00100000u) != 0 || size == 0)
+    if ((flags & ~0xF0100000u) != 0 || size == 0)
         Stop(StopCode::Unimplemented, "XamAlloc(flags %08X, size %u) is not modelled", flags, size);
     const uint32_t block = runtime::VirtualHeap(4096)->Alloc(size, 4096, runtime::mem::kReserve | runtime::mem::kCommit,
                                                              runtime::page::kReadWrite, false);
@@ -267,4 +269,25 @@ GUEST_IMPORT(XamFree, "REFERENCE_DERIVED: Xenia xam_info.cc:413-418 (system heap
     if (!runtime::VirtualHeap(4096)->Release(block, &released))
         Stop(StopCode::Unimplemented, "XamFree(%08X): the heap could not release it", block);
     ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(MmCreateKernelStack, "REFERENCE_DERIVED: Xenia xboxkrnl_memory.cc:713-728 (a committed read/write stack in the 0x70000000 range; returns its top)")
+{
+    // (size, r4 = 0): a guest stack (arena.h: committed, zeroed, unmapped guard pages around it, at least `size` bytes
+    // rounded up to the page) and its top, one past the highest usable byte, as Xenia's stack_address + stack_size.
+    // Xenia asserts r4 is zero (an unknown argument): another value stops here. A zero size stops.
+    const uint32_t size = ctx.r3.u32, unknown = ctx.r4.u32;
+    if (!size || unknown)
+        Stop(StopCode::Unimplemented, "MmCreateKernelStack(size %u, r4 %08X): a zero size or a non-zero second argument", size, unknown);
+    ctx.r3.u64 = runtime::AllocateStack(base, size).base;
+}
+
+GUEST_IMPORT(MmDeleteKernelStack, "REFERENCE_DERIVED: Xenia xboxkrnl_memory.cc:730-739 (the stack released; SUCCESS, or UNSUCCESSFUL if it is no stack)")
+{
+    // (stack base = its top, stack end = its lowest usable byte), as DeleteFiber passes them (block +4, +12;
+    // the local capture delete_fiber (not distributed)). A fiber running on it is forgotten first (fibers.h); then the stack is released
+    // (arena.h: its pages dropped and inaccessible). Not a stack MmCreateKernelStack returned: STATUS_UNSUCCESSFUL.
+    const uint32_t top = ctx.r3.u32, limit = ctx.r4.u32;
+    runtime::DiscardFiber(top);
+    ctx.r3.u64 = runtime::ReleaseStack(base, top, limit) ? 0 : 0xC0000001;  // STATUS_UNSUCCESSFUL
 }

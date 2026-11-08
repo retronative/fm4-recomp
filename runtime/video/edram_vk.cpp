@@ -485,6 +485,7 @@ struct Unit
     uint8_t* guestBase = nullptr;               // main.cpp's writable guest memory (renderer.h Options::guestBase)
     ResolveWriteObserver observer = nullptr;    // guest_writes.h MarkGuestWritten, from the renderer
     uint64_t transfers = 0, transferDraws = 0, resolves = 0;
+    std::map<uint64_t, uint64_t> transferPairs;  // (source key << 32 | destination key) -> count; the first of each is logged
 };
 std::unique_ptr<Unit> unit;
 
@@ -942,6 +943,9 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
         if (!ok)
             return false;
         unit->transfers++;
+        if (unit->transferPairs[uint64_t(t.source.packed) << 32 | dest.key.packed]++ == 0)
+            std::fprintf(stderr, "[edram] first transfer key %06X (%u sample(s)) -> key %06X (%u sample(s)), tiles %u-%u\n", t.source.packed, source.samples,
+                         dest.key.packed, dest.samples, t.startTiles, t.endTiles);
     }
     return true;
 }
@@ -1026,6 +1030,42 @@ bool GuestRange(uint32_t physical, uint32_t bytes, uint32_t& guest, std::string&
     return true;
 }
 
+// The sample dump (kResolveDump / kResolveDumpDepth) of rectangle `r` of `source`: every guest sample one R32_UINT pixel
+// of the dump image (DumpLayout), copied tightly packed into the staging buffer at `stagingOffset`.
+bool RecordDump(VkCommandBuffer c, Target& source, bool depth, uint32_t storage, Msaa msaa, const edram::Rect& r, const DumpLayout& layout,
+                VkDeviceSize stagingOffset, std::string& error)
+{
+    Target& dump = unit->dump;
+    Transition(c, source, source.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    Transition(c, dump, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    const VkExtent2D extent{layout.width * layout.columns, layout.height * layout.rows};
+    VkRenderPassBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    if (!Pass(dump.format, 1, false, begin.renderPass, error))
+        return false;
+    begin.framebuffer = dump.framebuffer;
+    begin.renderArea = {{0, 0}, extent};
+    vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, &source.source, 0, nullptr);
+    const VkViewport viewport{0.0f, 0.0f, float(dump.width), float(dump.height), 0.0f, 1.0f};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    const TransferPush push{0, 0, storage, 0, 0, 0, 0, uint32_t(msaa), 0, r.x, r.y, layout.width, layout.height, 0};
+    const bool ok = Draw3(c, depth ? PipelineKind::DumpDepth : PipelineKind::Dump, source.samples > 1, dump, 0, push, {VkRect2D{{0, 0}, extent}}, error);
+    vkCmdEndRenderPass(c);
+    Rest(c, source);
+    if (!ok)
+        return false;
+    Transition(c, dump, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = stagingOffset;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {extent.width, extent.height, 1};  // tightly packed: DumpLayout::Word
+    vkCmdCopyImageToBuffer(c, dump.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &copy);
+    return true;
+}
+
 bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_t draw, std::string& error)
 {
     (void)d, (void)draw;
@@ -1095,38 +1135,8 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
             copy.imageExtent = {r.width, r.height, 1};  // bufferRowLength 0: tightly packed, as ResolveToGuest reads it
             vkCmdCopyImageToBuffer(c, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &copy);
         }
-        else
-        {
-            // The sample dump (kResolveDump): the source sampled, every guest sample one R32_UINT pixel of the dump image.
-            Target& dump = unit->dump;
-            Transition(c, *source, source->depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-            Transition(c, dump, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-            const VkExtent2D extent{layout.width * layout.columns, layout.height * layout.rows};
-            VkRenderPassBeginInfo begin{};
-            begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            if (!Pass(dump.format, 1, false, begin.renderPass, error))
-                return false;
-            begin.framebuffer = dump.framebuffer;
-            begin.renderArea = {{0, 0}, extent};
-            vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
-            vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, &source->source, 0, nullptr);
-            const VkViewport viewport{0.0f, 0.0f, float(dump.width), float(dump.height), 0.0f, 1.0f};
-            vkCmdSetViewport(c, 0, 1, &viewport);
-            const TransferPush push{0, 0, storage, 0, 0, 0, 0, uint32_t(info.msaa), 0, r.x, r.y, layout.width, layout.height, 0};
-            const bool ok = Draw3(c, depthCopy ? PipelineKind::DumpDepth : PipelineKind::Dump, source->samples > 1, dump, 0, push,
-                                  {VkRect2D{{0, 0}, extent}}, error);
-            vkCmdEndRenderPass(c);
-            Rest(c, *source);
-            if (!ok)
-                return false;
-            Transition(c, dump, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {extent.width, extent.height, 1};  // tightly packed: DumpLayout::Word
-            vkCmdCopyImageToBuffer(c, dump.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &copy);
-        }
+        else if (!RecordDump(c, *source, depthCopy, storage, info.msaa, r, layout, 0, error))
+            return false;
         VkBufferMemoryBarrier host{};
         host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
         host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1241,6 +1251,8 @@ bool Create(SpirvCompiler& compiler, std::string& error)
         {VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT, "A2B10G10R10_UNORM_PACK32"},
         {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT, "R16G16B16A16_SFLOAT"},  // storage 3 (7e3)
         {VK_FORMAT_R32_SFLOAT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT, "R32_SFLOAT"},                    // storage 14 (32_FLOAT)
+        {VK_FORMAT_R16G16_SNORM, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT,
+         "R16G16_SNORM"},  // storage 4 (16_16), blended as X's host path
         {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, "D32_SFLOAT_S8_UINT"},
         {VK_FORMAT_R32_UINT, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT, "R32_UINT"},  // the resolve's sample dump
     };
@@ -1369,7 +1381,7 @@ bool Create(SpirvCompiler& compiler, std::string& error)
     VkBufferCreateInfo buffer{};
     buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer.size = kStagingBytes;
-    buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buffer.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;  // SRC: the self-check uploads through it
     if (!Ok(vkCreateBuffer(device, &buffer, nullptr, &unit->staging), "vkCreateBuffer (EDRAM staging)", error))
         return false;
     VkMemoryRequirements requirements;
@@ -1385,6 +1397,83 @@ bool Create(SpirvCompiler& compiler, std::string& error)
 }
 
 }  // namespace
+
+// ---- The isolated GPU check of the 4x -> 2x depth transfer (FM4_SELFCHECK_EDRAM=depth4x2x) -------------------------
+
+bool RecordDepthSelfCheck(VkCommandBuffer c, std::string& error)
+{
+    if (!unit)
+        return Fail(error, "the EDRAM unit is not initialized");
+    // edram_vk_plan.h DepthSelfCheck*: known words in the 1x key, transferred 1x -> 4x (the observed path) and 4x -> 2x
+    // (the new one) over tiles 1024-1055 (two rows of 16), every sample of both dumped through the depth resolve's dump.
+    const Key k1 = Key::Depth(1024, 16, Msaa::X1, edram::DepthFormat::D24FS8), k4 = Key::Depth(1024, 16, Msaa::X4, edram::DepthFormat::D24FS8),
+              k2 = Key::Depth(1024, 16, Msaa::X2, edram::DepthFormat::D24FS8);
+    Target* t1 = GetTarget(c, k1, error);
+    Target* t4 = t1 ? GetTarget(c, k4, error) : nullptr;
+    Target* t2 = t4 ? GetTarget(c, k2, error) : nullptr;
+    if (t2 == nullptr)
+        return false;
+    if (t1->width != kDepthSelfCheckWidth || t4->width != kDepthSelfCheckWidth / 2 || t2->width != kDepthSelfCheckWidth)
+        return Fail(error, "self-check: unexpected host target widths");
+    const uint32_t w = kDepthSelfCheckWidth, rows = kDepthSelfCheckRows1x;
+    float* depth = static_cast<float*>(unit->stagingMapped);
+    uint8_t* stencil = static_cast<uint8_t*>(unit->stagingMapped) + size_t(w) * rows * 4;
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t x = 0; x < w; x++)
+            depth[size_t(r) * w + x] = DepthSelfCheckDepth(x, r), stencil[size_t(r) * w + x] = uint8_t(DepthSelfCheckStencil(x, r));
+    // The upload: the depth aspect as 32-bit floats, the stencil aspect as bytes (Vulkan's buffer layouts of
+    // D32_SFLOAT_S8_UINT aspects); the submission makes the host writes visible.
+    Transition(c, *t1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy upload[2]{};
+    upload[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    upload[0].imageExtent = {w, rows, 1};
+    upload[1] = upload[0];
+    upload[1].bufferOffset = VkDeviceSize(w) * rows * 4;
+    upload[1].imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    vkCmdCopyBufferToImage(c, unit->staging, t1->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, upload);
+    Rest(c, *t1);
+    if (!ExecuteTransfers(c, *t4, {{1024, 1056, k1}}, error) || !ExecuteTransfers(c, *t2, {{1024, 1056, k4}}, error))
+        return false;
+    const uint32_t format = uint32_t(edram::DepthFormat::D24FS8);
+    if (!RecordDump(c, *t4, true, format, Msaa::X4, {0, 0, w / 2, rows / 2}, DumpLayoutFor(Msaa::X4, w / 2, rows / 2), kDepthSelfCheckDump4x, error) ||
+        !RecordDump(c, *t2, true, format, Msaa::X2, {0, 0, w, rows / 2}, DumpLayoutFor(Msaa::X2, w, rows / 2), kDepthSelfCheckDump2x, error))
+        return false;
+    VkBufferMemoryBarrier host{};
+    host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host.buffer = unit->staging;
+    host.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
+    return true;
+}
+
+DepthSelfCheckResult VerifyDepthSelfCheck()
+{
+    DepthSelfCheckResult result;
+    const uint32_t w = kDepthSelfCheckWidth, h = kDepthSelfCheckRows1x / 2;
+    const uint8_t* staging = static_cast<const uint8_t*>(unit->stagingMapped);
+    auto check = [&](const uint32_t* words, const DumpLayout& l, uint32_t samples, bool is4x, uint64_t& checked, uint64_t& mismatches) {
+        for (uint32_t y = 0; y < l.height; y++)
+            for (uint32_t x = 0; x < l.width; x++)
+                for (uint32_t g = 0; g < samples; g++)
+                {
+                    const uint32_t got = words[l.Word(x, y, g)];
+                    const uint32_t want = is4x ? DepthSelfCheckExpected4x(x, y, g) : DepthSelfCheckExpected2x(x, y, g);
+                    checked++;
+                    if (got != want && mismatches++ == 0)
+                    {
+                        char text[128];
+                        std::snprintf(text, sizeof text, "%s (%u, %u) guest sample %u: %08X, expected %08X", is4x ? "4x" : "2x", x, y, g, got, want);
+                        result.first = text;
+                    }
+                }
+    };
+    check(reinterpret_cast<const uint32_t*>(staging + kDepthSelfCheckDump4x), DumpLayoutFor(Msaa::X4, w / 2, h), 4, true, result.checked4x, result.mismatches4x);
+    check(reinterpret_cast<const uint32_t*>(staging + kDepthSelfCheckDump2x), DumpLayoutFor(Msaa::X2, w, h), 2, false, result.checked2x, result.mismatches2x);
+    return result;
+}
 
 const EdramHooks* InitializeEdramVk(const VulkanDevice& device, SpirvCompiler& compiler, uint8_t* guestBase, ResolveWriteObserver observer,
                                     std::string& error)

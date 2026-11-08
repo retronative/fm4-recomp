@@ -89,7 +89,15 @@ private:
 // 54 (k_2_10_10_10_AS_16_16_16_16): the HDR resolve's destination at 1BB71000, sampled from draw 27039 (the local capture draw_c2d1 (not distributed)).
 // 36 (k_32_FLOAT): a 32x32 float texture the HDR luminance pass samples (the local capture draw_loop1 (not distributed) draw 22725 tex 1).
 // 6 (k_8_8_8_8): a 16x16x16 3D lookup texture (the local capture draw_tex3d1 (not distributed) draw 33248 slot 7).
-constexpr bool ObservedFormat(uint32_t format) { return format == 2 || format == 6 || format == 36 || format == 50 || format == 51 || format == 54; }
+// 23 (k_24_8_FLOAT): a 1280x720 depth texture at 1C421000 the intro race's first a0-relative PS samples (the local capture scenario6 (not distributed)
+// draw 452279 slot 1).
+// 53 (k_DXT4_5_AS_16_16_16_16): a 256x128 gamma DXT5 texture at 11946000 (the local capture scenario9 (not distributed) draw 459668 slot 0).
+// 20 (k_DXT4_5): a 512x512 gamma DXT5 with 10 levels at 0A98E000, sampled by the dynamic-loop PS.
+constexpr bool ObservedFormat(uint32_t format)
+{
+    return format == 2 || format == 6 || format == 20 || format == 23 || format == 36 || format == 50 || format == 51 || format == 53 ||
+           format == 54;
+}
 
 // VkComponentMapping {R, G, B, A}: what a view may use without imageViewFormatSwizzle (the portability
 // subset's VkImageViewCreateInfo rule: with the feature VK_FALSE every component must be the identity

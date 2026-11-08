@@ -16,8 +16,9 @@ OUT="$ROOT/build/tests/texture_vk"
 mkdir -p "$OUT"
 export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 perl -e 'alarm 300; exec @ARGV' "$LLVM/clang++" -std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -isysroot "$SDKROOT" \
-  -I"$ROOT/runtime" -I"$ROOT/runtime/video" "$ROOT/tests/runtime/test_texture_vk.cpp" "$ROOT/runtime/video/texture_upload.cpp" \
-  "$ROOT/runtime/video/texture_info.cpp" "$ROOT/runtime/video/texture_untile.cpp" -o "$OUT/test_texture_vk"
+  -I"$ROOT/runtime" -I"$ROOT/runtime/video" -I/opt/homebrew/include "$ROOT/tests/runtime/test_texture_vk.cpp" "$ROOT/runtime/video/texture_upload.cpp" \
+  "$ROOT/runtime/video/texture_info.cpp" "$ROOT/runtime/video/texture_untile.cpp" "$ROOT/runtime/video/edram.cpp" \
+  "$ROOT/runtime/video/edram_vk_plan.cpp" -o "$OUT/test_texture_vk"
 status=0
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_texture_vk" || status=$?
 if [ "$status" = 0 ] && [ -z "${KEEP_WORK:-}" ]; then rm -r "$OUT"; fi

@@ -141,7 +141,7 @@ if [ "${1:-}" = "--self-test" ]; then
   exit 0
 fi
 
-[ $# -eq 6 ] || [ $# -eq 7 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present|window> [<shader classes: none|branch,predicate,loop>] | --self-test" >&2; exit 2; }
+[ $# -eq 6 ] || [ $# -eq 7 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present|window> [<shader classes: none|branch,predicate,loop,dynloop>] | --self-test" >&2; exit 2; }
 # The shader-class allow-list (runtime/video/shader_class.h) is required by fm4recomp with a GPU renderer mode and has no
 # default: a run that may create pipelines names the classes approved for it; "none" allows straight-line shaders only.
 SHADER_CLASSES="${7:-}"
@@ -149,7 +149,7 @@ OUT="$1"; RUNS="$2"; DEADLINE="$3"; STOP_AT_SWAP="$4"; AUDIO="$5"; RENDERER="$6"
 [[ "$AUDIO" == audible || "$AUDIO" == mute ]] || { echo "audio must be audible or mute" >&2; exit 2; }
 [[ "$RENDERER" == headless || "$RENDERER" == self-check || "$RENDERER" == present || "$RENDERER" == window ]] || { echo "renderer must be headless, self-check, present or window" >&2; exit 2; }
 if [ "$RENDERER" != headless ]; then
-  [[ "$SHADER_CLASSES" =~ ^(none|(branch|predicate|loop)(,(branch|predicate|loop))*)$ ]] || { echo "a GPU renderer needs the shader classes: none, or a list of branch, predicate, loop (fm4recomp --shader-classes)" >&2; exit 2; }
+  [[ "$SHADER_CLASSES" =~ ^(none|(branch|predicate|loop|dynloop)(,(branch|predicate|loop|dynloop))*)$ ]] || { echo "a GPU renderer needs the shader classes: none, or a list of branch, predicate, loop, dynloop (fm4recomp --shader-classes)" >&2; exit 2; }
 else
   [ -z "$SHADER_CLASSES" ] || { echo "shader classes apply to a GPU renderer only" >&2; exit 2; }
 fi

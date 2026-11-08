@@ -65,13 +65,13 @@ uint32_t FinishOverlapped(const PPCContext& ctx, uint8_t* base, uint32_t address
 
 }  // namespace runtime
 
-GUEST_IMPORT(XamGetOverlappedResult, "REFERENCE_DERIVED: Xenia xam_msg.cc:113-136 XamGetOverlappedResult (pending: stops, see below)")
+GUEST_IMPORT(XamGetOverlappedResult, "REFERENCE_DERIVED: Xenia xam_msg.cc:113-136 XamGetOverlappedResult (pending with an event: waits on it)")
 {
     // (XOVERLAPPED*, length*, wait). A result other than ERROR_IO_PENDING (0x3E5) is returned as it is; when it
     // succeeded (XSUCCEEDED, xbox.h:33: bits 31-30 clear, so every Win32 code does) the length is written to length*
-    // if given. Pending without an event: ERROR_IO_INCOMPLETE (0x3E4). Pending with an event: Xenia waits on it with
-    // no timeout. Here every completion is immediate (overlapped.h), so nothing would ever set that event: the wait
-    // could only end at the run's deadline. It stops instead, naming the XOVERLAPPED. The third argument (the XDK's
+    // if given. Pending without an event: ERROR_IO_INCOMPLETE (0x3E4). Pending with an event: as Xenia, a wait on it with
+    // no timeout, then the fields are read again: a request a XamTaskSchedule routine completes (XMsgCompleteIORequest)
+    // sets it from another thread; a handle that is not an event stops (7). The third argument (the XDK's
     // bWait, INFERRED from the name of XGetOverlappedResult's parameter) is ignored, as Xenia does.
     using namespace runtime;
     const uint32_t address = ctx.r3.u32, lengthOut = ctx.r4.u32;
@@ -80,11 +80,17 @@ GUEST_IMPORT(XamGetOverlappedResult, "REFERENCE_DERIVED: Xenia xam_msg.cc:113-13
     uint32_t result = Load32(base, address + overlapped::kResult);
     if (result == overlapped::kErrorIoPending)
     {
-        if (Load32(base, address + overlapped::kEvent) != 0)
-            Stop(StopCode::Unimplemented, "XamGetOverlappedResult: XOVERLAPPED %08X is pending with event %08X; no asynchronous "
-                 "completion is modelled, so the wait could never end (caller lr %08X)", address,
-                 Load32(base, address + overlapped::kEvent), uint32_t(ctx.lr));
-        result = overlapped::kErrorIoIncomplete;
+        const uint32_t event = Load32(base, address + overlapped::kEvent);
+        if (event == 0)
+            result = overlapped::kErrorIoIncomplete;
+        else
+        {
+            const auto object = LookupHandle(event);
+            if (!object || object->type != ObjectType::Event)
+                Stop(StopCode::Unimplemented, "XamGetOverlappedResult: XOVERLAPPED %08X has event field %08X, which is no event", address, event);
+            WaitForObject(base, object->header, nullptr, ctx.r13.u32 ? CurrentThread(ctx, base) : 0);
+            result = Load32(base, address + overlapped::kResult);
+        }
     }
     if ((result & 0xC0000000u) == 0 && lengthOut != 0)
         Store32(base, lengthOut, Load32(base, address + overlapped::kLength));

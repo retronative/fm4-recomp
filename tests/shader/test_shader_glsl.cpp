@@ -138,12 +138,13 @@ struct Alu
 {
     uint32_t vop = 2, sop = 50, vdest = 0, sdest = 0, vmask = 0, smask = 0;
     bool exp = false, sdestRel = false, vclamp = false, sclamp = false, absConst = false, pred = false, c0rel = false;
+    bool c1rel = false, a0rel = false;  // FM4 Recomp: const_1_rel (word1 30), relative constants use a0 (word1 29)
     bool predCond = false;
     Src s1, s2, s3;
 };
 // word0: vdest 0-5, abs_constants 7, sdest 8-13, sdest_rel 14, export 15, vmask 16-19,
 // smask 20-23, clamps 24/25, scalar opcode 26-31. word1: swizzles 0-7 (src3), 8-15, 16-23 (src1),
-// negates 24 (src3), 25, 26 (src1), predicate condition 27, predicated 28, const_0_rel 31. word2: regs 0-7 (src3), 8-15,
+// negates 24 (src3), 25, 26 (src1), predicate condition 27, predicated 28, a0 (else aL) 29, const_1_rel 30, const_0_rel 31. word2: regs 0-7 (src3), 8-15,
 // 16-23 (src1), vector opcode 24-28, selects 29 (src3), 30, 31 (src1).
 void Put(std::vector<uint32_t>& p, const Alu& a)
 {
@@ -151,7 +152,8 @@ void Put(std::vector<uint32_t>& p, const Alu& a)
                 uint32_t(a.exp) << 15 | a.vmask << 16 | a.smask << 20 | uint32_t(a.vclamp) << 24 |
                 uint32_t(a.sclamp) << 25 | a.sop << 26);
     p.push_back(a.s3.swz | a.s2.swz << 8 | a.s1.swz << 16 | uint32_t(a.s3.neg) << 24 | uint32_t(a.s2.neg) << 25 |
-                uint32_t(a.s1.neg) << 26 | uint32_t(a.predCond) << 27 | uint32_t(a.pred) << 28 | uint32_t(a.c0rel) << 31);
+                uint32_t(a.s1.neg) << 26 | uint32_t(a.predCond) << 27 | uint32_t(a.pred) << 28 | uint32_t(a.a0rel) << 29 |
+                uint32_t(a.c1rel) << 30 | uint32_t(a.c0rel) << 31);
     p.push_back(a.s3.reg | a.s2.reg << 8 | a.s1.reg << 16 | a.vop << 24 | uint32_t(a.s3.temp) << 29 |
                 uint32_t(a.s2.temp) << 30 | uint32_t(a.s1.temp) << 31);
 }
@@ -2800,16 +2802,156 @@ void TestUniformBranches()
                           "        return uintBitsToFloat(r < 0.0 ? 0xFF7FFFFFu : 0x7F7FFFFFu);\n    return r;\n}\n") &&
               t.glsl.find("float xe_rcp(float x)") < t.glsl.find("float xe_rcpc(float x)") && Compiles(t.glsl, true));
         CONTROL(Has(t.glsl, "0x7F800000u : 0x7F7FFFFFu"));
-        // MAXAs (23): MAXs of a = r0.w, b = r0.x; its a0 write has no reader (a0-relative constants
-        // stay refused).
+        // MAXAs (23): MAXs of a = r0.w, b = r0.x, and the a0 write of a (TestAddressRegister).
         r.sop = 23;
         CHECK(Translate(ColourPs(r), true, t) && Has(t.glsl, "    precise float xe_s0 = (r0.w >= r0.x ? r0.w : r0.x);\n") &&
-              Compiles(t.glsl, true));
+              Has(t.glsl, "    xe_a0 = xe_maxa(r0.w);\n") && Compiles(t.glsl, true));
         CONTROL(Has(t.glsl, "(r0.x >= r0.w"));
         Alu rel = r;
-        rel.s1 = C(4), rel.c0rel = true;
-        CHECK(Refuses(ColourPs(rel), true, "relatively addressed constant"));
+        rel.s1 = C(4), rel.c0rel = true;  // word1 bit 29 clear: aL-relative
+        CHECK(Refuses(ColourPs(rel), true, "aL-relative constant"));
     }
+}
+
+// FM4 Recomp: 13. PS "indexed constants" (the shape of the intro race's pixel shader, the local capture relconst (not distributed)):
+//   cf0 alloc colours; cf1 exec(2, 1) or, with condA0, a conditional exec on bool 0 (true);
+//   cf2 exec_end(3, 3); cf3 nop.
+//    2: MAXAs (masks empty) a = r0.w: a0 = int(clamp(floor(r0.w + 0.5), -256, 255))
+//    3: MULv r1 = r0 * c[a0 + 5]   (src2 the first constant: const_0 flag; word1 bit 29: a0)
+//    4: MULADDv r1 = c2 * r1 + c[a0 + 7]   (src1 constant absolute (const_0 clear), src3 the second
+//       constant: const_1 flag)
+//    5: MAXv export0 = r1.
+// Expected per Xenia (shader_glsl.cpp "Address register a0"): reads xe_c[clamp(xe_a0 + n, 0, 255)].
+struct IndexedOptions
+{
+    bool condA0 = false;     // slot 2 in a bool-constant conditional exec
+    uint32_t slot2Sop = 23;  // MAXAs; 5 = MAXs (no a0 write)
+    bool slot3A0 = true;     // slot 3's relative constant uses a0 (else aL)
+    bool sameInstr = false;  // slot 2's vector op also reads c[a0 + 5] (vector MAX into r2)
+};
+std::vector<uint32_t> IndexedPs(const IndexedOptions& o = {})
+{
+    std::vector<uint32_t> p;
+    PackCf(p, AllocCf(2), o.condA0 ? CondExecCf(2, 1, 0, true) : ExecCf(2, 1, 0));
+    PackCf(p, ExecCf(3, 3, 0, true), OpCf(0));
+    Alu maxa;
+    maxa.sop = o.slot2Sop, maxa.s1 = T(0), maxa.s2 = T(0), maxa.s3 = T(0);
+    if (o.sameInstr)
+        maxa.vdest = 2, maxa.vmask = 0xF, maxa.s1 = C(5), maxa.s2 = C(5), maxa.c0rel = true, maxa.c1rel = true, maxa.a0rel = true;
+    Put(p, maxa);
+    Alu mul;
+    mul.vop = 1, mul.vdest = 1, mul.vmask = 0xF, mul.s1 = T(0), mul.s2 = C(5), mul.s3 = T(0), mul.c0rel = true, mul.a0rel = o.slot3A0;
+    Put(p, mul);
+    Alu mad;
+    mad.vop = 11, mad.vdest = 1, mad.vmask = 0xF, mad.s1 = C(2), mad.s2 = T(1), mad.s3 = C(7), mad.c1rel = true, mad.a0rel = true;
+    Put(p, mad);
+    Alu e;
+    e.exp = true, e.vdest = 0, e.vmask = 0xF, e.s1 = T(1), e.s2 = T(1), e.s3 = T(0);
+    Put(p, e);
+    return p;
+}
+
+void TestAddressRegister()
+{
+    ShaderTranslation t;
+    CHECK(Translate(IndexedPs(), true, t));
+    const std::string write = "    xe_a0 = xe_maxa(r0.w);\n", read5 = "xe_c[clamp(xe_a0 + 5, 0, 255)].xyzw",
+                      read7 = "xe_c[clamp(xe_a0 + 7, 0, 255)].xyzw";
+    CHECK(Has(t.glsl, "    int xe_a0 = 0;\n") && Has(t.glsl, write) && Has(t.glsl, "xe_mul(r0.xyzw, " + read5 + ")") &&
+          Has(t.glsl, read7) && Has(t.glsl, "xe_c[2].xyzw") &&
+          Has(t.glsl, "int xe_maxa(float a)\n{\n    precise float t = floor(a + 0.5);\n"
+                      "    return isnan(t) ? -256 : int(clamp(t, -256.0, 255.0));\n}\n") &&
+          t.glsl.find(write) < t.glsl.find(read5) && Compiles(t.glsl, true));
+    CONTROL(Has(t.glsl, "xe_c[clamp(xe_a0 + 2, 0, 255)]"));  // src1 of slot 4 is absolute (const_0 clear)
+    CONTROL(Has(t.glsl, "xe_c[5]"));                         // slot 3's constant is not absolute
+    {
+        ShaderTranslation plain;
+        CHECK(Translate(ColourPs(), true, plain));
+        CONTROL(Has(plain.glsl, "xe_a0") || Has(plain.glsl, "xe_maxa"));  // declared only when MAXAs runs
+    }
+    IndexedOptions o;
+    o.slot2Sop = 5;
+    CHECK(Refuses(IndexedPs(o), true, "ALU source 2 reads a0 before any MAXAs sets it"));
+    o = {}, o.slot3A0 = false;
+    CHECK(Refuses(IndexedPs(o), true, "ALU source 2 is an aL-relative constant"));
+    // Operands are read before the instruction writes: a MAXAs does not feed its own instruction's reads.
+    o = {}, o.sameInstr = true;
+    CHECK(Refuses(IndexedPs(o), true, "ALU source 1 reads a0 before any MAXAs sets it"));
+    // a0 set only where bool 0 is true: the false path reads it unset.
+    o = {}, o.condA0 = true;
+    CHECK(Refuses(IndexedPs(o), true, "reads a0 before any MAXAs sets it"));
+}
+
+// FM4 Recomp: 14. PS "dynamic loop" (the shape of the local capture predjump (not distributed)'s ps_b25e79897ea09f8c):
+//   cf0 exec(4, 1):   4: MAXv r1 = r0 + PRED_SETNEs a = r0.w: p0 = r0.w != 0
+//   cf1 cond_jmp to cf5, predicated, taken when p0 == 0 (the region cf2-cf4 runs where p0 == 1)
+//   cf2 exec(5, 2):   5: tfetch r2 = tex0(r1.xy);  6: ADDv r1 = r1 + c0 + PRED_SETEs a = r2.w: p0 = r2.w == 0
+//   cf3 cond_jmp back to cf2, predicated, taken when p0 == 0 (repeat while r2.w != 0)
+//   cf4 jmp to cf6 (unconditional: skips cf5, the else branch)
+//   cf5 exec(7, 1):   7: MAXv r2 = r0
+//   cf6 alloc colours; cf7 exec_end(8, 1): 8: MAXv export0 = r2.
+// Expected (shader_glsl.cpp "Dynamic loops"): `if (xe_p0) { for (uint xe_dl0 = 0u; xe_dl0 < 255u; xe_dl0++) { fetch; add;
+// p0 = ...; if (xe_p0) break; } } else { r2 = r0 }` (the back jump is not taken where p0 == 1).
+struct DynLoopOptions
+{
+    uint32_t backTarget = 2;
+    bool backPredicated = true, bodySetsPred = true, bodyPredExec = false, exportInBody = false;
+};
+std::vector<uint32_t> DynLoopPs(const DynLoopOptions& o = {})
+{
+    std::vector<uint32_t> p;
+    PackCf(p, ExecCf(4, 1, 0), JmpCf(Jmp{5, 0, false, false, true}));
+    PackCf(p, o.bodyPredExec ? PredExecCf(5, 2, true, false, 0x1) : ExecCf(5, 2, 0x1), JmpCf(Jmp{o.backTarget, 0, false, false, o.backPredicated}));
+    PackCf(p, JmpCf(Jmp{6, 0, false, true, false}), ExecCf(7, 1, 0));
+    PackCf(p, AllocCf(2), ExecCf(8, 1, 0, true));
+    Alu set;
+    set.vdest = 1, set.vmask = 0xF, set.s1 = T(0), set.s2 = T(0), set.sop = 28, set.s3 = T(0);
+    Put(p, set);
+    TFetch f;
+    f.src = 1, f.dest = 2;
+    Put(p, f);
+    Alu body;
+    body.vop = 0, body.vdest = 1, body.vmask = 0xF, body.s1 = T(1), body.s2 = C(0), body.sop = o.bodySetsPred ? 27 : 50, body.s3 = T(2);
+    if (o.bodyPredExec)
+        body.pred = true, body.predCond = true;
+    if (o.exportInBody)
+        body.exp = true, body.vdest = 0, body.sop = 50;
+    Put(p, body);
+    Alu other;
+    other.vdest = 2, other.vmask = 0xF, other.s1 = T(0), other.s2 = T(0), other.s3 = T(0);
+    Put(p, other);
+    Alu e;
+    e.exp = true, e.vdest = 0, e.vmask = 0xF, e.s1 = T(2), e.s2 = T(2), e.s3 = T(0);
+    Put(p, e);
+    return p;
+}
+
+void TestDynamicLoop()
+{
+    ShaderTranslation t;
+    std::string error;
+    CHECK(Translate(DynLoopPs(), true, t, &error));
+    if (!error.empty())
+        std::fprintf(stderr, "  dynamic loop: %s\n", error.c_str());
+    const size_t loop = t.glsl.find("for (uint xe_dl0 = 0u; xe_dl0 < 255u; xe_dl0++)\n");
+    const size_t sample = t.glsl.find("texture(", loop == std::string::npos ? 0 : loop);
+    const size_t set = t.glsl.find("xe_p0 = (", sample == std::string::npos ? 0 : sample);
+    const size_t exit = t.glsl.find("if (xe_p0)\n", set == std::string::npos ? 0 : set);
+    CHECK(loop != std::string::npos && sample != std::string::npos && set != std::string::npos && exit != std::string::npos &&
+          Has(t.glsl.substr(exit), "    break;\n") &&
+          t.glsl.find("if (xe_p0)\n") < loop && Has(t.glsl, "else\n") && Compiles(t.glsl, true));
+    CONTROL(Has(t.glsl, "if (!xe_p0)\n" + std::string()) && t.glsl.find("if (!xe_p0)\n") > loop);  // the exit tests p0 == 1, not 0
+    DynLoopOptions o;
+    o.bodySetsPred = false;
+    CHECK(Refuses(DynLoopPs(o), true, "dynamic loop whose body never sets p0"));
+    o = {}, o.backPredicated = false;
+    CHECK(Refuses(DynLoopPs(o), true, "texture fetch inside a predicated jump's skipped region"));  // no loop: a bool-constant back jump
+    o = {}, o.backTarget = 3;
+    CHECK(Refuses(DynLoopPs(o), true, "backward jump to itself"));
+    o = {}, o.bodyPredExec = true;
+    CHECK(Refuses(DynLoopPs(o), true, "dynamic loop body holds control-flow instruction 2 other than exec"));
+    o = {}, o.exportInBody = true;
+    CHECK(Refuses(DynLoopPs(o), true, "export inside"));
 }
 
 void TestRefusals()
@@ -2877,7 +3019,9 @@ void TestRefusals()
     p.pred = true;
     CHECK(Refuses(ColourPs(p), true, "predicated ALU instruction reads the predicate before any predicate-setting op sets it"));
     p = a, p.s1 = C(4), p.c0rel = true;
-    CHECK(Refuses(ColourPs(p), true, "relatively addressed constant"));
+    CHECK(Refuses(ColourPs(p), true, "aL-relative constant"));
+    p.a0rel = true;
+    CHECK(Refuses(ColourPs(p), true, "ALU source 1 reads a0 before any MAXAs sets it"));
     p = a, p.s1 = T(0x40), p.s2 = T(0x40);
     CHECK(Refuses(ColourPs(p), true, "relatively addressed temp"));
     // Unsupported export targets: PS colour 1, PS depth (61), VS point size (63), memory (32).
@@ -3196,6 +3340,8 @@ int main(int argc, char** argv)
     TestVertexFormats();
     TestMiniFetchScope();
     TestUniformBranches();
+    TestAddressRegister();
+    TestDynamicLoop();
     TestRefusals();
     std::printf("test_shader_glsl: %d passed, %d failed (%d negative controls, %d shaders compiled and validated)\n",
                 passed, failed, controls, compiled);

@@ -13,11 +13,13 @@
 //   kLoop       loop_start / loop_end (7, 8)
 //   kCall       cond_call (9) and return (10): the translator refuses them; listed so the tag names them
 //   kUnknown    opcode 15 (mark_vs_fetch_done) or a control-flow program with no exec_end: refused always
+//   kDynLoop    FM4 Recomp: a cond_jmp to itself or an earlier instruction (a data-dependent loop; shader_glsl.cpp "Dynamic
+//               loops" caps it at 255 iterations); also kBranch, as every cond_jmp
 // A shader with none of them is straight-line (nop, exec, exec_end, alloc).
 //
 // The allow-list: `fm4recomp --shader-classes <list>` (required with a GPU renderer mode, no silent
 // default; required arguments have no silent defaults). "none" allows straight-line
-// shaders only; "branch,predicate,loop" allows those classes too; "call" and unknown opcodes are
+// shaders only; "branch,predicate,loop" allows those classes too ("dynloop" the dynamic loops, named on its own); "call" and unknown opcodes are
 // never allowed. The renderer checks a pair's classes before its first pipeline is created
 // (pipeline_cache.cpp), because MoltenVK compiles the MSL at vkCreateGraphicsPipelines and the hang
 // hypothesis of the execution model (§8: PS 8776478A) sits below the GLSL. The run log names each
@@ -38,6 +40,7 @@ enum ShaderClassBits : uint32_t
     kClassLoop = 1u << 2,
     kClassCall = 1u << 3,
     kClassUnknown = 1u << 4,
+    kClassDynLoop = 1u << 5,
 };
 using ShaderClass = uint32_t;
 
@@ -73,7 +76,11 @@ inline ShaderClass ScanShaderClass(const uint32_t* words, uint32_t count)
             ended = IsExecEnd(op);
             break;
         case CfOpcode::LoopStart: case CfOpcode::LoopEnd: cls |= kClassLoop; break;
-        case CfOpcode::CondJmp: cls |= kClassBranch; break;
+        case CfOpcode::CondJmp:
+            cls |= kClassBranch;
+            if (!DecodeBranch(cf).unconditional && DecodeBranch(cf).address <= i)
+                cls |= kClassDynLoop;
+            break;
         case CfOpcode::CondCall: case CfOpcode::Return: cls |= kClassCall; break;
         default: cls |= kClassUnknown; break;  // 15 (mark_vs_fetch_done)
         }
@@ -89,21 +96,22 @@ inline std::string ShaderClassName(ShaderClass cls)
         return "straight";
     std::string s;
     const struct { ShaderClass bit; const char* name; } names[] = {
-        {kClassBranch, "branch"}, {kClassPredicate, "predicate"}, {kClassLoop, "loop"}, {kClassCall, "call"}, {kClassUnknown, "unknown"}};
+        {kClassBranch, "branch"}, {kClassPredicate, "predicate"}, {kClassLoop, "loop"}, {kClassDynLoop, "dynloop"}, {kClassCall, "call"},
+        {kClassUnknown, "unknown"}};
     for (const auto& n : names)
         if (cls & n.bit)
             s += (s.empty() ? "" : ",") + std::string(n.name);
     return s;
 }
 
-// Parses --shader-classes: "none", or a comma-separated list of branch, predicate, loop. Anything
+// Parses --shader-classes: "none", or a comma-separated list of branch, predicate, loop, dynloop. Anything
 // else (an empty string, "call", "unknown", a typo) is refused with `error` set: a mistyped
 // allow-list must not silently allow or refuse.
 inline bool ParseShaderClassAllowList(const char* text, ShaderClass& allowed, std::string& error)
 {
     allowed = kClassStraight;
     if (text == nullptr || *text == '\0')
-        return error = "--shader-classes is empty (use none, or a list of branch, predicate, loop)", false;
+        return error = "--shader-classes is empty (use none, or a list of branch, predicate, loop, dynloop)", false;
     const std::string s = text;
     if (s == "none")
         return true;
@@ -117,8 +125,10 @@ inline bool ParseShaderClassAllowList(const char* text, ShaderClass& allowed, st
             allowed |= kClassPredicate;
         else if (item == "loop")
             allowed |= kClassLoop;
+        else if (item == "dynloop")
+            allowed |= kClassDynLoop;
         else
-            return error = "--shader-classes: \"" + item + "\" is not one of branch, predicate, loop", allowed = kClassStraight, false;
+            return error = "--shader-classes: \"" + item + "\" is not one of branch, predicate, loop, dynloop", allowed = kClassStraight, false;
         at = end + 1;
     }
     return true;

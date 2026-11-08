@@ -29,6 +29,7 @@
 // takes the queue lock first (bounded; uncontended in the other modes).
 #include "renderer.h"
 #include "capture_store.h"
+#include "capture_keep.h"
 #include "draw_record.h"
 #include "draw_state.h"
 #include "edram_vk.h"
@@ -69,6 +70,8 @@ constexpr uint32_t kDisplayWidth = 1280, kDisplayHeight = 720;  // the accepted 
 constexpr uint32_t kSlots = 1;                                     // unit 4; D-b's 12 slots come with unit 5
 constexpr size_t kCaptureRecords = 16;
 constexpr uint64_t kCaptureBytes = 64ull << 20;                    // 16 stored-deflate 1280x720 PNGs are ~44 MB
+constexpr size_t kKeepRecords = 96;                               // FM4_CAPTURE_KEEP_EVERY (capture_keep.h)
+constexpr uint64_t kKeepBytes = 320ull << 20;                      // 96 x ~2.8 MB
 constexpr uint64_t kRingBytes = 16ull << 20;                       // per slot (D-b): ~9.7 KB of blocks per draw plus its vertex windows
 constexpr uint32_t kDrawsPerSlot = 4096;                           // descriptor sets per slot pool (a race frame is ~3,000 draws, L §3.4); a set
                                                                    // costs every binding of the layout (32 samplers), written or not
@@ -167,6 +170,8 @@ public:
 VulkanBackend backend;
 std::optional<GpuGuard<Transient, kSlots>> guard;
 std::optional<CaptureStore<kCaptureRecords>> captures;
+std::optional<CaptureStore<kKeepRecords>> kept;  // FM4_CAPTURE_KEEP_EVERY
+uint64_t keepEvery = 0;
 
 // A refused verdict ends the run: a stranding with its own code (GPU_STOP was written), anything
 // else as a setup failure.
@@ -350,6 +355,18 @@ void Capture(uint64_t id, const char* what)
         Stop(StopCode::Setup, "renderer: capture of %s: %s", what, error.c_str());
     std::fprintf(stderr, "[gpu] %s captured: %s (ring %zu files, %llu bytes)\n", what, captures->PathOf(id).c_str(), captures->Count(),
                  (unsigned long long)captures->Bytes());
+    if (kept && id % keepEvery == 0)
+    {
+        if (!kept->Add(id, png.size(), [&](const std::string& path) {
+                FILE* f = std::fopen(path.c_str(), "wb");
+                if (f == nullptr)
+                    return false;
+                const bool written = std::fwrite(png.data(), 1, png.size(), f) == png.size();
+                return std::fclose(f) == 0 && written;
+            }, error))
+            Stop(StopCode::Setup, "renderer: kept capture of %s: %s", what, error.c_str());
+        std::fprintf(stderr, "[gpu] %s kept: %s\n", what, kept->PathOf(id).c_str());
+    }
 }
 
 // The display gamma ramp, applied on the CPU to the detiled front buffer before the upload, so the display image and the
@@ -501,6 +518,17 @@ uint64_t NowNs()
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+// FM4_SELFCHECK_EDRAM: unset, or "depth4x2x" (RunSelfCheck step 6, the 4x -> 2x depth transfer); anything else stops.
+bool EdramSelfCheckRequested()
+{
+    const char* v = std::getenv("FM4_SELFCHECK_EDRAM");
+    if (v == nullptr || *v == 0)
+        return false;
+    if (std::strcmp(v, "depth4x2x") != 0)
+        Stop(StopCode::Setup, "renderer: FM4_SELFCHECK_EDRAM=%s: only depth4x2x is defined", v);
+    return true;
+}
+
 void Expect(bool ok, const char* what)
 {
     std::fprintf(stderr, "[gpu self-check] %s %s\n", ok ? "pass" : "FAIL", what);
@@ -594,6 +622,16 @@ bool Initialize(const Options& o)
     guard.emplace(backend, gate, o.gpuStopPath, gpu::FenceTimeoutNs(timeout.ms));
     Require(guard->Begin("renderer initialize"));  // GPU_STOP before any Vulkan call
     captures.emplace(o.captureDir, "frame_", kCaptureBytes);
+    const KeepEvery keep = KeepEveryFromEnv(std::getenv("FM4_CAPTURE_KEEP_EVERY"));
+    if (keep.malformed)
+        Stop(StopCode::Setup, "renderer: FM4_CAPTURE_KEEP_EVERY is not a decimal number from 1 to 1000000");
+    if (keep.every)
+    {
+        keepEvery = keep.every;
+        kept.emplace(o.captureDir, "keep_", kKeepBytes);
+        std::fprintf(stderr, "[gpu] diagnostic FM4_CAPTURE_KEEP_EVERY=%llu: every %llu-th swap also kept (at most %zu files, %llu MB)\n",
+                     (unsigned long long)keepEvery, (unsigned long long)keepEvery, kKeepRecords, (unsigned long long)(kKeepBytes >> 20));
+    }
     SetStopQuiesce(QuiesceForStop, ReportForSignalStop);
     if (o.mode == Mode::Window && o.surface == nullptr)
         Stop(StopCode::Setup, "renderer: window mode needs the window's surface request (window_sdl.h OpenWindow)");
@@ -620,8 +658,9 @@ bool Initialize(const Options& o)
     SetTextureHooks(InitializeTextureUnit(dev));  // unit 7 (texture_vk.h)
     // The EDRAM unit (edram_vk.h): its transfer shaders through the same compiler, its resolve writes through main.cpp's
     // writable guest base, each recorded resolve reported to the texture unit (guest_writes.h MarkGuestWritten). Present
-    // mode only: the self-check draws nothing and keeps its device work unchanged.
-    if (o.mode == Mode::Present || o.mode == Mode::Window)
+    // mode only: the self-check draws nothing and keeps its device work unchanged, unless FM4_SELFCHECK_EDRAM asks for the
+    // isolated EDRAM check (RunSelfCheck step 6).
+    if (o.mode == Mode::Present || o.mode == Mode::Window || (o.mode == Mode::SelfCheck && EdramSelfCheckRequested()))
     {
         if (o.guestBase == nullptr)
             Stop(StopCode::Setup, "renderer: present mode needs the writable guest base (Options::guestBase)");
@@ -1186,10 +1225,36 @@ void RunSelfCheck()
         Expect(!small.Add(9, tiny.size(), write, error) && ::access(small.PathOf(9).c_str(), F_OK) != 0, "an oversized capture is refused, no file");
     }
 
+    // 6. (FM4_SELFCHECK_EDRAM=depth4x2x only) The EDRAM depth transfer 4x -> 2x on the device, isolated: known depth and
+    //    stencil uploaded into the 1x key, transferred 1x -> 4x and 4x -> 2x by the unit's own transfer passes, every guest
+    //    sample of both dumped and compared with the EDRAM sample layout's expectation (edram_vk.h RecordDepthSelfCheck).
+    const bool edramCheck = EdramSelfCheckRequested();
+    if (edramCheck)
+    {
+        Require(guard->Begin("self-check EDRAM depth 4x -> 2x"));
+        const VkCommandBuffer e = BeginSlot(0);
+        std::string error;
+        const bool recorded = RecordDepthSelfCheck(e, error);
+        if (!recorded)
+            std::fprintf(stderr, "[gpu self-check] EDRAM depth 4x -> 2x: %s\n", error.c_str());
+        // Ended even after a refusal, so the command buffer is well formed (nothing below submits it then). No display
+        // readback: step 1 left the display image in TRANSFER_SRC, and this step reads its results from the EDRAM staging buffer.
+        Check(vkEndCommandBuffer(e), "vkEndCommandBuffer");
+        Expect(recorded, "EDRAM depth 4x -> 2x recorded (1x upload, transfers 1x -> 4x and 4x -> 2x, depth dumps)");
+        Require(guard->Submit(0));
+        Require(guard->Retire(0));
+        const DepthSelfCheckResult r = VerifyDepthSelfCheck();
+        std::fprintf(stderr, "[gpu self-check] EDRAM depth: 4x %llu sample(s), %llu mismatch(es); 2x %llu sample(s), %llu mismatch(es)%s%s\n",
+                     (unsigned long long)r.checked4x, (unsigned long long)r.mismatches4x, (unsigned long long)r.checked2x,
+                     (unsigned long long)r.mismatches2x, r.first.empty() ? "" : "; first: ", r.first.c_str());
+        Expect(r.checked4x == 640ull * 16 * 4 && r.mismatches4x == 0, "EDRAM 1x -> 4x depth: every guest sample's depth and stencil word as the layout places it");
+        Expect(r.checked2x == 1280ull * 16 * 2 && r.mismatches2x == 0, "EDRAM 4x -> 2x depth: every guest sample's depth and stencil word as the layout places it");
+    }
+
     Shutdown();
     Stop(StopCode::GpuSelfCheck, "GPU self-check passed: device, clear and upload read back, deferred destruction, bounded fence wait (stranding "
-                            "on a scratch flag), GPU_STOP refusal, loop-work cap, capped captures; %llu validation message(s)",
-         (unsigned long long)ValidationMessageCount());
+                            "on a scratch flag), GPU_STOP refusal, loop-work cap, capped captures%s; %llu validation message(s)",
+         edramCheck ? ", EDRAM depth transfer 4x -> 2x" : "", (unsigned long long)ValidationMessageCount());
 }
 
 }  // namespace runtime::video

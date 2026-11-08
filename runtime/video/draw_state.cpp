@@ -254,7 +254,13 @@ struct Decoder
         if ((cc >> 4) & 1)
             return Refuse("RB_COLORCONTROL " + Hex(cc) + ": alpha to mask (coverage) is not modelled");
         d.alphaTest.func = cc & 7;
-        d.alphaTest.enabled = ((cc >> 3) & 1) && d.alphaTest.func != 7;
+        // FM4 Recomp: no alpha test in kDepth (DepthOnly): Xenia runs no pixel shader there (xenos.h:903-925 "the pixel shader
+        // is never used with kDepth"; vulkan_command_processor.cc:2196-2208 sets it only for kColorDepth; draw_util.cc:121-126),
+        // so RB_COLORCONTROL's test cannot discard a depth-only draw. FM4's welcome screen clears depth with a kDepth rect while
+        // the UI's alpha test (8700000C: GREATER, ref 0) is still set and the clear's colour alpha is 0; testing it discarded the
+        // clear. The guest PS still runs for DepthOnly here (a kill or oDepth in it
+        // would still apply: APPROXIMATE against Xenia's no-fragment-stage pipeline).
+        d.alphaTest.enabled = d.kind == DrawKind::Draw && ((cc >> 3) & 1) && d.alphaTest.func != 7;
         d.alphaTest.ref = RegFloat(xr::kRbAlphaRef);
         return true;
     }
@@ -339,11 +345,14 @@ struct Decoder
         if (t.colorWritten)
         {
             // 0 8_8_8_8, 1 8_8_8_8_GAMMA, 2 2_10_10_10, 3 2_10_10_10_FLOAT, 14 32_FLOAT (X xenos.h:299-318; 14 is 32 bpp, xenos.h:323-327,
-            // so the tile arithmetic below holds; FM4's HDR luminance reduction, the local capture draw_loop1 (not distributed) draw 22725); the rest are not modelled
-            if (t.colorFormat > 3 && t.colorFormat != 14)
-                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 10, 12, 14 are)");
-            if (t.colorExpBias != 0)
-                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour exponent bias " + Num(uint64_t(int64_t(t.colorExpBias))) + " is not modelled");
+            // so the tile arithmetic below holds; FM4's HDR luminance reduction), 4 16_16 (32 bpp; FM4
+            // Recomp: FM4's intro); the rest are not modelled
+            if (t.colorFormat > 4 && t.colorFormat != 14)
+                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 4, 10, 12, 14 are)");
+            // The exponent bias: only where the host's scale is 1 (pipeline_key.h ColorExpBiasAccepted: 16_16 with 5, else 0).
+            if (t.colorFormat == 4 ? t.colorExpBias != 5 : t.colorExpBias != 0)
+                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour exponent bias " + Num(uint64_t(int64_t(t.colorExpBias))) + " is not modelled" +
+                              (t.colorFormat == 4 ? " (16_16 takes 5)" : ""));
             if (t.depthWritten && t.colorBase == t.depthBase)
                 return Refuse("RB_COLOR_INFO " + Hex(ci) + " / RB_DEPTH_INFO " + Hex(di) + ": colour and depth at the same EDRAM base, both written");
         }
@@ -419,6 +428,7 @@ struct Decoder
         {
         case 2: case 6: case 50:   // k_8, k_8_8_8_8, k_8_8_8_8_AS_16_16_16_16
         case 18: case 51:          // k_DXT1, k_DXT1_AS_16_16_16_16
+        case 20: case 53:          // k_DXT4_5, k_DXT4_5_AS_16_16_16_16 (FM4 Recomp: the local capture dynloop1 (not distributed), scenario9)
         case 7: case 54:           // k_2_10_10_10, k_2_10_10_10_AS_16_16_16_16
         case 36: case 22: case 23: // k_32_FLOAT, k_24_8, k_24_8_FLOAT
         case 25:                   // k_16_16 (signed integer only)

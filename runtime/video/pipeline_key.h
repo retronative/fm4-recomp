@@ -158,9 +158,19 @@ inline bool ColorFormatMapped(uint32_t format)
 {
     switch (format)
     {
-    case 0: case 1: case 2: case 3: case 7: case 14: case 15: return true;  // 8_8_8_8, _GAMMA, 2_10_10_10, _FLOAT, 16_16_16_16_FLOAT, 32_FLOAT, 32_32_FLOAT
-    default: return false;  // 4 16_16, 5 16_16_16_16 (SNORM + XE_COLOR0_SCALE, ForzaRecomp's rule, not adopted yet), 6, 10, 12
+    case 0: case 1: case 2: case 3: case 4: case 7: case 14: case 15: return true;  // 8_8_8_8, _GAMMA, 2_10_10_10, _FLOAT, 16_16 (R16G16_SNORM), 16_16_16_16_FLOAT, 32_FLOAT, 32_32_FLOAT
+    default: return false;  // 5 16_16_16_16, 6, 10, 12
     }
+}
+
+// FM4 Recomp: the colour exponent bias (RB_COLOR_INFO bits 20-25) the host accepts. Xenia scales the shader's colour by
+// 2^bias, and on its host-render-target path by 2^(bias - 5) for 16_16 / 16_16_16_16, whose -32..32 range its SNORM target
+// holds as -1..1 (vulkan_command_processor.cc:3755-3774; render_target_cache.cc:188 snorm16_render_target_full_range true).
+// Only the case where that scale is 1 is accepted: 16_16 with bias 5 (FM4's intro, RB_COLOR_INFO
+// 00540340), so no shader scale is emitted; any other bias is refused.
+inline bool ColorExpBiasAccepted(uint32_t format, int32_t bias)
+{
+    return format == 4 ? bias == 5 : bias == 0;
 }
 
 // The pipeline state of a draw. `vs`/`ps`: the stage's current shaders; the variants (DeriveVariants)

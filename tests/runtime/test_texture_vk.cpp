@@ -556,6 +556,115 @@ void TestMips()
 // FIRST byte in memory; the fetch's 4th swizzle component is W (3) -> the view's A. So: alpha = guest byte 0 of each texel.
 // Tiled texel offsets (GetTiledOffset2D :443-458, 4-byte blocks, pitch 800): (0,0) 0, (1,0) 4, (0,1) (y & 1) << 4 = 16,
 // (8,0) ((x >> 3) & 3) << 6 = 64.
+// FM4 Recomp: k_24_8_FLOAT (23), an FM4 depth texture (slot 1). Hand decode (xenos.h:1206-1307):
+// 8A024802: type 2, signs 0 (bits 2-9 of 0x4802), clamp 2 2 2, pitch ((1u << 31 | 0x0A024802) >> 22) & 0x1FF = 0x28 -> 1280, tiled.
+// 1C421097: format 0x17 = 23, endian (0x97 >> 6) & 3 = 2 (8in32), base 1C421000. 0059E4FF: 1280 x 720. 01000D11: number format
+// bit 0 = 1 (float data: ignored, as Xenia never reads it), swizzle (0xD11 >> 1) & 0xFFF = 0x688 = X Y Z W, point mag / min,
+// mip base map. Host (Xenia vulkan_texture_cache.cc:210-213): R32_SFLOAT, RRRR -> R R R R. Staging 1280 x 720 x 4 = 3,686,400.
+const uint32_t kDepthTex[6] = {1u << 31 | 0x0A024802u, 0x1C421097u, 0x0059E4FFu, 0x01000D11u, 0x00000000u, 0x00000200u};
+// A linear k_24_8_FLOAT 5x1, pitch 32 texels, endian 8in32, at 0x00100000, point sampled.
+const uint32_t kDepthSmall[6] = {2u | kClampEdgeXYZ | 1u << 22, 23u | 2u << 6 | kSmallBase, 4u, kSwizzleXYZW | kMipBaseMap | 1u, 0, kDim2D};
+
+void TestDepthFloat()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kDepthTex, ShaderFetch{}, false, kFull);
+    Expect(p.entry != nullptr && p.plan.stagingBytes == 3686400 && !p.binding.gamma &&
+               Components(p.binding, vk::kSwizzleR, vk::kSwizzleR, vk::kSwizzleR, vk::kSwizzleR) &&
+               p.entry->description.host.vkFormat == vk::kFormatR32Sfloat,
+           "scenario6 depth texture: k_24_8_FLOAT (23) 1280x720 tiled 8in32 at 1C421000, R32_SFLOAT R R R R, 3,686,400 bytes");
+    // 20e4 by hand (Xenia pixel_formats.xesli:622-638: exponent bits 20-23, mantissa 0-19, float exponent e + 112, a
+    // denormal normalized, 0 -> 0); the guest words big-endian, swapped by 8in32:
+    //   F00000AB: d24 F00000, e 15 m 0 -> 2^0 = 1.0 = 3F800000 (stencil AB dropped)
+    //   E8000000: e 14, m 0x80000 -> 1.5 * 2^-1 = 0.75 = 3F400000
+    //   08000012: e 0, m 0x80000 (denormal) -> 0.5 * 2^(1-15) = 2^-15 = 38000000
+    //   00000077: d24 0 -> 0.0
+    //   FFFFFFFF: e 15, m 0xFFFFF -> (127 << 23) | (0xFFFFF << 3) = 3FFFFFF8 (just under 2)
+    const uint32_t words[5] = {0xF00000ABu, 0xE8000000u, 0x08000012u, 0x00000077u, 0xFFFFFFFFu};
+    const uint32_t want[5] = {0x3F800000u, 0x3F400000u, 0x38000000u, 0x00000000u, 0x3FFFFFF8u};
+    FakeGuest g{kSmallBase, std::vector<uint8_t>(128, 0)};
+    for (int i = 0; i < 5; i++)
+        for (int b = 0; b < 4; b++)
+            g.bytes[size_t(4 * i + b)] = uint8_t(words[i] >> (24 - 8 * b));
+    const PreparedTexture s = m.Prepare(kDepthSmall, ShaderFetch{}, false, kFull);
+    std::vector<uint8_t> out(s.entry != nullptr ? s.plan.stagingBytes : 0, 0xEE);
+    std::string error;
+    bool ok = s.entry != nullptr && FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    for (int i = 0; ok && i < 5; i++)
+    {
+        uint32_t u;
+        std::memcpy(&u, out.data() + 4 * i, 4);
+        ok = u == want[i];
+    }
+    Expect(ok, "k_24_8_FLOAT staging: each word becomes the float32 of its 20e4 depth (1.0, 0.75, 2^-15, 0, 0x3FFFFFF8)");
+    uint32_t asFloat32[6];
+    std::memcpy(asFloat32, kDepthSmall, sizeof asFloat32);
+    asFloat32[1] = 36u | 2u << 6 | kSmallBase;  // k_32_FLOAT: the same words uploaded unchanged
+    const PreparedTexture f = m.Prepare(asFloat32, ShaderFetch{}, false, kFull);
+    uint32_t first = 0;
+    Expect(f.entry != nullptr && FillStaging(f.entry->description, f.plan, GuestOf, &g, out.data(), error) &&
+               (std::memcpy(&first, out.data(), 4), first == 0xF00000ABu),
+           "CONTROL: k_32_FLOAT leaves the word as it is (the 20e4 transform is k_24_8_FLOAT's)");
+    uint32_t signedDepth[6];
+    std::memcpy(signedDepth, kDepthTex, sizeof signedDepth);
+    signedDepth[0] |= 1u << 2;  // sign of component X: signed (Xenia has no signed k_24_8_FLOAT host format)
+    const PreparedTexture q = m.Prepare(signedDepth, ShaderFetch{}, false, kFull);
+    Expect(q.entry == nullptr && Has(q.error, "signed component 0"), "CONTROL: a signed k_24_8_FLOAT component is refused");
+}
+
+// FM4 Recomp: k_DXT4_5_AS_16_16_16_16 (53), an FM4 texture (slot 0). Hand decode (xenos.h:1206-1307):
+// 820248FE: type 2, signs (0x48FE >> 2) & 0xFF = 0x3F -> 3 3 3 0 (x y z gamma), clamp 2 2 2, pitch ((1u << 31 | 0x020248FE) >> 22) &
+// 0x1FF = 8 -> 256, tiled. 11946075: format 0x35 = 53, endian (0x75 >> 6) & 3 = 1 (8in16), base 11946000. 000FE0FF: 256 x 128.
+// 00280D10: swizzle 0x688 = X Y Z W, mag 1, min 1, mip 0. 00000A00: 2D, one level. Host (Xenia vulkan_texture_cache.cc:350-354):
+// BC3_UNORM (137), RGBA, 16-byte 4x4 blocks: 64 x 32 blocks x 16 = 32,768 bytes; gamma as the UI's DXT1.
+const uint32_t kDxt5[6] = {1u << 31 | 0x020248FEu, 0x11946075u, 0x000FE0FFu, 0x00280D10u, 0x00000003u, 0x00000A00u};
+// A tiled DXT5 8x8 texels (2x2 blocks of 16 bytes), 8in16, pitch 32 texels, at 0x00100000.
+const uint32_t kDxt5Small[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 53u | 1u << 6 | kSmallBase, 7u | 7u << 13,
+                                kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+
+// FM4 Recomp: k_DXT4_5 (20), the local capture dynloop1 (not distributed) draw 460886 slot 0. Hand decode: 840200FE: type 2, signs 3 3 3 0 (gamma), clamp
+// 2 2 2 (0x00FE bits 10-15 = 0; dword 0 bits 16-18 = 2; x y: (0xFE >> 10) = 0 -> repeat), pitch ((1u << 31 | 0x040200FE) >> 22) & 0x1FF = 0x10 ->
+// 512, tiled. 0A98E054: format 0x14 = 20, endian 1 (8in16), base 0A98E000. 003FE1FF: 512 x 512. 00000243: mip min 0, max
+// (0x243 >> 6) & 0xF = 9. 0A971A00: 2D, mip address 0A971000. Ten levels 512 .. 1 of 16-byte blocks: 128^2, 64^2, 32^2, 16^2,
+// 8^2, 4^2, 2^2 blocks then three 1-block levels: 262,144 + 65,536 + 16,384 + 4,096 + 1,024 + 256 + 64 + 3 x 16 = 349,552 bytes.
+const uint32_t kDxt5Mips[6] = {1u << 31 | 0x040200FEu, 0x0A98E054u, 0x003FE1FFu, 0x01280D10u, 0x00000243u, 0x0A971A00u};
+
+void TestDxt5()
+{
+    {
+        TextureUnitModel m(TextureValidity::ReloadEveryBind);
+        const PreparedTexture p = m.Prepare(kDxt5Mips, ShaderFetch{}, true, kFull);
+        Expect(p.entry != nullptr && p.entry->description.levelCount == 10 && p.plan.stagingBytes == 349552 &&
+                   p.entry->description.host.vkFormat == 137 && p.binding.gamma,
+               "dynloop1 DXT5: k_DXT4_5 (20) 512x512, 10 levels, BC3, gamma, 349,552 staging bytes");
+    }
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kDxt5, ShaderFetch{}, true, kFull);
+    Expect(p.entry != nullptr && p.plan.stagingBytes == 32768 && p.binding.gamma && p.entry->description.host.vkFormat == 137 &&
+               p.entry->description.host.blockCompressed && Components(p.binding, vk::kSwizzleR, vk::kSwizzleG, vk::kSwizzleB, vk::kSwizzleA),
+           "scenario9 DXT5: k_DXT4_5_AS_16_16_16_16 (53) 256x128 tiled 8in16 at 11946000, BC3 R G B A, gamma, 32,768 bytes");
+    const PreparedTexture noBc = m.Prepare(kDxt5, ShaderFetch{}, true, {false, true});
+    Expect(noBc.entry == nullptr && Has(noBc.error, "textureCompressionBC"), "CONTROL: DXT5 without textureCompressionBC is refused");
+    // GetTiledOffset2D (texture_util.cc:443-458) with 16-byte blocks (log2 4), macro 0:
+    //   micro = ((x & 7) + ((y & 0xE) << 2)) << 4; offset = ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4); result = offset.
+    //   (0,0): 0. (1,0): micro 16 -> 32. (0,1): 0 + 16 = 16. (1,1): 32 + 16 = 48. Output rows (0,0) (1,0) (0,1) (1,1);
+    //   8in16: output byte j of a block is source byte j ^ 1.
+    const PreparedTexture s = m.Prepare(kDxt5Small, ShaderFetch{}, false, kFull);
+    Expect(s.entry != nullptr && s.plan.stagingBytes == 64, "small DXT5: 2 x 2 blocks of 16 bytes = 64 staging bytes");
+    if (s.entry == nullptr)
+        return;
+    FakeGuest g = Pattern(kSmallBase, s.entry->description.levels[0].extentBytes);
+    std::vector<uint8_t> out(64, 0xEE);
+    std::string error;
+    const uint32_t offsets[4] = {0, 32, 16, 48};
+    bool all = FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    for (uint32_t k = 0; all && k < 4; k++)
+        for (uint32_t j = 0; j < 16; j++)
+            all = out[k * 16 + j] == uint8_t(offsets[k] + (j ^ 1));
+    Expect(all, "small DXT5: each 16-byte block from its hand-computed tiled offset (0, 32, 16, 48), 8in16-swapped");
+    Expect(out[16] == 33 && out[32] == 17, "small DXT5: block (1,0) comes from 32 and (0,1) from 16 (tiled, not row-major)");
+}
+
 void TestGlow()
 {
     const uint32_t kGlow[6] = {1u << 31 | 0x064200FEu, 0x117D80B2u, 0x003E631Fu, 0x00280C14u, 0x00000003u, 0x00000A00u};
@@ -610,6 +719,8 @@ int main()
     Test3D();
     TestMips();
     TestGlow();
+    TestDepthFloat();
+    TestDxt5();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

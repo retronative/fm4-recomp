@@ -3,6 +3,7 @@
 //
 // texture_upload.h (see its header comment).
 #include "texture_upload.h"
+#include "edram_vk_plan.h"
 #include <cstdio>
 
 namespace runtime::video {
@@ -31,7 +32,7 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
                               (d.dimension == 2 ? "x" + std::to_string(d.depth) + " (3D)" : std::string()) + " at " + Hex(d.base.physical);
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 36, 50, 51, 54) this unit was checked for";
+        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 20, 23, 36, 50, 51, 53, 54) this unit was checked for";
         return p;
     }
     // Every level the description holds (texture_info.cpp, Xenia's level range texture_util.cc:60-92 and layout :200-438,
@@ -108,6 +109,14 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
             error = "level " + std::to_string(i) + " at " + Hex(l.address) + ": the " + (d.fetch.tiled ? "untile" : "linear copy") + " refused it";
             return false;
         }
+        if (d.host.depth20e4)  // texture_info.h HostFormat::depth20e4
+            for (uint64_t at = 0; at + 4 <= plan.levelBytes[i]; at += 4)
+            {
+                uint32_t word;
+                std::memcpy(&word, level + at, 4);
+                const float depth = ColorWordDepth(word, edram::DepthFormat::D24FS8);
+                std::memcpy(level + at, &depth, 4);
+            }
     }
     return true;
 }

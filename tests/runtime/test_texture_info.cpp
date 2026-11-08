@@ -131,8 +131,10 @@ void TestFormatsAndDescriptions()
     Expect(HostFormatFor(6, h) && h.vkFormat == vk::kFormatR8G8B8A8Unorm && HostFormatFor(50, h) && h.vkFormat == vk::kFormatR8G8B8A8Unorm &&
                HostFormatFor(54, h) && h.vkFormat == vk::kFormatA2B10G10R10UnormPack32,
            "host format: k_8_8_8_8 / _AS_16_16_16_16 -> R8G8B8A8_UNORM, k_2_10_10_10_AS_16_16_16_16 -> A2B10G10R10 (:121-125, :335-339, :355-360)");
-    Expect(!HostFormatFor(19, h) && !HostFormatFor(20, h) && !HostFormatFor(49, h) && !HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
-           "CONTROL: DXT3, DXT5, DXN, 5_6_5 and 2_10_10_10 have no host mapping yet");
+    Expect(HostFormatFor(20, h) && h.vkFormat == 137 && h.blockCompressed && HostFormatFor(53, h) && h.vkFormat == 137,
+           "host format: k_DXT4_5 and k_DXT4_5_AS_16_16_16_16 -> BC3_UNORM_BLOCK (137; :196-200, :350-354)");
+    Expect(!HostFormatFor(19, h) && !HostFormatFor(49, h) && !HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
+           "CONTROL: DXT3, DXN, 5_6_5 and 2_10_10_10 have no host mapping yet");
 
     // The Y plane: level 0 only, extent 1280 * 719 + 1280 = 921,600 (texture_util.cc:420-423: rows - 1
     // pitches plus the last row; the base's pitch is the fetch constant's, 1280, not re-aligned).
@@ -254,7 +256,7 @@ void TestRefusals()
         {"dimension 1D", With(kYPlane, 5, 3u << 9, 0u), {}, "dimension 0"},
         {"stacked", With(kYPlane, 1, 1u << 10, 1u << 10), {}, "stacked"},
         {"shader samples 3D", std::vector<uint32_t>(kYPlane, kYPlane + 6), ShaderFetch{3, 3, 3, 7, 2}, "dimension 2"},
-        {"format DXT5 (20)", With(kYPlane, 1, 0x3Fu, 20u), {}, "no host format"},
+        {"format DXT3 (19)", With(kYPlane, 1, 0x3Fu, 19u), {}, "no host format"},
         {"format 5_6_5 (4)", With(kYPlane, 1, 0x3Fu, 4u), {}, "no host format"},
         {"integer number format", With(kYPlane, 3, 1u, 1u), {}, "integer"},
         {"base address 0", With(kYPlane, 1, 0xFFFFF000u, 0u), {}, "base address 0"},
@@ -566,7 +568,7 @@ void TestCache()
     Expect(watch.Rearm(0x09000000u, 65536) && watch.GetStats().rearms == 15, "CONTROL: Rearm over unwatched pages protects nothing");
 
     // A refused fetch constant: no entry, the reason; a failing backend: Loaded false, the entry invalid.
-    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 20u).data());
+    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 19u).data());  // DXT3: no host format
     Expect(!bad.entry && Has(bad.error, "no host format") && cache.GetStats().refused == 1 && cache.Size() == 2, "CONTROL: a refused fetch constant makes no entry and names its reason");
     fake.fail = true;
     TextureCache::Lookup v = cache.Find(kUPlane);

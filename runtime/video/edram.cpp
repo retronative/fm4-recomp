@@ -55,8 +55,12 @@ bool SupportedKey(Key k, std::string& why)
         // FM4's HDR luminance reduction (RB_COLOR_INFO 000E0000).
         return true;
     case ColorFormat::k16_16:
+        // FM4 Recomp: 32 bpp (two signed 16-bit components, the guest range -32..32); FM4's intro, the local capture scenario11 (not distributed) draw
+        // 483247 (RB_COLOR_INFO 00540340). Host R16G16_SNORM (edram_vk_plan.h HostColorFormat). Its transfers and resolves stay
+        // refused by edram_vk_plan.cpp until a run needs them.
+        return true;
     case ColorFormat::k16_16_Float:
-        return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16, 16_16_FLOAT) is not supported in M4");
+        return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16_FLOAT) is not supported yet");
     case ColorFormat::k16_16_16_16:
     case ColorFormat::k16_16_16_16_Float:
     case ColorFormat::k32_32_Float:

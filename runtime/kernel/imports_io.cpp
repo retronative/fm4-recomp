@@ -5,8 +5,12 @@
 // src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc.
 #include "imports.h"
 #include "file_system.h"
+#include <algorithm>
+#include "content.h"
 #include "objects.h"
 #include <optional>
+#include <cstring>
+#include <cstdio>
 #include "dispatcher.h"
 #include <string>
 #include <string_view>
@@ -131,6 +135,49 @@ void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t han
     if (resolved == runtime::Resolved::OtherDevice)  // first, so the stop names the real reason
         Stop(StopCode::Unimplemented, "%s(\"%s\" = %s, access %08X, disposition %u): not on the disc, and no other device is mounted",
              import, path.c_str(), device.c_str(), access, disposition);
+    if (entry.writable)
+    {
+        // A writable content root (saved content): Xenia virtual_file_system.cc:181-329 OpenFile on a writable
+        // HostPathDevice. OPEN and OVERWRITE need the entry (NO_SUCH_FILE, FILE_DOES_NOT_EXIST), CREATE needs it absent
+        // (OBJECT_NAME_COLLISION 0xC0000035, FILE_EXISTS 4); a missing parent NO_SUCH_FILE. A missing entry is created
+        // (FILE_DIRECTORY_FILE (1): a directory) with FILE_CREATED (2); an existing one opens (FILE_OPENED) or, for
+        // SUPERSEDE (0) and OVERWRITE(_IF) (4, 5), is emptied (FILE_SUPERSEDED 0, FILE_OVERWRITTEN 3; Xenia deletes and
+        // recreates). A host failure: ACCESS_DENIED (0xC0000022), as Xenia's failed create or delete.
+        constexpr uint32_t kSupersede = 0, kCreate = 2, kOverwrite = 4, kOverwriteIf = 5, kDirectoryFile = 0x1;
+        constexpr uint32_t kSuperseded = 0, kCreated = 2, kOverwritten = 3, kExists = 4;
+        if (disposition > kOverwriteIf)
+            Stop(StopCode::Unimplemented, "%s(\"%s\"): disposition %u is not a file disposition", import, path.c_str(), disposition);
+        const bool found = resolved == runtime::Resolved::Found;
+        if (!found && entry.host.empty())
+            return finish(0xC000000F, kDoesNotExist, 0xFFFFFFFF);  // the parent is missing
+        if (found && entry.directory && (options & kNonDirectoryFile))
+            return finish(0xC00000BA, 0, 0xFFFFFFFF);
+        if (!found && (disposition == kOpen || disposition == kOverwrite))
+            return finish(0xC000000F, kDoesNotExist, 0xFFFFFFFF);
+        if (found && disposition == kCreate)
+            return finish(0xC0000035, kExists, 0xFFFFFFFF);  // STATUS_OBJECT_NAME_COLLISION
+        uint32_t action = kOpened;
+        if (!found)
+        {
+            const bool directory = (options & kDirectoryFile) != 0;
+            if (!runtime::CreateHostEntry(entry.host, directory))
+                return finish(0xC0000022, kDoesNotExist, 0xFFFFFFFF);  // STATUS_ACCESS_DENIED
+            entry.directory = directory, entry.size = 0, entry.attributes = directory ? runtime::file_attribute::kDirectory : 0x80;
+            action = kCreated;
+        }
+        else if (disposition == kSupersede || disposition == kOverwrite || disposition == kOverwriteIf)
+        {
+            if (entry.directory)
+                Stop(StopCode::Unimplemented, "%s(\"%s\", disposition %u): replacing a directory is not modelled", import, path.c_str(), disposition);
+            if (!runtime::TruncateHostFile(entry.host))
+                return finish(0xC0000022, kDoesNotExist, 0xFFFFFFFF);
+            entry.size = 0;
+            action = disposition == kSupersede ? kSuperseded : kOverwritten;
+        }
+        std::fprintf(stderr, "[fs] %s(\"%s\", access %08X, disposition %u): %s in the writable content root\n", import, path.c_str(), access,
+                     disposition, action == kCreated ? "created" : action == kOpened ? "opened" : "emptied");
+        return finish(0, action, runtime::OpenDiscFile(base, entry, (options & kSynchronousIo) != 0));
+    }
     if ((access & kWriteAccess) || (disposition != kOpen && disposition != kOpenIf))
         Stop(StopCode::Unimplemented, "%s(\"%s\", access %08X, disposition %u): the disc is read-only; writing is not modelled",
              import, path.c_str(), access, disposition);
@@ -165,6 +212,150 @@ GUEST_IMPORT(NtOpenFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:173 NtOpenFile
     OpenOnDisc(ctx, base, "NtOpenFile", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, kOpen, ctx.r7.u32);
 }
 
+GUEST_IMPORT(NtQueryDirectoryFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:547-588 NtQueryDirectoryFile, kernel/xfile.cc:43-94 QueryDirectory, xfile.h:36")
+{
+    // (handle, event, APC routine, APC context, io status*, X_FILE_DIRECTORY_INFORMATION*, length, ANSI file name*,
+    // restart scan): one child of the directory per call, as Xenia. A file name sets the pattern and restarts the
+    // scan (Xenia: "Always restart the search?"); without one the scan goes on, from the start if `restart`. The record
+    // (big-endian): next 0, index (the child's 1-based position), four times, size, allocation size, attributes, name
+    // length, then the name (not terminated). Xenia's order: length < 72 INFO_LENGTH_MISMATCH; an invalid pattern
+    // INVALID_PARAMETER; a handle that is no file NO_SUCH_FILE; nothing left NO_MORE_FILES, or NO_SUCH_FILE for a file
+    // name with no match or a name past the buffer. The io status gets {status, length on success, else 0}. An event or
+    // APC (completion through them) stops (7), as does a pattern with a path separator (Xenia asserts on it).
+    const uint32_t handle = ctx.r3.u32, event = ctx.r4.u32, apc = ctx.r5.u32, ioStatus = ctx.r7.u32, info = ctx.r8.u32,
+                   length = ctx.r9.u32, fileName = ctx.r10.u32, restart = runtime::Argument(ctx, base, 8);
+    if (event != 0 || apc != 0)
+        Stop(StopCode::Unimplemented, "NtQueryDirectoryFile(%08X): completion through event %08X or APC %08X is not modelled", handle, event, apc);
+    if (length < 72)
+        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH
+    std::string name;
+    if (fileName != 0)
+    {
+        const uint32_t size = uint32_t(base[fileName] << 8 | base[fileName + 1]), buffer = runtime::Load32(base, fileName + 4);
+        name.assign(reinterpret_cast<const char*>(base + buffer), size);
+    }
+    if (!runtime::ValidGuestPath(name, true))
+        return (void)(ctx.r3.u64 = 0xC000000D);  // STATUS_INVALID_PARAMETER
+    if (name.find('\\') != std::string::npos)
+        Stop(StopCode::Unimplemented, "NtQueryDirectoryFile(%08X, \"%s\"): a pattern with a path is not modelled", handle, name.c_str());
+    const auto object = runtime::LookupHandle(handle);
+    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
+    uint32_t status = 0;
+    if (file == nullptr)
+        status = 0xC000000F;  // STATUS_NO_SUCH_FILE
+    else
+    {
+        if (!file->listed)
+            file->children = runtime::ListDirectory(file->entry), file->listed = true;
+        if (!name.empty())
+        {
+            file->findPattern = name, file->findIndex = 0;
+            std::fprintf(stderr, "[fs] NtQueryDirectoryFile(%s, \"%s\"): %zu children\n",
+                         file->entry.package ? "a package directory" : ("disc \\" + file->entry.relative).c_str(), name.c_str(), file->children.size());
+        }
+        else if (restart != 0)
+            file->findIndex = 0;
+        const runtime::DirectoryChild* child = nullptr;
+        while (child == nullptr && file->findIndex < file->children.size())
+        {
+            const runtime::DirectoryChild& c = file->children[file->findIndex++];
+            if (runtime::WildcardMatch(file->findPattern, c.name))
+                child = &c;
+        }
+        if (child == nullptr || 0x40 + child->name.size() > length)
+            status = child == nullptr && name.empty() ? (1u << 31 | 0x6) : 0xC000000F;  // STATUS_NO_MORE_FILES : STATUS_NO_SUCH_FILE
+        else
+        {
+            const uint64_t times = runtime::kDiscTimeStamp;
+            const uint64_t values[6] = {times, times, times, times, child->entry.size, runtime::DiscAllocationSize(child->entry)};
+            runtime::Store32(base, info, 0);
+            runtime::Store32(base, info + 4, uint32_t(file->findIndex));
+            for (int i = 0; i < 6; i++)
+                runtime::Store32(base, info + 8 + 8 * i, uint32_t(values[i] >> 32)), runtime::Store32(base, info + 12 + 8 * i, uint32_t(values[i]));
+            runtime::Store32(base, info + 0x38, runtime::DiscAttributes(child->entry));
+            runtime::Store32(base, info + 0x3C, uint32_t(child->name.size()));
+            std::memcpy(base + info + 0x40, child->name.data(), child->name.size());
+        }
+    }
+    if (ioStatus)
+        runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, status == 0 ? length : 0);
+    ctx.r3.u64 = status;
+}
+
+GUEST_IMPORT(NtWriteFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:354-429 NtWriteFile, xfile.cc:239-268 XFile::Write; compatibility policy: save storage (quota)")
+{
+    // (handle, event, APC routine, APC context, io status*, buffer*, length, offset*), completed at once as Xenia and as
+    // NtReadFile here: a bad event or file handle INVALID_HANDLE with io status {status, 0}; the write at *offset, or at
+    // the position without one (or -1); io status {0, bytes}, the event set, PENDING for an asynchronous file. A
+    // synchronous file's position becomes offset + bytes (NT; as NtReadFile). The quota (content.h, owner policy; Xenia
+    // has none): a write growing stored content past it fails with STATUS_DISK_FULL (C000007F), io status {status, 0},
+    // nothing written. A file outside a writable content root (the disc, a package), an APC, or an asynchronous write
+    // without an offset stops (7).
+    const uint32_t handle = ctx.r3.u32, event = ctx.r4.u32, apc = ctx.r5.u32, ioStatus = ctx.r7.u32;
+    const uint32_t buffer = ctx.r8.u32, length = ctx.r9.u32, offsetAt = ctx.r10.u32;
+    auto fail = [&](uint32_t status) {
+        if (ioStatus)
+            runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, 0);
+        ctx.r3.u64 = status;
+    };
+    std::optional<runtime::KernelObject> eventObject;
+    if (event != 0)
+    {
+        eventObject = runtime::LookupHandle(event);
+        if (!eventObject || eventObject->type != runtime::ObjectType::Event)
+            return fail(runtime::status::kInvalidHandle);
+    }
+    const auto object = runtime::LookupHandle(handle);
+    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
+    if (file == nullptr)
+        return fail(runtime::status::kInvalidHandle);
+    if ((apc & ~1u) != 0)
+        Stop(StopCode::Unimplemented, "NtWriteFile(%08X): an APC routine (%08X) is not implemented", handle, apc);
+    if (!file->entry.writable || file->entry.directory)
+        Stop(StopCode::Unimplemented, "NtWriteFile(%08X): %s is not a file in a writable content root (writing the disc or a package is not modelled)",
+             handle, file->entry.host.c_str());
+    uint64_t offset = file->position;
+    bool explicitOffset = false;
+    if (offsetAt != 0)
+    {
+        const uint64_t given = uint64_t(runtime::Load32(base, offsetAt)) << 32 | runtime::Load32(base, offsetAt + 4);
+        if (given != ~uint64_t(0))
+            offset = given, explicitOffset = true;
+    }
+    if (!file->synchronous && !explicitOffset)
+        Stop(StopCode::Unimplemented, "NtWriteFile(%08X): an asynchronous write without an offset", handle);
+    const uint64_t size = runtime::HostFileSize(file->entry), end = offset + length;
+    const uint64_t growth = length != 0 && end > size ? end - size : 0;
+    if (growth != 0 && runtime::ContentBytesUsed() + growth > runtime::kContentQuota)
+        return fail(0xC000007F);  // STATUS_DISK_FULL
+    const uint32_t bytes = length != 0 ? runtime::WriteHostFile(file->entry, offset, base + buffer, length) : 0;
+    file->entry.size = std::max(size, offset + bytes);
+    if (file->synchronous)
+        file->position = offset + bytes;
+    if (ioStatus)
+        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, bytes);
+    if (eventObject)
+        runtime::SetEvent(base, eventObject->header);
+    ctx.r3.u64 = file->synchronous ? 0 : 0x103;  // STATUS_PENDING
+}
+
+GUEST_IMPORT(NtFlushBuffersFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:590-601 NtFlushBuffersFile (success, io status {0, 0})")
+{
+    // (handle, io status*): Xenia returns success for any handle. Writes here reach the host file at once (NtWriteFile),
+    // so a file in a writable content root is fsync'ed and the flush succeeds; a read-only file has nothing to flush.
+    // The io status gets {0, 0}. A handle that is no file stops (7) (Xenia does not check; success would be invented).
+    const uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32;
+    const auto object = runtime::LookupHandle(handle);
+    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
+    if (file == nullptr)
+        Stop(StopCode::Unimplemented, "NtFlushBuffersFile(%08X): not a file handle", handle);
+    if (file->entry.writable && !file->entry.directory)
+        runtime::SyncHostFile(file->entry);
+    if (ioStatus)
+        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, 0);
+    ctx.r3.u64 = 0;
+}
+
 GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc:58 NtQueryInformationFile, info/file.h:19")
 {
     // (handle, io status*, info*, length, class): FilePositionInformation (14: the position, big-endian
@@ -184,6 +375,8 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
     runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
     if (file == nullptr)
         return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
+    if (file->entry.writable && !file->entry.directory)
+        file->entry.size = runtime::HostFileSize(file->entry);  // another handle may have written since
     std::memset(base + info, 0, length);
     if (infoClass == kSector)
         runtime::Store32(base, info, file->entry.sector);
@@ -199,26 +392,61 @@ GUEST_IMPORT(NtQueryInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.
     ctx.r3.u64 = 0;
 }
 
-GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc:186-245 NtSetInformationFile (XFilePositionInformation)")
+GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc:186-262 NtSetInformationFile (XFilePositionInformation, XFileAllocationInformation ignored, XFileEndOfFileInformation -> XFile::SetLength)")
 {
-    // (handle, io status*, info*, length, class): FilePositionInformation (14) sets the position from its big-endian
-    // 64 bits. Xenia's order: a length below the class's minimum (8) is INFO_LENGTH_MISMATCH, an unknown handle
-    // INVALID_HANDLE; then the io status {0, 8} and 0. Any other class stops (7): disposition (deletion) and
-    // allocation are writes to a read-only disc that Xenia ignores, not modelled until a run needs them.
+    // (handle, io status*, info*, length, class): FilePositionInformation (14) sets the position, FileEndOfFileInformation
+    // (20) the file's length (a writable saved-content file: cut or zero-extended on the host), each from big-endian 64
+    // bits. FileAllocationInformation (19): Xenia ignores it (:222-226, success); here so does an allocation at or above the
+    // file's size (space is taken on write, where the quota is checked), while one below it, which NT would cut the file
+    // to, stops (7). FileDispositionInformation (13, 1 byte): Xenia ignores it (:207-214); here, as NT, a writable
+    // saved-content file is removed when this handle closes (NtClose) if the byte is non-zero (io status {0, 0}); a disc
+    // file or a directory stops (7). Xenia's order: a length below the class's minimum (8) is INFO_LENGTH_MISMATCH, an unknown handle
+    // INVALID_HANDLE; then the io status {status, 8} and the status. Growing stored content past the quota (content.h)
+    // is STATUS_DISK_FULL with nothing changed, as NtWriteFile. The length of a disc file, and any other class, stop (7):
+    // disposition (deletion) and allocation are not modelled until a run needs them.
     const uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32, info = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
-    constexpr uint32_t kPosition = 14;
-    if (infoClass != kPosition)
+    constexpr uint32_t kDisposition = 13, kPosition = 14, kAllocation = 19, kEndOfFile = 20;
+    if (infoClass != kDisposition && infoClass != kPosition && infoClass != kAllocation && infoClass != kEndOfFile)
         Stop(StopCode::Unimplemented, "NtSetInformationFile: information class %u is not implemented", infoClass);
-    if (length < 8)
+    if (length < (infoClass == kDisposition ? 1u : 8u))
         return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH
     const auto object = runtime::LookupHandle(handle);
     runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;
     if (file == nullptr)
         return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
-    file->position = uint64_t(runtime::Load32(base, info)) << 32 | runtime::Load32(base, info + 4);
+    if (infoClass == kDisposition)
+    {
+        if (!file->entry.writable || file->entry.directory)
+            Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): delete-on-close of a disc file or a directory", handle);
+        file->deleteOnClose = base[info] != 0;
+        if (ioStatus)
+            runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, 0);
+        return (void)(ctx.r3.u64 = 0);
+    }
+    const uint64_t value = uint64_t(runtime::Load32(base, info)) << 32 | runtime::Load32(base, info + 4);
+    uint32_t status = 0;
+    if (infoClass == kPosition)
+        file->position = value;
+    else if (infoClass == kAllocation)
+    {
+        const uint64_t size = file->entry.writable && !file->entry.directory ? runtime::HostFileSize(file->entry) : file->entry.size;
+        if (value < size)
+            Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): an allocation of %llu bytes below the file's %llu would cut it", handle,
+                 (unsigned long long)value, (unsigned long long)size);
+    }
+    else
+    {
+        if (!file->entry.writable || file->entry.directory)
+            Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): setting the length of a file outside a writable content root", handle);
+        const uint64_t size = runtime::HostFileSize(file->entry);
+        if (value > size && runtime::ContentBytesUsed() + (value - size) > runtime::kContentQuota)
+            status = 0xC000007F;  // STATUS_DISK_FULL
+        else
+            runtime::SetHostFileLength(file->entry, value), file->entry.size = value;
+    }
     if (ioStatus)
-        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, 8);
-    ctx.r3.u64 = 0;
+        runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, 8);
+    ctx.r3.u64 = status;
 }
 
 GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile, xfile.cc:96 XFile::Read, disc_image_file.cc:26")
@@ -255,6 +483,8 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
     }
     if (!file->synchronous && !explicitOffset)
         Stop(StopCode::Unimplemented, "NtReadFile(%08X): an asynchronous read without an offset", handle);
+    if (file->entry.writable && !file->entry.directory)
+        file->entry.size = runtime::HostFileSize(file->entry);  // another handle may have written since
     uint32_t status = 0, bytes = 0;
     if (length != 0)
     {

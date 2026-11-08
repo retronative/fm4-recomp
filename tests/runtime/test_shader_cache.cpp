@@ -283,6 +283,12 @@ void TestClass()
     Expect(cls(BranchesVs()) == kClassBranch, "BranchesVs (bool cexecs) is class branch");
     CONTROL(cls(LoopPs()) == kClassStraight, "a loop shader is not straight-line");
     Expect(cls(CfOnly(OpCf(11, 2), ExecCf(1, 1, 0, true))) == kClassBranch, "a cond_jmp is class branch");
+    // FM4 Recomp: a cond_jmp (word0 target 0-12, bit 13 unconditional) at instruction 1 back to 0 is a dynamic loop;
+    // unconditional, or forward, it is not.
+    Expect(cls(CfOnly(ExecCf(1, 1, 0), OpCf(11, 0 | 1u << 14))) == (kClassBranch | kClassDynLoop | kClassUnknown),
+           "a predicated cond_jmp back to instruction 0 is class branch,dynloop (no exec_end: unknown too)");
+    CONTROL(cls(CfOnly(ExecCf(1, 1, 0), OpCf(11, 0 | 1u << 13))) & kClassDynLoop, "an unconditional backward jump is not a dynamic loop");
+    CONTROL(cls(CfOnly(OpCf(11, 2), ExecCf(1, 1, 0, true))) & kClassDynLoop, "a forward cond_jmp is not a dynamic loop");
     Expect(cls(CfOnly(PredExecCf(1, 1, true), ExecCf(1, 1, 0, true))) == kClassPredicate, "a predicated exec is class predicate");
     Expect(cls(CfOnly(OpCf(9, 2), ExecCf(1, 1, 0, true))) == kClassCall, "a cond_call is class call");
     Expect(cls(CfOnly(OpCf(10), ExecCf(1, 1, 0, true))) == kClassCall, "a return is class call");
@@ -303,6 +309,9 @@ void TestClass()
     Expect(!ParseShaderClassAllowList("", allowed, error) && allowed == kClassStraight && Has(error, "empty"), "an empty allow-list is refused");
     Expect(!ParseShaderClassAllowList(nullptr, allowed, error), "a missing allow-list is refused");
     Expect(!ParseShaderClassAllowList("call", allowed, error) && Has(error, "\"call\""), "call is never allowed");
+    Expect(ParseShaderClassAllowList("branch,dynloop", allowed, error) && allowed == (kClassBranch | kClassDynLoop), "--shader-classes branch,dynloop");
+    Expect(RefusedClasses(kClassStraight, kClassBranch | kClassDynLoop, kClassBranch | kClassPredicate | kClassLoop) == kClassDynLoop,
+           "dynloop is refused unless named");
     Expect(!ParseShaderClassAllowList("loops", allowed, error) && allowed == kClassStraight && Has(error, "\"loops\""), "a typo is refused, nothing allowed");
     Expect(!ParseShaderClassAllowList("loop,", allowed, error), "a trailing comma is refused");
     Expect(RefusedClasses(kClassLoop, kClassStraight, kClassStraight) == kClassLoop, "a loop VS with no allow-list is refused as loop");

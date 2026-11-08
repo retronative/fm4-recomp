@@ -5,7 +5,7 @@
 // Taken from ForzaRecomp runtime/stops.cpp (GPL-3.0-or-later, same owner), reviewed and re-tested here.
 // FM4 Recomp changes: an import stop also reports r7 and r8 (six argument registers); PpcStrictStop is
 // PpcResidualStop (patch 0035: the dispatch's name, address, index and caller); unused parameters are
-// marked instead of a disabled warning; messages name our milestones.
+// marked instead of a disabled warning; messages name our milestones; PpcJumpBuffer keeps host jmp_bufs (no longer a stop).
 #include "stops.h"
 #include "indirect.h"
 #include "layout.h"
@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <map>
 #include <unistd.h>
 
 namespace {
@@ -99,15 +100,20 @@ void PpcCallIndirect(PPCContext& ctx, uint8_t* base, uint32_t target)
 
 // Runtime interfaces the translation declares; each is M3 work and stops until then. (PpcQueryTimebase,
 // mftb, is defined in kernel/clock.cpp.)
+// setjmp/longjmp (XenonRecomp's emission, recompiler.cpp printFunctionCall): the host's setjmp runs inline at each guest
+// setjmp call after the whole PPCContext is snapshotted into a local, which a second return (from a longjmp) restores;
+// longjmp is the host's. The runtime only keeps the host jmp_buf for each guest jmp_buf address, per host thread (a
+// guest jmp_buf is never valid on another thread). Guest memory is not written: FM4's jmp_bufs are only passed to
+// setjmp and longjmp (config/fm4.toml setjmp_address / longjmp_address). std::map keeps each buffer where it is while
+// other addresses are added (setjmp writes through the reference). Both calls arrive here, so a longjmp to a buffer no
+// setjmp on this thread filled cannot be told apart from a setjmp; valid guest code always calls setjmp first.
 jmp_buf& PpcJumpBuffer(uint32_t guestAddress)
 {
-    Stop(StopCode::Unimplemented, "setjmp/longjmp on the guest jmp_buf at %08X is not implemented (M3)", guestAddress);
-}
-
-PPC_FUNC(PpcRuntime_switch_fiber)
-{
-    (void)base;
-    Stop(StopCode::Unimplemented, "fiber switch is not implemented (M3; lr=%08X)", uint32_t(ctx.lr));
+    struct HostJumpBuffer { jmp_buf buffer; };
+    thread_local std::map<uint32_t, HostJumpBuffer> buffers;
+    if (guestAddress == 0)
+        Stop(StopCode::GuestFault, "setjmp/longjmp with a null jmp_buf");
+    return buffers[guestAddress].buffer;
 }
 
 PPC_FUNC(PpcRuntime_restore_context)

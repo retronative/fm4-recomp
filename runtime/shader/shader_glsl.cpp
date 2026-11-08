@@ -39,11 +39,12 @@
 //                 shaders).
 //   scalar ALU    ADDs (0), ADD_PREVs (1), MULs (2), MUL_PREVs (3), MAXs (5), MINs (6), SETEs (7), SETGTs (8), SETGTEs (9),
 //                 SETNEs (10), FRACs (11), TRUNCs (12), FLOORs (13), EXP_IEEE (14), LOG_IEEE (16), RECIP_CLAMP (17),
-//                 RECIP_IEEE (19), RECIPSQ_IEEE (22), MAXAs (23, without its a0 write), SUBs (25), SUB_PREVs (26),
+//                 RECIP_IEEE (19), RECIPSQ_IEEE (22), MAXAs (23, writes a0), SUBs (25), SUB_PREVs (26),
 //                 PRED_SETEs (27), PRED_SETNEs (28), PRED_SETGTs (29), PRED_SETGTEs (30), SQRT_IEEE (40), MUL_CONST_0/1 (42/43),
 //                 ADD_CONST_0/1 (44/45), SUB_CONST_0/1 (46/47), SIN (48), COS (49), RETAIN_PREV (50);
 //                 predicated ALU instructions.
-//   operands      temp or constant (absolute addressing), abs (temp bit 7, abs_constants),
+//   operands      temp or constant (absolute or, constants only, a0-relative addressing; see
+//                 "Address register a0" below), abs (temp bit 7, abs_constants),
 //                 negate, swizzle; clamp; non-relative destinations; export constant 0 / 1.
 //   exports       VS position (62) and PS colour 0, each written in full; interpolators 0-15, whose
 //                 unwritten components are 0 (REFERENCE_DERIVED: Xenia zeroes every interpolator
@@ -62,7 +63,8 @@
 //                 (uniform control flow: see "Uniform control flow" below); not in a predicated
 //                 jump's region.
 // The other predicate-setting ops (vector 20-23, scalar 31-34), the other predicated fetches and
-// all predicated exports, relative addressing (so aL and a0 are never read), calls, other
+// a backward jump other than a dynamic loop's (see "Dynamic loops" below), all predicated exports, aL-relative addressing (so aL is never read), a0-relative constants in
+// ADD/MUL/SUB_CONST, the vector MAXA (29) and MAXAsf (24) a0 writes, calls, other
 // unconditional jumps, backward, in-loop and nested jumps, the other conditional execs (3, 4, 6,
 // 14), loops nested deeper than 4, loop_start reusing aL and loop_end's predicated break are
 // refused.
@@ -279,6 +281,33 @@
 //     clamps when a transfer packs 7e3. Clamping here, before blending, is an FM4 Recomp choice:
 //     APPROXIMATE against both Xenia's host path and the hardware, which stores the blended result
 //     as 7e3. The guards keep NaN and -0 out, which NClamp may not).
+//   Dynamic loops (FM4 Recomp): a predicated cond_jmp at control-flow
+//     instruction J back to T < J repeats T..J-1 while p0 equals its condition (taken: [X] ucode.h cond_jmp; Xenia's
+//     translator runs it as a jump in its main loop, unbounded). Emitted as `for (uint xe_dlK = 0u; xe_dlK < 255u;
+//     xe_dlK++) { T..J-1; if (p0 != condition) break; }`: the body runs at least once, as the hardware's; the cap of 255
+//     iterations (the constant loops' maximum count) bounds the GPU work, and a pixel that would iterate longer leaves
+//     with p0 still equal to the condition (APPROXIMATE there; the hardware behaviour is the unbounded loop). Only this
+//     shape is accepted: T..J-1 holds exec instructions only (no exec_end, jump, loop, alloc or conditional exec), the
+//     body sets p0 (checked in Emit), the loop is not nested in another loop, and inside a jump region it ends before the
+//     region does. The loop branches on p0, per invocation: Divergent holds inside, so exports, vertex fetches and
+//     getTextureGradients there are refused; texture fetches sample in place with the implicit derivatives of divergent
+//     control flow (undefined in Vulkan; Xenia takes coarse derivatives in place the same way: APPROXIMATE). Analysis walks
+//     the body once (iteration 1 sees the pre-loop registers, later iterations a superset, as for constant loops) and
+//     keeps p0 as the body's predicate set left it in that pass, so both exit values of p0 are analysed.
+//   Address register a0 (FM4 Recomp; emitted as `int xe_a0`). MAXAs writes a0 = int(clamp(floor(a + 0.5), -256,
+//     255)), a = component (3 + swz[6:7]) & 3 of src3, whatever its write masks, NaN giving -256 (GLSL
+//     NClamp); a constant source n flagged addressed (IsConstantAddressed) with word1 bit 29 set reads
+//     xe_c[a0 + its index]. REFERENCE_DERIVED [X] (spirv_shader_translator_alu.cc kMaxAs: OpFAdd 0.5,
+//     Floor, NClamp(-256, 255), ConvertFToS stored to xe_var_address_register; shader_translator.cc
+//     ParseAluInstructionOperand: storage index = the source byte, kAddressRegisterRelative;
+//     spirv_shader_translator.cc GetStorageAddressingIndex: index = a0 + storage index). Operands are
+//     read before the instruction writes (as registers), so an instruction reads the a0 an earlier one
+//     set, as in [X] for the scalar MAXAs (its vector operands load first, its own before the store).
+//     a0's initial value is UNKNOWN ([X]: 0): a relative read reached on any path before a MAXAs is
+//     refused, as for p0. The index is clamped to 0-255 here: [X] does not clamp (its constant buffer
+//     holds all 256 with dynamic addressing) and the hardware's out-of-range behaviour is UNKNOWN; the
+//     clamp keeps the host access in bounds (APPROXIMATE outside 0-255). The host block always holds
+//     all 256 constants (draw_record.h XeVsConstants / XePsConstants).
 //   Predicate p0 (one bit per invocation, emitted as `bool xe_p0`). PRED_SETEs: p0 = a == 0
 //     (ordered: NaN gives 0), result 0.0 where p0 is set else 1.0; PRED_SETNEs: p0 = a != 0 (true
 //     for NaN, [X]'s OpFUnordNotEqual), result likewise; a = component (3 + swz[6:7]) & 3 of src3.
@@ -483,6 +512,7 @@ private:
     bool readsPs_;
     bool psWritten_ = false;  // a scalar op has run (Emit: on some path; Analyze: on this one)
     bool predWritten_ = false;  // p0 has been set (Emit: on some path; Analyze: on this one)
+    bool a0Written_ = false;    // MAXAs has set a0 (Emit: on some path; Analyze: on this one)
     bool lodWritten_ = false;   // setTextureLod has set the register LOD (xe_lod) in program order
     bool pred_ = false;         // Analyze: p0's value on this path
     bool inPredExec_ = false, predExecCondition_ = false;  // inside a predicated exec on p0 == condition
@@ -492,6 +522,10 @@ private:
     bool inConditional_ = false;
     bool inCondExec_ = false;  // inside a bool-constant conditional exec (opcode 13)
     bool inLoop_ = false;
+    // FM4 Recomp: dynamic loops (see the header comment): body start T -> the backward jump's index J.
+    std::map<uint32_t, uint32_t> dynLoops_;
+    bool inDynLoop_ = false, dynLoopSetsPred_ = false;
+    uint32_t dynLoopEnd_ = 0, dynLoopOrdinal_ = 0;
     bool inJump_ = false;     // inside a cond_jmp's skipped region, which ends at jumpEnd_
     bool inPredJump_ = false; // that region (or its else) depends on p0: a predicated cond_jmp's
     // FM4 Recomp: the current bool-constant jump region ends in exec_end (an early end of the
@@ -532,7 +566,8 @@ private:
     void Line(const std::string& s) { body_ += "    " + indent_ + s + "\n"; }
     const char* Conditional() const
     {
-        return inPredExec_   ? "predicated exec"
+        return inDynLoop_    ? "dynamic loop"
+               : inPredExec_ ? "predicated exec"
                : inCondExec_ ? "conditional exec"
                : inPredJump_ ? "predicated jump's skipped region"
                              : "jump's skipped region";
@@ -541,7 +576,7 @@ private:
     // predicated jump's region (p0 is per invocation). Bool-constant conditional execs, bool-constant
     // jump regions and loops branch on the uniform block (xe_bool, xe_loop), the same value for
     // every invocation of a draw, so they stay uniform control flow (see the header comment).
-    bool Divergent() const { return inPredExec_ || inPredJump_; }
+    bool Divergent() const { return inPredExec_ || inPredJump_ || inDynLoop_; }
 
     // Records a read of temp `reg` components `mask` (bit 0 = x); fails on undefined data.
     bool ReadTemp(uint32_t reg, uint32_t mask)
@@ -591,6 +626,9 @@ private:
     bool PredExec(uint32_t index, const CfExec& e);
     bool Jump(uint32_t index, CfWords cf, uint32_t& next);
     bool LoopStart(uint32_t index, CfWords cf, uint32_t& next);
+    bool FindDynamicLoops();
+    bool OpenDynamicLoop(uint32_t index);
+    bool CloseDynamicLoop(uint32_t index, const CfBranch& j, const std::string& where, uint32_t& next);
     bool ConstTempOperands(const AluInstruction& a, const std::string& where, std::string& c, std::string& r);
     std::string SamplerDeclarations() const;
     std::string Assemble(uint32_t interpolators) const;
@@ -619,9 +657,16 @@ bool Translator::VectorOperand(const AluInstruction& a, uint32_t n, uint32_t pos
     }
     else
     {
+        std::string index = Num(s.reg);
         if (IsConstantAddressed(a, n))
-            return Fail("ALU source " + Num(n) + " is a relatively addressed constant");
-        base = a.absConstants ? "abs(xe_c[" + Num(s.reg) + "])" : "xe_c[" + Num(s.reg) + "]";
+        {
+            if (!a.constAddressRelativeA0)
+                return Fail("ALU source " + Num(n) + " is an aL-relative constant");
+            if (!a0Written_)
+                return Fail("ALU source " + Num(n) + " reads a0 before any MAXAs sets it");
+            index = "clamp(xe_a0 + " + index + ", 0, 255)";
+        }
+        base = a.absConstants ? "abs(xe_c[" + index + "])" : "xe_c[" + index + "]";
     }
     out = base + "." + swizzle;
     if (s.negate)
@@ -714,6 +759,7 @@ bool Translator::PredicateSet(const AluInstruction& a, const std::string& where,
         return Fail("predicate set inside an exec whose predicate-clean hint says p0 is not modified" + where);
     if (!ScalarOperand(a, 3, operand))
         return false;
+    dynLoopSetsPred_ = dynLoopSetsPred_ || inDynLoop_;
     if (mode_ == Mode::Emit)
     {
         if (Dimensions() == kMaxBools)
@@ -744,6 +790,7 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
 
     // Operands of both ops are read before either op writes.
     std::string vector;
+    std::string a0Source;  // MAXAs: the operand of its a0 write, emitted after every read
     switch (VectorOpcode(a.vectorOpcode))
     {
     case VectorOpcode::Add:
@@ -993,14 +1040,17 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
     case uint32_t(ScalarOpcode::Maxs):
     case uint32_t(ScalarOpcode::MaxAs):
     {
-        // FM4 Recomp: MAXAs (23) is MAXs plus a write of the address register a0 = int(clamp(floor(a +
-        // 0.5), -256, 255)) (REFERENCE_DERIVED [X] ucode.h kMaxAs, spirv_shader_translator_alu.cc). a0
-        // is read only by a0-relative constant addressing, which this unit refuses (IsConstantAddressed
-        // fails every relatively addressed constant): the a0 write has no reader and is not emitted.
-        // Admitting a0-relative addressing requires modelling it here first.
+        // FM4 Recomp: MAXAs (23) is MAXs plus the a0 write (see "Address register a0" above), which
+        // happens whatever the write masks: a0Source keeps its operand for the write after the reads.
+        std::string sa, sb;
+        if (a.scalarOpcode == uint32_t(ScalarOpcode::MaxAs))
+        {
+            if (!ScalarOperand(a, 3, sa))
+                return false;
+            a0Source = sa;
+        }
         if (!runScalar)
             break;
-        std::string sa, sb;
         if (!ScalarOperand(a, 3, sa) || !ScalarOperand(a, 0, sb))
             return false;
         if (a.scalarOpcode == uint32_t(ScalarOpcode::Adds))
@@ -1093,6 +1143,11 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
     }
     else if (!scalar.empty())
         Line("precise float " + s + " = " + (a.scalarClamp ? "xe_sat(" + scalar + ")" : scalar) + ";");
+    if (!a0Source.empty())
+    {
+        Line("xe_a0 = xe_maxa(" + a0Source + ");");
+        a0Written_ = true;
+    }
 
     std::string target;
     if (a.isExport)
@@ -1103,7 +1158,7 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
         // Jump), and each analysis pass checks its own path's exports.
         if (inConditional_ && !(inJump_ && terminalRegion_ && !inCondExec_ && !inPredExec_))
             return Fail("export inside a " + std::string(Conditional()) + where);
-        if (inLoop_)
+        if (inLoop_ || inDynLoop_)
             return Fail("export inside a loop" + where);
         if (a.predicated)
             return Fail("predicated export" + where);
@@ -1189,7 +1244,7 @@ bool Translator::VertexFetchOp(const uint32_t w[3], uint32_t slot)
     const bool guarded = inPredExec_ && !inJump_;
     if (inConditional_ && !guarded)
         return Fail("vertex fetch inside a " + std::string(Conditional()) + where);
-    if (inLoop_)
+    if (inLoop_ || inDynLoop_)
         return Fail("vertex fetch inside a loop" + where);
     if (f.predicated && !(guarded && f.predicateCondition == predExecCondition_))
         return Fail("predicated vertex fetch" + where);
@@ -1354,8 +1409,9 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
     // predicated exec inside a bool-constant jump region hoists its fetches into that region. Inside a
     // predicated jump's region the registers the fetch reads may have been written under p0 earlier in
     // the region, so it can be neither hoisted nor sampled in place: refused.
-    const bool hoisted = inPredExec_ && !inPredJump_ && pixel_;
-    if (Divergent() && !hoisted)
+    // FM4 Recomp: inside a dynamic loop the fetch samples in place (see "Dynamic loops").
+    const bool hoisted = inPredExec_ && !inPredJump_ && !inDynLoop_ && pixel_;
+    if (Divergent() && !hoisted && !inDynLoop_)
         return Fail("texture fetch inside a " + std::string(Conditional()) + where);
     // A predicated fetch inside a predicated exec on the same condition is the exec's own guard
     // (Xenia ucode.h TextureFetchInstruction is_predicated / pred_condition, word 1 bit 31 / word 2
@@ -1615,7 +1671,11 @@ bool Translator::Jump(uint32_t index, CfWords cf, uint32_t& next)
     if (j.direction)
         return Fail("jump with word 1 bit 1 (direction, meaning unknown) set is not supported" + where);
     if (j.address <= index)
-        return Fail("backward jump to control-flow instruction " + Num(j.address) + " is not supported" + where);
+    {
+        if (!inDynLoop_ || index != dynLoopEnd_)
+            return Fail("backward jump to control-flow instruction " + Num(j.address) + " is not supported" + where);
+        return CloseDynamicLoop(index, j, where, next);
+    }
     if (j.unconditional)
     {
         // Only as the last instruction of a jump's region, skipping forward from its end: the
@@ -1678,6 +1738,81 @@ bool Translator::Jump(uint32_t index, CfWords cf, uint32_t& next)
     inPredJump_ = j.predicated;
     terminalRegion_ = terminal;
     jumpEnd_ = j.address;
+    next = index;
+    return true;
+}
+
+// FM4 Recomp: finds the dynamic loops (see the header comment) and checks their shape; true when every backward jump
+// has it (the others are refused later by Jump, with the old message, when the walk reaches them).
+bool Translator::FindDynamicLoops()
+{
+    uint32_t firstInstruction = count_ / 3;
+    CfWords cf;
+    for (uint32_t i = 0; i / 2 < firstInstruction && ReadCf(words_, count_, i, cf); i++)
+    {
+        const CfOpcode op = CfOpcodeOf(cf);
+        if (IsExec(op))
+            firstInstruction = std::min(firstInstruction, DecodeExec(cf).address);
+        if (op == CfOpcode::ExecEnd)
+            break;
+        if (op != CfOpcode::CondJmp)
+            continue;
+        const CfBranch j = DecodeBranch(cf);
+        // Only a jump predicated on p0 alone is a dynamic loop; Jump refuses the other backward jumps.
+        if (j.unconditional || j.address > i || !j.predicated || j.boolAddress != 0)
+            continue;
+        const std::string where = " (backward cond_jmp at control-flow instruction " + Num(i) + ")";
+        if (j.address == i)
+            return Fail("backward jump to itself (an empty loop) is not supported" + where);
+        for (uint32_t k = j.address; k < i; k++)
+        {
+            CfWords body;
+            if (!ReadCf(words_, count_, k, body) || CfOpcodeOf(body) != CfOpcode::Exec)
+                return Fail("dynamic loop body holds control-flow instruction " + Num(k) + " other than exec" + where);
+        }
+        for (const auto& [start, end] : dynLoops_)
+            if (!(i < start || j.address > end))
+                return Fail("dynamic loops that overlap are not supported" + where);
+        dynLoops_[j.address] = i;
+    }
+    return true;
+}
+
+bool Translator::OpenDynamicLoop(uint32_t index)
+{
+    const uint32_t end = dynLoops_.at(index);
+    const std::string where = " (dynamic loop at control-flow instructions " + Num(index) + "-" + Num(end) + ")";
+    if (inLoop_ || inDynLoop_)
+        return Fail("dynamic loop inside a loop is not supported" + where);
+    if (inJump_ && end + 1 >= jumpEnd_)
+        return Fail("dynamic loop that does not end inside its jump region is not supported" + where);
+    if (mode_ == Mode::Emit)
+    {
+        const std::string i = "xe_dl" + Num(dynLoopOrdinal_++);
+        Line("for (uint " + i + " = 0u; " + i + " < 255u; " + i + "++)");
+        Line("{");
+        indent_ += "    ";
+    }
+    inDynLoop_ = true;
+    dynLoopSetsPred_ = false;
+    dynLoopEnd_ = end;
+    return true;
+}
+
+bool Translator::CloseDynamicLoop(uint32_t index, const CfBranch& j, const std::string& where, uint32_t& next)
+{
+    if (!ReadPredicate("dynamic loop's backward jump", where))
+        return false;
+    if (mode_ == Mode::Emit)
+    {
+        if (!dynLoopSetsPred_)
+            return Fail("dynamic loop whose body never sets p0 is not supported" + where);
+        Line(PredicateTest(!j.condition));  // the jump is not taken: the loop ends
+        Line("    break;");
+        indent_.resize(indent_.size() - 4);
+        Line("}");
+    }
+    inDynLoop_ = false;
     next = index;
     return true;
 }
@@ -1747,6 +1882,11 @@ bool Translator::LoopStart(uint32_t index, CfWords cf, uint32_t& next)
 bool Translator::Run(std::string& error)
 {
     uint32_t firstInstruction = ~0u;
+    if (!FindDynamicLoops())
+    {
+        error = error_;
+        return false;
+    }
     for (uint32_t i = 0;; i++)
     {
         CfWords cf;
@@ -1773,6 +1913,8 @@ bool Translator::Run(std::string& error)
             }
             terminalRegion_ = false;
         }
+        if (dynLoops_.count(i) && !OpenDynamicLoop(i))
+            break;
         const CfOpcode op = CfOpcodeOf(cf);
         if (op == CfOpcode::Nop)
             continue;
@@ -1780,6 +1922,7 @@ bool Translator::Run(std::string& error)
         // end in an unconditional jump; a terminal region also allocs and ends in its exec_end.
         if (inJump_ && op != CfOpcode::Exec && op != CfOpcode::CondExecPred && op != CfOpcode::CondExecPredClean &&
             !(op == CfOpcode::CondJmp && DecodeBranch(cf).unconditional && !inElse_ && i + 1 == jumpEnd_) &&
+            !(op == CfOpcode::CondJmp && inDynLoop_ && i == dynLoopEnd_) &&
             !(terminalRegion_ && (op == CfOpcode::Alloc || (op == CfOpcode::ExecEnd && i + 1 == jumpEnd_))))
         {
             Fail(std::string(op == CfOpcode::ExecEnd ? "exec_end" : CfName(op)) + " (control-flow opcode " +
@@ -2030,6 +2173,13 @@ constexpr const char* kDp3Helper = R"(float xe_dp3(vec4 a, vec4 b)
 // 1.0 : 1.0 / src0.a; if (t == -INF) t = -FLT_MAX; else if (t == INF) t = FLT_MAX") and
 // spirv_shader_translator_alu.cc kRcpc (the clamp is on the quotient, so a finite operand whose
 // reciprocal overflows clamps too). Emitted after kRcpHelper.
+// MAXAs's a0 value (see "Address register a0"): NClamp's NaN rule spelled out.
+constexpr const char* kMaxaHelper = R"(int xe_maxa(float a)
+{
+    precise float t = floor(a + 0.5);
+    return isnan(t) ? -256 : int(clamp(t, -256.0, 255.0));
+}
+)";
 constexpr const char* kRcpcHelper = R"(float xe_rcpc(float x)
 {
     float r = xe_rcp(x);
@@ -2176,12 +2326,16 @@ std::string Translator::Assemble(uint32_t interpolators) const
     // The register LOD; never read before setTextureLod sets it (checked).
     if (lodWritten_)
         temps += "    float xe_lod = 0.0;\n";
+    // The address register a0; never read before MAXAs sets it (checked).
+    if (a0Written_)
+        temps += "    int xe_a0 = 0;\n";
     // Set by kill ops; the pixel is discarded at the end of main.
     if (kills_)
         temps += "    bool xe_kill = false;\n";
     const std::string helpers = std::string(kAluHelpers) + (needDp3_ ? kDp3Helper : "") + (needRcp_ ? kRcpHelper : "") +
                                 (needRcpc_ ? kRcpcHelper : "") +
-                                (needCube_ ? kCubeHelper : "") + (needCubeDir_ ? kCubeDirHelper : "");
+                                (needCube_ ? kCubeHelper : "") + (needCubeDir_ ? kCubeDirHelper : "") +
+                                (a0Written_ ? kMaxaHelper : "");
 
     // Bool constants follow the float constants (std140 offset 4096) when a conditional exec or
     // a loop reads them; loop constants follow the bools (offset 4128) when a loop reads them.

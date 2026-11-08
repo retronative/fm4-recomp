@@ -17,7 +17,8 @@
 
 namespace runtime {
 
-enum class ObjectType { Event, Thread, Semaphore, File, Enumerator, NotifyListener, Timer, Mutant };
+// Title: an object of a title-defined type (ObCreateObject; its OBJECT_TYPE pointer at body - 8).
+enum class ObjectType { Event, Thread, Semaphore, File, Enumerator, NotifyListener, Timer, Mutant, Title };
 
 struct KernelObject { ObjectType type; uint32_t header; };
 

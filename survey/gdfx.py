@@ -7,7 +7,7 @@
 
 Reads the image read-only and writes a manifest the runtime serves the extracted disc with (the extraction keeps
 neither sectors nor attribute bytes): one line per entry, `path<TAB>sector<TAB>size<TAB>attributes` (hex), paths
-with '/' and in byte order. Layout, re-derived from Xenia xenia-canary 67f16c4e315f
+with '/' and in GDFX tree order (in-order, depth first: Xenia's children order). Layout, re-derived from Xenia xenia-canary 67f16c4e315f
 vfs/devices/disc_image_device.cc:70-185 (all fields little-endian):
   - the game partition starts at one of 0, 0xFB20, 0x20600, 0x2080000, 0xFD90000 bytes; its sector 32 (2048-byte
     sectors) begins "MICROSOFT*XBOX*MEDIA" and holds the root directory's sector (+20) and size (+24);
@@ -98,7 +98,8 @@ def main():
             rows = entries(f, image.stat().st_size)
     except (GdfxError, UnicodeDecodeError) as e:
         sys.exit(f'gdfx: {image}: {e}')
-    rows.sort(key=lambda r: r[0].encode())
+    # Kept in tree order (in-order, depth first): the runtime lists a directory's children in this order, as Xenia
+    # (vfs/devices/disc_image_device.cc:126-187).
     out.write_text(''.join(f'{p}\t{s:x}\t{n:x}\t{a:02x}\n' for p, s, n, a in rows))
     print(f'gdfx: {len(rows)} entries ({sum(1 for r in rows if r[3] & 0x10)} directories) -> {out}')
 

@@ -162,10 +162,8 @@ KeyResult DerivePipelineKey(const DrawStateView& s, const CachedShader& vs, cons
         c.format = uint8_t(Field(s.rbColorInfo[0], 16, 4));
         if (!ColorFormatMapped(c.format))
             return Refuse("RB_COLOR_INFO " + Hex8(s.rbColorInfo[0]) + ": colour format " + std::to_string(c.format) + " is not mapped on the host");
-        // color_exp_bias (bits 20-25, signed): the translator's XE_COLOR0_SCALE exists for it, but the
-        // general rule (Xenia vulkan_command_processor.cc, not in research/) is unverified here: refused
-        // rather than silently ignored.
-        if (const int32_t bias = runtime::shader::ucode::SignedBits(s.rbColorInfo[0], 20, 6); bias != 0)
+        // color_exp_bias (bits 20-25, signed): pipeline_key.h ColorExpBiasAccepted (only the biases whose host scale is 1).
+        if (const int32_t bias = runtime::shader::ucode::SignedBits(s.rbColorInfo[0], 20, 6); !ColorExpBiasAccepted(c.format, bias))
             return Refuse("RB_COLOR_INFO " + Hex8(s.rbColorInfo[0]) + ": colour exponent bias " + std::to_string(bias) + " is not supported yet");
         const uint32_t bc = s.rbBlendControl[0];
         const uint32_t factors[4] = {Field(bc, 0, 5), Field(bc, 8, 5), Field(bc, 16, 5), Field(bc, 24, 5)};

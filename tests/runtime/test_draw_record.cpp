@@ -199,6 +199,11 @@ void TestVariants()
     d = Ui(), d.target.colorFormat = 1, d.kind = DrawKind::DepthOnly, d.colorWriteMask = 0;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"},
            "DepthOnly: no colour conversion define, and XE_NO_COLOR_OUTPUT (no colour attachment)");
+    // FM4 Recomp: the welcome screen's kDepth clear (the local capture glow (not distributed)): its decoded alpha test is off (draw_state.cpp), so no
+    // XE_ALPHA_TEST reaches the PS, which would otherwise discard the clear (alpha 0 under GREATER 0).
+    d = Ui(), d.kind = DrawKind::DepthOnly, d.colorWriteMask = 0, d.alphaTest.enabled = false, d.alphaTest.func = 4;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"},
+           "DepthOnly with the decoded alpha test off: no XE_ALPHA_TEST");
     const CachedShader both = Vs({95}, {0});
     Expect(VariantsFromDrawState(Ui(), both, ups, v, p).ok && v.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"}, "a VS that lists the slot gets the define too");
 }

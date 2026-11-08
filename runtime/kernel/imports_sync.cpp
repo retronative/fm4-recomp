@@ -242,3 +242,41 @@ GUEST_IMPORT(KeReleaseMutant, "INFERRED: NT KeReleaseMutant (previous signal sta
              "STATUS_MUTANT_NOT_OWNED) (lr=%08X)", mutant, previous, Load32(base, mutant + kMutantOwner), uint32_t(ctx.lr));
     ctx.r3.u64 = uint32_t(previous);
 }
+
+namespace {
+// X_SLIST_HEADER (Xenia xbox.h:291-296): next +0 (32 bits), depth +4 (16), sequence +6 (16), big-endian, 8-byte aligned.
+// Updated with one 64-bit compare-and-swap on the raw bytes, as the translation's stdcx. does (XenonRecomp
+// PPC_INST_STDCX), so these imports and the title's own reservation loops on the same header exclude each other.
+uint64_t* SListWord(uint8_t* base, uint32_t header, const char* import)
+{
+    if (header == 0 || header % 8 != 0)
+        Stop(StopCode::Unimplemented, "%s(%08X): a null or unaligned list header", import, header);
+    return reinterpret_cast<uint64_t*>(base + header);
+}
+}  // namespace
+
+GUEST_IMPORT(InterlockedPopEntrySList, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc:1549-1575 (atomic pop: next = first->next, depth - 1, sequence kept)")
+{
+    // (header*): the first entry, or 0 for an empty list.
+    uint64_t* word = SListWord(base, ctx.r3.u32, "InterlockedPopEntrySList");
+    for (;;)
+    {
+        const uint64_t raw = __atomic_load_n(word, __ATOMIC_SEQ_CST), value = __builtin_bswap64(raw);
+        const uint32_t first = uint32_t(value >> 32);
+        if (first == 0)
+            return (void)(ctx.r3.u64 = 0);
+        const uint16_t depth = uint16_t(value >> 16), sequence = uint16_t(value);
+        const uint64_t next = runtime::Load32(base, first);
+        const uint64_t updated = next << 32 | uint64_t(uint16_t(depth - 1)) << 16 | sequence;
+        if (__sync_bool_compare_and_swap(word, raw, __builtin_bswap64(updated)))
+            return (void)(ctx.r3.u64 = first);
+    }
+}
+
+GUEST_IMPORT(InterlockedFlushSList, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc:1577-1596 (atomic: the whole list taken, header zeroed)")
+{
+    // (header*): the first entry (0 if empty); the header becomes {0, 0, 0} (Xenia zeroes the sequence too).
+    uint64_t* word = SListWord(base, ctx.r3.u32, "InterlockedFlushSList");
+    const uint64_t raw = __atomic_exchange_n(word, 0, __ATOMIC_SEQ_CST);
+    ctx.r3.u64 = uint32_t(__builtin_bswap64(raw) >> 32);
+}

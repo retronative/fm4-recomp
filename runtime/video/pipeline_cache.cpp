@@ -79,6 +79,7 @@ VkFormat HostColorFormat(uint32_t xenosFormat)
     case 2: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case 3: case 7: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case 14: return VK_FORMAT_R32_SFLOAT;
+    case 4: return VK_FORMAT_R16G16_SNORM;  // 16_16 (edram_vk_plan.cpp HostColorFormat)
     case 15: return VK_FORMAT_R32G32_SFLOAT;
     default: return VK_FORMAT_UNDEFINED;
     }

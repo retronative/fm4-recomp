@@ -27,6 +27,7 @@ VkFormat HostColorFormat(ColorFormat storage)
     case ColorFormat::k2_10_10_10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case ColorFormat::k2_10_10_10_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;  // X vulkan_render_target_cache.cc:1601-1603
     case ColorFormat::k32_Float: return VK_FORMAT_R32_SFLOAT;  // X :1618-1619 (transfers and clears via R32_UINT, :1643-1644)
+    case ColorFormat::k16_16: return VK_FORMAT_R16G16_SNORM;   // X :1604-1608 (the guest's -32..32 as -1..1: pipeline_key.cpp)
     default: return VK_FORMAT_UNDEFINED;  // edram::SupportedKey refuses the rest in M4
     }
 }
@@ -111,8 +112,12 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
     if (sm != dm && (sm == Msaa::X2 || dm == Msaa::X2) && (sm == Msaa::X1 || dm == Msaa::X1))
         return refuse("2x MSAA: 1x <-> 2x is not implemented (never observed; 4x <-> 2x and 2x <-> 2x are)");
-    if (dest.IsDepth() && dm == Msaa::X2)
-        return refuse("a transfer into a 2x depth target (never observed: the HDR resolve's depth clear claims its tiles under the cutout)");
+    // Into a 2x depth key: only from a 4x depth key (the local capture scenario3 (not distributed): FM4's 3D scene after the welcome binds the 2x
+    // kD24FS8 key 688400 over tiles the 4x kD24FS8 key 708400 owns), through the 4x -> 2x rule of MapTransferTexel (X
+    // :2786-2802) and the depth and stencil-bit passes every depth destination uses. Colour -> 2x depth and 2x -> 2x depth
+    // are never observed.
+    if (dest.IsDepth() && dm == Msaa::X2 && !(source.IsDepth() && sm == Msaa::X4))
+        return refuse("a transfer into a 2x depth target other than from a 4x depth key (never observed)");
     if (!source.IsDepth() && dest.IsDepth())  // X kColorToDepth + kColorToStencilBit (:170-171, :178-180, :4904-4908)
     {
         if (!colorStorage(source))
@@ -295,6 +300,21 @@ bool DecodeColorClear(uint32_t value, uint32_t storage, float rgba[4])
         for (uint32_t j = 0; j < 3; j++)
             rgba[j] = float((value >> (j * 10)) & 0x3FF) * (1.0f / 0x3FF);
         rgba[3] = float((value >> 30) & 3) * (1.0f / 3);
+        return true;
+    }
+    if (storage == uint32_t(ColorFormat::k16_16))
+    {
+        // FM4 Recomp: X :5393-5404 clears the raw 16-bit halves through an R16G16_UINT view. Here the SNORM target takes
+        // s / 32767, which Vulkan's SNORM conversion (round(f * 32767)) returns to s exactly for s in -32767..32767; 0x8000
+        // (-32768) would come back as 0x8001, so a clear holding it is refused (false).
+        for (uint32_t j = 0; j < 2; j++)
+        {
+            const int16_t s = int16_t(uint16_t(value >> (j * 16)));
+            if (s == -32768)
+                return false;
+            rgba[j] = float(s) / 32767.0f;
+        }
+        rgba[2] = 0.0f, rgba[3] = 0.0f;
         return true;
     }
     return false;
@@ -621,6 +641,33 @@ bool ResolveDepthToGuest(const edram::ResolveInfo& info, const uint32_t* words, 
             std::memcpy(dest + TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2), &w, 4);  // a little-endian store
         }
     return true;
+}
+
+float DepthSelfCheckDepth(uint32_t x, uint32_t row)
+{
+    return float(1 + (x * 37 + row * 1031) % 4095) / 8192.0f;  // k / 2^13, k < 2^12: exact in float32 and in 20e4
+}
+
+uint32_t DepthSelfCheckStencil(uint32_t x, uint32_t row)
+{
+    return (x * 7 + row * 13 + 1) & 0xFF;
+}
+
+uint32_t DepthSelfCheckWord(uint32_t x, uint32_t row)
+{
+    return PackDepthStencilWord(DepthSelfCheckDepth(x, row), DepthSelfCheckStencil(x, row), edram::DepthFormat::D24FS8);
+}
+
+uint32_t DepthSelfCheckExpected4x(uint32_t x, uint32_t y, uint32_t guestSample)
+{
+    // 4x guest sample g is host sample ((g & 1) << 1) | (g >> 1) (GuestSampleOfHost, its own inverse), at EDRAM sample
+    // (2x + (h & 1), 2y + (h >> 1)) (X shaders/edram.xesli:23-33): column 2x + (g >> 1), row 2y + (g & 1).
+    return DepthSelfCheckWord(2 * x + (guestSample >> 1 & 1), 2 * y + (guestSample & 1));
+}
+
+uint32_t DepthSelfCheckExpected2x(uint32_t x, uint32_t y, uint32_t guestSample)
+{
+    return DepthSelfCheckWord(x, 2 * y + (guestSample & 1));  // X shaders/edram.xesli:23-33: 2x guest g at (x, 2y + g)
 }
 
 }  // namespace runtime::video

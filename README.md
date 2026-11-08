@@ -12,6 +12,9 @@ arm64 macOS, following the method of ReCarbon.
 
 Early development.
 
+Saves are stored in `game/user-data/` and use a fixed, built-in compatibility key (the console's own key is unknown).
+Compatibility with real Xbox 360 saves is **unverified**: saves made here are expected to load only here.
+
 ## Getting started (developers)
 
 ```sh

@@ -41,7 +41,8 @@ namespace runtime::video {
 // ---- Vulkan numeric values this header mirrors (vulkan_core.h; the renderer static_asserts them) --
 namespace vk {
 constexpr uint32_t kFormatUndefined = 0, kFormatR8Unorm = 9, kFormatR8G8B8A8Unorm = 37, kFormatA2B10G10R10UnormPack32 = 64,
-                   kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133;
+                   kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133,
+                   kFormatBc3UnormBlock = 137;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipmapModeNearest = 0, kMipmapModeLinear = 1;
 constexpr uint32_t kAddressRepeat = 0, kAddressMirroredRepeat = 1, kAddressClampToEdge = 2, kAddressClampToBorder = 3;
@@ -154,10 +155,18 @@ struct HostFormat
 {
     uint32_t vkFormat = vk::kFormatUndefined;
     uint32_t formatSwizzle = 0;   // e.g. RRRR for k_8 (R8_UNORM), RGBA for k_8_8_8_8
-    bool blockCompressed = false; // BC1: 4x4 texel blocks of 8 bytes; needs textureCompressionBC
+    bool blockCompressed = false; // BC1 / BC3: 4x4 texel blocks of 8 / 16 bytes; needs textureCompressionBC
     // Float data: the fetch's sign field changes nothing (Xenia maps both signednesses to one format, unsigned_signed_compatible:
     // vulkan_texture_cache.cc:275-279 k_32_FLOAT), so signed components are not refused; nor is the number-format bit.
     bool signIgnored = false;
+    // Float data: the number-format bit (dword 3 bit 0) is ignored (texture_info.cpp DescribeBinding). k_32_FLOAT and
+    // k_24_8_FLOAT; the sign rule above stays separate (k_24_8_FLOAT has no signed host format in Xenia).
+    bool floatData = false;
+    // FM4 Recomp: k_24_8_FLOAT: each 32-bit word w (host order) is uploaded as the float32 of its 20e4 depth, Float20e4To32(w >> 8)
+    // (Xenia vulkan_texture_cache.cc:210-213 kLoadShaderIndexDepthFloat -> R32_SFLOAT, RRRR; texture_load_depth_float.cs.xesl
+    // XE_TEXTURE_LOAD_32BPB_TRANSFORM = XeFloat20e4To32(blocks >> 8), pixel_formats.xesli:622-638, no [0, 0.5) remap),
+    // = edram_vk_plan.h ColorWordDepth(w, D24FS8). The stencil (bits 0-7) is not sampled.
+    bool depth20e4 = false;
 };
 bool HostFormatFor(uint32_t format, HostFormat& out);
 

@@ -26,7 +26,7 @@ namespace runtime {
 namespace {
 
 std::string discRoot;  // realpath of the extracted disc
-struct MapEntry { uint32_t sector; uint64_t size; uint32_t attributes; };
+struct MapEntry { uint32_t sector; uint64_t size; uint32_t attributes; size_t rank; };  // rank: the line (GDFX tree order)
 std::unordered_map<std::string, MapEntry> discMap;  // by path relative to the root, '/'-separated, disc case
 constexpr std::string_view kCdrom = "\\Device\\Cdrom0";
 constexpr std::string_view kLinks[] = {"game:", "d:"};
@@ -72,7 +72,10 @@ void MountDisc(const std::string& root, const std::string& map)
         if (!std::getline(fields, path, '\t') || !std::getline(fields, sector, '\t') || !std::getline(fields, size, '\t') ||
             !std::getline(fields, attributes) || path.empty())
             Stop(StopCode::Setup, "--disc-map %s: a malformed line: %.80s", map.c_str(), line.c_str());
-        discMap[path] = MapEntry{uint32_t(std::stoul(sector, nullptr, 16)), std::stoull(size, nullptr, 16), uint32_t(std::stoul(attributes, nullptr, 16))};
+        const size_t rank = discMap.size();
+        if (!discMap.emplace(path, MapEntry{uint32_t(std::stoul(sector, nullptr, 16)), std::stoull(size, nullptr, 16),
+                                            uint32_t(std::stoul(attributes, nullptr, 16)), rank}).second)
+            Stop(StopCode::Setup, "--disc-map %s lists %s twice", map.c_str(), path.c_str());
     }
     if (discMap.empty())
         Stop(StopCode::Setup, "--disc-map %s is empty", map.c_str());
@@ -108,20 +111,88 @@ std::string CanonicalGuestPath(std::string_view path)
     return result;
 }
 
-bool ValidGuestPath(std::string_view path)
+bool ValidGuestPath(std::string_view path, bool pattern)
 {
+    bool asterisk = false;
     for (const char c : path)
     {
         const unsigned char u = static_cast<unsigned char>(c);
         if (u <= 31 || u >= 127)
             return false;
+        if (asterisk)
+        {
+            if (c != '.')
+                return false;
+            asterisk = false;
+        }
         switch (c)
         {
-        case '"': case '*': case '+': case ',': case ';': case '<': case '=': case '>': case '?': case '|':
+        case '"': case '+': case ',': case ';': case '<': case '=': case '>': case '|':
             return false;
+        case '*':
+            if (!pattern)
+                return false;
+            asterisk = true;
+            break;
+        case '?':
+            if (!pattern)
+                return false;
+            break;
         default:
             break;
         }
+    }
+    return true;
+}
+
+bool WildcardMatch(std::string_view pattern, std::string_view name)
+{
+    // Xenia's rules: literal runs (the first from the start, the last to the end, both when the pattern has no
+    // wildcard), each run of '?' a rule matching exactly that many characters, '*' only separating rules.
+    struct Rule { std::string match; bool fromStart, toEnd, exactLength; };
+    auto lower = [](std::string_view v) {
+        std::string out(v);
+        for (char& c : out)
+            c = c >= 'A' && c <= 'Z' ? char(c + 32) : c;
+        return out;
+    };
+    std::vector<Rule> rules;
+    bool first = true;
+    size_t n = 0, last = 0;
+    while ((n = pattern.find_first_of("*?", last)) != std::string_view::npos)
+    {
+        if (last != n)
+            rules.push_back({lower(pattern.substr(last, n - last)), first, false, false});
+        if (pattern[n] == '?')
+        {
+            const size_t end = pattern.find_first_not_of('?', n + 1);
+            const size_t count = end == std::string_view::npos ? pattern.size() - n : end - n;
+            rules.push_back({std::string(pattern.substr(n, count)), false, false, true});
+            last = n + count;
+        }
+        else
+            last = n + 1;
+        first = false;
+    }
+    if (last != pattern.size())
+        rules.push_back({lower(pattern.substr(last)), last == 0, true, false});
+    const std::string text = lower(name);
+    size_t offset = 0;
+    for (const Rule& r : rules)
+    {
+        if (r.match.empty())
+            continue;
+        if (text.size() - offset < r.match.size())
+            return false;
+        if (r.exactLength)
+        {
+            offset += r.match.size();
+            continue;
+        }
+        const size_t at = text.find(r.match, offset);
+        if (at == std::string::npos || (r.fromStart && at != offset) || (r.toEnd && at != text.size() - r.match.size()))
+            return false;
+        offset = at + r.match.size();
     }
     return true;
 }
@@ -145,6 +216,7 @@ uint64_t DiscAllocationSize(const DiscEntry& entry)
 namespace {
 std::mutex rootsLock;
 std::map<std::string, std::shared_ptr<const stfs::Package>> contentRoots;  // by lower-case root name
+std::map<std::string, std::string> directoryRoots;                           // by lower-case root name: the host directory
 
 std::string Lower(std::string_view s)
 {
@@ -154,7 +226,70 @@ std::string Lower(std::string_view s)
     return out;
 }
 
-// "<root>:\a\b" inside a mounted package; any other device is OtherDevice.
+DiscEntry PackageEntry(const std::shared_ptr<const stfs::Package>& package, int32_t at)
+{
+    DiscEntry entry;
+    entry.host = package->Host();
+    entry.package = package;
+    entry.packageFile = at;
+    entry.directory = at < 0 || package->Files()[size_t(at)].directory;
+    entry.size = entry.directory ? 0 : package->Files()[size_t(at)].length;
+    entry.attributes = entry.directory ? file_attribute::kDirectory : 0x80 | file_attribute::kReadOnly;
+    return entry;
+}
+
+// A path inside a writable root's host directory: each part matched in any case; a symlink stops (9).
+Resolved ResolveDirectoryPath(const std::string& hostDirectory, std::string_view rest, DiscEntry& entry)
+{
+    std::string host = hostDirectory;
+    bool directory = true;
+    uint64_t size = 0;
+    const std::vector<std::string_view> parts = SplitPath(rest);
+    entry = DiscEntry{};
+    entry.writable = true;  // NotFound: `host` names where the last part would be created ("" if its parent is missing)
+    for (size_t k = 0; k < parts.size(); k++)
+    {
+        const std::string_view part = parts[k];
+        if (!directory)
+            return Resolved::NotFound;
+        std::string match;
+        int matches = 0;
+        DIR* listing = opendir(host.c_str());
+        if (listing == nullptr)
+            Stop(StopCode::Setup, "user data: cannot list %s", host.c_str());
+        while (const dirent* d = readdir(listing))
+            if (EqualCase(d->d_name, part) && std::string_view(d->d_name) != "." && std::string_view(d->d_name) != "..")
+                match = d->d_name, matches++;
+        closedir(listing);
+        if (matches == 0)
+        {
+            if (k + 1 == parts.size())
+            {
+                if (part.find(':') != std::string_view::npos)
+                    Stop(StopCode::Unimplemented, "user data: the name %.*s (with ':') is not created on the host", int(part.size()), part.data());
+                entry.host = host + "/" + std::string(part);
+            }
+            return Resolved::NotFound;
+        }
+        if (matches > 1)
+            Stop(StopCode::Setup, "user data: %s holds %d names equal to %.*s in any case", host.c_str(), matches, int(part.size()), part.data());
+        host += "/" + match;
+        struct stat info;
+        if (lstat(host.c_str(), &info) != 0 || S_ISLNK(info.st_mode) || !(S_ISDIR(info.st_mode) || S_ISREG(info.st_mode)))
+            Stop(StopCode::Setup, "user data: %s is a symlink, unreadable or not a file or directory", host.c_str());
+        directory = S_ISDIR(info.st_mode);
+        size = directory ? 0 : uint64_t(info.st_size);
+    }
+    entry = DiscEntry{};
+    entry.host = host;
+    entry.directory = directory;
+    entry.size = size;
+    entry.attributes = directory ? file_attribute::kDirectory : 0x80;
+    entry.writable = true;
+    return Resolved::Found;
+}
+
+// "<root>:\a\b" inside a mounted package or writable root; any other device is OtherDevice.
 Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
 {
     const size_t colon = device.find(':');
@@ -163,6 +298,11 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
     std::shared_ptr<const stfs::Package> package;
     {
         std::lock_guard guard(rootsLock);
+        if (const auto d = directoryRoots.find(Lower(std::string_view(device).substr(0, colon))); d != directoryRoots.end())
+        {
+            const std::string hostDirectory = d->second;
+            return ResolveDirectoryPath(hostDirectory, std::string_view(device).substr(colon + 1), entry);
+        }
         const auto it = contentRoots.find(Lower(std::string_view(device).substr(0, colon)));
         if (it == contentRoots.end())
             return Resolved::OtherDevice;
@@ -181,13 +321,7 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
             return Resolved::NotFound;
         at = found;
     }
-    entry = DiscEntry{};
-    entry.host = package->Host();
-    entry.package = package;
-    entry.packageFile = at;
-    entry.directory = at < 0 || package->Files()[size_t(at)].directory;
-    entry.size = entry.directory ? 0 : package->Files()[size_t(at)].length;
-    entry.attributes = entry.directory ? file_attribute::kDirectory : 0x80 | file_attribute::kReadOnly;
+    entry = PackageEntry(package, at);
     return Resolved::Found;
 }
 }  // namespace
@@ -195,13 +329,61 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
 bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package)
 {
     std::lock_guard guard(rootsLock);
-    return contentRoots.emplace(Lower(root), std::move(package)).second;
+    return directoryRoots.count(Lower(root)) == 0 && contentRoots.emplace(Lower(root), std::move(package)).second;
+}
+
+bool MountDirectoryRoot(const std::string& root, const std::string& hostDirectory)
+{
+    std::lock_guard guard(rootsLock);
+    return contentRoots.count(Lower(root)) == 0 && directoryRoots.emplace(Lower(root), hostDirectory).second;
+}
+
+bool ContentRootMounted(const std::string& root)
+{
+    std::lock_guard guard(rootsLock);
+    return contentRoots.count(Lower(root)) == 1 || directoryRoots.count(Lower(root)) == 1;
+}
+
+namespace {
+void SyncTree(const std::string& path)
+{
+    struct stat info;
+    if (lstat(path.c_str(), &info) != 0 || S_ISLNK(info.st_mode))
+        Stop(StopCode::Setup, "user data: %s is gone or a symbolic link", path.c_str());
+    if (S_ISDIR(info.st_mode))
+        if (DIR* dir = opendir(path.c_str()))
+        {
+            while (const dirent* e = readdir(dir))
+                if (std::string(e->d_name) != "." && std::string(e->d_name) != "..")
+                    SyncTree(path + "/" + e->d_name);
+            closedir(dir);
+        }
+    const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0 || fsync(fd) != 0 || close(fd) != 0)
+        Stop(StopCode::Setup, "user data: flushing %s failed", path.c_str());
+}
+}  // namespace
+
+bool FlushContentRoot(const std::string& root)
+{
+    std::string host;
+    {
+        std::lock_guard guard(rootsLock);
+        if (contentRoots.count(Lower(root)))
+            return true;
+        const auto found = directoryRoots.find(Lower(root));
+        if (found == directoryRoots.end())
+            return false;
+        host = found->second;
+    }
+    SyncTree(host);
+    return true;
 }
 
 bool UnmountContentRoot(const std::string& root)
 {
     std::lock_guard guard(rootsLock);
-    return contentRoots.erase(Lower(root)) == 1;
+    return contentRoots.erase(Lower(root)) + directoryRoots.erase(Lower(root)) == 1;
 }
 
 Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& device)
@@ -254,6 +436,7 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
     }
     entry.host = host;
     entry.directory = directory;
+    entry.relative = relative;
     if (relative.empty())  // the root (Xenia disc_image_device.cc:116: directory, no other attribute)
     {
         entry.size = 0, entry.sector = 0, entry.attributes = file_attribute::kDirectory;
@@ -269,17 +452,134 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
     return Resolved::Found;
 }
 
+std::vector<DirectoryChild> ListDirectory(const DiscEntry& directory)
+{
+    std::vector<DirectoryChild> children;
+    if (!directory.directory)
+        return children;
+    if (directory.writable)
+        Stop(StopCode::Unimplemented, "listing the writable content directory %s is not modelled yet", directory.host.c_str());
+    if (directory.package)
+    {
+        const auto& files = directory.package->Files();
+        for (size_t i = 0; i < files.size(); i++)
+            if (files[i].parent == directory.packageFile)
+                children.push_back({files[i].name, PackageEntry(directory.package, int32_t(i))});
+        return children;
+    }
+    const std::string prefix = directory.relative.empty() ? "" : directory.relative + "/";
+    std::vector<std::pair<size_t, DirectoryChild>> ranked;
+    for (const auto& [path, m] : discMap)
+    {
+        if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0 || path.find('/', prefix.size()) != std::string::npos)
+            continue;
+        DiscEntry e;
+        e.host = discRoot + "/" + path;
+        e.relative = path;
+        e.directory = (m.attributes & file_attribute::kDirectory) != 0;
+        e.size = m.size;
+        e.sector = m.sector;
+        e.attributes = m.attributes | file_attribute::kReadOnly;  // as ResolveGuestPath
+        ranked.push_back({m.rank, {path.substr(prefix.size()), e}});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (auto& r : ranked)
+        children.push_back(std::move(r.second));
+    return children;
+}
+
 namespace {
 std::mutex filesLock;
 std::map<uint32_t, OpenFile> files;  // by object body
 }  // namespace
+
+bool CreateHostEntry(const std::string& host, bool directory)
+{
+    if (directory)
+        return mkdir(host.c_str(), 0755) == 0;
+    const int fd = open(host.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0644);
+    return fd >= 0 && close(fd) == 0;
+}
+
+bool TruncateHostFile(const std::string& host)
+{
+    const int fd = open(host.c_str(), O_WRONLY | O_TRUNC | O_NOFOLLOW);
+    return fd >= 0 && close(fd) == 0;
+}
+
+void RemoveHostFile(const DiscEntry& entry)
+{
+    struct stat info;
+    if (!entry.writable || entry.directory)
+        Stop(StopCode::Unimplemented, "removing %s: not a file in a writable content root", entry.host.c_str());
+    if (lstat(entry.host.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || unlink(entry.host.c_str()) != 0)
+        Stop(StopCode::Setup, "user data: removing %s failed (gone, not a regular file, or refused)", entry.host.c_str());
+}
+
+bool DirectoryRootMountedAt(const std::string& hostDirectory)
+{
+    std::lock_guard guard(rootsLock);
+    for (const auto& [root, host] : directoryRoots)
+        if (host == hostDirectory)
+            return true;
+    return false;
+}
+
+void SetHostFileLength(const DiscEntry& entry, uint64_t length)
+{
+    if (!entry.writable || entry.directory)
+        Stop(StopCode::Unimplemented, "setting the length of %s: not a file in a writable content root", entry.host.c_str());
+    const int fd = open(entry.host.c_str(), O_WRONLY | O_NOFOLLOW);
+    if (fd < 0 || ftruncate(fd, off_t(length)) != 0 || close(fd) != 0)
+        Stop(StopCode::Setup, "user data: setting the length of %s to %llu failed", entry.host.c_str(), (unsigned long long)length);
+}
+
+uint32_t WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* buffer, uint32_t size)
+{
+    if (!entry.writable || entry.directory)
+        Stop(StopCode::Unimplemented, "writing %s: not a file in a writable content root", entry.host.c_str());
+    const int fd = open(entry.host.c_str(), O_WRONLY | O_NOFOLLOW);
+    if (fd < 0)
+        Stop(StopCode::Setup, "user data: cannot open %s for writing", entry.host.c_str());
+    uint32_t done = 0;
+    while (done < size)
+    {
+        const ssize_t n = pwrite(fd, buffer + done, size - done, off_t(offset + done));
+        if (n <= 0)
+        {
+            close(fd);
+            Stop(StopCode::Setup, "user data: writing %s at %llu failed", entry.host.c_str(), (unsigned long long)(offset + done));
+        }
+        done += uint32_t(n);
+    }
+    if (close(fd) != 0)
+        Stop(StopCode::Setup, "user data: closing %s after a write failed", entry.host.c_str());
+    return done;
+}
+
+void SyncHostFile(const DiscEntry& entry)
+{
+    const int fd = open(entry.host.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0 || fsync(fd) != 0 || close(fd) != 0)
+        Stop(StopCode::Setup, "user data: flushing %s failed", entry.host.c_str());
+}
+
+uint64_t HostFileSize(const DiscEntry& entry)
+{
+    struct stat info;
+    if (lstat(entry.host.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+        Stop(StopCode::Setup, "user data: %s is gone or not a regular file", entry.host.c_str());
+    return uint64_t(info.st_size);
+}
 
 uint32_t OpenDiscFile(uint8_t* base, const DiscEntry& entry, bool synchronous)
 {
     const uint32_t body = ArenaAlloc(base, 16);
     {
         std::lock_guard guard(filesLock);
-        files[body] = OpenFile{entry, 0, synchronous};
+        OpenFile file;
+        file.entry = entry, file.synchronous = synchronous;
+        files[body] = std::move(file);
     }
     return CreateObject(ObjectType::File, body, "");
 }

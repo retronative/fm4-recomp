@@ -13,6 +13,7 @@
 //
 //   tests/run_renderer_guard_tests.sh
 #include "capture_store.h"
+#include "capture_keep.h"
 #include "front_buffer.h"
 #include "gpu_guard.h"
 #include "png.h"
@@ -254,6 +255,18 @@ void TestLoopWork()
     Expect(!vs.ok && vs.reason.find("vertex") != std::string::npos, "loop work over the cap (vertex): refused, naming the stage");
 }
 
+void TestKeepEvery()
+{
+    // FM4_CAPTURE_KEEP_EVERY: unset or empty = off; "300" = every 300th; 1 and 1000000 accepted; 0, 1000001, "3x", "-1" malformed.
+    const KeepEvery off = KeepEveryFromEnv(nullptr), empty = KeepEveryFromEnv(""), n = KeepEveryFromEnv("300");
+    Expect(off.every == 0 && !off.malformed && empty.every == 0 && !empty.malformed && n.every == 300 && !n.malformed &&
+               KeepEveryFromEnv("1").every == 1 && KeepEveryFromEnv("1000000").every == 1000000,
+           "FM4_CAPTURE_KEEP_EVERY: off unless set; a decimal interval from 1 to 1000000");
+    Expect(KeepEveryFromEnv("0").malformed && KeepEveryFromEnv("1000001").malformed && KeepEveryFromEnv("3x").malformed &&
+               KeepEveryFromEnv("-1").malformed && KeepEveryFromEnv("99999999999999999999999").malformed,
+           "FM4_CAPTURE_KEEP_EVERY: 0, too large, non-digits and overflow are malformed");
+}
+
 void TestCaptureStore()
 {
     // Records of 10 bytes, at most 2: the third evicts (and deletes) the first.
@@ -472,6 +485,7 @@ int main(int argc, char** argv)
     TestTimeoutFromEnvironment();
     TestWriteGpuStopAppends();
     TestLoopWork();
+    TestKeepEvery();
     TestCaptureStore();
     TestFrontBufferDecode();
     TestDetileProperties();

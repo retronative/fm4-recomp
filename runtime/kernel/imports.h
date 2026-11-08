@@ -3,7 +3,7 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // Taken from ForzaRecomp runtime/kernel/imports.h (GPL-3.0-or-later, same owner), reviewed and
-// re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: GUEST_IMPORT marks its parameters [[maybe_unused]].
+// re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: GUEST_IMPORT marks its parameters [[maybe_unused]]; Load16.
 //
 // Kernel/XAM imports (M3-T04). The generated strict stubs (fm4_imports.cpp) are weak: an import
 // is implemented by defining it with GUEST_IMPORT, which overrides the stub and records its
@@ -47,6 +47,12 @@ inline void Store32(uint8_t* base, uint32_t address, uint32_t value)
 {
     const uint32_t v = __builtin_bswap32(value);
     std::memcpy(base + address, &v, 4);
+}
+inline uint16_t Load16(const uint8_t* base, uint32_t address)
+{
+    uint16_t v;
+    std::memcpy(&v, base + address, 2);
+    return __builtin_bswap16(v);
 }
 inline void Store16(uint8_t* base, uint32_t address, uint16_t value)
 {

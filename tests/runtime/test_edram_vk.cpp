@@ -51,7 +51,8 @@ void TestFormats()
     CHECK(HostColorFormat(ColorFormat::k2_10_10_10) == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     // X vulkan_render_target_cache.cc:1601-1603; pipeline_cache.cpp:80 HostColorFormat(3) is the same (renderer.cpp:699 checks).
     CHECK(HostColorFormat(ColorFormat::k2_10_10_10_Float) == VK_FORMAT_R16G16B16A16_SFLOAT);
-    CONTROL(HostColorFormat(ColorFormat::k16_16) != VK_FORMAT_UNDEFINED);  // refused in M4 (edram::SupportedKey)
+    CHECK(HostColorFormat(ColorFormat::k16_16) == VK_FORMAT_R16G16_SNORM);  // FM4 Recomp: X vulkan_render_target_cache.cc:1604-1608
+    CONTROL(HostColorFormat(ColorFormat::k16_16_Float) != VK_FORMAT_UNDEFINED);  // not mapped (edram::SupportedKey refuses it)
     CHECK(HostDepthFormat(DepthFormat::D24FS8, false) == VK_FORMAT_D32_SFLOAT_S8_UINT);
     CHECK(HostDepthFormat(DepthFormat::D24FS8, true) == VK_FORMAT_D32_SFLOAT_S8_UINT);  // X vulkan_render_target_cache.cc:1581-1588
     CHECK(HostDepthFormat(DepthFormat::D24S8, true) == VK_FORMAT_D24_UNORM_S8_UINT);
@@ -338,12 +339,17 @@ void TestClears()
           c[3] == 1 * (1.0f / 3));
     CHECK(DecodeColorClear(0x44332211u, 0, c) && c[0] == 0x11 * (1.0f / 255) && c[3] == 0x44 * (1.0f / 255));
     // 7e3 (X :5383-5390 with the shader-form decode): R 0x1C0 = 1.5, G 0x080 = 0.25, B 0x001 = 2^-9, alpha 2 -> 2/3.
+    // FM4 Recomp: storage 4 (16_16): halves as signed 16-bit / 32767. 0x7FFF8001: R = 0x8001 = -32767 -> -1, G = 0x7FFF = 32767 -> 1;
+    // 0x00004000: R = 16384 -> 16384 / 32767, G = 0; a 0x8000 half (-32768) is refused (it would come back as 0x8001).
+    CHECK(DecodeColorClear(0x7FFF8001u, 4, c) && c[0] == -1.0f && c[1] == 1.0f && c[2] == 0.0f && c[3] == 0.0f);
+    CHECK(DecodeColorClear(0x00004000u, 4, c) && c[0] == 16384.0f / 32767.0f && c[1] == 0.0f);
+    CONTROL(DecodeColorClear(1u << 31, 4, c));  // G = 0x8000 (-32768)
     CHECK(DecodeColorClear((2u << 30 | 0x001201C0u), 3, c) && c[0] == 1.5f && c[1] == 0.25f && c[2] == 0.001953125f && c[3] == 2 * (1.0f / 3));
     // CONTROL: X's CPU xenos.cc:117 form, (3 + 124) << 23 | 64 << 3 = 0x3F800200 = 1.00006104, is not what is decoded.
     CONTROL(c[0] == 1.0f + std::ldexp(1.0f, -14));
     CHECK(DecodeColorClear(0u, 3, c) && c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f);
     CHECK(DecodeColorClear(0xFFFFFFFFu, 3, c) && c[0] == 31.875f && c[1] == 31.875f && c[2] == 31.875f && c[3] == 1.0f);
-    CONTROL(DecodeColorClear(0u, 4, c) || DecodeColorClear(0u, 14, c));  // 16_16 and 32_FLOAT storage are refused in M4
+    CONTROL(DecodeColorClear(0u, 14, c));  // 32_FLOAT clears through DecodeColorClearUint (16_16: FM4 Recomp, below)
     float d = -1.0f;
     uint32_t s = 99;
     DecodeDepthClear(0u, DepthFormat::D24FS8, d, s);  // trace12 RB_DEPTH_CLEAR 00000000
@@ -681,7 +687,7 @@ void TestBases()
     CHECK(ClassifyTransfer(kBd, d1024, why) == TransferKind::Depth);
     CHECK(ClassifyTransfer(Key::Depth(1024, 8, Msaa::X4, DepthFormat::D24FS8), kAd, why) == TransferKind::Depth);  // another pitch (TestDepthPitch)
     CHECK(ClassifyTransfer(kAd, d1024, why) == TransferKind::Depth);  // 4x -> 4x at another base (sampler2DMS)
-    CHECK(ClassifyTransfer(kAd, Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
+    CHECK(ClassifyTransfer(kAd, Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::Depth);  // 4x -> 2x (TestDepth4xTo2x)
 
     // Which tiles move (X ChangeOwnership, render_target_cache.cc:1539-1699): the front-buffer resolve's depth clear gives
     // tiles 720-1439 to kBd; the 7e3 clear's colour (draw 25343, 512 rows) takes 720-1023 (depth -> colour); a 4x
@@ -780,7 +786,7 @@ void TestHdrResolve()
     CHECK(ClassifyTransfer(kA7, k2, why) == TransferKind::Color && ClassifyTransfer(k2, kA7, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(kB7, k2, why) == TransferKind::Refused && why.find("2x MSAA") != std::string::npos);
     CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8), Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8), why) ==
-          TransferKind::Refused);
+          TransferKind::Depth);  // TestDepth4xTo2x
     // 4x -> 2x (X :2786-2802, native 2x: guest g = host ^ 1). EDRAM check by shaders/edram.xesli:23-33: 2x pixel (x, y)
     // guest sample g is EDRAM sample (x, 2y + g); 4x pixel (X, Y) host sample h is (2X + (h & 1), 2Y + (h >> 1)).
     auto is = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
@@ -1183,6 +1189,114 @@ void TestDepthResolveVk()
 
 }  // namespace
 
+// The depth transfer 4x -> 2x (FM4's: the 4x kD24FS8 key 708400 (base 1024, 16
+// tiles a row) -> the 2x kD24FS8 key 688400 (same base and pitch)). Expected values from the EDRAM sample layout (X
+// shaders/edram.xesli:23-33: 1x pixel (x, r) is EDRAM sample (x, r) of its tile; 4x pixel (X, Y) host sample h is
+// (2X + (h & 1), 2Y + (h >> 1)); 2x pixel (x, y) guest sample g = host h ^ 1 (X :2599-2601) is (x, 2y + g)), not from
+// MapTransferTexel; the passes (stencil cleared, depth copied, stencil set bit by bit: X :4975-5011, kStencilBit
+// :4156-4180) modelled as the pipelines state them (edram_vk.cpp: compare ALWAYS, REPLACE with reference 0xFF under write
+// mask 1 << bit, a fragment whose source bit is clear discarded).
+void TestDepth4xTo2x()
+{
+    std::string why;
+    const Key k1 = Key::Depth(1024, 16, Msaa::X1, DepthFormat::D24FS8), k4 = Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8),
+              k2 = Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8);
+    CHECK(k4.packed == 0x708400u && k2.packed == 0x688400u);  // the keys the stop names
+    CHECK(ClassifyTransfer(k4, k2, why) == TransferKind::Depth && ClassifyTransfer(kAd, k2, why) == TransferKind::Depth);
+    // Still refused: colour -> 2x depth, 1x or 2x depth -> 2x depth, another depth format.
+    CHECK(ClassifyTransfer(kA7, k2, why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
+    CHECK(ClassifyTransfer(k1, k2, why) == TransferKind::Refused);
+    CHECK(ClassifyTransfer(Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), k2, why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
+    CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24S8), k2, why) == TransferKind::Refused);
+    CONTROL(ClassifyTransfer(k1, k2, why) != TransferKind::Refused);
+
+    // The ownership model: the 4x key owns 1024-1439 (26 rows of 16 tiles); binding the 2x key (1280 pixels, 208 rows)
+    // claims (208 << 1) / 16 * 16 = 416 tiles from 1024: one transfer {1024, 1440, k4}, classified Depth.
+    edram::Ownership o;
+    std::vector<edram::Transfer> t;
+    CHECK(o.Change(k4, 0, 416, t, why) && t.empty());
+    RenderTarget rt;
+    rt.pitch = 1280, rt.msaa = 1, rt.samples = 2, rt.hizPitch = 1280, rt.depthBase = 1024, rt.depthFormat = 1, rt.targetHeight = 208;
+    const edram::Binding b = edram::Bind(o, BindRegistersFor(rt, false, true), 208);
+    CHECK(b.ok && b.depth == k2 && b.transfers[0] == std::vector<edram::Transfer>{{1024, 1440, k4}} && AllClassified(b.transfers[0], k2, TransferKind::Depth));
+
+    // Sample mapping over the whole transfer (1280 x 208 2x pixels, both samples): every destination sample reads the 4x
+    // sample at the same EDRAM sample, and each 4x sample is read exactly once.
+    auto edram4x = [](SourceTexel s) { return std::pair<uint32_t, uint32_t>{2 * s.x + (s.sample & 1), 2 * s.y + (s.sample >> 1)}; };
+    std::vector<uint8_t> hit(size_t(640) * 208 * 4, 0);
+    bool same = true, inside = true;
+    for (uint32_t y = 0; y < 208; y++)
+        for (uint32_t x = 0; x < 1280; x++)
+            for (uint32_t h = 0; h < 2; h++)
+            {
+                const SourceTexel s = MapEdramTexel(x, y, h, k4, k2);
+                inside = inside && s.x < 640 && s.y < 208 && s.sample < 4;
+                if (!inside)
+                    break;
+                same = same && edram4x(s) == std::pair<uint32_t, uint32_t>{x, 2 * y + (h ^ 1)};
+                hit[(size_t(s.y) * 640 + s.x) * 4 + s.sample]++;
+            }
+    bool once = inside;
+    for (uint8_t n : hit)
+        once = once && n == 1;
+    CHECK(inside && same && once);
+    // Hand-computed points: 2x (0, 0) host 0 = guest 1 -> EDRAM (0, 1) = 4x (0, 0) host 2; 2x (85, 3) host 1 = guest 0 ->
+    // EDRAM (85, 6) = 4x (42, 3) host 1; 2x (1279, 207) host 0 = guest 1 -> EDRAM (1279, 415) = 4x (639, 207) host 3.
+    auto is = [](SourceTexel s, uint32_t x, uint32_t y, uint32_t sample) { return s.x == x && s.y == y && s.sample == sample; };
+    CHECK(is(MapEdramTexel(0, 0, 0, k4, k2), 0, 0, 2) && is(MapEdramTexel(85, 3, 1, k4, k2), 42, 3, 1) && is(MapEdramTexel(1279, 207, 0, k4, k2), 639, 207, 3));
+    CONTROL(is(MapEdramTexel(0, 0, 0, k4, k2), 0, 0, 0));  // without the native 2x host sample order
+
+    // The isolated GPU check's data path (1x -> 4x -> 2x, edram_vk.cpp RecordDepthSelfCheck) composes the same mappings:
+    // its expectations (from the layout) agree with MapEdramTexel's composition for every sample of its two tile rows.
+    bool composed = true, exact = true;
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < 1280; x++)
+            for (uint32_t g = 0; g < 2; g++)
+            {
+                const SourceTexel s4 = MapEdramTexel(x, y, g ^ 1, k4, k2), s1 = MapEdramTexel(s4.x, s4.y, s4.sample, k1, k4);
+                composed = composed && s1.sample == 0 && DepthSelfCheckWord(s1.x, s1.y) == DepthSelfCheckExpected2x(x, y, g);
+            }
+    for (uint32_t y = 0; y < 16; y++)
+        for (uint32_t x = 0; x < 640; x++)
+            for (uint32_t g = 0; g < 4; g++)
+            {
+                const SourceTexel s1 = MapEdramTexel(x, y, ((g & 1) << 1) | (g >> 1), k1, k4);  // host of guest g
+                composed = composed && DepthSelfCheckWord(s1.x, s1.y) == DepthSelfCheckExpected4x(x, y, g);
+            }
+    for (uint32_t r = 0; r < 32; r++)
+        for (uint32_t x = 0; x < 1280; x++)
+        {
+            const float d = DepthSelfCheckDepth(x, r);
+            exact = exact && d > 0.0f && d < 0.5f && Float20e4To32(Depth32To20e4(d)) == d;
+        }
+    CHECK(composed && exact);
+    CHECK(DepthSelfCheckExpected2x(0, 0, 1) == DepthSelfCheckWord(0, 1) && DepthSelfCheckExpected4x(0, 0, 2) == DepthSelfCheckWord(1, 0));
+    CONTROL(DepthSelfCheckExpected2x(0, 0, 0) == DepthSelfCheckExpected2x(0, 0, 1));  // the two samples hold different words
+
+    // Depth and stencil preserved by the passes: stencil cleared to 0, depth copied (compare ALWAYS, write on), then for
+    // bits 0-7 REPLACE with reference 0xFF under write mask 1 << bit where the source bit is set.
+    auto passes = [](float sourceDepth, uint32_t sourceStencil, float oldDepth, uint32_t oldStencil, float& depth, uint32_t& stencil) {
+        (void)oldDepth;
+        (void)oldStencil;
+        stencil = 0;               // vkCmdClearAttachments, stencil aspect, 0
+        depth = sourceDepth;       // gl_FragDepth = texelFetch(...).r
+        for (uint32_t bit = 0; bit < 8; bit++)
+            if ((sourceStencil >> bit) & 1)
+                stencil = (stencil & ~(1u << bit)) | (0xFFu & (1u << bit));
+    };
+    bool preserved = true;
+    const float depths[] = {0.0f, 1.0f, 0.5f, 1.0f / 8192.0f, 0.259765625f, DepthSelfCheckDepth(1279, 31)};
+    for (const float d : depths)
+        for (uint32_t st = 0; st < 256; st++)
+        {
+            float dd;
+            uint32_t ds;
+            passes(d, st, 0.75f, 0xA5, dd, ds);
+            preserved = preserved && std::memcmp(&dd, &d, 4) == 0 && ds == st && PackDepthStencilWord(dd, ds) == PackDepthStencilWord(d, st);
+        }
+    CHECK(preserved);
+}
+
 int main()
 {
     TestFormats();
@@ -1205,6 +1319,7 @@ int main()
     TestDepthToColorPitch();
     TestDepthPitch();
     TestDepthResolveVk();
+    TestDepth4xTo2x();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

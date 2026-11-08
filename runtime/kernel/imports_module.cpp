@@ -265,3 +265,15 @@ std::vector<std::pair<uint32_t, uint32_t>> TitleTerminateNotifications()
     return terminateNotifications;
 }
 }  // namespace runtime
+
+GUEST_IMPORT(XamGetExecutionId, "REFERENCE_DERIVED: Xenia xam_info.cc:267-283 (the executable's execution info header)")
+{
+    // (info**): the guest address of the executable's XEX_HEADER_EXECUTION_INFO (0x00040006: media id, versions, title id
+    // +0xC, ...), 0. An executable without one stops (7) (Xenia returns GetOptHeader's failure).
+    const uint32_t out = ctx.r3.u32;
+    const uint32_t info = runtime::XexHeaderField(base, runtime::ExecutableModule().header, 0x00040006);
+    if (!info || !out)
+        Stop(StopCode::Unimplemented, "XamGetExecutionId(%08X): no execution info or no output", out);
+    runtime::Store32(base, out, info);
+    ctx.r3.u64 = 0;
+}

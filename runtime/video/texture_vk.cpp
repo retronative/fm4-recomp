@@ -23,7 +23,7 @@ namespace runtime::video {
 // texture_info.h's numeric mirrors of Vulkan (it builds without the header; its comment promises these).
 static_assert(vk::kFormatUndefined == VK_FORMAT_UNDEFINED && vk::kFormatR8Unorm == VK_FORMAT_R8_UNORM &&
               vk::kFormatR8G8B8A8Unorm == VK_FORMAT_R8G8B8A8_UNORM && vk::kFormatA2B10G10R10UnormPack32 == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
-              vk::kFormatBc1RgbaUnormBlock == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
+              vk::kFormatBc1RgbaUnormBlock == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && vk::kFormatBc3UnormBlock == VK_FORMAT_BC3_UNORM_BLOCK);
 static_assert(vk::kFilterNearest == VK_FILTER_NEAREST && vk::kFilterLinear == VK_FILTER_LINEAR &&
               vk::kMipmapModeNearest == VK_SAMPLER_MIPMAP_MODE_NEAREST && vk::kMipmapModeLinear == VK_SAMPLER_MIPMAP_MODE_LINEAR);
 static_assert(vk::kAddressRepeat == VK_SAMPLER_ADDRESS_MODE_REPEAT && vk::kAddressMirroredRepeat == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&

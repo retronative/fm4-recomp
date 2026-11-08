@@ -22,6 +22,7 @@ constexpr SystemExport kExports[] = {
     {"xam.xex", 0xB0B, "XamPartySetCustomData", "Xenia xam_table.inc:1698"},
     {"xam.xex", 0xB10, "XamPartyGetBandwidth", "Xenia xam_table.inc:1703"},
     {"xam.xex", 0x305, "XamShowPartyUI", "Xenia xam_table.inc:569"},
+    {"xam.xex", 0x279, "XamContentAggregateCreateEnumerator", "Xenia xam_table.inc:430"},
     {"xam.xex", 0x30B, "XamShowCommunitySessionsUI", "Xenia xam_table.inc:575"},
     {"xam.xex", 0x9BB, "XamMediaVerificationCreate", "Xenia xam_table.inc:1586"},
     {"xam.xex", 0x9BC, "XamMediaVerificationClose", "Xenia xam_table.inc:1587"},

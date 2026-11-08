@@ -113,6 +113,18 @@ GUEST_IMPORT(XamVoiceIsActiveProcess, "REFERENCE_DERIVED: Xenia xam_voice.cc:20-
     ctx.r3.u64 = 0;
 }
 
+GUEST_IMPORT(XamVoiceCreate, "REFERENCE_DERIVED: Xenia xam_voice.cc:26-32 (output zeroed, X_ERROR_ACCESS_DENIED); owner policy: voice absent")
+{
+    // (user index, flags (FM4: 0xF), DWORD* voice): no voice device exists here (the "honest absent answers" policy for
+    // voice): the voice handle is zeroed and the call fails with ERROR_ACCESS_DENIED (5), as Xenia. A null output pointer
+    // stops (7) (Xenia writes through it).
+    const uint32_t out = ctx.r5.u32;
+    if (out == 0)
+        Stop(StopCode::Unimplemented, "XamVoiceCreate(user %u, flags %X) without an output pointer is not modelled", ctx.r3.u32, ctx.r4.u32);
+    runtime::Store32(base, out, 0);
+    ctx.r3.u64 = 5;  // X_ERROR_ACCESS_DENIED
+}
+
 GUEST_IMPORT(XamVoiceSetMicArrayIdleUsers, "APPROXIMATE: Xenia lists the export only (xam_table.inc:960); no Kinect is connected; FM4 ignores the result (VERIFIED)")
 {
     // (?, ?, ?): which users the Kinect microphone array treats as idle (semantics UNKNOWN). No Kinect is
