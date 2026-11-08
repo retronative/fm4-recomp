@@ -73,7 +73,7 @@ bool LevelLayout(TextureDescription& d, uint32_t level, MipLevel& out)
     const uint32_t log2 = d.log2BytesPerBlock;
     out = {};
     out.packed = level >= d.packedLevel;
-    out.widthTexels = std::max(f.width >> level, 1u), out.heightTexels = std::max(f.height >> level, 1u);
+    out.widthTexels = std::max(d.width >> level, 1u), out.heightTexels = std::max(d.height >> level, 1u);
     out.widthBlocks = AlignUp(out.widthTexels, fi.blockWidth) / fi.blockWidth;
     out.heightBlocks = AlignUp(out.heightTexels, fi.blockHeight) / fi.blockHeight;
     if (level == 0)
@@ -82,6 +82,10 @@ bool LevelLayout(TextureDescription& d, uint32_t level, MipLevel& out)
         out.address = f.baseAddress;
         out.pitchBlocks = TiledPitchBlocks(f.pitchTexels, fi.blockWidth);
         out.rowPitchBytes = out.pitchBlocks << log2;
+        // 3D (DescribeTexture admits level 0 only): texture_util.cc:306-308 (the base's z slice stride is its height in
+        // texel rows), :328-333 (in blocks, aligned to 32), :403 (z extent = the depth).
+        out.depth = d.depth;
+        out.zStrideBlockRows = AlignUp(AlignUp(d.height, fi.blockHeight) / fi.blockHeight, kTileWidthHeight);
     }
     else
     {
@@ -109,7 +113,11 @@ bool LevelLayout(TextureDescription& d, uint32_t level, MipLevel& out)
     if (out.x + out.widthBlocks > out.pitchBlocks)
         return Refuse(d, "level " + std::to_string(level) + " is wider than its pitch (" + std::to_string(out.x + out.widthBlocks) + " > " +
                              std::to_string(out.pitchBlocks) + " blocks)");
-    if (f.tiled)
+    if (d.dimension == 2)  // texture_util.cc:406-412 (tiled: GetTiledAddressUpperBound3D with height = the y extent), :420-423
+        out.extentBytes = f.tiled ? TiledAddressUpperBound3D(out.widthBlocks, out.heightBlocks, out.depth, out.pitchBlocks, out.heightBlocks, log2)
+                                  : size_t(out.rowPitchBytes) * out.zStrideBlockRows * (out.depth - 1) +
+                                        LinearExtent(out.widthBlocks, out.heightBlocks, out.rowPitchBytes, log2);
+    else if (f.tiled)
         out.extentBytes = TiledAddressUpperBound2D(out.x + out.widthBlocks, out.y + out.heightBlocks, out.pitchBlocks, log2);
     else
         out.extentBytes = size_t(out.rowPitchBytes) * out.y + LinearExtent(out.x + out.widthBlocks, out.heightBlocks, out.rowPitchBytes, log2);
@@ -133,6 +141,7 @@ bool HostFormatFor(uint32_t format, HostFormat& out)
     case 6: case 50: out = {vk::kFormatR8G8B8A8Unorm, kSwizzleRGBA, false}; return true;      // k_8_8_8_8 (+ AS_16_16_16_16)
     case 18: case 51: out = {vk::kFormatBc1RgbaUnormBlock, kSwizzleRGBA, true}; return true;  // k_DXT1 (+ AS_16_16_16_16)
     case 54: out = {vk::kFormatA2B10G10R10UnormPack32, kSwizzleRGBA, false}; return true;    // k_2_10_10_10_AS_16_16_16_16
+    case 36: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, true}; return true;            // k_32_FLOAT :275-279 (R32_SFLOAT, RRRR)
     default: out = {}; return false;
     }
 }
@@ -172,8 +181,8 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
 
     if (f.type != 2)
         Refuse(d, "fetch constant type " + std::to_string(f.type) + " is not a texture (2)");
-    else if (f.dimension != 1)
-        Refuse(d, "texture dimension " + std::to_string(f.dimension) + " (0 1D, 2 3D, 3 cube) is not supported; only 2D (1)");
+    else if (f.dimension != 1 && f.dimension != 2)
+        Refuse(d, "texture dimension " + std::to_string(f.dimension) + " (0 1D, 3 cube) is not supported; only 2D (1) and 3D (2)");
     else if (f.stacked)
         Refuse(d, "a stacked 2D texture (" + std::to_string(f.stackDepth + 1) + " layers) is not supported");
     else if (!HostFormatFor(f.format, d.host))
@@ -194,8 +203,14 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
         return d;
     }
 
-    // Levels (texture_util.cc:60-92).
-    const uint32_t sizeMax = Log2Floor(std::max(f.width, f.height));
+    // The size: dword 2 as size_2d or, for 3D, size_3d (11/11/10 bits; xenos.h:1255-1271; texture_util.cc:15-64
+    // GetSubresourcesFromFetchConstant :36-41). A stacked 2D (an array) is refused above; 3D with stacked set is an
+    // assert in Xenia (:37) and refused the same way.
+    const bool volume = f.dimension == 2;
+    d.dimension = f.dimension;
+    d.width = volume ? f.width3D : f.width, d.height = volume ? f.height3D : f.height, d.depth = volume ? f.depth3D : 1;
+    // Levels (texture_util.cc:60-92; the longest axis includes the depth for 3D, :61-65).
+    const uint32_t sizeMax = Log2Floor(std::max(std::max(d.width, d.height), d.depth));
     uint32_t first = 0, last = 0;
     if (f.mipAddress != 0)
     {
@@ -212,9 +227,19 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
         Refuse(d, "mip address past the 512 MB physical memory");
         return d;
     }
-    d.width = f.width, d.height = f.height;
+    if (volume && last != 0)
+    {
+        Refuse(d, "a 3D texture with mip levels 0-" + std::to_string(last) + " (only its base level is modelled)");
+        return d;
+    }
     d.levelCount = last + 1;
-    d.packedLevel = PackedMipLevel(f.width, f.height, f.packedMips);
+    d.packedLevel = PackedMipLevel(d.width, d.height, f.packedMips);
+    if (volume && d.packedLevel == 0)
+    {
+        Refuse(d, "a 3D texture whose base is in a packed mip tail (" + std::to_string(d.width) + "x" + std::to_string(d.height) +
+                      " with packed mips; texture_util.cc:108-198 packed offsets are not modelled for 3D)");
+        return d;
+    }
     d.levels.resize(d.levelCount);
     for (uint32_t level = 0; level < d.levelCount; level++)
         if (!LevelLayout(d, level, d.levels[level]))
@@ -235,12 +260,18 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
 {
     TextureBinding b;
     const TextureFetch f = DecodeTextureFetch(fetch);
-    if (shader.dimension != 1)
+    // ucode fetch dimension 1 (2D) needs a 2D constant (dimension 1), 2 (3D or stacked) a 3D constant (dimension 2): a stacked
+    // 2D array sampled as 3D is refused by the storage description (stacked), a cube (3) by both.
+    if (!((shader.dimension == 1 && f.dimension == 1) || (shader.dimension == 2 && f.dimension == 2)))
     {
-        Refuse(b, "the shader samples with dimension " + std::to_string(shader.dimension) + "; only 2D (1) is supported");
+        Refuse(b, "the shader samples with dimension " + std::to_string(shader.dimension) + " but the constant's dimension is " +
+                      std::to_string(f.dimension) + "; only 2D fetches of 2D constants and 3D fetches of 3D constants are supported");
         return b;
     }
-    if (f.numFormat != 0)
+    // The number-format bit (dword 3 bit 0): Xenia 67f16c4 declares it (xenos.h:1274) but neither its texture cache nor its
+    // shader translator reads it; for float data it has no meaning (FM4's k_32_FLOAT luminance texture sets it), so it is
+    // ignored for float formats only (HostFormat::signIgnored) and still refused for normalized ones.
+    if (f.numFormat != 0 && !host.signIgnored)
     {
         Refuse(b, "integer number format (dword 3 bit 0) is not supported");
         return b;
@@ -263,7 +294,7 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
         }
         b.components[i] = vk::kSwizzleR + SwizzleComponent(host.formatSwizzle, g);
         const uint32_t sign = f.sign[g];
-        if (sign == 1 || sign == 2)
+        if ((sign == 1 || sign == 2) && !host.signIgnored)
         {
             Refuse(b, std::string(sign == 1 ? "signed" : "unsigned biased") + " component " + std::to_string(g) + " is not supported");
             return b;
@@ -288,11 +319,12 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
     b.expAdjust = f.expAdjust;
     b.lodBias = float(f.lodBias) / 32.0f;
 
-    // Sampler (vulkan_texture_cache.cc:611-690, :755-820): for 2D the z clamp is clamp-to-edge
-    // (texture_util.cc:597-618); modes Xenia only approximates (:2648-2665) are refused.
-    uint32_t* modes[2] = {&b.sampler.addressModeU, &b.sampler.addressModeV};
+    // Sampler (vulkan_texture_cache.cc:611-690, :755-820): the z clamp is the constant's for 3D, clamp-to-edge for 2D
+    // (texture_util.cc:597-618 GetClampModesForDimension); modes Xenia only approximates (:2648-2665) are refused.
+    uint32_t* modes[3] = {&b.sampler.addressModeU, &b.sampler.addressModeV, &b.sampler.addressModeW};
+    b.sampler.addressModeW = vk::kAddressClampToEdge;
     bool border = false;
-    for (uint32_t axis = 0; axis < 2; axis++)
+    for (uint32_t axis = 0; axis < (f.dimension == 2 ? 3u : 2u); axis++)
     {
         switch (f.clamp[axis])
         {
@@ -305,7 +337,6 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
             return b;
         }
     }
-    b.sampler.addressModeW = vk::kAddressClampToEdge;
     if (border)
     {
         if (f.borderColor > 1)

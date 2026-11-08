@@ -197,7 +197,8 @@ void TestVariants()
     d = Ui(), d.target.colorFormat = 3;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_7E3", "storage format 3: XE_COLOR0_7E3");
     d = Ui(), d.target.colorFormat = 1, d.kind = DrawKind::DepthOnly, d.colorWriteMask = 0;
-    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"}, "DepthOnly: no colour define");
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"},
+           "DepthOnly: no colour conversion define, and XE_NO_COLOR_OUTPUT (no colour attachment)");
     const CachedShader both = Vs({95}, {0});
     Expect(VariantsFromDrawState(Ui(), both, ups, v, p).ok && v.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"}, "a VS that lists the slot gets the define too");
 }
@@ -271,6 +272,36 @@ void TestIndices()
     CONTROL(BuildHostIndices(d, nullptr, nullptr, h).ok, "a no-write point list is not drawn");
     Expect(SwapIndex(0x1234, false, 1) == 0x3412 && SwapIndex(0x12345678, true, 2) == 0x78563412 && SwapIndex(0x12345678, false, 0) == 0x5678,
            "SwapIndex: 8in16 swaps the two bytes, 8in32 all four, a 16-bit element keeps its low 16 bits");
+
+    // Primitive restart (draw_state.h IndexBuffer::restart; X primitive_processor.cc:829-950, primitive_processor.h:80-95,
+    // registers.h:306-307: reset check, then offset, then clamp). Expected values by hand; the host restart value is 0xFFFFFFFF.
+    d = Clear(), d.hostPrimitive = HostPrimitive::TriangleStrip, d.primitiveType = 6, d.indices.indexed = true;
+    d.indices.restart = true, d.indices.resetIndex = 0xFFFF;
+    // 16-bit 8in16: guest big-endian shorts 0001 0002 0003 FFFF 0004 0005 0006 loaded little-endian (0x0100 ...); FFFF swaps to FFFF.
+    FakeIndices r16{{0x0100, 0x0200, 0x0300, 0xFFFF, 0x0400, 0x0500, 0x0600}};
+    d.indices.count = 7, d.indices.is32Bit = false, d.indices.endian = 1, d.indices.bytes = 14;
+    Expect(BuildHostIndices(d, ReadFake, &r16, h).ok && h.kind == HostIndices::Kind::Indexed &&
+               h.indices == std::vector<uint32_t>{1, 2, 3, 0xFFFFFFFFu, 4, 5, 6} && h.vertexCount == 7 && h.highIndex == 6,
+           "16-bit 8in16 strip: FFFF becomes the host restart value, highIndex skips it");
+    // 32-bit 8in32, reset index 0x00FFFF: guest 00000001 0000FFFF FF00FFFF 00000002 -> swapped 1, FFFF, FF00FFFF, 2; the low 24 bits
+    // of 0xFF00FFFF are 0x00FFFF: a reset too (X compares the low 24 bits, :1128-1135); the 0xFF00FFFF would otherwise be 0x00FFFF.
+    FakeIndices r32{{0x01000000, 0xFFFF0000, 0xFFFF00FF, 0x02000000}};
+    d.indices.count = 4, d.indices.is32Bit = true, d.indices.endian = 2, d.indices.bytes = 16;
+    Expect(BuildHostIndices(d, ReadFake, &r32, h).ok && h.indices == std::vector<uint32_t>{1, 0xFFFFFFFFu, 0xFFFFFFFFu, 2} && h.highIndex == 2,
+           "32-bit 8in32 strip: elements whose low 24 bits equal the reset index restart");
+    // The comparison precedes VGT_INDX_OFFSET: with offset 1, a raw FFFE is index FFFF (drawn), a raw FFFF restarts.
+    FakeIndices off{{0x0100, 0xFEFF, 0xFFFF, 0x0200}};  // raw 1, FFFE, FFFF, 2
+    d.indices.count = 4, d.indices.is32Bit = false, d.indices.endian = 1, d.indices.bytes = 8, d.indexOffset = 1;
+    Expect(BuildHostIndices(d, ReadFake, &off, h).ok && h.indices == std::vector<uint32_t>{2, 0xFFFF, 0xFFFFFFFFu, 3} && h.highIndex == 0xFFFF,
+           "reset before the offset: raw FFFE + 1 = FFFF is drawn, raw FFFF restarts");
+    d.indexOffset = 0, d.maxIndex = 2;  // and before the clamp: the reset element is not clamped to 2
+    Expect(BuildHostIndices(d, ReadFake, &off, h).ok && h.indices == std::vector<uint32_t>{1, 2, 0xFFFFFFFFu, 2}, "reset before the clamp");
+    d.maxIndex = 0xFFFFFF, d.indices.restart = false;
+    CONTROL(BuildHostIndices(d, ReadFake, &off, h).ok && h.indices[2] == 0xFFFFFFFFu, "without restart a raw FFFF does not restart");
+    Expect(BuildHostIndices(d, ReadFake, &off, h).ok && h.indices[2] == 0xFFFF, "without restart a raw FFFF is vertex 0xFFFF");
+    d.indices.restart = true, d.hostPrimitive = HostPrimitive::TriangleList;
+    r = BuildHostIndices(d, ReadFake, &off, h);
+    Expect(!r && Has(r.reason, "other than a triangle strip"), "restart on a list is refused (DrawState never sets it)");
 }
 
 void TestUploads()

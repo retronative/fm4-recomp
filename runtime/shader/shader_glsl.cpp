@@ -2194,10 +2194,15 @@ std::string Translator::Assemble(uint32_t interpolators) const
         g += SamplerDeclarations();
         for (uint32_t i = 0; i < interpolators; i++)
             g += "layout(location = " + Num(i) + ") in vec4 xe_interp_" + Num(i) + ";\n";
-        g += "layout(location = 0) out vec4 xe_color0;\n";
+        // XE_NO_COLOR_OUTPUT (the host's pipeline has no colour attachment: a depth-only pass): xe_color0 stays a value the
+        // shader writes and the alpha test reads (a failing alpha test still discards the pixel's depth write) but is no
+        // attachment output (Vulkan validation: Undefined-Value-ShaderOutputNotConsumed).
+        g += "#ifdef XE_NO_COLOR_OUTPUT\nvec4 xe_color0;\n#else\nlayout(location = 0) out vec4 xe_color0;\n#endif\n";
         g += helpers;
         g += kGammaHelpers;
+        // XE_ALPHA_TEST_QUANT: a diagnostic only (runtime/video/diag_alpha.h, FM4_DIAG_ALPHA_QUANT), never defined by default.
         g += "#ifdef XE_ALPHA_TEST\nbool xe_alpha_pass(float a, float r)\n{\n"
+             "#ifdef XE_ALPHA_TEST_QUANT\n    a = round(clamp(a, 0.0, 1.0) * XE_ALPHA_TEST_QUANT) / XE_ALPHA_TEST_QUANT;\n#endif\n"
              "    switch (XE_ALPHA_TEST)\n    {\n    case 0: return false;\n    case 1: return a < r;\n    case 2: return a == r;\n"
              "    case 3: return a <= r;\n    case 4: return a > r;\n    case 5: return a != r;\n    case 6: return a >= r;\n"
              "    default: return true;\n    }\n}\n#endif\n";

@@ -67,4 +67,40 @@ bool CopyLinearBlocksAt(const uint8_t* source, size_t sourceBytes, uint8_t* out,
     return true;
 }
 
+bool DetileBlocks3D(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t widthBlocks, uint32_t heightBlocks, uint32_t depth,
+                    uint32_t pitchBlocks, uint32_t zStrideBlockRows, uint32_t log2Bytes, uint32_t endian)
+{
+    if (!EndianSupported(log2Bytes, endian) || (pitchBlocks & (kTileWidthHeight - 1)) || widthBlocks > pitchBlocks || heightBlocks > zStrideBlockRows ||
+        TiledAddressUpperBound3D(widthBlocks, heightBlocks, depth, pitchBlocks, heightBlocks, log2Bytes) > tiledBytes)
+        return false;
+    const uint32_t bytes = 1u << log2Bytes;
+    for (uint32_t z = 0; z < depth; z++)
+        for (uint32_t y = 0; y < heightBlocks; y++)
+            for (uint32_t x = 0; x < widthBlocks; x++)
+            {
+                const size_t offset = TiledOffset3D(x, y, z, pitchBlocks, zStrideBlockRows, log2Bytes);
+                if (offset + bytes > tiledBytes)  // never for a covered region; kept as the bound of every read
+                    return false;
+                uint8_t* block = out + (((size_t(z) * heightBlocks + y) * widthBlocks + x) << log2Bytes);
+                std::memcpy(block, tiled + offset, bytes);
+                SwapBlockEndian(block, log2Bytes, endian);
+            }
+    return true;
+}
+
+bool CopyLinearBlocks3D(const uint8_t* source, size_t sourceBytes, uint8_t* out, uint32_t widthBlocks, uint32_t heightBlocks, uint32_t depth,
+                        uint32_t rowPitchBytes, uint32_t zStrideBlockRows, uint32_t log2Bytes, uint32_t endian)
+{
+    if (depth == 0)
+        return false;
+    const size_t sliceStride = size_t(rowPitchBytes) * zStrideBlockRows, sliceBytes = (size_t(widthBlocks) * heightBlocks) << log2Bytes;
+    if (heightBlocks > zStrideBlockRows || sliceStride * (depth - 1) > sourceBytes)
+        return false;
+    for (uint32_t z = 0; z < depth; z++)
+        if (!CopyLinearBlocksAt(source + sliceStride * z, sourceBytes - sliceStride * z, out + sliceBytes * z, 0, 0, widthBlocks, heightBlocks,
+                                rowPitchBytes, log2Bytes, endian))
+            return false;
+    return true;
+}
+
 }  // namespace runtime::video

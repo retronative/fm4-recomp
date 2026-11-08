@@ -27,17 +27,16 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
         return p;
     }
     const TextureDescription& d = lookup.entry->description;
-    const std::string where = std::string(d.info.name) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) + " at " + Hex(d.base.physical);
+    const std::string where = std::string(d.info.name) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) +
+                              (d.dimension == 2 ? "x" + std::to_string(d.depth) + " (3D)" : std::string()) + " at " + Hex(d.base.physical);
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 50, 51, 54) this unit was checked for";
+        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 36, 50, 51, 54) this unit was checked for";
         return p;
     }
-    if (d.levelCount != 1)  // every observed constant has one level (mip address 0); DrawState samples base maps only
-    {
-        p.error = where + ": " + std::to_string(d.levelCount) + " levels (mip address " + Hex(d.fetch.mipAddress) + "): only one level is uploaded so far";
-        return p;
-    }
+    // Every level the description holds (texture_info.cpp, Xenia's level range texture_util.cc:60-92 and layout :200-438,
+    // packed tails included) is uploaded: the sampler can reach all of them (maxLod VK_LOD_CLAMP_NONE unless the mip filter is
+    // base map, vulkan_texture_cache.cc:804-809). 3D mips stay refused by DescribeTexture.
     if (d.host.blockCompressed && !device.textureCompressionBC)
     {
         p.error = where + ": a BC format, and the device has no textureCompressionBC (the DXT1 -> RGBA8 decode is not implemented)";
@@ -95,7 +94,12 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
         if (source == nullptr)
             return false;
         uint8_t* level = out + plan.levelOffsets[i];
-        const bool ok = d.fetch.tiled ? DetileBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.pitchBlocks,
+        const bool ok = d.dimension == 2
+                            ? (d.fetch.tiled ? DetileBlocks3D(source, l.extentBytes, level, l.widthBlocks, l.heightBlocks, l.depth, l.pitchBlocks,
+                                                              l.zStrideBlockRows, d.log2BytesPerBlock, d.fetch.endian)
+                                             : CopyLinearBlocks3D(source, l.extentBytes, level, l.widthBlocks, l.heightBlocks, l.depth, l.rowPitchBytes,
+                                                                  l.zStrideBlockRows, d.log2BytesPerBlock, d.fetch.endian))
+                        : d.fetch.tiled ? DetileBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.pitchBlocks,
                                                        d.log2BytesPerBlock, d.fetch.endian)
                                       : CopyLinearBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.rowPitchBytes,
                                                            d.log2BytesPerBlock, d.fetch.endian);
@@ -112,7 +116,7 @@ std::vector<CopyRegion> CopyRegions(const TextureDescription& d, const LoadPlan&
 {
     std::vector<CopyRegion> regions;
     for (size_t i = 0; i < d.levels.size() && i < plan.levelOffsets.size(); i++)
-        regions.push_back({ringOffset + plan.levelOffsets[i], uint32_t(i), d.levels[i].widthTexels, d.levels[i].heightTexels});
+        regions.push_back({ringOffset + plan.levelOffsets[i], uint32_t(i), d.levels[i].widthTexels, d.levels[i].heightTexels, d.levels[i].depth});
     return regions;
 }
 

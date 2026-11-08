@@ -3,8 +3,11 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 //
-// The Vulkan instance and device on MoltenVK (macOS: a portability implementation), offscreen: no
-// surface, no swapchain (the window is unit 4b). Every failure stops the run (Setup, 9):
+// The Vulkan instance and device on MoltenVK (macOS: a portability implementation). Offscreen unless a
+// SurfaceRequest is given (fm4recomp --renderer window, unit 4b): then the
+// instance also enables the window system's surface extensions (SDL_Vulkan_GetInstanceExtensions), the surface is
+// created right after the instance, the queue family must support presenting to it, and the device enables
+// VK_KHR_swapchain. Every failure stops the run (Setup, 9):
 //   - MoltenVK pinned (driverInfo "1.4.2", the Homebrew molten-vk 1.4.2);
 //   - the Khronos validation layer pinned (spec version 1.4.363) and inserted by the instance itself
 //     when validation is on (fm4recomp --vk-validation on: the M4 default in scripts/gpu_run.sh);
@@ -12,13 +15,23 @@
 //     launcher's log check is the second, independent check).
 // After ForzaRecomp runtime/video/presenter.cpp:117-195 (instance with portability
 // enumeration, VK_KHR_portability_subset when offered, the MoltenVK pin; GPL-3.0-or-later, same
-// owner), reviewed and re-written here. FM4 Recomp changes: no SDL/surface; a graphics queue without
-// present support; the validation layer pinned and enabled in-process; the messenger stops.
+// owner), reviewed and re-written here. FM4 Recomp changes: SDL stays outside (the surface comes through
+// SurfaceRequest, window mode only); offscreen modes need no present support; the validation layer pinned and enabled
+// in-process; the messenger stops.
 #pragma once
 #include <cstdint>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace runtime::video {
+
+// The window's side of instance and device creation (window mode only; window_sdl.cpp fills it on the main thread).
+struct SurfaceRequest
+{
+    std::vector<const char*> instanceExtensions;  // SDL_Vulkan_GetInstanceExtensions: added (deduplicated) at vkCreateInstance
+    VkSurfaceKHR (*create)(VkInstance instance) = nullptr;               // SDL_Vulkan_CreateSurface, main thread; stops on failure
+    void (*destroy)(VkInstance instance, VkSurfaceKHR surface) = nullptr;  // SDL_Vulkan_DestroySurface, before the instance
+};
 
 constexpr const char* kMoltenVkVersion = "1.4.2";                        // driverInfo, the whole string
 constexpr uint32_t kValidationLayerSpec = VK_MAKE_API_VERSION(0, 1, 4, 363);  // VkLayer_khronos_validation.json api_version
@@ -39,14 +52,20 @@ struct VulkanDevice
     bool depthClamp = false;        // PA_CL_CLIP_CNTL clip_disable pipelines (pipeline_cache.cpp)
     bool independentBlend = false;
     bool imageViewFormatSwizzle = false;
+    // Window mode only: the surface (created right after the instance) and VK_KHR_swapchain enabled on the device.
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    void (*destroySurface)(VkInstance, VkSurfaceKHR) = nullptr;
+    bool swapchain = false;
 };
 
 // Creates the instance (validation as asked), picks the MoltenVK device with a graphics queue,
-// creates the device and its queue. Stops (9) on any failure or pin mismatch.
-VulkanDevice CreateVulkanDevice(bool validation);
+// creates the device and its queue. Stops (9) on any failure or pin mismatch. With `surface` (window
+// mode): its instance extensions, the surface, a queue family that can present to it (both the graphics
+// and the present queue: one queue, so no queue-family ownership transfer), and VK_KHR_swapchain.
+VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface = nullptr);
 // Only after GpuGuard::Shutdown kept nothing (no submission's completion unknown): destroying a
-// device with work in flight is invalid GPU work (GPU safety). Destroys device, messenger,
-// instance.
+// device with work in flight is invalid GPU work (GPU safety). Destroys device, surface,
+// messenger, instance (every swapchain must already be destroyed: VUID-vkDestroySurfaceKHR-surface-01266).
 void DestroyVulkanDevice(VulkanDevice& d);
 // A memory type with all of `wanted`; stops (9) if none.
 uint32_t MemoryType(const VulkanDevice& d, uint32_t typeBits, VkMemoryPropertyFlags wanted);

@@ -87,7 +87,9 @@ private:
 // k_8_8_8_8_AS_16_16_16_16 (50), k_DXT1_AS_16_16_16_16 (51). texture_info.cpp also maps 6, 18 and 54 (the
 // same host formats as 50 / 51, and A2B10G10R10); each joins this list when a run first needs it.
 // 54 (k_2_10_10_10_AS_16_16_16_16): the HDR resolve's destination at 1BB71000, sampled from draw 27039 (the local capture draw_c2d1 (not distributed)).
-constexpr bool ObservedFormat(uint32_t format) { return format == 2 || format == 50 || format == 51 || format == 54; }
+// 36 (k_32_FLOAT): a 32x32 float texture the HDR luminance pass samples (the local capture draw_loop1 (not distributed) draw 22725 tex 1).
+// 6 (k_8_8_8_8): a 16x16x16 3D lookup texture (the local capture draw_tex3d1 (not distributed) draw 33248 slot 7).
+constexpr bool ObservedFormat(uint32_t format) { return format == 2 || format == 6 || format == 36 || format == 50 || format == 51 || format == 54; }
 
 // VkComponentMapping {R, G, B, A}: what a view may use without imageViewFormatSwizzle (the portability
 // subset's VkImageViewCreateInfo rule: with the feature VK_FALSE every component must be the identity
@@ -193,6 +195,7 @@ struct CopyRegion
 {
     uint64_t bufferOffset = 0;
     uint32_t level = 0, width = 0, height = 0;  // texels (the host image level's extent)
+    uint32_t depth = 1;                         // 3D: slices (imageExtent.depth); 1 for 2D
 };
 std::vector<CopyRegion> CopyRegions(const TextureDescription& d, const LoadPlan& plan, uint64_t ringOffset);
 

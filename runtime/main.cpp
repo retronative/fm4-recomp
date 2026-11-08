@@ -29,6 +29,7 @@
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
 #include "video/renderer.h"
+#include "video/window_sdl.h"
 #include "kernel/imports.h"
 #include "kernel/loader.h"
 #include "kernel/module.h"
@@ -145,7 +146,7 @@ int main(int argc, char** argv)
     }
     if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || rendererMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
         Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --disc-map <disc1_gdfx.tsv> "
-             "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present> --stop-at-swap <n> --deadline <seconds> (all required; "
+             "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present|window> --stop-at-swap <n> --deadline <seconds> (all required; "
              "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off> --shader-classes <none|branch,predicate,loop>)");
     // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
     // the same 48 kHz pacing, frame conversion and callbacks (kernel/audio.h).
@@ -174,7 +175,8 @@ int main(int argc, char** argv)
     if (!std::strcmp(rendererMode, "headless")) video.mode = runtime::video::Mode::Headless;
     else if (!std::strcmp(rendererMode, "self-check")) video.mode = runtime::video::Mode::SelfCheck;
     else if (!std::strcmp(rendererMode, "present")) video.mode = runtime::video::Mode::Present;
-    else Stop(StopCode::Setup, "--renderer must be headless, self-check or present, not %s", rendererMode);
+    else if (!std::strcmp(rendererMode, "window")) video.mode = runtime::video::Mode::Window;  // present + a visible window (unit 4b)
+    else Stop(StopCode::Setup, "--renderer must be headless, self-check, present or window, not %s", rendererMode);
     if (video.mode != runtime::video::Mode::Headless)
     {
         if (gpuCaptureDir == nullptr || vkValidation == nullptr || (std::strcmp(vkValidation, "on") && std::strcmp(vkValidation, "off")))
@@ -273,6 +275,10 @@ int main(int argc, char** argv)
 
     // The renderer starts under the deadline (a hang in device creation is bounded in-process too), before
     // the title can start the ring.
+    // Window mode: SDL video and the window on this, the main thread (macOS: AppKit windows and events belong to the main
+    // thread), before the renderer creates the instance and the surface (also here, in Initialize).
+    if (video.mode == runtime::video::Mode::Window)
+        video.surface = runtime::video::window::OpenWindow();
     static const runtime::gpu::RendererHooks hooks{runtime::video::Present, runtime::video::Draw, runtime::video::LoadShader};
     if (runtime::video::Initialize(video))
     {
@@ -288,6 +294,11 @@ int main(int argc, char** argv)
     pthread_t thread;
     if (pthread_create(&thread, &attributes, RunGuest, nullptr) != 0)
         Stop(StopCode::Setup, "cannot start the guest thread");
+    // Window mode: this thread runs the window's events and presents the frames the command processor hands over. It
+    // never returns; the run still ends only by a stop (the window closed: 14; the deadline thread: 124; any other stop
+    // on its own thread), each of which ends the process with _exit without waiting for this loop.
+    if (video.mode == runtime::video::Mode::Window)
+        runtime::video::window::RunWindowLoop();
     pthread_join(thread, nullptr);
     return 0;
 }

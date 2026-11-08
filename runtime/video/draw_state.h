@@ -117,6 +117,16 @@ struct IndexBuffer
     bool is32Bit = false;      // initiator bit 11 (X registers.h:290; xenos.h:209-213 IndexFormat)
     uint32_t endian = 0;       // VGT_DMA_SIZE bits 30-31 (X registers.h:277): GpuSwap of each index (kernel/command_processor.h)
     uint32_t count = 0;        // initiator bits 16-31 num_indices
+    // Primitive restart (X primitive_processor.cc:604-649): on only for a DMA-indexed strip (type 6; Xenia's strip-like
+    // set :621-628, of which this decoder accepts only the triangle strip) with PA_SU_SC_MODE_CNTL multi_prim_ib_ena
+    // (bit 21), and for 16-bit indices only when VGT_MULTI_PRIM_IB_RESET_INDX (0x2103, 24 bits, X registers.h:309-325)
+    // fits in 16 bits (:635-638). An element restarts when its endian-swapped value equals `resetIndex`: the whole
+    // 16-bit value, or the low 24 bits of a 32-bit one (:672-675, :1125-1138; Xenia compares the raw element with the
+    // reset index swapped into guest order, which is the same test), before VGT_INDX_OFFSET and the min/max clamp
+    // (X registers.h:306-307 "primitive reset index checking -> offsetting -> clamping"). Lists and auto-indexed draws
+    // never restart (lists: :640-646; auto: the restart block is only in the DMA branch, :516-573 never enables it).
+    bool restart = false;
+    uint32_t resetIndex = 0;
 };
 
 // PA_CL_VPORT_* with the PA_CL_VTE_CNTL enables applied (X draw_util.cc:306-319: a disabled scale is

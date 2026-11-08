@@ -127,6 +127,19 @@ void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t viz
                                      ReadRegister(base, 0x4804 + 6 * slot), ReadRegister(base, 0x4805 + 6 * slot)));
 }
 
+void TraceTextures(const uint8_t* base, uint32_t opcode, uint32_t slotMask)
+{
+    std::lock_guard guard(traceLock);
+    if (Open() == nullptr)
+        return;
+    char text[128];
+    for (uint32_t slot = 0; slot < 32; slot++)
+        if ((slotMask >> slot & 1) && !(opcode == 0x22 && slot < 3))
+            Line(text, std::snprintf(text, sizeof text, "tex %u %08X %08X %08X %08X %08X %08X\n", slot, ReadRegister(base, 0x4800 + 6 * slot),
+                                     ReadRegister(base, 0x4801 + 6 * slot), ReadRegister(base, 0x4802 + 6 * slot), ReadRegister(base, 0x4803 + 6 * slot),
+                                     ReadRegister(base, 0x4804 + 6 * slot), ReadRegister(base, 0x4805 + 6 * slot)));
+}
+
 void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate)
 {
     std::lock_guard guard(traceLock);

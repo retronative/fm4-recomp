@@ -93,42 +93,8 @@ VkFormat HostDepthFormat(uint32_t xenosDepthFormat)
 PipelineCache::PipelineCache(VkDevice device, const PipelineDeviceFeatures& features, ShaderClass allowedClasses, KeyResult& result)
     : device_(device), features_(features), allowed_(allowedClasses)
 {
-    // The one set layout: bindings 0-5 as shader_glsl.h declares them, 8-23 one combined image
-    // sampler per texture slot 0-15, fragment stage only (pipeline_key.h kTextureBindings; the sampler type, 2D/3D/cube, is the
-    // image view's).
-    VkDescriptorSetLayoutBinding bindings[6 + kTextureBindings]{};
-    const struct { uint32_t binding; VkDescriptorType type; VkShaderStageFlags stages; } fixed[6] = {
-        {kBindingVertexData, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
-        {kBindingSystem, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
-        {kBindingVsConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
-        {kBindingPsConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT},
-        {kBindingIndices, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
-        {kBindingErrors, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
-    };
-    for (uint32_t i = 0; i < 6; i++)
-        bindings[i] = {fixed[i].binding, fixed[i].type, 1, fixed[i].stages, nullptr};
-    for (uint32_t s = 0; s < kTextureBindings; s++)
-        bindings[6 + s] = {kBindingTexture0 + s, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                           VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-    VkDescriptorSetLayoutCreateInfo setInfo{};
-    setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    setInfo.bindingCount = uint32_t(std::size(bindings));
-    setInfo.pBindings = bindings;
-    if (const VkResult r = vkCreateDescriptorSetLayout(device_, &setInfo, nullptr, &setLayout_); r != VK_SUCCESS)
-    {
-        result = Refuse(VkError("vkCreateDescriptorSetLayout", r));
-        return;
-    }
-    VkPipelineLayoutCreateInfo layoutInfo{};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.setLayoutCount = 1;
-    layoutInfo.pSetLayouts = &setLayout_;
-    if (const VkResult r = vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &layout_); r != VK_SUCCESS)
-    {
-        result = Refuse(VkError("vkCreatePipelineLayout", r));
-        return;
-    }
-    result = Accept();
+    Layouts none;
+    result = LayoutFor(0, none);
 }
 
 PipelineCache::~PipelineCache()
@@ -139,10 +105,57 @@ PipelineCache::~PipelineCache()
         vkDestroyRenderPass(device_, pass, nullptr);
     for (VkShaderModule m : modules_)
         vkDestroyShaderModule(device_, m, nullptr);
-    if (layout_ != VK_NULL_HANDLE)
-        vkDestroyPipelineLayout(device_, layout_, nullptr);
-    if (setLayout_ != VK_NULL_HANDLE)
-        vkDestroyDescriptorSetLayout(device_, setLayout_, nullptr);
+    for (auto& [key, l] : layouts_)
+    {
+        vkDestroyPipelineLayout(device_, l.pipeline, nullptr);
+        vkDestroyDescriptorSetLayout(device_, l.set, nullptr);
+    }
+}
+
+KeyResult PipelineCache::LayoutFor(uint64_t layoutKey, Layouts& out)
+{
+    if (const auto it = layouts_.find(layoutKey); it != layouts_.end())
+        return out = it->second, Accept();
+    // Bindings 0-5 as shader_glsl.h declares them; 8 + slot for each slot of the key, visible to the stages that fetch it
+    // (the sampler type, 2D/3D/cube, is the image view's).
+    std::vector<VkDescriptorSetLayoutBinding> bindings;
+    const struct { uint32_t binding; VkDescriptorType type; VkShaderStageFlags stages; } fixed[6] = {
+        {kBindingVertexData, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
+        {kBindingSystem, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
+        {kBindingVsConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
+        {kBindingPsConstants, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_FRAGMENT_BIT},
+        {kBindingIndices, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
+        {kBindingErrors, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
+    };
+    for (const auto& f : fixed)
+        bindings.push_back({f.binding, f.type, 1, f.stages, nullptr});
+    const uint32_t vsSlots = LayoutVsSlots(layoutKey), psSlots = LayoutPsSlots(layoutKey);
+    for (uint32_t slot = 0; slot < kTextureBindings; slot++)
+    {
+        const VkShaderStageFlags stages = (vsSlots >> slot & 1 ? VK_SHADER_STAGE_VERTEX_BIT : 0u) | (psSlots >> slot & 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : 0u);
+        if (stages != 0)
+            bindings.push_back({kBindingTexture0 + slot, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stages, nullptr});
+    }
+    Layouts l;
+    VkDescriptorSetLayoutCreateInfo setInfo{};
+    setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    setInfo.bindingCount = uint32_t(bindings.size());
+    setInfo.pBindings = bindings.data();
+    if (const VkResult r = vkCreateDescriptorSetLayout(device_, &setInfo, nullptr, &l.set); r != VK_SUCCESS)
+        return Refuse(VkError("vkCreateDescriptorSetLayout", r));
+    VkPipelineLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &l.set;
+    if (const VkResult r = vkCreatePipelineLayout(device_, &layoutInfo, nullptr, &l.pipeline); r != VK_SUCCESS)
+    {
+        vkDestroyDescriptorSetLayout(device_, l.set, nullptr);  // never used by any pipeline or set
+        return Refuse(VkError("vkCreatePipelineLayout", r));
+    }
+    layouts_[layoutKey] = l;
+    stats_.layouts++;
+    out = l;
+    return Accept();
 }
 
 KeyResult PipelineCache::Module(const CachedShader& shader, ShaderVariant& variant)
@@ -257,6 +270,18 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
         return Refuse("shader class " + ShaderClassName(refused) + " is not in --shader-classes (vs_" + vsHex + " is " + ShaderClassName(vs.cls) + ", ps_" +
                       psHex + " is " + ShaderClassName(ps.cls) + "); a never-seen class runs first in its own approved run");
     }
+    // The key's sampler layout must be the pair's own (PlanDescriptors' layoutKey): a key built without it would bind a
+    // layout that lacks the shaders' sampler bindings (invalid Vulkan), so it is refused before any Vulkan call.
+    {
+        uint32_t vsSlots = 0, psSlots = 0;
+        for (const uint32_t slot : vs.t.textureSlots)
+            vsSlots |= slot < kTextureBindings ? 1u << slot : 0u;
+        for (const uint32_t slot : ps.t.textureSlots)
+            psSlots |= slot < kTextureBindings ? 1u << slot : 0u;
+        if (key.samplerLayout != SamplerLayoutKey(vsSlots, psSlots))
+            return Refuse("the pipeline key's sampler layout " + std::to_string(key.samplerLayout) + " is not the pair's (" +
+                          std::to_string(SamplerLayoutKey(vsSlots, psSlots)) + "): the key was built without PlanDescriptors");
+    }
     if (key.depthClamp && !features_.depthClamp)
         return Refuse("PA_CL_CLIP_CNTL clip_disable needs the device's depthClamp feature, which it lacks");
     if (key.colorUsed && !features_.constantAlphaColorBlendFactors)
@@ -268,6 +293,8 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
     if (KeyResult r = Module(ps, psVariant); !r)
         return r;
     Entry e;
+    if (KeyResult r = LayoutFor(key.samplerLayout, e.layouts); !r)
+        return r;
     if (KeyResult r = RenderPass(key, e.renderPass); !r)
         return r;
 
@@ -284,10 +311,10 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
     VkPipelineInputAssemblyStateCreateInfo assembly{};
     assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     assembly.topology = HostTopology(key.topology);
-    // Metal cannot disable primitive restart on strips (MoltenVK 1.4.2 warns VK_ERROR_FEATURE_NOT_PRESENT: the local capture
-    // draw_branch1 (not distributed)), so strip pipelines always enable it. Exact: restart fires only on index 0xFFFFFFFF, and no host index can
-    // be that value (guest restart is refused, draw_record.cpp; indices are masked to 24 bits; auto-index draws are non-indexed
-    // or use generated small indices). Lists keep it off, as Vulkan requires.
+    // Metal cannot disable primitive restart on strips (MoltenVK 1.4.2 warns VK_ERROR_FEATURE_NOT_PRESENT),
+    // so strip pipelines always enable it. Exact: restart fires only on index 0xFFFFFFFF, which the host emits
+    // only for a guest reset index (draw_record.cpp BuildHostIndices; every other index is masked to 24 bits; auto-index
+    // draws are non-indexed or use generated small indices). Lists keep it off, as Vulkan requires.
     const bool strip = assembly.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || assembly.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
     assembly.primitiveRestartEnable = (key.primitiveRestart || strip) ? VK_TRUE : VK_FALSE;
     VkPipelineViewportStateCreateInfo viewport{};
@@ -357,7 +384,7 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
     info.pDepthStencilState = &depthStencil;
     info.pColorBlendState = &blending;
     info.pDynamicState = &dynamicState;
-    info.layout = layout_;
+    info.layout = e.layouts.pipeline;
     info.renderPass = e.renderPass;
     if (const VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &e.pipeline); r != VK_SUCCESS)
         return Refuse(VkError("vkCreateGraphicsPipelines", r));

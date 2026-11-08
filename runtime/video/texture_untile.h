@@ -34,6 +34,13 @@
 // unaligned pitch as Xenia does; the endian swap is a byte permutation (host-order independent) and
 // 2-byte blocks are supported; the copies take an origin block for packed mips (as DetileBlocksAt)
 // for linear storage too; nothing stops: the caller reports.
+// 3D (M4): TiledOffset3D and TiledAddressUpperBound3D transcribe
+// texture_util.cc:461-487 (GetTiledOffset3D, "reconstructed from disassembly of XGRAPHICS::TileVolume", the same
+// as shaders/texture_address.xesli:32-50 XeTextureTiledOffset3D) and :520-551 token for token; the load shaders
+// pass the z slice stride in block rows aligned to 32 as `height` (texture_load.xesli:37-38, :125-128). Linear 3D
+// storage: block (x, y, z) at x * bpb + (z * zStrideBlockRows + y) * rowPitchBytes (texture_address.xesli:164-166
+// XeTextureGuestLinearOffset). Slices are written one after another into the output, each tightly packed
+// (VkBufferImageCopy with bufferRowLength = bufferImageHeight = 0). New code, no ForzaRecomp source.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +88,48 @@ constexpr size_t LinearExtent(uint32_t widthBlocks, uint32_t heightBlocks, uint3
     return size_t(rowPitchBytes) * (heightBlocks - 1) + (size_t(widthBlocks) << log2Bytes);
 }
 
+// texture_util.cc:461-487 GetTiledOffset3D (x, y, z in blocks; pitch and height in blocks, each aligned to 32 here
+// as at :464-465; 2^log2Bytes bytes per block). Signed arithmetic as Xenia's int32_t.
+constexpr uint32_t TiledOffset3D(uint32_t xu, uint32_t yu, uint32_t zu, uint32_t pitchBlocks, uint32_t heightBlocks, uint32_t log2Bytes)
+{
+    const int32_t x = int32_t(xu), y = int32_t(yu), z = int32_t(zu);
+    const uint32_t pitch = AlignUp(pitchBlocks, kTileWidthHeight), height = AlignUp(heightBlocks, kTileWidthHeight);  // :464-465
+    const int32_t macroOuter = ((y >> 4) + (z >> 2) * int32_t(height >> 4)) * int32_t(pitch >> 5);                  // :466-467
+    const int32_t macro = ((((x >> 5) + macroOuter) << (log2Bytes + 6)) & 0xFFFFFFF) << 1;                         // :468-470
+    const int32_t micro = (((x & 7) + ((y & 6) << 2)) << (log2Bytes + 6)) >> 6;                                    // :471-472
+    const int32_t offsetOuter = ((y >> 3) + (z >> 2)) & 1;                                                         // :473
+    const int32_t offset1 = offsetOuter + ((((x >> 3) + (offsetOuter << 1)) & 3) << 1);                            // :474-475
+    const int32_t offset2 = ((macro + (micro & ~15)) << 1) + (micro & 15) + ((z & 3) << (log2Bytes + 6)) + ((y & 1) << 4);  // :476-477
+    int32_t address = (offset1 & 1) << 3;                                                                          // :478-486
+    address += (offset2 >> 6) & 7;
+    address <<= 3;
+    address += offset1 & ~1;
+    address <<= 2;
+    address += offset2 & ~511;
+    address <<= 3;
+    address += offset2 & 63;
+    return uint32_t(address);
+}
+
+// texture_util.cc:520-551 GetTiledAddressUpperBound3D: bytes from the storage's origin that blocks
+// [0, right) x [0, bottom) x [0, back) can touch (0 for an empty region): the 32x32x4 tile holding the last block,
+// plus ((pitch / 64) * 0x1000 + 0xC00 + (pitch & 32) * 32) for 1-byte blocks (64x32x8 portions), else
+// ((pitch << 6) + 0x800) << log2 (32x32x8 portions).
+constexpr uint32_t TiledAddressUpperBound3D(uint32_t right, uint32_t bottom, uint32_t back, uint32_t pitchBlocks, uint32_t heightBlocks,
+                                            uint32_t log2Bytes)
+{
+    if (right == 0 || bottom == 0 || back == 0)
+        return 0;
+    uint32_t bound = TiledOffset3D((right - 1) & ~(kTileWidthHeight - 1), (bottom - 1) & ~(kTileWidthHeight - 1), (back - 1) & ~3u, pitchBlocks,
+                                   heightBlocks, log2Bytes);
+    const uint32_t pitch = AlignUp(pitchBlocks, kTileWidthHeight);
+    if (log2Bytes == 0)
+        bound += ((pitch >> 6) << 12) + 0xC00 + ((pitch & 32) << 5);  // :535-541 (case 0)
+    else
+        bound += ((pitch << 6) + 0x800) << log2Bytes;                   // :542-549 (default)
+    return bound;
+}
+
 // ---- Endian ---------------------------------------------------------------------------------------
 constexpr uint32_t kEndianNone = 0, kEndian8in16 = 1, kEndian8in32 = 2, kEndian16in32 = 3;
 
@@ -126,5 +175,15 @@ bool DetileBlocksAt(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint3
 // rowPitchBytes * y0 + LinearExtent(x0 + widthBlocks, heightBlocks, rowPitchBytes, log2Bytes).
 bool CopyLinearBlocksAt(const uint8_t* source, size_t sourceBytes, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks,
                         uint32_t heightBlocks, uint32_t rowPitchBytes, uint32_t log2Bytes, uint32_t endian);
+
+// 3D storage -> depth slices of heightBlocks rows of widthBlocks blocks, tightly packed, from block (0, 0, 0).
+// Tiled: TiledOffset3D with `pitchBlocks` and `zStrideBlockRows` (the slice height in blocks, aligned to 32); the
+// source must cover TiledAddressUpperBound3D(widthBlocks, heightBlocks, depth, pitchBlocks, heightBlocks). Linear:
+// rows `rowPitchBytes` apart, slices zStrideBlockRows rows apart. False (nothing usable) for an unsupported endian,
+// a pitch that is not a multiple of 32 (tiled), a region wider than the pitch, or a short source.
+bool DetileBlocks3D(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t widthBlocks, uint32_t heightBlocks, uint32_t depth,
+                    uint32_t pitchBlocks, uint32_t zStrideBlockRows, uint32_t log2Bytes, uint32_t endian);
+bool CopyLinearBlocks3D(const uint8_t* source, size_t sourceBytes, uint8_t* out, uint32_t widthBlocks, uint32_t heightBlocks, uint32_t depth,
+                        uint32_t rowPitchBytes, uint32_t zStrideBlockRows, uint32_t log2Bytes, uint32_t endian);
 
 }  // namespace runtime::video

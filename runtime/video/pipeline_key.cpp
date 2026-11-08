@@ -244,16 +244,13 @@ KeyResult PlanVertexSlots(const DrawStateView& s, const CachedShader& vs, uint32
     return Accept();
 }
 
-KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, DescriptorPlan& out)
+KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, const SamplerLimits& limits, DescriptorPlan& out)
 {
     out = {};
     for (const CachedShader* shader : {&vs, &ps})
         for (size_t i = 0; i < shader->t.textureSlots.size(); i++)
         {
             const uint32_t slot = shader->t.textureSlots[i], d = shader->t.textureDimensions[i];
-            if (!shader->pixel)
-                return Refuse("vertex shader texture slot " + std::to_string(slot) + ": vertex texture fetch is not modelled (the sampler bindings "
-                              "are fragment-stage only, pipeline_key.h kTextureBindings)");
             if (slot >= kTextureBindings || d < 1 || d > 3)
                 return Refuse(std::string(shader->pixel ? "pixel" : "vertex") + " shader texture slot " + std::to_string(slot) + " dimension " +
                               std::to_string(d) + " is out of range");
@@ -263,6 +260,23 @@ KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, Descri
             out.dimension[slot] = uint8_t(d);
             (shader->pixel ? out.psSlots : out.vsSlots) |= 1u << slot;
         }
+    const uint32_t perStage = std::min(limits.perStageSamplers, limits.perStageSampledImages);
+    const uint32_t perSet = std::min(limits.setSamplers, limits.setSampledImages);
+    const struct { const char* name; uint32_t slots, buffers; } stages[2] = {{"vertex", out.vsSlots, kVsBufferBindings}, {"pixel", out.psSlots, kPsBufferBindings}};
+    for (const auto& st : stages)
+    {
+        const uint32_t n = uint32_t(__builtin_popcount(st.slots));
+        if (n > perStage)
+            return Refuse(std::string(st.name) + " shader samples " + std::to_string(n) + " texture slots, over the device's per-stage limit of " +
+                          std::to_string(perStage) + " (maxPerStageDescriptorSamplers / SampledImages)");
+        if (n + st.buffers > limits.perStageResources)
+            return Refuse(std::string(st.name) + " stage needs " + std::to_string(n + st.buffers) + " resources (" + std::to_string(n) + " samplers, " +
+                          std::to_string(st.buffers) + " buffers), over maxPerStageResources " + std::to_string(limits.perStageResources));
+    }
+    if (const uint32_t n = uint32_t(__builtin_popcount(out.vsSlots | out.psSlots)); n > perSet)
+        return Refuse("the pair samples " + std::to_string(n) + " distinct texture slots, over the device's per-set limit of " + std::to_string(perSet) +
+                      " (maxDescriptorSetSamplers / SampledImages)");
+    out.layoutKey = SamplerLayoutKey(out.vsSlots, out.psSlots);
     return Accept();
 }
 

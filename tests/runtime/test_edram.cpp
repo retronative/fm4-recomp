@@ -143,7 +143,9 @@ void TestTileMath()
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why) &&
           SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), why));  // storage 3 (7e3)
     CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16), why));
-    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why));
+    CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why));  // 32_FLOAT (the local capture draw_loop1 (not distributed) draw 22725)
+    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k32_32_Float), why));  // 64 bpp: refused by name
+    CHECK(why.find("64 bpp") != std::string::npos);
     CONTROL(SupportedKey(Key{}, why));
 }
 
@@ -771,7 +773,7 @@ void TestTrace10()
         r.surfaceInfo = 0x14000500, r.modeControl = 4, r.colorMask = 0xF, r.depthControl = 0x8777;
         r.depthInfo = kFm4Depth, r.colorInfo[0] = f << 16;
         Ownership scratch;
-        if (f == 3 || f == 12)
+        if (f == 3 || f == 12 || f == 14)
             CHECK(Bind(scratch, r, 720).ok);
         else
             CONTROL(Bind(scratch, r, 720).ok);
@@ -917,8 +919,8 @@ void TestResolveDecode()
         const ResolveInfo e = DecodeResolve(r);  // a zero-area rectangle: nothing to copy or clear, as X (not a refusal)
         CHECK(e.ok && e.empty);
     }
-    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4;  // depth source
-    CHECK(refused(r, "depth resolve"));
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4;  // depth source: decoded (TestDepthResolve)
+    CHECK(DecodeResolve(r).ok && DecodeResolve(r).isDepth);
     r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 3;  // array
     CHECK(refused(r, "3D"));
     r = Fm4Resolve(), r.copyDestInfo = 4 | 6u << 7;  // endian 8in64
@@ -929,6 +931,21 @@ void TestResolveDecode()
     CHECK(DecodeResolve(r).ok && DecodeResolve(r).destExpBias == 1);
     r = Fm4Resolve(), r.copyDestInfo = 2 | 6u << 7 | 1u << 13;  // signed fraction
     CHECK(refused(r, "number format 1"));
+    {
+        // FM4's k_32_FLOAT luminance resolve (the local capture draw_loop2 (not distributed) draw 31424): surface 00800050 (pitch 80, 1x),
+        // colour 000E0000 (format 14), RB_COPY_CONTROL 00100100, DEST_BASE 08D4F000, DEST_PITCH 00200020 (32x32),
+        // DEST_INFO 0000F202 = endian 2 | format 0x24 (36) << 7 | number 7 << 13; scissor 32x32; rectangle (0,0)-(32,32).
+        ResolveRegisters lum = Fm4Resolve();
+        lum.surfaceInfo = 0x00800050, lum.colorInfo[0] = 0x000E0000, lum.copyControl = 0x00100100, lum.copyDestBase = 0x08D4F000;
+        lum.copyDestPitch = 0x00200020, lum.copyDestInfo = 0x0000F202, lum.windowScissorBr = 0x00200020;
+        const float rect[6] = {0.0f, 0.0f, 32.0f, 0.0f, 32.0f, 32.0f};
+        for (int k = 0; k < 6; k++)
+            lum.vertexWords[k] = GuestFloat(rect[k]);
+        const ResolveInfo li = DecodeResolve(lum);
+        CHECK(li.ok && li.destFormat == 36 && li.x1 == 32 && li.y1 == 32);
+        lum.copyDestInfo = 2 | 6u << 7 | 7u << 13;  // CONTROL: number 7 (float) on a k_8_8_8_8 destination stays refused
+        CHECK(refused(lum, "number format 7"));
+    }
     r = Fm4Resolve(), r.copyDestPitch = 0 | 360u << 16;
     CHECK(refused(r, "pitch is 0"));
     r = Fm4Resolve(), r.colorInfo[0] = 0x00050000;  // 64 bpp source
@@ -952,6 +969,57 @@ void TestResolveDecode()
         r = Fm4Resolve(), r.copyDestInfo = 2 | f << 7;
         CHECK(DecodeResolve(r).ok);
     }
+}
+
+// Depth resolves (X draw_util.cc GetResolveInfo's depth path; no trace holds one yet: the local capture clip240_1 (not distributed) and clip240_2
+// stop at it without a CP trace, window4 stops before it). FM4's 640x360 4x scene with its kD24FS8 depth at 720.
+void TestDepthResolve()
+{
+    auto refused = [](ResolveRegisters rr, const char* text) {
+        const ResolveInfo x = DecodeResolve(rr);
+        return !x.ok && x.refusal.find(text) != std::string::npos;
+    };
+    ResolveRegisters r = Fm4Resolve();
+    r.copyControl = 1u << 20 | 6u << 4 | 4;  // convert, sample select k0123, copy_src_select 4
+    ResolveInfo i = DecodeResolve(r);
+    // SanitizeCopySampleSelect for 4x depth: k01 and k0123 -> k0, k23 -> k2 (single samples pass).
+    CHECK(i.ok && i.isDepth && i.sourceIndex == 4 && i.source == kAd && i.sampleSelect == SampleSelect::k0);
+    // The destination format is the depth buffer's (k_24_8_FLOAT = 23 for kD24FS8, X texture_info.h:170-180), not
+    // RB_COPY_DEST_INFO's 6; no bias, no swap; the endian is RB_COPY_DEST_INFO's (2).
+    CHECK(i.copy && i.destFormat == 23 && i.destExpBias == 0 && !i.destSwap && i.destEndian == 2 && i.destPitch == 640 && i.destHeight == 360);
+    // 32 bpp like the colour case: the same destination base and extent (TestResolveDecode: 983040 bytes).
+    CHECK(i.destBase == 0x00800000u && i.destExtentStart == 0x00800000u && i.destExtentLength == 983040);
+    // The span from the depth base (X :1222-1232: depth_base + edram_base_offset_tiles): 720, 16 tiles a row, 45 rows.
+    CHECK(i.spanBase == 720 && i.spanRowLength == 16 && i.spanRows == 45 && i.spanPitch == 16);
+    r.copyControl = 1u << 20 | 5u << 4 | 4;  // k23 -> k2
+    CHECK(DecodeResolve(r).sampleSelect == SampleSelect::k2);
+    r.copyControl = 1u << 20 | 1u << 4 | 4;  // k1 stays
+    CHECK(DecodeResolve(r).sampleSelect == SampleSelect::k1);
+    // kD24S8 -> k_24_8 (22).
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4, r.depthInfo = 0x2D0;
+    i = DecodeResolve(r);
+    CHECK(i.ok && i.destFormat == 22 && i.source == Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8));
+    // RB_COPY_DEST_INFO's format and number and the copy command do not matter for depth (X ignores them on this path).
+    r = Fm4Resolve(), r.copyControl = 0u << 20 | 4, r.copyDestInfo = 2 | 50u << 7 | 3u << 13;
+    i = DecodeResolve(r);
+    CHECK(i.ok && i.destFormat == 23 && i.command == CopyCommand::Raw);
+    // Still refused: an array destination, a 64/128-bit endian, pitch 0.
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4, r.copyDestInfo = 2 | 6u << 7 | 1u << 3;
+    CHECK(refused(r, "3D"));
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4, r.copyDestInfo = 4 | 6u << 7;
+    CHECK(refused(r, "endian 4"));
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4, r.copyDestPitch = 360u << 16;
+    CHECK(refused(r, "pitch is 0"));
+
+    // The plan: after FM4's scene binding kAd holds tiles 720-1439; the copy reads it with no transfer. With colour and
+    // depth clears requested, only the depth clear happens (X draw_util.h: a depth resolve cannot clear colour).
+    Ownership o;
+    CHECK(Bind(o, Fm4Bind(), 360).ok);
+    r = Fm4Resolve(), r.copyControl = 1u << 20 | 4 | 1u << 8 | 1u << 9, r.depthClear = 0xF0000000u;
+    i = DecodeResolve(r);
+    ResolvePlan p = PrepareResolve(o, i);
+    CHECK(p.ok && p.copy && p.copySource == kAd && p.copyRect == Rect{0, 0, 640, 360} && p.copyTransfers.empty());
+    CHECK(p.hasDepthClear && !p.hasColorClear && p.depthClear.target == kAd && p.depthClear.rect == Rect{0, 0, 640, 360});
 }
 
 void TestResolvePlan()
@@ -1107,6 +1175,8 @@ struct ReplayState
     std::vector<std::string> crossAspectLog;
     uint64_t otherBase = 0, otherBaseTiles = 0;  // same-aspect transfers between keys of different bases
     std::vector<std::string> otherBaseLog;       // the first 20
+    uint64_t pitchOrF32 = 0;                     // transfers between pitches or with a 32_FLOAT key
+    std::vector<std::string> pitchOrF32Log;      // the first 20
     ResolveRegisters pendingRegs;
     // A mode-4/5 draw waiting for its `state` line (window offset, scissor TL, PA_SU_VTX_CNTL, viewport: the extent).
     bool bindPending = false;
@@ -1130,7 +1200,24 @@ struct ReplayState
         uint32_t base, extentStart, extentLength, format, endian;
     };
     std::vector<Dest> dests;  // every distinct resolve destination
+    // Every distinct (source key, destination key) transfer pair, with its count and first draw (binds and resolves), so
+    // that the Vulkan unit's classification can be checked against exactly the traced pairs (test_edram_vk).
+    struct Pair
+    {
+        uint32_t source, dest;
+        uint64_t count;
+        unsigned long long firstDraw;
+    };
+    std::vector<Pair> pairs;
 };
+
+void NotePair(ReplayState& s, Key source, Key dest, unsigned long long draw)
+{
+    for (auto& p : s.pairs)
+        if (p.source == source.packed && p.dest == dest.packed)
+            return void(p.count++);
+    s.pairs.push_back({source.packed, dest.packed, 1, draw});
+}
 
 void ReplayResolve(ReplayState& s, unsigned long long n, ResolveRegisters rr, bool fromTrace)
 {
@@ -1153,11 +1240,11 @@ void ReplayResolve(ReplayState& s, unsigned long long n, ResolveRegisters rr, bo
     if (!p.ok)
         s.refusals++, std::printf("draw %llu: resolve refused: %s\n", n, p.refusal.c_str());
     for (const Transfer& t : p.copyTransfers)
-        s.resolveTransfers++, s.resolveTransferTiles += t.endTiles - t.startTiles;
+        s.resolveTransfers++, s.resolveTransferTiles += t.endTiles - t.startTiles, NotePair(s, t.source, p.copySource, n);
     for (const Transfer& t : p.depthClear.transfers)
-        s.clearTransfers[1]++, s.clearTransferTiles[1] += t.endTiles - t.startTiles;
+        s.clearTransfers[1]++, s.clearTransferTiles[1] += t.endTiles - t.startTiles, NotePair(s, t.source, p.depthClear.target, n);
     for (const Transfer& t : p.colorClear.transfers)
-        s.clearTransfers[0]++, s.clearTransferTiles[0] += t.endTiles - t.startTiles;
+        s.clearTransfers[0]++, s.clearTransferTiles[0] += t.endTiles - t.startTiles, NotePair(s, t.source, p.colorClear.target, n);
     // Record the configuration.
     ReplayState::Config* c = nullptr;
     for (auto& k : s.configs)
@@ -1247,6 +1334,20 @@ void ReplayBind(ReplayState& s, const uint32_t* vertexMaxY = nullptr)
                 if (s.otherBaseLog.size() < 20)
                     s.otherBaseLog.push_back(text);
             }
+            // Different pitches (X's separate source pitch, vulkan_render_target_cache.cc:2956-2965) or a 32_FLOAT key
+            // (storage 14), listed whatever the aspect.
+            if (t.source.PitchTilesAt32bpp() != dest.PitchTilesAt32bpp() || (!t.source.IsDepth() && t.source.Format() == 14) ||
+                (!dest.IsDepth() && dest.Format() == 14))
+            {
+                char text[200];
+                std::snprintf(text, sizeof text, "draw %llu (height %u): tiles %u-%u from key %06X (pitch %u, format %u) to key %06X (pitch %u, format %u)",
+                              s.bindDraw, height, t.startTiles, t.endTiles - 1, t.source.packed, t.source.PitchTilesAt32bpp(), t.source.Format(), dest.packed,
+                              dest.PitchTilesAt32bpp(), dest.Format());
+                s.pitchOrF32++;
+                if (s.pitchOrF32Log.size() < 20)
+                    s.pitchOrF32Log.push_back(text);
+            }
+            NotePair(s, t.source, dest, s.bindDraw);
         }
 }
 
@@ -1443,6 +1544,13 @@ int Replay(const char* path, const uint32_t* vertexMaxY)
                 (unsigned long long)s.otherBaseTiles, s.otherBaseLog.size());
     for (const std::string& l : s.otherBaseLog)
         std::printf("  other-base %s\n", l.c_str());
+    std::printf("pitch/32_FLOAT: %llu transfer(s) between pitches or with a 32_FLOAT key (first %zu listed)\n", (unsigned long long)s.pitchOrF32,
+                s.pitchOrF32Log.size());
+    std::printf("pairs: %zu distinct transfer pair(s) (source key -> destination key: count, first draw)\n", s.pairs.size());
+    for (const auto& p : s.pairs)
+        std::printf("  pair %06X -> %06X: %llu, first draw %llu\n", p.source, p.dest, (unsigned long long)p.count, p.firstDraw);
+    for (const std::string& l : s.pitchOrF32Log)
+        std::printf("  pitch/f32 %s\n", l.c_str());
     return (s.refusals || s.texMismatches) ? 1 : 0;
 }
 
@@ -1469,6 +1577,7 @@ int main(int argc, char** argv)
     TestFixedPoint();
     TestResolveDecode();
     TestResolvePlan();
+    TestDepthResolve();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

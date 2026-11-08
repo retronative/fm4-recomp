@@ -16,6 +16,10 @@ namespace runtime::gpu {
 // ShaderHash: kernel/shader_hash.h (shared with runtime/video/shader_cache.h).
 bool TraceEnabled();
 void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t vizQueryToken);
+// After TraceDraw, from the renderer (which knows the bound shaders): a `tex <slot> <6 dwords>` line for each slot in
+// `slotMask` (bit s = texture fetch constant s, registers 4800 + 6 * s) that TraceDraw did not already log (it logs
+// slots 0-2 of DRAW_INDX, opcode 22). Same line format, so a reader takes every `tex` line after a `draw` line.
+void TraceTextures(const uint8_t* base, uint32_t opcode, uint32_t slotMask);
 // FM4_SHADER_DUMP=<dir> also writes each distinct shader once (<vs|ps>_<hash>.bin, big-endian words; capped at 4096).
 void TraceShader(uint32_t type, const uint32_t* code, uint32_t words, uint64_t hash, bool immediate);
 

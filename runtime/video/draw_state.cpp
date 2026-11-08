@@ -147,11 +147,14 @@ struct Decoder
         default:
             return Refuse("primitive type " + Num(d.primitiveType) + " (" + PrimitiveTypeName(d.primitiveType) + ") is not modelled");
         }
-        // Primitive restart applies to strips, fans, loops and polygons only (X primitive_processor.cc:619-628).
+        // Primitive restart (IndexBuffer::restart, draw_state.h): only a DMA-indexed strip restarts; Xenia ignores
+        // multi_prim_ib_ena for lists (X primitive_processor.cc:640-646) and for auto-indexed draws (:516-573), as here.
         const uint32_t sc = Reg(xr::kPaSuScModeCntl);
-        if (((sc >> 21) & 1) && d.primitiveType == 6 && !noWrite)
-            return Refuse("PA_SU_SC_MODE_CNTL " + Hex(sc) + " multi_prim_ib_ena with a triangle strip (reset index " +
-                          Hex(Reg(xr::kVgtMultiPrimIbResetIndx) & 0xFFFFFF) + "): primitive restart is not modelled");
+        if (((sc >> 21) & 1) && d.primitiveType == 6 && d.indices.indexed)
+        {
+            d.indices.resetIndex = Reg(xr::kVgtMultiPrimIbResetIndx) & 0xFFFFFF;  // reset_indx: 24 bits (X registers.h:320)
+            d.indices.restart = d.indices.is32Bit || d.indices.resetIndex <= 0xFFFF;  // (:635-638)
+        }
         return true;
     }
 
@@ -335,8 +338,10 @@ struct Decoder
         t.colorFormat = t.colorFormatRaw == 10 ? 2 : t.colorFormatRaw == 12 ? 3 : t.colorFormatRaw;
         if (t.colorWritten)
         {
-            if (t.colorFormat > 3)  // 0 8_8_8_8, 1 8_8_8_8_GAMMA, 2 2_10_10_10, 3 2_10_10_10_FLOAT (X xenos.h:299-318); the rest are not modelled
-                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 10, 12 are)");
+            // 0 8_8_8_8, 1 8_8_8_8_GAMMA, 2 2_10_10_10, 3 2_10_10_10_FLOAT, 14 32_FLOAT (X xenos.h:299-318; 14 is 32 bpp, xenos.h:323-327,
+            // so the tile arithmetic below holds; FM4's HDR luminance reduction, the local capture draw_loop1 (not distributed) draw 22725); the rest are not modelled
+            if (t.colorFormat > 3 && t.colorFormat != 14)
+                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 10, 12, 14 are)");
             if (t.colorExpBias != 0)
                 return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour exponent bias " + Num(uint64_t(int64_t(t.colorExpBias))) + " is not modelled");
             if (t.depthWritten && t.colorBase == t.depthBase)
@@ -515,8 +520,7 @@ struct Decoder
                               Num(t.dimension) + " (0 1D, 1 2D or stacked, 2 3D, 3 cube)");
             if (t.stacked)
                 return Refuse(where + "a stacked (2D array) texture is not modelled");
-            if (t.dimension == 2 && t.tiled)
-                return Refuse(where + "a tiled 3D texture is not modelled");
+            // A tiled 3D texture: the texture unit untiles it (texture_untile.h TiledOffset3D, Xenia texture_util.cc:461-487).
             if (t.dimension == 3 && t.width != t.height)
                 return Refuse(where + "a cube map with faces " + Num(t.width) + "x" + Num(t.height) + " is not square");
             if (t.dimension != 2 && t.pitchTexels < t.width)
@@ -540,9 +544,8 @@ struct Decoder
                               Num(t.magFilter) + "/" + Num(t.minFilter));
             if (t.mipMinLevel > t.mipMaxLevel)
                 return Refuse(where + "mip_min_level " + Num(t.mipMinLevel) + " above mip_max_level " + Num(t.mipMaxLevel));
-            if (t.mipMaxLevel > t.mipMinLevel && t.mipFilter != 2)  // more than one level is sampled unless the mip filter is base map (X xenos.h:136)
-                return Refuse(where + "mip levels " + Num(t.mipMinLevel) + "-" + Num(t.mipMaxLevel) + " with mip filter " + Num(t.mipFilter) +
-                              ": mipmapping is not modelled (only the base level, mip filter 2)");
+            // Mipmapping (mip filter 0 point / 1 linear with levels mip_min-mip_max, X xenos.h:131-138): the texture unit uploads
+            // every level (texture_upload.cpp) and the sampler takes the mip mode (texture_info.cpp DescribeBinding).
             for (uint32_t i = 0; i < 4; i++)  // X xenos.h XE_GPU_TEXTURE_SWIZZLE: 0-3 components, 4 zero, 5 one
                 if (((t.swizzle >> (3 * i)) & 7) > 5)
                     return Refuse(where + "swizzle component " + Num((t.swizzle >> (3 * i)) & 7) + " is not modelled (X Y Z W 0 1 are)");

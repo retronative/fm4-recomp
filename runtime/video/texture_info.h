@@ -41,7 +41,7 @@ namespace runtime::video {
 // ---- Vulkan numeric values this header mirrors (vulkan_core.h; the renderer static_asserts them) --
 namespace vk {
 constexpr uint32_t kFormatUndefined = 0, kFormatR8Unorm = 9, kFormatR8G8B8A8Unorm = 37, kFormatA2B10G10R10UnormPack32 = 64,
-                   kFormatBc1RgbaUnormBlock = 133;
+                   kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipmapModeNearest = 0, kMipmapModeLinear = 1;
 constexpr uint32_t kAddressRepeat = 0, kAddressMirroredRepeat = 1, kAddressClampToEdge = 2, kAddressClampToBorder = 3;
@@ -155,6 +155,9 @@ struct HostFormat
     uint32_t vkFormat = vk::kFormatUndefined;
     uint32_t formatSwizzle = 0;   // e.g. RRRR for k_8 (R8_UNORM), RGBA for k_8_8_8_8
     bool blockCompressed = false; // BC1: 4x4 texel blocks of 8 bytes; needs textureCompressionBC
+    // Float data: the fetch's sign field changes nothing (Xenia maps both signednesses to one format, unsigned_signed_compatible:
+    // vulkan_texture_cache.cc:275-279 k_32_FLOAT), so signed components are not refused; nor is the number-format bit.
+    bool signIgnored = false;
 };
 bool HostFormatFor(uint32_t format, HostFormat& out);
 
@@ -171,6 +174,8 @@ struct MipLevel
     uint32_t x = 0, y = 0;        // the level's first block inside its storage (0, 0 unless packed)
     uint32_t widthBlocks = 0, heightBlocks = 0;  // the level's own size in blocks
     uint32_t widthTexels = 0, heightTexels = 0;  // the level's own size in texels (the host image level)
+    uint32_t depth = 1;                // 3D: slices (the level's z extent); 1 otherwise
+    uint32_t zStrideBlockRows = 0;     // 3D: the slice stride in block rows, aligned to 32 (texture_util.cc:328-333)
     size_t extentBytes = 0;       // bytes from `address` the copy reads
     bool packed = false;
 };
@@ -195,6 +200,8 @@ struct TextureDescription
     HostFormat host{};
     uint32_t log2BytesPerBlock = 0;
     uint32_t width = 0, height = 0;       // level 0, texels
+    uint32_t depth = 1;                   // 3D: slices; 1 for 2D
+    uint32_t dimension = 1;               // the fetch constant's (1 2D, 2 3D; others are refused)
     uint32_t levelCount = 0;              // host image levels, from level 0 (never a first level above 0)
     uint32_t packedLevel = UINT32_MAX;
     std::vector<MipLevel> levels;         // levelCount entries, level 0 first
@@ -202,8 +209,8 @@ struct TextureDescription
 };
 
 // Decodes and validates the storage of `fetch` (the six host-order dwords). Refuses (ok false,
-// error) anything outside the modelled subset: type not texture, a dimension other than 2D
-// (stacked, 3D and cube: not yet), a format without a host mapping, an endian the block size has no
+// error) anything outside the modelled subset: type not texture, a dimension other than 2D or 3D
+// (1D, cube and stacked 2D arrays: not yet), a 3D texture with mips or a packed base, a format without a host mapping, an endian the block size has no
 // rule for, a base address of 0 or outside the 512 MB physical memory, a first level above 0, a
 // level wider than its pitch, a level that overflows the physical memory, a packed-mip offset
 // inside a block.
@@ -244,7 +251,8 @@ struct TextureBinding
 };
 
 // The per-draw binding of `fetch` for a draw whose shader fetches it as `shader` says, given the
-// host format its (already accepted) storage uses. Refuses: a shader dimension other than 2D,
+// host format its (already accepted) storage uses. Refuses: a shader dimension that is not the constant's (2D
+// fetch of a 2D constant, 3D fetch of a 3D constant),
 // integer number format, signed or biased components, mixed gamma, gamma on w, swizzle values 6-7,
 // clamp modes Xenia only approximates, YCbCr border colours, an unresolved or invalid filter.
 TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, const ShaderFetch& shader);

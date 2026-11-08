@@ -1826,7 +1826,11 @@ int main(int, char** argv)
                    "saved content: empty at first (NO_MORE_FILES); a stored record is enumerated once; device 2 E_INVALIDARG; type 2 stops (7)");
         }
         symlink((disc + "/Media").c_str(), (disc + "/Link").c_str());
-        Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup), "a symlink on the disc stops (9)");
+        // The stop must be the symlink check's own: a link missing from the disc map also stops (9), with another message
+        // (mutant FS8 survived on the exit code alone).
+        Expect(ExitCodeOf([&] { (void)query("game:\\Link"); }) == int(StopCode::Setup) &&
+                   StderrOf([&] { (void)query("game:\\Link"); }).find("on the disc is a symlink or unreadable") != std::string::npos,
+               "a symlink on the disc stops (9), named as a symlink");
         unlink((disc + "/Link").c_str());
     }
     PPCContext gm{};

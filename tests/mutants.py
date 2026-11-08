@@ -414,10 +414,6 @@ MUTANTS = [
     dict(id='SWT2', milestone="M1", file=SWITCH_TABLES, test='switch_tables', fault='unproven inline table made a data range',
          old='switches.append((bctr, index, [], table, 0))',
          new='switches.append((bctr, index, [], table, 12))', expect='unproven inline table: table named, table_size 0'),
-    dict(id='SWT3', milestone="M1", file=SWITCH_TABLES, test='switch_tables', fault='function-level bound not compared with the inline table',
-         old='if not scanned or lowest != scanned or bound + 1 != scanned:',
-         new='if not scanned or lowest != scanned:', expect='the bound (4 cases) exceeds the inline table',
-         equivalent="the only caller (switch_tables main loop) keeps a function-level bound only if inline_table_extent's result equals region = bound + 1; without the bound comparison the function returns scanned != bound + 1 and the caller refuses with the same reason ('the inline table does not have N entries'), so no input differs"),
     dict(id='SWT4', milestone="M1", file=SWITCH_TABLES, test='switch_tables', fault='pointer-reached code in the region ignored',
          old="        if x in entries:\n            return 0, f'{x:08X} may be entered",
          new="        if False:\n            return 0, f'{x:08X} may be entered", expect='a code address of the region stored in data'),
@@ -686,8 +682,8 @@ MUTANTS = [
          old='name, address,\n         index, lr);',
          new='name, address,\n         index & 0, lr);', expect='the residual stop names the dispatch'),
     dict(id='RT4', milestone="M2", file=STOPS_CPP, test='runtime', fault='indirect calls not checked against the code range',
-         old='PPCFunc* function = runtime::IsCodeAddress(target, PPC_CODE_BASE, PPC_CODE_SIZE) ? PPC_LOOKUP_FUNC(base, target) : nullptr;',
-         new='PPCFunc* function = PPC_LOOKUP_FUNC(base, target);', expect='indirect call outside the code stops'),
+         old='PPCFunc* function = runtime::IsCodeAddress(target, PPC_CODE_BASE, PPC_CODE_SIZE) ? PPC_LOOKUP_FUNC(base, target)\n',
+         new='PPCFunc* function = true ? PPC_LOOKUP_FUNC(base, target)\n', expect='indirect call outside the code stops'),
     dict(id='RT5', milestone="M2", file=STOPS_CPP, test='runtime', fault='a missing indirect target is called',
          old='    if (function == nullptr)\n        Stop(StopCode::IndirectCall,',
          new='    if (false)\n        Stop(StopCode::IndirectCall,', expect='indirect call to a code word with no function stops'),
@@ -1064,8 +1060,8 @@ MUTANTS = [
          old="            if (i > 0 && parts[i - 1].back() != ':')  // never above a device",
          new='            if (i > 0)  // never above a device', expect='canonical guest paths'),
     dict(id='FS5', milestone="M3", file=K_FS, test='runtime', fault='another device reported as a missing file',
-         old='    if (device.compare(0, kCdrom.size(), kCdrom) != 0)\n        return Resolved::OtherDevice;',
-         new='    if (device.compare(0, kCdrom.size(), kCdrom) != 0)\n        return Resolved::NotFound;', expect='another device or a root handle stops'),
+         old='    if (colon == std::string::npos)\n        return Resolved::OtherDevice;',
+         new='    if (colon == std::string::npos)\n        return Resolved::NotFound;', expect='another device or a root handle stops'),
     dict(id='FS6', milestone="M3", file=K_IMPIO, test='runtime', fault='a root directory handle accepted',
          old='    if (root != 0 && root != 0xFFFFFFFD)',
          new='    if (root != 0 && root != 0xFFFFFFFD && root > 0x10000)', expect='another device or a root handle stops'),
@@ -1108,10 +1104,6 @@ MUTANTS = [
     dict(id='FS19', milestone="M3", file=K_IMPIO, test='runtime', fault='the io status reports the buffer length',
          old='        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, needed);',
          new='        runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, length);', expect='network open (34) of Cars.bin'),
-    dict(id='FS20', milestone="M3", file=K_IMPIO, test='runtime', fault='a non-file handle accepted',
-         old='        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH\n    const auto object = runtime::LookupHandle(handle);\n    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;',
-         new='        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH\n    const auto object = runtime::LookupHandle(handle);\n    runtime::OpenFile* file = object ? runtime::FindOpenFile(object->header) : runtime::FindOpenFile(0);', expect='55 bytes INFO_LENGTH_MISMATCH',
-         equivalent='object bodies are distinct kernel arena blocks and only File bodies are in the open-file map, so FindOpenFile of any other object (or 0) is null: the type check is defence only'),
     dict(id='FS21', milestone="M3", file=K_IMPIO, test='runtime', fault='the position advanced from the old position (Xenia rule)',
          old='        file->position = offset + bytes;',
          new='        file->position += bytes;', expect='10 bytes at 30'),
@@ -1406,10 +1398,6 @@ MUTANTS = [
          new='            }\n            if (switchTable->second.labels.empty())', expect='test_residual_stop'),
 
     # ---- M1: patches/xenonrecomp/0034, negative-input check ----
-    dict(id='P34e', milestone="M1", file=RECOMP, test='translator', fault='negative-input check removed',
-         old='println("\\t{}.f64 = {}.f64 < 0.0 ? __builtin_nan(\\"\\") : 1.0 / sqrt({}.f64);",',
-         new='println("\\t{}.f64 = false ? 0.0 : 1.0 / sqrt({}.f64);",', expect='frsqrte_policy',
-         equivalent="on the AArch64 host sqrt of a negative non-NaN (including -inf) is an IEEE 754 invalid operation that returns the default NaN 0x7FF8000000000000 (Arm ARM, FPDefaultNaN), the same bits as __builtin_nan(\"\"); NaN inputs fail the < 0.0 test in both versions and -0.0 < 0.0 is false, so no input differs. The explicit check keeps the policy independent of the host's default-NaN sign (x86 returns 0xFFF8000000000000)"),
 
     # ---- M1: patches/xenonrecomp/0034 (ours: frsqrte as a double-precision reciprocal square root, accepted policy) ----
     dict(id='P34a', milestone="M1", file=RECOMP, test='translator', fault='rounded through float',
@@ -1635,10 +1623,6 @@ MUTANTS = [
     dict(id='O2', milestone="M1", file=RECOMP, test='translator', fault='any instruction before padding accepted (fail-open)',
          old='else if (endsInCall && nextWord != nullptr && *nextWord == 0)',
          new='else if (nextWord != nullptr && *nextWord == 0)', expect='falls_into_padding'),
-    dict(id='O3', milestone="M1", file=RECOMP, test='translator', fault='padding case: NOTE without the stop',
-         old='                println("\\t__builtin_trap();");\n                fmt::println("NOTE: function {:X} ends in a call followed by padding',
-         new='                fmt::println("NOTE: function {:X} ends in a call followed by padding', expect='call_then_padding',
-         equivalent="the padding word inside the function's extent is translated first and traps (patch 0004's zero-word rule), so 0019's trap after it is unreachable; a .pdata extent ending at the call makes the sweep turn the padding into its own function instead (0003's fall-through call)"),
 
     # ---- M1: patches/xenonrecomp/0018, loader: export table address ----
     dict(id='J6', milestone="M1", file=XEX_CPP, test='analysis', fault='export table ignored (upstream)',
@@ -1978,4 +1962,30 @@ MUTANTS = [
          old="result = std::make_unique<uint8_t[]>(security->imageSize.get());",
          new="result = std::unique_ptr<uint8_t[]>(new uint8_t[security->imageSize.get()]);",
          expect="xex_basic_allocation_test"),  # re-expressed: make_unique_for_overwrite needs C++20; the CMake build is not
+]
+
+# Retired from the active registry (mutation-suite audit): proven EQUIVALENT, so no test can kill them and each cost a run in every gate.
+# Kept verbatim with their rationale and last result as history; the gate never runs this list (tests/mutate.py reads
+# MUTANTS only). Restore one by moving it back if the code it targets changes so that it may stop being equivalent.
+RETIRED_MUTANTS = [
+    # retired 2026-11-08: EQUIVALENT (last result run 2026-11-05T23:02:15+07:00; research/mutation/ledger.json)
+    dict(id='SWT3', milestone="M1", file=SWITCH_TABLES, test='switch_tables', fault='function-level bound not compared with the inline table',
+         old='if not scanned or lowest != scanned or bound + 1 != scanned:',
+         new='if not scanned or lowest != scanned:', expect='the bound (4 cases) exceeds the inline table',
+         equivalent="the only caller (switch_tables main loop) keeps a function-level bound only if inline_table_extent's result equals region = bound + 1; without the bound comparison the function returns scanned != bound + 1 and the caller refuses with the same reason ('the inline table does not have N entries'), so no input differs"),
+    # retired 2026-11-08: EQUIVALENT (last result run 2026-11-08T11:59:39+07:00; research/mutation/ledger.json)
+    dict(id='FS20', milestone="M3", file=K_IMPIO, test='runtime', fault='a non-file handle accepted',
+         old='    if (length < needed)\n        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH\n    const auto object = runtime::LookupHandle(handle);\n    runtime::OpenFile* file = object && object->type == runtime::ObjectType::File ? runtime::FindOpenFile(object->header) : nullptr;',
+         new='    if (length < needed)\n        return (void)(ctx.r3.u64 = 0xC0000004);  // STATUS_INFO_LENGTH_MISMATCH\n    const auto object = runtime::LookupHandle(handle);\n    runtime::OpenFile* file = object ? runtime::FindOpenFile(object->header) : runtime::FindOpenFile(0);', expect='55 bytes INFO_LENGTH_MISMATCH',
+         equivalent='object bodies are distinct kernel arena blocks and only File bodies are in the open-file map, so FindOpenFile of any other object (or 0) is null: the type check is defence only'),
+    # retired 2026-11-08: EQUIVALENT (last result run 2026-11-05T23:47:29+07:00; research/mutation/ledger.json)
+    dict(id='P34e', milestone="M1", file=RECOMP, test='translator', fault='negative-input check removed',
+         old='println("\\t{}.f64 = {}.f64 < 0.0 ? __builtin_nan(\\"\\") : 1.0 / sqrt({}.f64);",',
+         new='println("\\t{}.f64 = false ? 0.0 : 1.0 / sqrt({}.f64);",', expect='frsqrte_policy',
+         equivalent="on the AArch64 host sqrt of a negative non-NaN (including -inf) is an IEEE 754 invalid operation that returns the default NaN 0x7FF8000000000000 (Arm ARM, FPDefaultNaN), the same bits as __builtin_nan(\"\"); NaN inputs fail the < 0.0 test in both versions and -0.0 < 0.0 is false, so no input differs. The explicit check keeps the policy independent of the host's default-NaN sign (x86 returns 0xFFF8000000000000)"),
+    # retired 2026-11-08: EQUIVALENT (last result run 2026-11-05T23:47:29+07:00; research/mutation/ledger.json)
+    dict(id='O3', milestone="M1", file=RECOMP, test='translator', fault='padding case: NOTE without the stop',
+         old='                println("\\t__builtin_trap();");\n                fmt::println("NOTE: function {:X} ends in a call followed by padding',
+         new='                fmt::println("NOTE: function {:X} ends in a call followed by padding', expect='call_then_padding',
+         equivalent="the padding word inside the function's extent is translated first and traps (patch 0004's zero-word rule), so 0019's trap after it is unreachable; a .pdata extent ending at the call makes the sweep turn the padding into its own function instead (0003's fall-through call)"),
 ]

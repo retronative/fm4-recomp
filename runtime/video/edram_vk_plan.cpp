@@ -26,6 +26,7 @@ VkFormat HostColorFormat(ColorFormat storage)
     case ColorFormat::k8_8_8_8: return VK_FORMAT_R8G8B8A8_UNORM;
     case ColorFormat::k2_10_10_10: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case ColorFormat::k2_10_10_10_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;  // X vulkan_render_target_cache.cc:1601-1603
+    case ColorFormat::k32_Float: return VK_FORMAT_R32_SFLOAT;  // X :1618-1619 (transfers and clears via R32_UINT, :1643-1644)
     default: return VK_FORMAT_UNDEFINED;  // edram::SupportedKey refuses the rest in M4
     }
 }
@@ -82,20 +83,27 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     };
     if (source.IsDepth() && !dest.IsDepth())  // X kDepthToColor (:4910-4913); edram_vk_plan.h for the accepted shape
     {
-        if (source.PitchTilesAt32bpp() != dest.PitchTilesAt32bpp())
-            return refuse("depth -> colour between keys of different pitches (never observed)");
-        if (source.MsaaMode() != Msaa::X1 || (dest.MsaaMode() != Msaa::X1 && dest.MsaaMode() != Msaa::X4))
-            return refuse("depth -> colour from a 4x (or 2x) depth source or into a 2x target (needs multisampled depth and stencil sampling; never observed)");
-        if (source.Format() != uint32_t(edram::DepthFormat::D24FS8))
-            return refuse("depth -> colour from kD24S8 (X's RoundEven unorm24 packing; never observed)");
+        // Any pitches: X splits the destination tile index by the destination's pitch (:2516-2577) and the source tile index
+        // by the source's (:2956-2987), one path for every transfer mode (observed:
+        // the 4x kD24FS8 key 7082D0, 16 tiles a row, into the 4x 2_10_10_10 key 910000, 32 tiles a row).
+        // Any MSAA pair of MapTransferTexel (X :2779-2864, the same rules for every 32bpp mode); a multisampled source is
+        // read per sample (X :2307-2358 the MS depth and stencil textures, :3052-3080 their per-sample fetches).
+        const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
+        if (uint32_t(sm) > 2 || uint32_t(dm) > 2)
+            return refuse("msaa_samples 3 is undefined");
+        if (sm != dm && (sm == Msaa::X2 || dm == Msaa::X2) && (sm == Msaa::X1 || dm == Msaa::X1))
+            return refuse("depth -> colour between 1x and 2x (never observed; MapTransferTexel has no 1x <-> 2x rule)");
+        // Both depth formats: kD24FS8 through Depth32To20e4, kD24S8 through Depth32ToUnorm24 (X :3591-3609).
         if (!colorStorage(dest))
             return refuse("depth -> colour into a storage format other than 0, 2 and 3");
         return TransferKind::DepthToColor;
     }
     // Different bases go through the tile offset of MapEdramTexel (X uses one tile-offset path for every transfer mode,
-    // vulkan_render_target_cache.cc:2938-2954); different pitches would need X's separate source pitch (not modelled).
-    if (source.PitchTilesAt32bpp() != dest.PitchTilesAt32bpp())
-        return refuse("between keys of different pitches (never observed; the texel mapping assumes equal pitches)");
+    // vulkan_render_target_cache.cc:2938-2954), different pitches through X's separate source pitch (:2956-2987): accepted
+    // between colour keys (observed: the 1280-wide 7e3 key, 16 tiles a row, into the
+    // 80-wide 32_FLOAT key, 1 tile a row), depth -> colour (above) and into a depth key (observed:
+    // the 4x kD24FS8 keys 7082D0 and 688400 (2x), 16 tiles a row, into the 4x kD24FS8 key 710400, 32 a row).
+    // The depth, stencil-bit and colour -> depth shaders read their source through the same XeSourceTexel.
     if (uint32_t(source.MsaaMode()) > 2 || uint32_t(dest.MsaaMode()) > 2)
         return refuse("msaa_samples 3 is undefined");
     // The MSAA pairs MapTransferTexel implements (X :2779-2864): equal, 1x <-> 4x, 4x <-> 2x (native 2x attachments: the
@@ -109,8 +117,8 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     {
         if (!colorStorage(source))
             return refuse("colour -> depth from a storage format other than 0, 2 and 3");
-        if (dest.Format() != uint32_t(edram::DepthFormat::D24FS8))
-            return refuse("colour -> depth into kD24S8 (X's unorm24 path; never observed)");
+        // Both depth formats (X :4101-4125: kD24S8 through the unorm24 conversion, kD24FS8 through Depth20e4To32;
+        // FM4 has a kD24S8 case).
         return TransferKind::ColorToDepth;
     }
     if (dest.IsDepth())
@@ -124,10 +132,10 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     const auto storage = [](Key k)
     {
         return k.Format() == uint32_t(ColorFormat::k8_8_8_8) || k.Format() == uint32_t(ColorFormat::k2_10_10_10) ||
-               k.Format() == uint32_t(ColorFormat::k2_10_10_10_Float);
+               k.Format() == uint32_t(ColorFormat::k2_10_10_10_Float) || k.Format() == uint32_t(ColorFormat::k32_Float);
     };
     if (!storage(source) || !storage(dest))
-        return refuse("a colour storage format other than 0 (8_8_8_8), 2 (2_10_10_10) and 3 (2_10_10_10_FLOAT, 7e3)");
+        return refuse("a colour storage format other than 0 (8_8_8_8), 2 (2_10_10_10), 3 (2_10_10_10_FLOAT, 7e3) and 14 (32_FLOAT)");
     // An unchanged sample count with equal bases, pitches and formats is the same key (refused above): here the formats
     // differ, and the pixel goes through the 32-bit packing (X :3387-3700) at the same pixel and sample (MapTransferTexel).
     return TransferKind::Color;
@@ -166,7 +174,8 @@ SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, K
         p.x = p.x < half ? p.x + half : p.x - half;                                                          // X :2921-2935
     }
     const uint32_t sourceTile = (destTile + dest.Base() - source.Base()) & (edram::kTileCount - 1);       // X :2938-2954
-    p.x += (sourceTile % pitch) * stw, p.y += (sourceTile / pitch) * sth;
+    const uint32_t sourcePitch = source.PitchTilesAt32bpp();  // X :2956-2965: the source's own pitch splits its tile index
+    p.x += (sourceTile % sourcePitch) * stw, p.y += (sourceTile / sourcePitch) * sth;
     return p;
 }
 
@@ -179,9 +188,22 @@ uint32_t Depth32To20e4(float depth)
     return (biased >> 3) & 0xFFFFFFu;  // X rb.cc:323-325, truncating (depth_float24_round false)
 }
 
-float ColorWordDepth(uint32_t word) { return Float20e4To32(word >> 8); }
+float ColorWordDepth(uint32_t word, edram::DepthFormat format)
+{
+    return format == edram::DepthFormat::D24S8 ? UNorm24To32(word >> 8) : Float20e4To32(word >> 8);  // X :4101-4125
+}
 
-uint32_t PackDepthStencilWord(float depth, uint32_t stencil) { return (stencil & 0xFF) | Depth32To20e4(depth) << 8; }  // X :3614-3617
+uint32_t Depth32ToUnorm24(float depth)
+{
+    const float d = depth > 0.0f ? std::min(depth, 1.0f) : 0.0f;          // edram_vk_plan.h (NaN -> 0)
+    const float product = d * float(0xFFFFFF);                             // X :3600-3602, one float32 multiply
+    return uint32_t(std::nearbyint(product));                              // X :3599 RoundEven (default rounding: to nearest even)
+}
+
+uint32_t PackDepthStencilWord(float depth, uint32_t stencil, edram::DepthFormat format)  // X :3591-3617
+{
+    return (stencil & 0xFF) | (format == edram::DepthFormat::D24S8 ? Depth32ToUnorm24(depth) : Depth32To20e4(depth)) << 8;
+}
 
 uint32_t Float32To7e3(float f)
 {
@@ -218,6 +240,12 @@ float Float7e3To32(uint32_t f10)
 uint32_t PackTransferColor(const float rgba[4], uint32_t storage)
 {
     const auto unorm = [](float v, float scale) { return uint32_t(v * scale + 0.5f); };  // X OpConvertFToU(v * scale + 0.5)
+    if (storage == uint32_t(ColorFormat::k32_Float))  // X :3580-3585: the float's bits (the shader reads an R32_UINT view)
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &rgba[0], 4);
+        return bits;
+    }
     if (storage == uint32_t(ColorFormat::k8_8_8_8))
         return (unorm(rgba[0], 255.0f) & 0xFF) | (unorm(rgba[1], 255.0f) & 0xFF) << 8 | (unorm(rgba[2], 255.0f) & 0xFF) << 16 |
                (unorm(rgba[3], 255.0f) & 0xFF) << 24;
@@ -230,6 +258,12 @@ uint32_t PackTransferColor(const float rgba[4], uint32_t storage)
 
 void UnpackTransferColor(uint32_t word, uint32_t storage, float rgba[4])
 {
+    if (storage == uint32_t(ColorFormat::k32_Float))  // X :3713-3726: the word is the float32 (written through an R32_UINT view)
+    {
+        std::memcpy(&rgba[0], &word, 4);
+        rgba[1] = rgba[2] = rgba[3] = 0.0f;
+        return;
+    }
     if (storage == uint32_t(ColorFormat::k8_8_8_8))
     {
         for (uint32_t i = 0; i < 4; i++)
@@ -264,6 +298,14 @@ bool DecodeColorClear(uint32_t value, uint32_t storage, float rgba[4])
         return true;
     }
     return false;
+}
+
+bool DecodeColorClearUint(uint32_t value, uint32_t storage, uint32_t rgba[4])
+{
+    if (storage != uint32_t(ColorFormat::k32_Float))
+        return false;
+    rgba[0] = value, rgba[1] = rgba[2] = rgba[3] = 0;  // X vulkan_render_target_cache.cc:5417-5421: uint32[0] = the clear word
+    return true;
 }
 
 float UNorm24To32(uint32_t n24)
@@ -341,7 +383,8 @@ bool ResolveConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, 
     if (info.msaa != Msaa::X1 || info.sampleSelect != edram::SampleSelect::k0)
         return Refuse(why, shape + "a resolve from a " + MsaaName(info.msaa) + " source is not implemented in M4 (only 1x sources are observed)");
     const bool equivalent = (sourceStorage == uint32_t(ColorFormat::k8_8_8_8) && (info.destFormat == 6 || info.destFormat == 50)) ||
-                            (sourceStorage == uint32_t(ColorFormat::k2_10_10_10) && (info.destFormat == 7 || info.destFormat == 54));
+                            (sourceStorage == uint32_t(ColorFormat::k2_10_10_10) && (info.destFormat == 7 || info.destFormat == 54)) ||
+                            (sourceStorage == uint32_t(ColorFormat::k32_Float) && info.destFormat == 36);  // xenos.h:634-635
     if (!equivalent)  // X takes its full (converting) resolve shader here (draw_util.cc:1312-1337); never observed
         return Refuse(why, shape + "a resolve from storage format " + std::to_string(sourceStorage) + " into texture format " +
                                std::to_string(info.destFormat) + " is a converting resolve (not bitwise equivalent, X xenos.h:616-641): not implemented in M4");
@@ -368,7 +411,8 @@ bool ResolveToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, cons
         for (uint32_t x = 0; x < width; x++)
         {
             uint32_t w = texels[size_t(y) * width + x];
-            if (info.destSwap)  // X resolve.xesli:769-777
+            // X resolve.xesli:769-797: the fast path swaps only 8_8_8_8 and the 2_10_10_10 family (32_FLOAT: no swap).
+            if (info.destSwap && sourceStorage != uint32_t(ColorFormat::k32_Float))
                 w = is8888 ? (w & ~0x00FF00FFu) | (w & 0xFFu) << 16 | ((w >> 16) & 0xFFu)
                            : (w & ~0x3FF003FFu) | (w & 0x3FFu) << 20 | ((w >> 20) & 0x3FFu);
             w = edram::GpuSwap32(w, info.destEndian);  // X resolve_fast_32bpp_1x2xmsaa.xesli:67-69 XeEndianSwap32
@@ -423,8 +467,14 @@ bool ResolveSamples(const edram::ResolveInfo& info, uint32_t indices[4], uint32_
 
 namespace {
 
-void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolve.xesli:273-300
+void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolve.xesli:273-321
 {
+    if (storage == uint32_t(ColorFormat::k32_Float))  // :313-318 "Treat as 32_FLOAT": (f, 0, 0, 0)
+    {
+        std::memcpy(&rgba[0], &w, 4);
+        rgba[1] = rgba[2] = rgba[3] = 0.0f;
+        return;
+    }
     if (storage == uint32_t(ColorFormat::k8_8_8_8))  // pixel_formats.xesli XeUnpackR8G8B8A8UNorm
     {
         for (uint32_t i = 0; i < 4; i++)
@@ -469,6 +519,12 @@ uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStor
         c *= exp;  // :695-698
     if (info.destSwap)  // :699-704 .bgra
         std::swap(pixel[0], pixel[2]);
+    if (info.destFormat == 36)  // pixel_formats.xesli:247-252 (the default, "Treat as 32_FLOAT"): the red float's bits
+    {
+        uint32_t bits;
+        std::memcpy(&bits, &pixel[0], 4);
+        return bits;
+    }
     if (info.destFormat == 6 || info.destFormat == 50)  // XePackR8G8B8A8UNorm
         return PackUnorm(pixel[0], 255.0f) | PackUnorm(pixel[1], 255.0f) << 8 | PackUnorm(pixel[2], 255.0f) << 16 | PackUnorm(pixel[3], 255.0f) << 24;
     return PackUnorm(pixel[0], 1023.0f) | PackUnorm(pixel[1], 1023.0f) << 10 | PackUnorm(pixel[2], 1023.0f) << 20 | PackUnorm(pixel[3], 3.0f) << 30;  // XePackR10G10B10A2UNorm
@@ -484,10 +540,14 @@ bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStora
                               " to texture format " + std::to_string(info.destFormat) + " (exp bias " + std::to_string(info.destExpBias) + ", swap " +
                               std::to_string(int(info.destSwap)) + ", endian " + std::to_string(info.destEndian) + "): ";
     if (sourceStorage != uint32_t(ColorFormat::k8_8_8_8) && sourceStorage != uint32_t(ColorFormat::k2_10_10_10) &&
-        sourceStorage != uint32_t(ColorFormat::k2_10_10_10_Float))
-        return Refuse(why, shape + "a source storage format other than 0, 2 and 3");
-    if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54)
-        return Refuse(why, shape + "a destination format other than 6, 7, 50 and 54");
+        sourceStorage != uint32_t(ColorFormat::k2_10_10_10_Float) && sourceStorage != uint32_t(ColorFormat::k32_Float))
+        return Refuse(why, shape + "a source storage format other than 0, 2, 3 and 14");
+    // A multisampled 32_FLOAT source would go through the sample dump's float sampling, where X reads its uint view
+    // (vulkan_render_target_cache.cc:1643-1644): refused until observed (the 1x copy keeps the bits).
+    if (sourceStorage == uint32_t(ColorFormat::k32_Float) && info.msaa != Msaa::X1)
+        return Refuse(why, shape + "a multisampled 32_FLOAT source (never observed)");
+    if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54 && info.destFormat != 36)
+        return Refuse(why, shape + "a destination format other than 6, 7, 36, 50 and 54");
     uint32_t indices[4], count = 0;
     if (!ResolveSamples(info, indices, count))
         return Refuse(why, shape + "a selected sample the source does not have");
@@ -518,6 +578,47 @@ bool ResolveConvertToGuest(const edram::ResolveInfo& info, uint32_t sourceStorag
                 samples[g] = words[l.Word(x, y, g)];
             const uint32_t w = edram::GpuSwap32(ResolveConvertPixel(info, sourceStorage, samples), info.destEndian);  // resolve_full_32bpp.xesli:62-65
             std::memcpy(dest + TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2), &w, 4);
+        }
+    return true;
+}
+
+bool ResolveDepthConvertible(const edram::ResolveInfo& info, std::string& why)
+{
+    if (!info.ok || !info.copy || !info.isDepth || !info.source.IsDepth())
+        return Refuse(why, "the resolve has no decoded depth copy");
+    const std::string shape = "depth resolve of " + KeyName(info.source) + ", sample select " + std::to_string(uint32_t(info.sampleSelect)) +
+                              " to texture format " + std::to_string(info.destFormat) + " (endian " + std::to_string(info.destEndian) + "): ";
+    const uint32_t expected = info.source.Format() == uint32_t(edram::DepthFormat::D24S8) ? 22u : 23u;  // X texture_info.h:170-180
+    if (info.destFormat != expected || info.destExpBias != 0 || info.destSwap)
+        return Refuse(why, shape + "not the k_24_8 / k_24_8_FLOAT bit copy DecodeResolve sets up");
+    uint32_t indices[4], count = 0;
+    if (!ResolveSamples(info, indices, count) || count != 1)
+        return Refuse(why, shape + "not one sample of the source (X sanitizes depth to one, draw_util.cc SanitizeCopySampleSelect)");
+    if (info.destBase != info.destExtentStart)
+        return Refuse(why, shape + "the destination base is not the start of its extent");
+    if (info.x1 <= info.x0 || info.y1 <= info.y0)
+        return Refuse(why, shape + "an empty resolve rectangle");
+    return true;
+}
+
+bool ResolveDepthToGuest(const edram::ResolveInfo& info, const uint32_t* words, uint8_t* dest, uint32_t destBytes, std::string& why)
+{
+    if (!ResolveDepthConvertible(info, why))
+        return false;
+    const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
+    for (uint32_t y = 0; y < height; y++)  // every address first: a refusal writes nothing
+        for (uint32_t x = 0; x < width; x++)
+            if (uint64_t(TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2)) + 4 > destBytes)
+                return Refuse(why, "resolve texel (" + std::to_string(x) + ", " + std::to_string(y) + ") lands past the destination's " +
+                                       std::to_string(destBytes) + " bytes");
+    uint32_t indices[4], count = 0;
+    ResolveSamples(info, indices, count);
+    const DumpLayout l = DumpLayoutFor(info.msaa, width, height);
+    for (uint32_t y = 0; y < height; y++)
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint32_t w = edram::GpuSwap32(words[l.Word(x, y, indices[0])], info.destEndian);
+            std::memcpy(dest + TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2), &w, 4);  // a little-endian store
         }
     return true;
 }

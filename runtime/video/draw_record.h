@@ -73,7 +73,10 @@ struct HostIndices
 // shader's XE_RECT_LIST expansion (shader_glsl.h). Refuses: 0 indices; a rect list whose count is not
 // a multiple of 3, a quad list not a multiple of 4; an indexed draw without a reader; a DMA endian
 // other than none / 8in16 for 16-bit or none / 8in32 for 32-bit indices (the others have no observed
-// meaning: refused, not guessed); a 16-bit DMA buffer whose bytes are fewer than 2 * count (32-bit: 4 * count).
+// meaning: refused, not guessed); a 16-bit DMA buffer whose bytes are fewer than 2 * count (32-bit: 4 * count);
+// restart on anything but a strip (DrawState never sets it so). With DrawState's IndexBuffer::restart, an element equal to
+// the reset index (after the swap, before the offset and clamp) becomes 0xFFFFFFFF, the host's restart value; highIndex
+// skips it.
 KeyResult BuildHostIndices(const DrawState& d, GuestIndexReader read, const void* context, HostIndices& out);
 
 // The DMA endian applied to one raw element (X xenos.h:193-198 Endian; command_processor.h GpuSwap for 32-bit).

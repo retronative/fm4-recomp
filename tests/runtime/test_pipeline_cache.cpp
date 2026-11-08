@@ -129,8 +129,9 @@ void TestKeyEquality()
            "the base key's fields are the state's");
     PipelineKey zero;
     std::memset(&zero, 0, sizeof zero);
-    Expect(zero.Hash() == 0x7479744ad77ee805ull, "the documented hash: FNV-1a-64 over the 88 bytes (Python value for all zero)");
-    Expect(sizeof(PipelineKey) == 88, "the key is 88 bytes");
+    Expect(zero.Hash() == 0x0243cfa845185aa5ull, "the documented hash: FNV-1a-64 over the 96 bytes (Python value for all zero)");
+    Expect(sizeof(PipelineKey) == 96, "the key is 96 bytes (88 + the sampler layout key)");
+    Expect(a.samplerLayout == 0, "DerivePipelineKey leaves the sampler layout to PlanDescriptors (0 until set)");
 
     // Each pipeline-relevant field changes the key.
     struct Change
@@ -182,6 +183,13 @@ void TestKeyEquality()
     Expect(Key(base, vs2, ps) != a && Key(base, vs, ps2) != a, "a different key for: the vertex or pixel shader hash");
     Expect(Key(base, vs, ps, 5, 0) != a && Key(base, vs, ps, 0, 5) != a && Key(base, vs, ps, 5, 0) != Key(base, vs, ps, 0, 5),
            "a different key for: the vertex or pixel variant id");
+    {
+        PipelineKey l = a;
+        l.samplerLayout = SamplerLayoutKey(0, 1);  // the pixel shader samples slot 0
+        PipelineKey m = a;
+        m.samplerLayout = SamplerLayoutKey(1, 0);  // the vertex shader samples slot 0
+        Expect(l != a && m != a && l != m && l.Hash() != m.Hash(), "a different key for: the sampler layout (which slots, which stage)");
+    }
 }
 
 void TestKeyNormalization()
@@ -488,31 +496,102 @@ void TestVertexPlans()
     Expect(PlanVertexSlots(s, none, 3, plans, total).ok && plans.empty() && total == 0, "a shader without vertex fetches plans nothing");
 }
 
+// The M5 through MoltenVK 1.4.2 (OBSERVED the local capture draw_loop3 (not distributed) "[gpu] device Apple M5 ... per-stage samplers 16,
+// sampled images 256"); the per-stage resource and per-set values are CONSTRUCTED (large enough not to bind here).
+SamplerLimits M5Limits()
+{
+    SamplerLimits l;
+    l.perStageSamplers = 16, l.perStageSampledImages = 256, l.perStageResources = 1024, l.setSamplers = 1024, l.setSampledImages = 1024;
+    return l;
+}
+
+void SetTextures(CachedShader& s, std::vector<uint32_t> slots, std::vector<uint32_t> dims)
+{
+    s.t.textureSlots = std::move(slots), s.t.textureDimensions = std::move(dims);
+    s.t.textureFilters.assign(s.t.textureSlots.size(), {});
+}
+
 void TestDescriptors()
 {
+    const SamplerLimits m5 = M5Limits();
     CachedShader vs = MakeVs();
     CachedShader ps = MakePs(0, 1);
-    ps.t.textureSlots = {0, 1, 15}, ps.t.textureDimensions = {1, 2, 1}, ps.t.textureFilters = {{}, {}, {}};
+    SetTextures(ps, {0, 1, 15}, {1, 2, 1});
     DescriptorPlan plan;
-    Expect(PlanDescriptors(vs, ps, plan).ok && plan.dimension[0] == 1 && plan.dimension[1] == 2 && plan.dimension[2] == 0 && plan.dimension[15] == 1 &&
-               plan.vsSlots == 0 && plan.psSlots == 0x8003,
-           "the plan holds the pixel shader's slots 0, 1 and 15 (the last binding) with their dimensions");
-    // Vertex texture fetch: the sampler bindings are fragment-stage only (16 per stage on the M5: the local capture gpu_selfcheck6 (not distributed)).
-    vs.t.textureSlots = {1}, vs.t.textureDimensions = {1}, vs.t.textureFilters = {{}};
-    KeyResult r = PlanDescriptors(vs, ps, plan);
-    Expect(!r && Has(r.reason, "vertex shader texture slot 1") && Has(r.reason, "not modelled"), "a vertex-shader texture fetch is refused by name");
-    vs.t.textureSlots = {}, vs.t.textureDimensions = {}, vs.t.textureFilters = {};
-    ps.t.textureSlots = {0, 1}, ps.t.textureDimensions = {1, 1}, ps.t.textureFilters = {{}, {}};
-    Expect(PlanDescriptors(vs, ps, plan).ok, "CONTROL: the same pair without the vertex fetch is accepted");
-    ps.t.textureDimensions = {1, 1}, ps.t.textureSlots = {0, 16};
-    r = PlanDescriptors(vs, ps, plan);
-    Expect(!r && Has(r.reason, "slot 16") && Has(r.reason, "out of range"), "slot 16 (beyond the 16 bindings) is refused");
-    ps.t.textureSlots = {0, 1}, ps.t.textureDimensions = {1, 4};
-    r = PlanDescriptors(vs, ps, plan);
+    // Slots 0, 1, 15 from the PS: layout key bits 2s + 1 = 1, 3, 31 -> (1 << 31) | 0xA.
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.dimension[0] == 1 && plan.dimension[1] == 2 && plan.dimension[2] == 0 && plan.dimension[15] == 1 &&
+               plan.vsSlots == 0 && plan.psSlots == 0x8003 && plan.layoutKey == (1ull << 31 | 0xA),
+           "the plan holds the pixel shader's slots 0, 1 and 15 with their dimensions; layout key bits 31, 3, 1 (fragment bits)");
+    // Draw 31269 (the local capture draw_loop3 (not distributed), run1.err "vertex shader texture slot 17"): VS 48b7493f34f9ef46 fetches
+    // texture slot 17 as 2D, PS cabc1bc4a6d34db8 slots 1 and 0 as 2D (census report.tsv texture_slots 17 / 0,1; dimension field 1 in
+    // word 2 bits 14-15 of the tfetches A9181001 0F1C0FF8 00004000, 10183001 ... 00004000, 10082001 ... 00004000, decoded by hand).
+    // Layout key: bit 2 * 17 = 34 (VS) and bits 1, 3 (PS) -> 0x40000000A.
+    SetTextures(vs, {17}, {1});
+    SetTextures(ps, {0, 1}, {1, 1});
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.vsSlots == 1u << 17 && plan.psSlots == 3 && plan.dimension[17] == 1 &&
+               plan.layoutKey == 0x40000000Aull && LayoutVsSlots(plan.layoutKey) == 1u << 17 && LayoutPsSlots(plan.layoutKey) == 3,
+           "draw 31269: vertex texture slot 17 is bound (vertex-visible binding 25), the PS's 0 and 1 fragment-visible");
+    // One slot both stages fetch: one binding visible to both (bits 2s and 2s + 1).
+    SetTextures(vs, {1}, {1});
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.layoutKey == (0x4ull | 0x8ull | 0x2ull), "slot 1 from both stages: key bits 2 and 3 (+ slot 0's 1)");
+    SetTextures(vs, {1}, {2});
+    KeyResult r = PlanDescriptors(vs, ps, m5, plan);
+    Expect(!r && Has(r.reason, "slot 1") && Has(r.reason, "dimension 2") && Has(r.reason, "and 1"), "one slot sampled as 3D and 2D is refused");
+    // Every slot 0-31 can be bound now: slot 31 (binding 39) from the PS.
+    SetTextures(vs, {}, {});
+    SetTextures(ps, {31}, {3});
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.layoutKey == (1ull << 63) && plan.dimension[31] == 3, "slot 31 (a cube) is bound: key bit 63");
+    SetTextures(ps, {0, 32}, {1, 1});
+    r = PlanDescriptors(vs, ps, m5, plan);
+    Expect(!r && Has(r.reason, "slot 32") && Has(r.reason, "out of range"), "slot 32 (past Xenos's 32 fetch constants) is refused");
+    SetTextures(ps, {0, 1}, {1, 4});
+    r = PlanDescriptors(vs, ps, m5, plan);
     Expect(!r && Has(r.reason, "out of range"), "a dimension beyond 3 is refused");
-    Expect(kTextureBindings == 16 && kBindingTexture0 == 8 && kBindingVertexData == 0 && kBindingSystem == 1 && kBindingVsConstants == 2 && kBindingPsConstants == 3 &&
+    // The per-stage limit: 16 fragment samplers fit, 17 do not; the vertex stage counts separately (16 + 16 distinct slots fit).
+    std::vector<uint32_t> s16, s17, d16(16, 1), d17(17, 1), v16;
+    for (uint32_t i = 0; i < 16; i++)
+        s16.push_back(i), v16.push_back(16 + i);
+    s17 = s16, s17.push_back(16);
+    SetTextures(ps, s16, d16);
+    SetTextures(vs, v16, d16);
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.psSlots == 0xFFFF && plan.vsSlots == 0xFFFF0000u, "16 PS + 16 VS samplers fit 16 per stage");
+    SetTextures(ps, s17, d17);
+    SetTextures(vs, {}, {});
+    r = PlanDescriptors(vs, ps, m5, plan);
+    Expect(!r && Has(r.reason, "pixel shader samples 17") && Has(r.reason, "per-stage limit of 16"), "CONTROL: 17 pixel samplers exceed the M5's 16, refused by name");
+    SetTextures(ps, {}, {});
+    SetTextures(vs, s17, d17);
+    r = PlanDescriptors(vs, ps, m5, plan);
+    Expect(!r && Has(r.reason, "vertex shader samples 17"), "CONTROL: 17 vertex samplers are refused by name");
+    // A slot both stages fetch counts in each stage: 16 shared slots fill both budgets (fit); a 17th in the VS does not.
+    SetTextures(ps, s16, d16);
+    SetTextures(vs, s16, d16);
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok, "16 slots fetched by both stages fit");
+    // The limits are the smaller of samplers and sampled images; maxPerStageResources counts the stage's buffers (VS 5, PS 1).
+    SamplerLimits tight = m5;
+    tight.perStageSampledImages = 2;
+    SetTextures(vs, {}, {});
+    SetTextures(ps, {0, 1, 2}, {1, 1, 1});
+    r = PlanDescriptors(vs, ps, tight, plan);
+    Expect(!r && Has(r.reason, "per-stage limit of 2"), "the sampled-image limit applies to combined image samplers");
+    tight = m5, tight.perStageResources = 7;  // VS: 5 buffers + 3 samplers = 8 > 7
+    SetTextures(vs, {0, 1, 2}, {1, 1, 1});
+    SetTextures(ps, {}, {});
+    r = PlanDescriptors(vs, ps, tight, plan);
+    Expect(!r && Has(r.reason, "vertex stage needs 8 resources"), "maxPerStageResources counts the vertex stage's 5 buffers");
+    SetTextures(vs, {0, 1}, {1, 1});
+    Expect(PlanDescriptors(vs, ps, tight, plan).ok, "CONTROL: 5 + 2 = 7 resources fit");
+    tight = m5, tight.setSamplers = 2;
+    SetTextures(vs, {0, 1}, {1, 1});
+    SetTextures(ps, {2}, {1});
+    r = PlanDescriptors(vs, ps, tight, plan);
+    Expect(!r && Has(r.reason, "3 distinct texture slots") && Has(r.reason, "per-set limit of 2"), "the per-set sampler limit counts distinct slots");
+    Expect(SamplerLayoutKey(0, 0) == 0 && SamplerLayoutKey(1u << 31, 1u << 31) == (3ull << 62) && LayoutVsSlots(0xAAAAAAAAAAAAAAAAull) == 0 &&
+               LayoutPsSlots(0xAAAAAAAAAAAAAAAAull) == 0xFFFFFFFFu,
+           "the layout key packs 2 bits per slot (VS low, PS high)");
+    Expect(kTextureBindings == 32 && kBindingTexture0 == 8 && kBindingVertexData == 0 && kBindingSystem == 1 && kBindingVsConstants == 2 && kBindingPsConstants == 3 &&
                kBindingIndices == 4 && kBindingErrors == 5,
-           "the bindings are shader_glsl.h's");
+           "the bindings are shader_glsl.h's (8 + slot for slots 0-31)");
     Expect(kSystemBytes == 1200 && kSystemVertexBaseOffset == 768 && kSystemViewportScaleOffset == 1152 && kSystemViewportOffsetOffset == 1168 &&
                kSystemFlagsOffset == 1184 && kConstantsBoolOffset == 4096 && kConstantsLoopOffset == 4128 && kConstantsBytes == 4256,
            "block layouts: std140 offsets of shader_glsl.h (48 + 24 uvec4, two vec4, a uint; 256 vec4, 2 + 8 uvec4)");

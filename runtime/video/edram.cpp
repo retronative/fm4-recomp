@@ -50,10 +50,13 @@ bool SupportedKey(Key k, std::string& why)
     case ColorFormat::k2_10_10_10:
     case ColorFormat::k2_10_10_10_Float:
         return true;  // the storage formats of 0, 1, 2, 10 and of 3, 12 (7e3: X xenos.h:394-404)
+    case ColorFormat::k32_Float:
+        // 32 bpp, its own storage format (X xenos.h:394-404 maps nothing onto it; xenos.h:323-327 Is64bpp lists 15 only):
+        // FM4's HDR luminance reduction (RB_COLOR_INFO 000E0000).
+        return true;
     case ColorFormat::k16_16:
     case ColorFormat::k16_16_Float:
-    case ColorFormat::k32_Float:
-        return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16, 16_16_FLOAT, 32_FLOAT) is not supported in M4");
+        return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16, 16_16_FLOAT) is not supported in M4");
     case ColorFormat::k16_16_16_16:
     case ColorFormat::k16_16_16_16_Float:
     case ColorFormat::k32_32_Float:
@@ -447,51 +450,88 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     else
         sel = uint32_t(SampleSelect::k0);
     info.sampleSelect = SampleSelect(sel);
-    if (info.isDepth)
-        return refuse("a depth resolve (copy_src_select " + std::to_string(srcSelect) + ") is not supported in M4");
 
-    // The source surface's Key at its original base (:1255-1278; the storage format as Bind keys it).
     info.pitchTilesAt32bpp = PitchTilesAt32bpp(surface.pitch, info.msaa);
-    const ColorInfo color = DecodeColorInfo(r.colorInfo[srcSelect]);
-    if (!IsKnownColorFormat(color.format))
-        return refuse("resolve source colour format " + std::to_string(color.format) + " is unknown");
-    const bool is64 = Is64bpp(ColorFormat(color.format));
-    info.source = Key::Color(color.base, info.pitchTilesAt32bpp, info.msaa, StorageFormat(ColorFormat(color.format)));
-    if (std::string why; !SupportedKey(info.source, why))
-        return refuse("resolve source: " + why);
-
-    // The destination (:929-1200). RB_COPY_DEST_INFO (X registers.h:812-826): endian 0-2, array 3, slice 4-6,
-    // format 7-12, number 13-15, exp bias 16-21, swap 24.
+    // RB_COPY_DEST_INFO (X registers.h:812-826): endian 0-2, array 3, slice 4-6, format 7-12, number 13-15, exp bias 16-21, swap 24.
     info.destEndian = r.copyDestInfo & 7;
-    info.destFormat = (r.copyDestInfo >> 7) & 0x3F;
-    info.destExpBias = SignedField(r.copyDestInfo, 16, 6);
-    info.destSwap = (r.copyDestInfo >> 24) & 1;
-    const uint32_t destNumber = (r.copyDestInfo >> 13) & 7;
     info.destPitch = r.copyDestPitch & 0x3FFF, info.destHeight = (r.copyDestPitch >> 16) & 0x3FFF;
-    // Every destination-side refusal names the whole copy, so one stop records its complete shape (a 7e3 source's
-    // resolve is always a converting one, X xenos.h:616-641, and its destination is not traced yet: NOTES.md).
-    const std::string shape = "resolve of colour " + std::to_string(srcSelect) + " (RB_COLOR_INFO format " + std::to_string(color.format) + ", storage " +
-                              std::to_string(info.source.Format()) + ", " + std::to_string(1u << uint32_t(info.msaa)) + "x, sample select " +
-                              std::to_string(uint32_t(info.sampleSelect)) + ") to texture format " + std::to_string(info.destFormat) + " (number " +
-                              std::to_string(destNumber) + ", exp bias " + std::to_string(info.destExpBias) + ", swap " +
-                              std::to_string(int(info.destSwap)) + ", endian " + std::to_string(info.destEndian) + ", command " + std::to_string(command) +
-                              "): ";
-    if ((r.copyDestInfo >> 3) & 1)
-        return refuse(shape + "a resolve into a 3D (array) destination is not supported in M4");
-    if (info.destEndian > 3)
-        return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
-    // 32 bpp destinations only; bitwise-equivalent to the accepted sources (X xenos.h:616-641) or the
-    // 8_8_8_8 <-> 2_10_10_10 unorm conversion that FM4's menus may use (HYPOTHESIS, NOTES.md).
-    if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54)
-        return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 50, 54 are)");
-    if (destNumber != 0)
-        return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
-    // An exponent bias is X's full (converting) resolve's dest_exp_bias_factor (shaders/resolve.xesli:131-133), applied by
-    // edram_vk_plan.cpp ResolveConvertToGuest; the range is the field's (6-bit signed, -32..31).
-    if (info.destPitch == 0)
-        return refuse(shape + "resolve destination pitch is 0");
-    if (info.command == CopyCommand::Raw)
-        return refuse(shape + "resolve copy command raw (0) has not been observed; convert (1) only in M4");
+    const uint32_t destFormatRaw = (r.copyDestInfo >> 7) & 0x3F, destNumber = (r.copyDestInfo >> 13) & 7;
+    bool is64 = false;
+    uint32_t sourceBase = 0;
+    if (info.isDepth)
+    {
+        // A depth resolve (X draw_util.cc GetResolveInfo, line numbers of the 67f16c4 copy:
+        // :1068-1093 the format, :1220-1236 the depth EDRAM info, :1268-1276 the patched
+        // RB_COPY_DEST_INFO; GetCopyShader :1310-1324): the source
+        // is the depth buffer at RB_DEPTH_INFO's base; the destination format is k_24_8 (22) for kD24S8 or k_24_8_FLOAT
+        // (23) for kD24FS8 (X texture_info.h:170-180 DepthRenderTargetToTextureFormat) whatever copy_dest_format says
+        // (Direct3D 9 writes k_8_8_8_8 there, X xenos.h:936-941); no exponent bias (:1220), no red/blue swap
+        // (:1271-1274); always X's fast (bit-copy) shader of the guest word (depth << 8 | stencil) of the one selected
+        // sample (the sanitization above leaves one sample for depth). copy_dest_format, copy_dest_number and the copy
+        // command (raw or convert) change nothing in X's depth path, so they are not checked (the shape records them).
+        const DepthInfo depth = DecodeDepthInfo(r.depthInfo);
+        info.source = Key::Depth(depth.base, info.pitchTilesAt32bpp, info.msaa, DepthFormat(depth.format));
+        if (std::string why; !SupportedKey(info.source, why))
+            return refuse("depth resolve source: " + why);
+        sourceBase = depth.base;
+        info.destFormat = depth.format == uint32_t(DepthFormat::D24S8) ? 22u : 23u;
+        info.destExpBias = 0, info.destSwap = false;
+        const std::string shape = "depth resolve (" + std::string(depth.format ? "kD24FS8" : "kD24S8") + ", " + std::to_string(1u << uint32_t(info.msaa)) +
+                                  "x, sample select " + std::to_string(uint32_t(info.sampleSelect)) + ", RB_COPY_DEST_INFO format " +
+                                  std::to_string(destFormatRaw) + " number " + std::to_string(destNumber) + ", endian " +
+                                  std::to_string(info.destEndian) + ", command " + std::to_string(command) + "): ";
+        if ((r.copyDestInfo >> 3) & 1)
+            return refuse(shape + "a resolve into a 3D (array) destination is not supported in M4");
+        if (info.destEndian > 3)
+            return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
+        if (info.destPitch == 0)
+            return refuse(shape + "resolve destination pitch is 0");
+    }
+    else
+    {
+        // The source surface's Key at its original base (:1255-1278; the storage format as Bind keys it).
+        const ColorInfo color = DecodeColorInfo(r.colorInfo[srcSelect]);
+        if (!IsKnownColorFormat(color.format))
+            return refuse("resolve source colour format " + std::to_string(color.format) + " is unknown");
+        is64 = Is64bpp(ColorFormat(color.format));
+        info.source = Key::Color(color.base, info.pitchTilesAt32bpp, info.msaa, StorageFormat(ColorFormat(color.format)));
+        if (std::string why; !SupportedKey(info.source, why))
+            return refuse("resolve source: " + why);
+        sourceBase = color.base;
+
+        // The destination (:929-1200).
+        info.destFormat = destFormatRaw;
+        info.destExpBias = SignedField(r.copyDestInfo, 16, 6);
+        info.destSwap = (r.copyDestInfo >> 24) & 1;
+        // Every destination-side refusal names the whole copy, so one stop records its complete shape (a 7e3 source's
+        // resolve is always a converting one, X xenos.h:616-641, and its destination is not traced yet).
+        const std::string shape = "resolve of colour " + std::to_string(srcSelect) + " (RB_COLOR_INFO format " + std::to_string(color.format) + ", storage " +
+                                  std::to_string(info.source.Format()) + ", " + std::to_string(1u << uint32_t(info.msaa)) + "x, sample select " +
+                                  std::to_string(uint32_t(info.sampleSelect)) + ") to texture format " + std::to_string(info.destFormat) + " (number " +
+                                  std::to_string(destNumber) + ", exp bias " + std::to_string(info.destExpBias) + ", swap " +
+                                  std::to_string(int(info.destSwap)) + ", endian " + std::to_string(info.destEndian) + ", command " + std::to_string(command) +
+                                  "): ";
+        if ((r.copyDestInfo >> 3) & 1)
+            return refuse(shape + "a resolve into a 3D (array) destination is not supported in M4");
+        if (info.destEndian > 3)
+            return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
+        // 32 bpp destinations only; bitwise-equivalent to the accepted sources (X xenos.h:616-641) or the
+        // 8_8_8_8 <-> 2_10_10_10 unorm conversion that FM4's menus may use (HYPOTHESIS).
+        // 36 = k_32_FLOAT (xenos.h:604), the bitwise equivalent of a 32_FLOAT render target (xenos.h:634-635).
+        if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54 && info.destFormat != 36)
+            return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 36, 50, 54 are)");
+        // RB_COPY_DEST_INFO copy_dest_number (X registers.h:819): Xenia 67f16c4 declares it and never reads it in its resolve path.
+        // FM4 resolves its k_32_FLOAT target into texture format 36 with number 7 (kFloat, xenos.h:216-224; the local capture draw_loop2 (not distributed),
+        // draw 31424): the natural value for float data. Accepted for that pairing only; every other non-zero value stays refused.
+        if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36))
+            return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
+        // An exponent bias is X's full (converting) resolve's dest_exp_bias_factor (shaders/resolve.xesli:131-133), applied by
+        // edram_vk_plan.cpp ResolveConvertToGuest; the range is the field's (6-bit signed, -32..31).
+        if (info.destPitch == 0)
+            return refuse(shape + "resolve destination pitch is 0");
+        if (info.command == CopyCommand::Raw)
+            return refuse(shape + "resolve copy command raw (0) has not been observed; convert (1) only in M4");
+    }
     // :1146-1178 with bpp_log2 2: the base granularity is 32x32 texels (X xenos.h:1188-1195), so the copy's
     // origin is the 32x32 tile of (x0, y0) and the offset within it; the extent is X texture_util.h:297-303
     // GetTiledAddressLowerBound2D to texture_util.cc:490-518 GetTiledAddressUpperBound2D (+ 0x400 << 2).
@@ -510,7 +550,7 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     info.edramOffsetXDiv8 = (x0Samples % kTileWidthSamples) >> (sx + 3);
     info.edramOffsetYDiv8 = (y0Samples % kTileHeightSamples) >> (sy + 3);
     info.spanPitch = info.pitchTilesAt32bpp << (is64 ? 1 : 0);
-    const uint32_t baseTiles = color.base + (offsetTiles << (is64 ? 1 : 0));
+    const uint32_t baseTiles = sourceBase + (offsetTiles << (is64 ? 1 : 0));  // the depth or colour base (X :1222-1256)
     const uint32_t xScale = 3 + sx + (is64 ? 1 : 0), yScale = 3 + sy;
     const uint32_t tx0 = (info.edramOffsetXDiv8 << xScale) / kTileWidthSamples;
     const uint32_t tx1 = (((info.edramOffsetXDiv8 + widthDiv8) << xScale) + kTileWidthSamples - 1) / kTileWidthSamples;

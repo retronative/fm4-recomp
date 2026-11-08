@@ -5,6 +5,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS  // VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h)
 #include "vulkan_device.h"
 #include "stops.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -80,7 +81,7 @@ void RequirePinnedLayer()
 
 uint64_t ValidationMessageCount() { return validationMessages.load(); }
 
-VulkanDevice CreateVulkanDevice(bool validation)
+VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
 {
     VulkanDevice d;
     d.validation = validation;
@@ -94,6 +95,10 @@ VulkanDevice CreateVulkanDevice(bool validation)
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         layers.push_back("VK_LAYER_KHRONOS_validation");
     }
+    if (surface != nullptr)  // window mode only: the window system's surface extensions (VK_KHR_surface, VK_EXT_metal_surface on macOS)
+        for (const char* wanted : surface->instanceExtensions)
+            if (std::none_of(extensions.begin(), extensions.end(), [&](const char* e) { return !std::strcmp(e, wanted); }))
+                extensions.push_back(wanted);
     VkApplicationInfo application{};
     application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application.pApplicationName = "fm4recomp";
@@ -114,6 +119,13 @@ VulkanDevice CreateVulkanDevice(bool validation)
         if (create == nullptr)
             Stop(StopCode::Setup, "vulkan: vkCreateDebugUtilsMessengerEXT is not available");
         Check(create(d.instance, &messengerInfo, nullptr, &d.messenger), "vkCreateDebugUtilsMessengerEXT");
+    }
+    if (surface != nullptr)
+    {
+        if (surface->create == nullptr || surface->destroy == nullptr)
+            Stop(StopCode::Setup, "vulkan: window mode without a surface factory");
+        d.surface = surface->create(d.instance);  // on the main thread (main.cpp calls Initialize there); stops on failure
+        d.destroySurface = surface->destroy;
     }
 
     uint32_t count = 0;
@@ -142,23 +154,43 @@ VulkanDevice CreateVulkanDevice(bool validation)
         std::vector<VkQueueFamilyProperties> family(families);
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, family.data());
         for (uint32_t i = 0; i < families && d.gpu == VK_NULL_HANDLE; i++)
-            if (family[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
-                d.gpu = candidate, d.queueFamily = i;
+        {
+            if (!(family[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+                continue;
+            if (d.surface != VK_NULL_HANDLE)  // window mode: the one queue also presents (never assumed: queried)
+            {
+                VkBool32 presents = VK_FALSE;
+                Check(vkGetPhysicalDeviceSurfaceSupportKHR(candidate, i, d.surface, &presents), "vkGetPhysicalDeviceSurfaceSupportKHR");
+                if (presents != VK_TRUE)
+                    continue;
+            }
+            d.gpu = candidate, d.queueFamily = i;
+        }
         if (d.gpu != VK_NULL_HANDLE)
             break;
     }
     if (d.gpu == VK_NULL_HANDLE)
-        Stop(StopCode::Setup, "vulkan: no MoltenVK device with a graphics queue");
+        Stop(StopCode::Setup, "vulkan: no MoltenVK device with a graphics queue%s", d.surface != VK_NULL_HANDLE ? " that can present to the window's surface" : "");
 
     uint32_t available = 0;
     Check(vkEnumerateDeviceExtensionProperties(d.gpu, nullptr, &available, nullptr), "vkEnumerateDeviceExtensionProperties");
     std::vector<VkExtensionProperties> offered(available);
     Check(vkEnumerateDeviceExtensionProperties(d.gpu, nullptr, &available, offered.data()), "vkEnumerateDeviceExtensionProperties");
     std::vector<const char*> enabled;
-    bool portabilityOffered = false;
+    bool portabilityOffered = false, swapchainOffered = false;
     for (const VkExtensionProperties& e : offered)
+    {
         if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset"))  // required when offered
             enabled.push_back("VK_KHR_portability_subset"), portabilityOffered = true;
+        swapchainOffered |= !std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
+    if (d.surface != VK_NULL_HANDLE)  // window mode only; offscreen modes keep their device unchanged
+    {
+        if (!swapchainOffered)
+            Stop(StopCode::Setup, "vulkan: the device does not offer %s (window mode)", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        enabled.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        d.swapchain = true;
+    }
     // Features the texture unit needs, enabled only when offered (Vulkan: enabling an unsupported feature is invalid):
     // textureCompressionBC (MoltenVK sets it from MTLDevice.supportsBCTextureCompression) and the portability subset's
     // imageViewFormatSwizzle (component mappings in image views; MoltenVK hard-codes it on Apple GPUs). Both logged.
@@ -219,7 +251,8 @@ VulkanDevice CreateVulkanDevice(bool validation)
                      o & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? "C " : "", o & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? "D " : "",
                      o & VK_FORMAT_FEATURE_BLIT_DST_BIT ? "B " : "", o & VK_FORMAT_FEATURE_TRANSFER_DST_BIT ? "T " : "", o);
     }
-    std::fprintf(stderr, "[gpu] MoltenVK %s, queue family %u, validation %s\n", kMoltenVkVersion, d.queueFamily,
+    std::fprintf(stderr, "[gpu] MoltenVK %s, queue family %u%s, validation %s\n", kMoltenVkVersion, d.queueFamily,
+                 d.swapchain ? " (graphics and present, VK_KHR_swapchain)" : "",
                  validation ? "on (VK_LAYER_KHRONOS_validation 1.4.363, messenger stops at the first warning)" : "OFF");
     return d;
 }
@@ -228,6 +261,8 @@ void DestroyVulkanDevice(VulkanDevice& d)
 {
     if (d.device != VK_NULL_HANDLE)
         vkDestroyDevice(d.device, nullptr);
+    if (d.surface != VK_NULL_HANDLE && d.destroySurface != nullptr)
+        d.destroySurface(d.instance, d.surface);  // after every swapchain and the device, before the instance
     if (d.messenger != VK_NULL_HANDLE)
         if (auto destroy = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(vkGetInstanceProcAddr(d.instance, "vkDestroyDebugUtilsMessengerEXT")))
             destroy(d.instance, d.messenger, nullptr);

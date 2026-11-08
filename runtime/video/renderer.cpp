@@ -22,6 +22,11 @@
 // OpenSlot, after the slot's previous submission was confirmed complete (RetireSlot) and before the
 // next one records anything; the xe_error dwords of the slot's draws are read in RetireSlot, after the
 // confirmed completion and before that reset.
+//
+// Window mode (unit 4b): the same present path, then the display image is handed to the main thread's presenter
+// (window_present.cpp) after the swap's submission retired and its capture was written; the next swap waits (bounded)
+// only while the presenter is blitting from it. The one VkQueue is shared with the presenter: every submission here
+// takes the queue lock first (bounded; uncontended in the other modes).
 #include "renderer.h"
 #include "capture_store.h"
 #include "draw_record.h"
@@ -32,16 +37,23 @@
 #include "guest_writes.h"
 #include "pipeline_cache.h"
 #include "png.h"
+#include "diag_alpha.h"
+#include "diag_depth.h"
+#include "texture_dump.h"
+#include "ps_trace.h"
 #include "shader_cache.h"
 #include "shader_class.h"
 #include "texture_vk.h"
 #include "vulkan_device.h"
+#include "window_present.h"
+#include "kernel/cp_trace.h"
 #include "kernel/graphics.h"
 #include "kernel/virtual_memory.h"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
@@ -89,14 +101,16 @@ VkImage display = VK_NULL_HANDLE;
 VkDeviceMemory displayMemory = VK_NULL_HANDLE;
 Transient readback;  // persistent: read on the CPU only after the slot's completion is confirmed
 uint64_t transientsDestroyed = 0, drawsSinceSwap = 0, shadersSinceSwap = 0;
-uint64_t noWriteSinceSwap = 0, resolvesSinceSwap = 0, drawNumber = 0;
+uint64_t noWriteSinceSwap = 0, resolvesSinceSwap = 0, ringFlushesSinceSwap = 0, drawNumber = 0;
 gpu::SubmissionGate gate;
+std::timed_mutex queueLock;  // vkQueueSubmit / vkQueuePresentKHR on dev.queue (window mode: two threads)
 
 // Unit 8.
 std::optional<GlslangCompiler> compiler;
 std::optional<ShaderCache> shaders;
 std::optional<PipelineCache> pipelines;
 ShaderClass allowedClasses = kClassStraight;
+SamplerLimits samplerLimits;  // the device's (CreateResources), for PlanDescriptors and the descriptor pools
 const EdramHooks* edramHooks = nullptr;
 const TextureHooks* textures = nullptr;
 struct FramebufferKey
@@ -172,6 +186,13 @@ void RequireDraw(uint64_t draw, const Verdict& v)
 {
     if (!v.ok)
         Stop(v.stranded ? StopCode::GpuStranded : StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, v.reason.c_str());
+}
+
+// The slot's recorded commands to the queue, under the queue lock (window_present.h LockQueue: bounded).
+void SubmitSlot(uint32_t s)
+{
+    std::unique_lock<std::timed_mutex> queue = LockQueue(queueLock, PresenterWaitBoundNs(guard->FenceTimeoutNs()), "submit");
+    Require(guard->Submit(s));
 }
 
 Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
@@ -272,13 +293,13 @@ void FlushSlot(uint32_t s)
     if (!slots[s].open)
         return;
     Check(vkEndCommandBuffer(slots[s].commands), "vkEndCommandBuffer");
-    Require(guard->Submit(s));
+    SubmitSlot(s);
     RetireSlot(s);  // confirmed completion, then the draws' xe_error dwords
 }
 
 // The display image (already in TRANSFER_DST_OPTIMAL after `written`) -> the readback buffer, made
-// visible to the host. Ends the recording.
-void EndWithReadback(VkCommandBuffer c)
+// visible to the host. Leaves the display image in TRANSFER_SRC_OPTIMAL (the window's presenter blits from it).
+void RecordReadback(VkCommandBuffer c)
 {
     ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -294,6 +315,12 @@ void EndWithReadback(VkCommandBuffer c)
     host.buffer = readback.buffer;
     host.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
+}
+
+// RecordReadback, then ends the recording.
+void EndWithReadback(VkCommandBuffer c)
+{
+    RecordReadback(c);
     Check(vkEndCommandBuffer(c), "vkEndCommandBuffer");
 }
 
@@ -386,6 +413,15 @@ void CreateResources()
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(dev.gpu, &properties);
     const uint64_t uniformAlign = properties.limits.minUniformBufferOffsetAlignment, storageAlign = properties.limits.minStorageBufferOffsetAlignment;
+    // The sampler budgets of the per-pair layouts (pipeline_key.h SamplerLimits), queried, never assumed.
+    samplerLimits.perStageSamplers = properties.limits.maxPerStageDescriptorSamplers;
+    samplerLimits.perStageSampledImages = properties.limits.maxPerStageDescriptorSampledImages;
+    samplerLimits.perStageResources = properties.limits.maxPerStageResources;
+    samplerLimits.setSamplers = properties.limits.maxDescriptorSetSamplers;
+    samplerLimits.setSampledImages = properties.limits.maxDescriptorSetSampledImages;
+    std::fprintf(stderr, "[gpu] sampler limits: per stage %u samplers, %u sampled images, %u resources; per set %u samplers, %u sampled images\n",
+                 samplerLimits.perStageSamplers, samplerLimits.perStageSampledImages, samplerLimits.perStageResources, samplerLimits.setSamplers,
+                 samplerLimits.setSampledImages);
     if (uniformAlign == 0 || (uniformAlign & (uniformAlign - 1)) || storageAlign == 0 || (storageAlign & (storageAlign - 1)))
         Stop(StopCode::Setup, "renderer: buffer offset alignments %llu / %llu are not powers of two", (unsigned long long)uniformAlign,
              (unsigned long long)storageAlign);
@@ -413,7 +449,8 @@ void CreateResources()
         const VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kDrawsPerSlot},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTextureBindings * kDrawsPerSlot},  // the layout's 16 sampler bindings per set
+            // A set holds only its pair's samplers (per-pair layouts), at most min(32, the set budget) of them: the worst case per set.
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, std::min<uint32_t>(kTextureBindings, std::min(samplerLimits.setSamplers, samplerLimits.setSampledImages)) * kDrawsPerSlot},
         };
         VkDescriptorPoolCreateInfo dp{};
         dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -558,10 +595,12 @@ bool Initialize(const Options& o)
     Require(guard->Begin("renderer initialize"));  // GPU_STOP before any Vulkan call
     captures.emplace(o.captureDir, "frame_", kCaptureBytes);
     SetStopQuiesce(QuiesceForStop, ReportForSignalStop);
+    if (o.mode == Mode::Window && o.surface == nullptr)
+        Stop(StopCode::Setup, "renderer: window mode needs the window's surface request (window_sdl.h OpenWindow)");
     std::fprintf(stderr, "[gpu] renderer %s: fence timeout %u ms, captures %s (at most %zu files, %llu MB), GPU_STOP %s, shader classes allowed: %s\n",
-                 o.mode == Mode::SelfCheck ? "self-check" : "present", timeout.ms, o.captureDir, kCaptureRecords,
+                 o.mode == Mode::SelfCheck ? "self-check" : o.mode == Mode::Window ? "window" : "present", timeout.ms, o.captureDir, kCaptureRecords,
                  (unsigned long long)(kCaptureBytes >> 20), o.gpuStopPath, allowedClasses == kClassStraight ? "none (straight-line only)" : ShaderClassName(allowedClasses).c_str());
-    dev = CreateVulkanDevice(o.validation);
+    dev = CreateVulkanDevice(o.validation, o.mode == Mode::Window ? o.surface : nullptr);  // surface and swapchain: window mode only
     CreateResources();
     // Unit 8: the shader and pipeline caches. The portability-subset features are not exposed by
     // vulkan_device.cpp yet: constant-alpha colour blend factors stay refused (conservative; FM4's first
@@ -577,11 +616,12 @@ bool Initialize(const Options& o)
     pipelines.emplace(dev.device, features, allowedClasses, created);
     if (!created)
         Stop(StopCode::Setup, "renderer: %s", created.reason.c_str());
+    SetTextureDumpDir(o.captureDir);              // FM4_DUMP_TEXTURE (diagnostic, texture_dump.h): nothing unless set
     SetTextureHooks(InitializeTextureUnit(dev));  // unit 7 (texture_vk.h)
     // The EDRAM unit (edram_vk.h): its transfer shaders through the same compiler, its resolve writes through main.cpp's
     // writable guest base, each recorded resolve reported to the texture unit (guest_writes.h MarkGuestWritten). Present
     // mode only: the self-check draws nothing and keeps its device work unchanged.
-    if (o.mode == Mode::Present)
+    if (o.mode == Mode::Present || o.mode == Mode::Window)
     {
         if (o.guestBase == nullptr)
             Stop(StopCode::Setup, "renderer: present mode needs the writable guest base (Options::guestBase)");
@@ -591,6 +631,8 @@ bool Initialize(const Options& o)
             Stop(StopCode::Setup, "renderer: EDRAM unit: %s", edramError.c_str());
         SetEdramHooks(hooks);
     }
+    if (o.mode == Mode::Window)  // on the main thread (main.cpp): the swapchain, the presenter's slot and guard
+        InitializePresenter({&dev, display, {kDisplayWidth, kDisplayHeight}, &gate, o.gpuStopPath, guard->FenceTimeoutNs(), &queueLock});
     enabled = true;
     return true;
 }
@@ -623,6 +665,11 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
         for (size_t i = 0; i < size_t(width) * height; i++)
             linear[i] = SwapRedBlue1010102(linear[i]);
     ApplyDisplayGamma(base, linear, size_t(width) * height, swap);
+    const bool windowed = options.mode == Mode::Window;
+    if (windowed)  // the display image is written below: never while the presenter blits from it (bounded wait)
+        if (HandOver().BeginWrite(PresenterWaitBoundNs(guard->FenceTimeoutNs())) == window::FrameHandOver::Write::TimedOut)
+            Stop(StopCode::Setup, "renderer: swap %llu: the window's presenter still reads the display image after %llu ms", (unsigned long long)swap,
+                 (unsigned long long)(PresenterWaitBoundNs(guard->FenceTimeoutNs()) / 1000000));
     const VkCommandBuffer c = OpenSlot(0);  // a fresh recording: the frame's draws completed above
     if (!guard->Hold(0, staging))
         Stop(StopCode::Setup, "renderer: the staging buffer cannot be held (slot not idle)");
@@ -633,16 +680,18 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     copy.imageExtent = {width, height, 1};
     vkCmdCopyBufferToImage(c, staging.buffer, display, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     EndWithReadback(c);
-    Require(guard->Submit(0));
+    SubmitSlot(0);
     RetireSlot(0);  // one bounded wait per swap: the one-frame throttle (execution model §2); then the draws' xe_error dwords
     Capture(swap, "front buffer");
-    std::fprintf(stderr, "[gpu] swap %llu presented offscreen; since the last swap: %llu draw(s) rendered, %llu no-write draw(s) %s, %llu resolve(s), "
-                         "%llu shader load(s); %llu bytes of the slot's ring used; %s\n",
-                 (unsigned long long)swap, (unsigned long long)drawsSinceSwap, (unsigned long long)noWriteSinceSwap,
+    if (windowed && !HandOver().Offer(swap))  // the main thread blits it to the swapchain and presents (window_present.cpp)
+        Stop(StopCode::Setup, "renderer: swap %llu: the window hand-over was not idle after BeginWrite (contract breach)", (unsigned long long)swap);
+    std::fprintf(stderr, "[gpu] swap %llu presented %s; since the last swap: %llu draw(s) rendered, %llu no-write draw(s) %s, %llu resolve(s), "
+                         "%llu shader load(s); %llu bytes of the slot's ring used, %llu ring flush(es); %s\n",
+                 (unsigned long long)swap, windowed ? "offscreen and handed to the window" : "offscreen", (unsigned long long)drawsSinceSwap, (unsigned long long)noWriteSinceSwap,
                  kNoWriteDraws == NoWriteDraws::Skip ? "recorded as nothing (draw_record.h kNoWriteDraws)" : "(none allowed)",
                  (unsigned long long)resolvesSinceSwap, (unsigned long long)shadersSinceSwap, (unsigned long long)slots[0].allocator->Used(),
-                 TextureUnitSummary().c_str());
-    drawsSinceSwap = shadersSinceSwap = noWriteSinceSwap = resolvesSinceSwap = 0;
+                 (unsigned long long)ringFlushesSinceSwap, TextureUnitSummary().c_str());
+    drawsSinceSwap = shadersSinceSwap = noWriteSinceSwap = resolvesSinceSwap = ringFlushesSinceSwap = 0;
 }
 
 void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
@@ -660,6 +709,16 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     const CachedShader* ps = shaders->Current(true);
     if (vs == nullptr || ps == nullptr)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: no %s shader was loaded (IM_LOAD) before it", (unsigned long long)draw, vs ? "pixel" : "vertex");
+    // FM4_CP_TRACE: the fetch constants of every texture slot the bound pair samples (the CP logs slots 0-2 of DRAW_INDX only).
+    if (runtime::gpu::TraceEnabled())
+    {
+        uint32_t mask = 0;
+        for (const CachedShader* stage : {vs, ps})
+            for (const uint32_t s : stage->t.textureSlots)
+                mask |= s < 32 ? 1u << s : 0u;
+        runtime::gpu::TraceTextures(base, opcode, mask);
+    }
+    TracePsDraw(base, draw, vs->hash, ps->hash, vs->t);  // FM4_TRACE_PS (diagnostic, ps_trace.h): nothing unless set
     DrawInputs in;
     in.read = ReadRegisterHook;
     in.context = base;
@@ -704,6 +763,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // 4. The shader variants, the pipeline key and the descriptor plan (CPU).
     ShaderVariantDefines vsDefines, psDefines;
     RequireDraw(draw, VariantsFromDrawState(d, *vs, *ps, vsDefines, psDefines));
+    DiagAlphaQuantize(ps->hash, psDefines);  // FM4_DIAG_ALPHA_QUANT (diagnostic, diag_alpha.h): nothing unless set
     ShaderVariant* vsVariant = shaders->Variant(*vs, vsDefines, error);
     if (vsVariant == nullptr)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, error.c_str());
@@ -712,8 +772,10 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: %s", (unsigned long long)draw, error.c_str());
     PipelineKey key;
     RequireDraw(draw, KeyFromDrawState(d, *vs, *ps, vsVariant->id, psVariant->id, key));
+    const bool noDepthDiagnostic = DiagNoDepth(ps->hash, key);  // FM4_DIAG_PS_NO_DEPTH (diagnostic, diag_depth.h): nothing unless set
     DescriptorPlan plan;
-    RequireDraw(draw, PlanDescriptors(*vs, *ps, plan));
+    RequireDraw(draw, PlanDescriptors(*vs, *ps, samplerLimits, plan));
+    key.samplerLayout = plan.layoutKey;  // the pipeline layout is the pair's (PipelineCache::Get refuses a key without it)
     // 5. The pipeline: the shader-class allow-list is PipelineCache::Get's first step, before any Vulkan call.
     PipelineCache::Entry pipeline;
     RequireDraw(draw, pipelines->Get(key, *vs, *vsVariant, *ps, *psVariant, pipeline));
@@ -752,6 +814,27 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         }
         BoundTargetHeight(d, vs->t, positionWindow ? loads.data() : nullptr, loads.size(), positionWindow ? positionWindow->endian : 0, indices,
                           target.targetHeight, extentNote);
+    }
+    // The slot's ring must hold this whole draw (every texture reloads at every bind: texture_upload.h kTextureValidity).
+    // Draws are separate render passes, so a full ring is flushed between draws (submit, confirmed retire, reset) rather
+    // than refusing the draw (one observed draw had 14,971,540 of 16,777,216 bytes used, 1,869,120 more needed).
+    {
+        const uint64_t slack = 256;  // per block: the device's uniform/storage alignment is at most 256 (Vulkan limits)
+        uint64_t need = kSystemBytes + 2 * uint64_t(kConstantsBytes) + std::max<uint64_t>(uint64_t(vertexDwords) * 4, 4) +
+                        std::max<uint64_t>(indices.indices.size() * 4, 4) + kErrorsBytes + 6 * slack;
+        for (uint32_t s = 0; s < kTextureBindings; s++)
+            if (plan.dimension[s] != 0 && textures != nullptr)
+                for (const TextureSlot& t : d.textureSlots)
+                    if (t.slot == s)
+                        need += textures->stagingBytes(t);
+        if (need > slot.allocator->Capacity())
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: needs %llu ring bytes, more than the slot's %llu", (unsigned long long)draw,
+                 (unsigned long long)need, (unsigned long long)slot.allocator->Capacity());
+        if (slot.open && slot.allocator->Used() + need > slot.allocator->Capacity())
+        {
+            FlushSlot(0);
+            ringFlushesSinceSwap++;
+        }
     }
     const VkCommandBuffer c = OpenSlot(0);
     HostTargets targets;
@@ -802,15 +885,15 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     slot.errorDwords.emplace_back(errorAt, draw);
     // 8. The descriptor set: the six buffer bindings and the textures the pair samples.
     VkDescriptorSet set = VK_NULL_HANDLE;
-    const VkDescriptorSetLayout layout = pipelines->SetLayout();
+    const VkDescriptorSetLayout layout = pipeline.layouts.set;
     VkDescriptorSetAllocateInfo setInfo{};
     setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     setInfo.descriptorPool = slot.descriptors;
     setInfo.descriptorSetCount = 1;
     setInfo.pSetLayouts = &layout;
     if (const VkResult r = vkAllocateDescriptorSets(dev.device, &setInfo, &set); r != VK_SUCCESS)
-        Stop(StopCode::Unimplemented, "renderer: draw %llu: vkAllocateDescriptorSets failed (VkResult %d): the slot's pool (%u sets of %u bindings) is exhausted",
-             (unsigned long long)draw, int(r), kDrawsPerSlot, 6 + kTextureBindings);
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: vkAllocateDescriptorSets failed (VkResult %d): the slot's pool (%u sets) is exhausted "
+             "(this set: 6 buffers, %d samplers)", (unsigned long long)draw, int(r), kDrawsPerSlot, __builtin_popcount(plan.vsSlots | plan.psSlots));
     const VkDescriptorBufferInfo buffers[6] = {
         {slot.ring.buffer, vertexAt, vertexBytes},         // 0 XeVertexData
         {slot.ring.buffer, systemAt, kSystemBytes},        // 1 XeSystem
@@ -851,7 +934,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         VkSampler sampler = VK_NULL_HANDLE;
         const TextureBindContext context{c, base, slot.ring.buffer, static_cast<uint8_t*>(slot.ring.mapped), &*slot.allocator};
         if (!textures->bind(context, *t, view, sampler, error) || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE)
-            Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u: %s", (unsigned long long)draw, s, error.empty() ? "no view or sampler" : error.c_str());
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u (%08X %08X %08X %08X %08X %08X): %s", (unsigned long long)draw, s,
+                 t->words[0], t->words[1], t->words[2], t->words[3], t->words[4], t->words[5], error.empty() ? "no view or sampler" : error.c_str());
         images.push_back({sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
         VkWriteDescriptorSet w{};
         w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -872,12 +956,34 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     pass.renderArea = {{0, 0}, {targets.width, targets.height}};
     vkCmdBeginRenderPass(c, &pass, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines->Layout(), 0, 1, &set, 0, nullptr);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, 1, &set, 0, nullptr);
     const HostViewport hv = FoldViewport(d.viewport, targets.width, targets.height);
     const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.height), hv.zMin, hv.zMax};
     vkCmdSetViewport(c, 0, 1, &viewport);
     const VkRect2D scissor{{int32_t(d.scissor.x), int32_t(d.scissor.y)}, {d.scissor.width, scissorBottom - d.scissor.y}};
     vkCmdSetScissor(c, 0, 1, &scissor);
+    {
+        // FM4_TRACE_PS (diagnostic, ps_trace.h): the bind and dynamic state of a traced draw.
+        PsBindTrace t;
+        t.depthControl = runtime::gpu::ReadRegister(base, 0x2200), t.suScModeCntl = runtime::gpu::ReadRegister(base, 0x2205);
+        t.pitch = target.pitch, t.msaa = target.msaa, t.colorBase = target.colorBase, t.colorFormat = target.colorFormat;
+        t.depthBase = target.depthBase, t.depthFormat = target.depthFormat, t.pitchTiles = target.pitchTiles, t.edramRows = target.edramRows;
+        t.targetHeight = target.targetHeight, t.colorWritten = target.colorWritten, t.depthWritten = target.depthWritten;
+        t.keyDepthUsed = key.depthUsed, t.keyDepthWrite = key.depthWrite, t.keyDepthFunc = key.depthFunc, t.keyStencil = key.stencilEnable;
+        t.keySamples = key.samples, t.hostWidth = targets.width, t.hostHeight = targets.height, t.hostSamples = targets.samples;
+        t.scissorX = scissor.offset.x, t.scissorY = scissor.offset.y, t.scissorWidth = scissor.extent.width, t.scissorHeight = scissor.extent.height;
+        t.viewportWidth = viewport.width, t.viewportHeight = viewport.height, t.minDepth = viewport.minDepth, t.maxDepth = viewport.maxDepth;
+        t.noDepthDiagnostic = noDepthDiagnostic;
+        t.colorControl = runtime::gpu::ReadRegister(base, 0x2202);
+        for (uint32_t i = 0; i < 6; i++)
+            t.vport[i] = runtime::gpu::ReadRegister(base, 0x210F + i);
+        t.clipCntl = runtime::gpu::ReadRegister(base, 0x2204), t.vteCntl = runtime::gpu::ReadRegister(base, 0x2206);
+        t.vtxCntl = runtime::gpu::ReadRegister(base, 0x2302), t.systemFlags = d.systemFlags;
+        t.foldZScale = hv.scale[2], t.foldZOffset = hv.offset[2];
+        const std::string psDefineText = psDefines.Joined();
+        t.psDefines = psDefineText.c_str();
+        TracePsBind(draw, t);
+    }
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.ref);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_BACK_BIT, d.depthStencil.back.ref);
     vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_BIT, d.depthStencil.front.compareMask);

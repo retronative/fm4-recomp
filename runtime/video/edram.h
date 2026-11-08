@@ -185,7 +185,8 @@ struct Key
 // The M4 whitelist: colour 8_8_8_8, 8_8_8_8_GAMMA, 2_10_10_10 and its _AS_10_10_10_10
 // variant (storage 0 and 2), 2_10_10_10_FLOAT and its _AS_16_16_16_16 variant (storage 3, 7e3: X xenos.h:394-404
 // GetStorageColorFormat, "the same packing and meaning of values ... without blending precision modifiers"); both
-// depth formats; 1x, 2x and 4x MSAA. False with the reason otherwise.
+// 32_FLOAT (storage 14, 32 bpp); both depth formats; 1x, 2x and 4x MSAA. False with the reason otherwise (64 bpp formats,
+// 32_32_FLOAT among them, by name).
 bool SupportedKey(Key k, std::string& why);
 
 // ---- Ownership ----------------------------------------------------------------------------------------
@@ -327,7 +328,7 @@ struct ResolveInfo
     bool copy = false;  // false: a clear-only resolve
     CopyCommand command = CopyCommand::Raw;
     SampleSelect sampleSelect = SampleSelect::k0;  // sanitized (X draw_util.cc:495-545)
-    uint32_t destFormat = 0;    // xenos ColorFormat (texture format) of the destination
+    uint32_t destFormat = 0;    // xenos ColorFormat (texture format) of the destination; a depth resolve: 22 k_24_8 / 23 k_24_8_FLOAT
     uint32_t destEndian = 0;    // Endian128 0-3 (X xenos.h:200-207)
     int32_t destExpBias = 0;
     bool destSwap = false;      // red/blue exchange (copy_dest_swap)

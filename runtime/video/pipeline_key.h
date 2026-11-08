@@ -106,6 +106,7 @@ struct PipelineKey
 {
     uint64_t vsHash, psHash;
     uint64_t vsVariant, psVariant;  // ShaderVariantDefines::Id of each stage's variant
+    uint64_t samplerLayout;         // DescriptorPlan::layoutKey: the pair's sampler bindings and their stages (the pipeline layout)
     uint8_t topology;               // Topology
     uint8_t primitiveRestart;       // strips only (PA_SU_SC_MODE_CNTL multi_prim_ib_ena)
     uint8_t cullFront, cullBack, frontClockwise;  // PA_SU_SC_MODE_CNTL bits 0, 1, 2
@@ -138,7 +139,7 @@ struct PipelineKey
     };
 };
 static_assert(std::is_trivially_copyable_v<PipelineKey>);
-static_assert(sizeof(PipelineKey) == 88, "the key's layout is documented; a change needs the tests updated");
+static_assert(sizeof(PipelineKey) == 96, "the key's layout is documented; a change needs the tests updated");
 
 // A refusal names its field and value; the renderer stops with it.
 struct KeyResult
@@ -212,17 +213,60 @@ KeyResult PlanVertexSlots(const DrawStateView& s, const CachedShader& vs, uint32
 
 // ---- Descriptors -------------------------------------------------------------------------------
 
-// One descriptor set layout serves every pipeline (bindings 0-5 and 8-39 always declared, the
-// samplers for both stages; a binding the pair does not use is simply not written, which Vulkan
-// allows for bindings a pipeline does not statically use). The per-draw plan says which sampler
-// bindings to write and with which image view type.
+// Per-pair descriptor set layouts. Each layout
+// declares bindings 0-5 (shader_glsl.h) and exactly the sampler bindings 8 + slot the pair fetches, visible to the
+// stages that fetch them, so any texture slot 0-31 can be bound and each stage counts only its own samplers against
+// the device's per-stage limits (VUID-VkPipelineLayoutCreateInfo-descriptorType-03016: a binding counts towards every
+// stage in its stageFlags; the shared 32-binding VS|PS layout broke it on the M5).
+// The layout key is the stage mask per slot: bit 2s = the vertex shader fetches slot s, bit 2s + 1 = the pixel shader
+// does. The dimension (2D, 3D, cube) is not part of it: a VkDescriptorSetLayout binding has no image dimension (the
+// image view's type carries it, DescriptorPlan::dimension), so pairs that differ only in dimensions share a layout.
 struct DescriptorPlan
 {
     uint8_t dimension[32] = {};  // per texture slot: 0 unused, 1 2D, 2 3D, 3 cube (ucode kDimension*)
     uint32_t vsSlots = 0, psSlots = 0;  // bitmasks
+    uint64_t layoutKey = 0;      // SamplerLayoutKey(vsSlots, psSlots)
 };
-// Refuses a slot both stages read with different dimensions (one binding, one sampler type).
-KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, DescriptorPlan& out);
+constexpr uint64_t SamplerLayoutKey(uint32_t vsSlots, uint32_t psSlots)
+{
+    uint64_t k = 0;
+    for (uint32_t s = 0; s < 32; s++)
+        k |= uint64_t(vsSlots >> s & 1) << (2 * s) | uint64_t(psSlots >> s & 1) << (2 * s + 1);
+    return k;
+}
+// The VS / PS slot bitmasks of a layout key.
+constexpr uint32_t LayoutVsSlots(uint64_t key)
+{
+    uint32_t m = 0;
+    for (uint32_t s = 0; s < 32; s++)
+        m |= uint32_t(key >> (2 * s) & 1) << s;
+    return m;
+}
+constexpr uint32_t LayoutPsSlots(uint64_t key)
+{
+    uint32_t m = 0;
+    for (uint32_t s = 0; s < 32; s++)
+        m |= uint32_t(key >> (2 * s + 1) & 1) << s;
+    return m;
+}
+
+// The device limits a layout must fit (VkPhysicalDeviceLimits, queried by the renderer; never assumed). A combined
+// image sampler counts as a sampler and as a sampled image (Vulkan spec, "Descriptor Set Layouts" limits), so the
+// per-stage sampler budget is min(maxPerStageDescriptorSamplers, maxPerStageDescriptorSampledImages), the set's
+// min(maxDescriptorSetSamplers, maxDescriptorSetSampledImages); maxPerStageResources counts the stage's buffers too
+// (VS: storage 0, 4, 5 and uniform 1, 2 = 5; PS: uniform 3 = 1).
+struct SamplerLimits
+{
+    uint32_t perStageSamplers = 0, perStageSampledImages = 0, perStageResources = 0;
+    uint32_t setSamplers = 0, setSampledImages = 0;
+};
+constexpr uint32_t kVsBufferBindings = 5, kPsBufferBindings = 1;
+
+// The pair's sampler bindings. Refuses: a slot past 31 or a dimension not 1-3; a slot both stages read with different
+// dimensions (one binding, one image view); a stage whose samplers exceed the per-stage budget, or whose samplers plus
+// buffers exceed maxPerStageResources; a set whose distinct sampler bindings exceed the set budget. Each refusal names
+// the stage, the count and the limit.
+KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, const SamplerLimits& limits, DescriptorPlan& out);
 
 // Fixed bindings (shader_glsl.h). 6 and 7 are unused.
 enum DescriptorBinding : uint32_t
@@ -233,12 +277,8 @@ enum DescriptorBinding : uint32_t
     kBindingPsConstants = 3,  // uniform, PS
     kBindingIndices = 4,      // storage, VS (rect lists)
     kBindingErrors = 5,       // storage, VS
-    kBindingTexture0 = 8,     // combined image samplers 8-23 (texture slots 0-15), fragment stage only
-    // 16, not Xenos's 32 fetch slots: one shared layout must stay within maxPerStageDescriptorSamplers, 16 on the M5 through
-    // MoltenVK 1.4.2 (OBSERVED: the local capture gpu_selfcheck6 (not distributed), VUID-VkPipelineLayoutCreateInfo-descriptorType-03016). FM4's first
-    // screens sample slots 0-2 from pixel shaders only (reference/gpu/texture.md); a slot of 16 or more, or any vertex-shader
-    // texture fetch, is refused by PlanDescriptors until a per-pipeline layout is needed.
-    kTextureBindings = 16,
+    kBindingTexture0 = 8,     // combined image sampler 8 + slot for texture slot 0-31, in the layouts of the pairs that fetch it
+    kTextureBindings = 32,    // Xenos's texture fetch constants; a layout declares only the pair's (DescriptorPlan::layoutKey)
 };
 
 // ---- Uniform and storage block layouts (std140 / std430, shader_glsl.h) ------------------------------

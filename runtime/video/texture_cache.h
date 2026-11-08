@@ -218,11 +218,16 @@ struct TextureKey
     uint32_t pitch = 0;                  // texels
     uint32_t format = 0, endian = 0, mipMaxLevel = 0;
     bool tiled = false, packedMips = false;
+    uint32_t depth = 1, dimension = 1;   // 3D (dimension 2): size_3d's depth; width / height from size_3d too
+    bool stacked = false;                // dword 1 bit 10: an array, other storage (refused by DescribeTexture; keyed so a
+                                         // stacked constant never reuses a non-stacked entry with the same fields)
     bool operator==(const TextureKey&) const = default;
 };
 inline TextureKey KeyOf(const TextureFetch& f)
 {
-    return {f.baseAddress, f.mipAddress, f.width, f.height, f.pitchTexels, f.format, f.endian, f.mipMaxLevel, f.tiled, f.packedMips};
+    const bool volume = f.dimension == 2;  // xenos.h:1255-1271: dword 2 is size_3d for 3D
+    return {f.baseAddress, f.mipAddress, volume ? f.width3D : f.width, volume ? f.height3D : f.height, f.pitchTexels, f.format, f.endian,
+            f.mipMaxLevel, f.tiled, f.packedMips, volume ? f.depth3D : 1, f.dimension, f.stacked};
 }
 struct TextureKeyHash
 {
@@ -230,7 +235,7 @@ struct TextureKeyHash
     {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint64_t v : {uint64_t(k.base), uint64_t(k.mip), uint64_t(k.width) << 32 | k.height, uint64_t(k.pitch) << 32 | k.format,
-                           uint64_t(k.endian) << 32 | k.mipMaxLevel, uint64_t(k.tiled) << 1 | k.packedMips})
+                           uint64_t(k.endian) << 32 | k.mipMaxLevel, uint64_t(k.tiled) << 1 | k.packedMips, uint64_t(k.depth) << 32 | k.dimension, uint64_t(k.stacked)})
             h = (h ^ v) * 0x100000001b3ull;
         return size_t(h);
     }
@@ -252,7 +257,7 @@ struct LoadPlan
     uint64_t sequence = 0;              // WriteWatch::Current before the untile reads guest memory
     size_t stagingBytes = 0;            // the slot's staging buffer: every level, tightly packed rows
     std::vector<size_t> levelOffsets;   // each level's offset in the staging buffer (16-byte aligned)
-    std::vector<size_t> levelBytes;     // each level's bytes (widthBlocks * heightBlocks * bytes per block)
+    std::vector<size_t> levelBytes;     // each level's bytes (widthBlocks * heightBlocks * depth * bytes per block)
 };
 
 class TextureCache
@@ -305,7 +310,7 @@ public:
         for (const MipLevel& l : e.description.levels)
         {
             p.levelOffsets.push_back(p.stagingBytes);
-            const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks) << e.description.log2BytesPerBlock;
+            const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks * l.depth) << e.description.log2BytesPerBlock;
             p.levelBytes.push_back(bytes);
             p.stagingBytes += (bytes + 15) & ~size_t(15);
         }

@@ -799,7 +799,7 @@ void TestColourPs()
     CHECK(Translate(ColourPs(), true, t));
     const std::string& g = t.glsl;
     CHECK(t.interpolatorCount == 1);
-    CHECK(Has(g, "layout(location = 0) in vec4 xe_interp_0;") && Has(g, "layout(location = 0) out vec4 xe_color0;"));
+    CHECK(Has(g, "layout(location = 0) in vec4 xe_interp_0;") && Has(g, "#ifdef XE_NO_COLOR_OUTPUT\nvec4 xe_color0;\n#else\nlayout(location = 0) out vec4 xe_color0;\n#endif\n"));
     CHECK(Has(g, "vec4 r0 = xe_interp_0;") && Has(g, "xe_color0.z = xe_v0.z;"));
     CHECK(Has(g, "layout(std140, set = 0, binding = 3) uniform XePsConstants { vec4 xe_c[256]; };"));
     CHECK(Compiles(g, true));
@@ -1211,6 +1211,10 @@ void TestVideoPs()
         defined.insert(defined.find('\n') + 1, "#define XE_TEXTURE_0_GAMMA\n#define XE_TEXTURE_1_GAMMA\n"
                                                 "#define XE_TEXTURE_2_GAMMA\n#define XE_COLOR0_GAMMA\n");
         CHECK(Compiles(defined, true));
+        // A depth-only pipeline's variant: no colour output, the alpha test still reads xe_color0.
+        std::string depthOnly = g;
+        depthOnly.insert(depthOnly.find('\n') + 1, "#define XE_NO_COLOR_OUTPUT\n#define XE_ALPHA_TEST 4\n#define XE_ALPHA_REF 0.5\n");
+        CHECK(Compiles(depthOnly, true));
     }
 
     // Bool 33: dword 1 = xe_bool[0].y, bit 1; bool 255: dword 7 = xe_bool[1].w, bit 31.

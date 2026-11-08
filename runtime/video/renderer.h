@@ -19,12 +19,19 @@
 //               descriptor pool, the EDRAM and texture hooks (render_hooks.h). A draw the host cannot
 //               render faithfully stops the run naming the draw; a NoWrite draw follows the one policy
 //               switch draw_record.h kNoWriteDraws (decision pending) and is counted in the swap line.
+//   window      present, plus a visible window (unit 4b; window_sdl.h, window_policy.h, window_present.cpp): at each swap,
+//               after the frame's submission retired and the capture was written, the command processor hands the
+//               display image to the main thread, which acquires a swapchain image, blits the display image into it
+//               (letterboxed) in its own submission through its own GpuGuard on the shared gate, and presents (FIFO).
+//               Closing the window stops with StopCode::WindowClosed (14). Captures are unchanged.
 // All GPU work goes through GpuGuard (gpu_guard.h): GPU_STOP, submission gate, per-slot lifetime,
 // bounded fence waits, loop-work cap, GPU_STOP written on a stranding.
 #pragma once
 #include "gpu/submission_gate.h"
 #include "render_hooks.h"
 #include "stops.h"
+#include "vulkan_device.h"
+#include "window_policy.h"
 #include <cstdint>
 
 namespace runtime::video {
@@ -34,6 +41,7 @@ enum class Mode
     Headless,
     SelfCheck,
     Present,
+    Window,  // Present + the window (main thread)
 };
 
 struct Options
@@ -50,6 +58,8 @@ struct Options
     // main.cpp's writable guest memory base (runtime::ReserveGuestMemory), required in present mode: the EDRAM unit
     // writes resolved rectangles into guest memory through it (edram_vk.h), never through the CP's const base.
     uint8_t* guestBase = nullptr;
+    // Window mode only (required there): the window's surface factory and instance extensions (window_sdl.h OpenWindow).
+    const SurfaceRequest* surface = nullptr;
 };
 
 // The EDRAM unit's and the texture unit's hooks (render_hooks.h), registered before the title runs. Without
@@ -78,6 +88,14 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken);
 // IM_LOAD / IM_LOAD_IMMEDIATE: ShaderCache::Load (translation at a hash miss, class tag); a refused shader
 // stops naming its hash.
 void LoadShader(uint32_t type, const uint32_t* words, uint32_t count);
+
+// Window mode, main thread only (window_sdl.cpp RunWindowLoop; defined in window_present.cpp). Waits up to `waitNs` for
+// the frame the command processor handed over and presents it: planner decision, bounded acquire, the blit submission
+// through the presenter's GpuGuard, vkQueuePresentKHR, the bounded retire. True when a frame was taken (presented or
+// skipped, both counted).
+bool PresentHandedOverFrame(uint64_t waitNs);
+// Window mode, main thread only: a window event for the swapchain planner (resize, minimize, restore).
+void WindowEvent(window::EventAction action, VkExtent2D pixels);
 
 // For stops.cpp (normal thread context, not a signal handler): begins the stop, waits (bounded) for
 // submissions in flight, reports. Signal-safe parts only from a signal handler: Submissions()

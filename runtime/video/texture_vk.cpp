@@ -11,6 +11,7 @@
 #include "guest_writes.h"
 #include "pipeline_key.h"
 #include "stops.h"
+#include "texture_dump.h"
 #include "texture_upload.h"
 #include "kernel/virtual_memory.h"
 #include <cstdio>
@@ -128,15 +129,31 @@ HostImage* Image(const TextureEntry& e, std::string& error)
     HostImage h;
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    info.imageType = VK_IMAGE_TYPE_2D;
+    info.imageType = d.dimension == 2 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
     info.format = VkFormat(d.host.vkFormat);
-    info.extent = {d.width, d.height, 1};
+    info.extent = {d.width, d.height, d.depth};
     info.mipLevels = d.levelCount;
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    // The device's limits for this format and type (a 3D BC or float image is a per-format property on Metal).
+    VkImageFormatProperties limits{};
+    if (Failed(vkGetPhysicalDeviceImageFormatProperties(unit->dev.gpu, info.format, info.imageType, info.tiling, info.usage, 0, &limits),
+               "vkGetPhysicalDeviceImageFormatProperties (texture)", error))
+    {
+        error += ": host format " + std::to_string(int(info.format)) + (d.dimension == 2 ? " as a 3D image" : " as a 2D image");
+        return nullptr;
+    }
+    if (info.extent.width > limits.maxExtent.width || info.extent.height > limits.maxExtent.height || info.extent.depth > limits.maxExtent.depth ||
+        info.mipLevels > limits.maxMipLevels)
+    {
+        error = "a " + std::to_string(d.width) + "x" + std::to_string(d.height) + "x" + std::to_string(d.depth) + " image of host format " +
+                std::to_string(int(info.format)) + " exceeds the device's " + std::to_string(limits.maxExtent.width) + "x" +
+                std::to_string(limits.maxExtent.height) + "x" + std::to_string(limits.maxExtent.depth);
+        return nullptr;
+    }
     if (Failed(vkCreateImage(unit->dev.device, &info, nullptr, &h.image), "vkCreateImage (texture)", error))
         return nullptr;
     VkMemoryRequirements requirements;
@@ -180,7 +197,8 @@ void Barrier(VkCommandBuffer c, VkImage image, uint32_t levels, VkImageLayout fr
 
 // Guest memory -> the slot's ring -> the image. An image an earlier draw of this (or an earlier) submission
 // sampled is overwritten only behind a barrier from the shader stages (write after read, same queue).
-bool Upload(const TextureBindContext& c, const TextureDescription& d, const LoadPlan& plan, HostImage& image, std::string& error)
+bool Upload(const TextureBindContext& c, const uint32_t words[6], const TextureDescription& d, const TextureBinding& binding, const LoadPlan& plan,
+            HostImage& image, std::string& error)
 {
     const uint64_t alignment = StagingAlignment(1u << d.log2BytesPerBlock, unit->copyAlignment);
     if (alignment == 0)
@@ -199,6 +217,7 @@ bool Upload(const TextureBindContext& c, const TextureDescription& d, const Load
     }
     if (!FillStaging(d, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset, error))
         return false;
+    MaybeDumpTexture(words, d, binding, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset);  // FM4_DUMP_TEXTURE (texture_dump.h)
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     Barrier(c.commands, image.image, d.levelCount, image.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, image.initialized ? shaders : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -209,7 +228,7 @@ bool Upload(const TextureBindContext& c, const TextureDescription& d, const Load
         VkBufferImageCopy copy{};
         copy.bufferOffset = r.bufferOffset;  // rows tightly packed: bufferRowLength = bufferImageHeight = 0
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, r.level, 0, 1};
-        copy.imageExtent = {r.width, r.height, 1};
+        copy.imageExtent = {r.width, r.height, r.depth};
         copies.push_back(copy);
     }
     vkCmdCopyBufferToImage(c.commands, c.ring, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()), copies.data());
@@ -229,7 +248,7 @@ VkImageView View(const TextureEntry& e, const HostImage& image, const uint32_t c
     VkImageViewCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     info.image = image.image;
-    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.viewType = e.description.dimension == 2 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;  // the shader's sampler3D / sampler2D
     info.format = VkFormat(e.description.host.vkFormat);
     info.components = {VkComponentSwizzle(components[0]), VkComponentSwizzle(components[1]), VkComponentSwizzle(components[2]), VkComponentSwizzle(components[3])};
     info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, e.description.levelCount, 0, 1};
@@ -293,7 +312,7 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
         return false;
     if (p.load)
     {
-        if (!Upload(c, d, p.plan, *image, error))
+        if (!Upload(c, t.words, d, p.binding, p.plan, *image, error))
             return false;
         if (!unit->model.Loaded(*p.entry, p.plan))
         {
@@ -313,7 +332,19 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     return sampler != VK_NULL_HANDLE;
 }
 
-const TextureHooks hooks{Bind};
+uint64_t StagingBytes(const TextureSlot& t)
+{
+    if (!unit)
+        return 0;
+    const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, 7, t.fetchDimension};
+    const PreparedTexture p = unit->model.Prepare(t.words, shader, t.gamma, unit->features);
+    if (p.entry == nullptr)
+        return 0;
+    const uint64_t alignment = StagingAlignment(1u << p.entry->description.log2BytesPerBlock, unit->copyAlignment);
+    return p.plan.stagingBytes + alignment;  // the worst-case padding PlaceInRing can add
+}
+
+const TextureHooks hooks{Bind, StagingBytes};
 
 }  // namespace
 

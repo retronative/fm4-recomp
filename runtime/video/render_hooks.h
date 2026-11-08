@@ -78,6 +78,9 @@ struct TextureBindContext
 struct TextureHooks
 {
     bool (*bind)(const TextureBindContext& context, const TextureSlot& slot, VkImageView& view, VkSampler& sampler, std::string& error);
+    // The ring bytes `bind` will place for this slot (staging plus alignment), so the renderer can flush the slot before a draw
+    // whose uploads would not fit; 0 when the texture cannot be prepared (bind then refuses it with the reason).
+    uint64_t (*stagingBytes)(const TextureSlot& slot);
 };
 
 }  // namespace runtime::video

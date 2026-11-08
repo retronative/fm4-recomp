@@ -346,6 +346,11 @@ void TestRectClear()
     g = RectClear(), g[xr::kRbColorInfo] = 0x000A0000;  // format 10 is storage format 2
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 2 && d.target.colorFormatRaw == 10, "colour format 10 decodes as storage format 2");
+    g = RectClear(), g[xr::kRbColorInfo] = 0x000E0000;  // format 14 (32_FLOAT, 32 bpp): its own storage format (the local capture draw_loop1 (not distributed) draw 22725)
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 14 && d.target.colorFormatRaw == 14, "colour format 14 decodes as storage format 14");
+    g = RectClear(), g[xr::kRbColorInfo] = 0x000F0000;  // format 15 (32_32_FLOAT, 64 bpp): not modelled
+    CONTROL(Decode(g, vs, ps), "colour format 15");
     g = RectClear(), g[xr::kRbColorInfo] = 0x00120000;  // exp bias 1 (bits 20-25)
     CONTROL(Decode(g, vs, ps), "exponent bias");
     g = RectClear(), g[xr::kRbColorInfo] = 0x00020800;  // base bit 11
@@ -411,10 +416,28 @@ void TestRectClear()
     CONTROL(Decode(g, vs, ps), "major mode 1");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030048;  // immediate indices (source 1)
     CONTROL(Decode(g, vs, ps), "immediate indices");
-    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030086, g[xr::kPaSuScModeCntl] = 1u << 21;  // strip with restart
-    CONTROL(Decode(g, vs, ps), "primitive restart");
-    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030084, g[xr::kPaSuScModeCntl] = 1u << 21;  // list with the bit: ignored (X primitive_processor.cc:619-628)
-    Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "multi_prim_ib_ena with a triangle list is ignored");
+    // Primitive restart (X primitive_processor.cc:604-649): only a DMA-indexed strip restarts.
+    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030086, g[xr::kPaSuScModeCntl] = 1u << 21, g[xr::kVgtMultiPrimIbResetIndx] = 0xFFFF;
+    d = Decode(g, vs, ps);  // auto-indexed strip: the restart block is only in Xenia's DMA branch (:574-649), so nothing restarts
+    Expect(d.kind == DrawKind::Draw && d.hostPrimitive == HostPrimitive::TriangleStrip && !d.indices.restart, "an auto-indexed strip with multi_prim_ib_ena: accepted, no restart");
+    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030084, g[xr::kPaSuScModeCntl] = 1u << 21;  // list with the bit: ignored (X primitive_processor.cc:640-646)
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && !d.indices.restart, "multi_prim_ib_ena with a triangle list is ignored");
+    // DMA-indexed strips: 16-bit (initiator bit 11 clear), 4 indices at 1B500000.
+    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00040006, g[xr::kVgtDmaBase] = 0x1B500000, g[xr::kVgtDmaSize] = (1u << 30) | 4;
+    g[xr::kPaSuScModeCntl] = 1u << 21, g[xr::kVgtMultiPrimIbResetIndx] = 0xFFFF;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.indices.indexed && d.indices.restart && d.indices.resetIndex == 0xFFFF, "16-bit DMA strip with reset FFFF: restart on");
+    g[xr::kVgtMultiPrimIbResetIndx] = 0xFF00FFFF;  // reset_indx is 24 bits (X registers.h:320): 0x00FFFF
+    Expect(Decode(g, vs, ps).indices.resetIndex == 0xFFFF, "VGT_MULTI_PRIM_IB_RESET_INDX keeps its low 24 bits");
+    g[xr::kVgtMultiPrimIbResetIndx] = 0x10000;  // above 16 bits with 16-bit indices: restart off (X :635-638)
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && !d.indices.restart, "16-bit indices with a reset index above FFFF: restart off");
+    g[xr::kVgtDrawInitiator] = 0x00040806;  // the same, 32-bit indices: restart on with the 24-bit value
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.indices.is32Bit && d.indices.restart && d.indices.resetIndex == 0x10000, "32-bit indices: reset index 10000, restart on");
+    g[xr::kPaSuScModeCntl] = 0;
+    Expect(!Decode(g, vs, ps).indices.restart, "CONTROL no restart without multi_prim_ib_ena");
     // Vertex fetch controls.
     g = RectClear(), g[xr::kFetchConstants + 0] = 0x00000003;  // type 3 at address 0
     CONTROL(Decode(g, vs, ps), "physical address 0");
@@ -603,7 +626,9 @@ void TestTextured()
     CONTROL(Decode(g, vs, ps), "border_size");
     g = Textured(), word(g, 1, 3) = 0x00A80D10;  // mag 1, min 1, mip 1 (linear) ...
     word(g, 1, 4) = 4u << 6;                     // ... with levels 0-4
-    CONTROL(Decode(g, vs, ps), "mipmapping");
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].mipFilter == 1 && d.textureSlots[0].mipMaxLevel == 4,
+           "mip levels 0-4 with the linear mip filter are accepted (the texture unit uploads every level)");
     g = Textured(), word(g, 1, 4) = 4u << 6;  // levels 0-4 with the base-map mip filter: accepted, base only
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::Draw && d.textureSlots[0].mipMaxLevel == 4, "mip levels with the base-map filter are accepted");
@@ -634,7 +659,7 @@ void TestTextured()
     Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "signed integer k_16_16 accepted");
     g = Textured(), word(g, 1, 1) = 0x1B6000A4, word(g, 1, 0) = 0x02004802 | 0x154;  // k_32_FLOAT signed
     Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "signed k_32_FLOAT accepted");
-    // A 3D fetch needs a linear 3D constant whose volume filters equal mag/min; a cube needs square faces
+    // A 3D fetch needs a 3D constant (linear or tiled) whose volume filters equal mag/min; a cube needs square faces
     // (the vertex shader samples nothing here: `vs` fetches slot 1 as 2D, which would disagree).
     const ShaderTranslation vsPlain = Vs({0}, {5}, {5}, 2);
     g = Textured();
@@ -650,8 +675,9 @@ void TestTextured()
             std::printf("  (%s)\n", d.error.c_str());
         word(g, 1, 4) = 0x0;  // volume filters point, mag/min linear
         CONTROL(Decode(g, vsPlain, ps3), "3D volume filters");
-        word(g, 1, 4) = 0x3, word(g, 1, 0) |= 1u << 31;  // tiled 3D
-        CONTROL(Decode(g, vsPlain, ps3), "tiled 3D");
+        word(g, 1, 4) = 0x3, word(g, 1, 0) |= 1u << 31;  // tiled 3D: the texture unit untiles it (TiledOffset3D)
+        d = Decode(g, vsPlain, ps3);
+        Expect(d.kind == DrawKind::Draw && d.textureSlots[0].tiled && d.textureSlots[0].depth == 8, "a tiled 3D 64 x 32 x 8 is accepted");
     }
     g = Textured();
     {
@@ -747,6 +773,15 @@ void TestObservedStates()
     const HostViewport h = FoldViewport(d.viewport, 1280, 720);
     Expect(Near(h.scale[0], 2.0f / 1280) && Near(h.offset[0], 1.0f / 1280 - 1.0f) && h.scale[2] == 1 && h.offset[2] == 0 && h.zMin == 0 && h.zMax == 1,
            "line 45744: screen-space fold");
+    // the local capture window3 (not distributed) line 209736, draw 59202 (the welcome-screen stop before this change): the same strip with
+    // sumode 00218000 (multi_prim_ib_ena, bit 21), depthctl 00700740, colorctl 8700000C (alpha test GREATER); initiator
+    // 00040086 is source select 2 (auto index): no index buffer, so no restart (X primitive_processor.cc:516-573).
+    s[xr::kPaSuScModeCntl] = 0x00218000, s[xr::kRbDepthControl] = 0x00700740, s[xr::kRbColorControl] = (0x87u << 24) | 0xC;
+    s[xr::kVgtMultiPrimIbResetIndx] = 0xFFFF;  // the stop line named reset index 0000FFFF
+    d = Decode(s, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.hostPrimitive == HostPrimitive::TriangleStrip && !d.indices.indexed && !d.indices.restart &&
+               d.indices.count == 4 && d.alphaTest.enabled && d.alphaTest.func == 4,
+           "window3 draw 59202: auto-indexed strip with multi_prim_ib_ena decodes to Draw, no restart");
     // Line 607, draw 277 (394 such; 45750: 39 with colour 0 and z 1 / 0; 45685: 1): mode 6 with the clear's packet on the 1X
     // surface, program 00010002, vtxcntl 4, interp 00010001, z -1 / 1: a resolve, decoded elsewhere.
     File q = UiQuad();

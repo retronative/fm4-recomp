@@ -6,7 +6,7 @@
 # first GPU run). After ForzaRecomp's gpu_run.sh (zsh), re-written in bash: a zsh
 # `status` variable once disabled a watchdog silently.
 #
-#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present>
+#   scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present|window>
 #   scripts/gpu_run.sh --self-test        # checks the refusal and lock-up detection on planted files; runs nothing
 #
 # Before: refuses if research/GPU_STOP exists (only the owner clears it), runs scripts/preflight.sh (the machine must
@@ -19,6 +19,10 @@
 # control (build/native/tests/fm4_validation_control: a wrong sType in a physical-device query, no device or
 # resource) must make the layer report VUID-VkPhysicalDeviceProperties2-sType-sType, else nothing runs.
 # After each run its log must show the layer inserted and no validation message; captures go to run<i>.captures/.
+# window (unit 4b): present plus a visible window on the main thread (runtime/video/window_sdl.h). Everything above
+# applies unchanged; in addition SDL must load the same Vulkan loader fm4recomp links (SDL_VULKAN_LIBRARY below; the
+# runtime checks it and stops otherwise), each run's log must show its "[window] swapchain:" line, and exit 14 is the
+# user closing the window (a named stop, not a failure of the launcher).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STOP_FLAG="$ROOT/research/GPU_STOP"
@@ -137,13 +141,13 @@ if [ "${1:-}" = "--self-test" ]; then
   exit 0
 fi
 
-[ $# -eq 6 ] || [ $# -eq 7 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present> [<shader classes: none|branch,predicate,loop>] | --self-test" >&2; exit 2; }
+[ $# -eq 6 ] || [ $# -eq 7 ] || { echo "usage: scripts/gpu_run.sh <evidence dir> <runs> <deadline seconds> <stop at swap n> <audio: audible|mute> <renderer: headless|self-check|present|window> [<shader classes: none|branch,predicate,loop>] | --self-test" >&2; exit 2; }
 # The shader-class allow-list (runtime/video/shader_class.h) is required by fm4recomp with a GPU renderer mode and has no
 # default: a run that may create pipelines names the classes approved for it; "none" allows straight-line shaders only.
 SHADER_CLASSES="${7:-}"
 OUT="$1"; RUNS="$2"; DEADLINE="$3"; STOP_AT_SWAP="$4"; AUDIO="$5"; RENDERER="$6"
 [[ "$AUDIO" == audible || "$AUDIO" == mute ]] || { echo "audio must be audible or mute" >&2; exit 2; }
-[[ "$RENDERER" == headless || "$RENDERER" == self-check || "$RENDERER" == present ]] || { echo "renderer must be headless, self-check or present" >&2; exit 2; }
+[[ "$RENDERER" == headless || "$RENDERER" == self-check || "$RENDERER" == present || "$RENDERER" == window ]] || { echo "renderer must be headless, self-check, present or window" >&2; exit 2; }
 if [ "$RENDERER" != headless ]; then
   [[ "$SHADER_CLASSES" =~ ^(none|(branch|predicate|loop)(,(branch|predicate|loop))*)$ ]] || { echo "a GPU renderer needs the shader classes: none, or a list of branch, predicate, loop (fm4recomp --shader-classes)" >&2; exit 2; }
 else
@@ -178,6 +182,16 @@ if [ "$RENDERER" != headless ]; then
   export VK_LAYER_PATH="$OUT/vulkan" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer MTL_DEBUG_LAYER=1
   shasum -a 256 "$ICD" "$LAYERS/VkLayer_khronos_validation.json" "$OUT/vulkan/VkLayer_khronos_validation.json" \
     /opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib | tee -a "$OUT/binary.sha256"
+  if [ "$RENDERER" = window ]; then
+    # SDL opens a Vulkan loader of its own for the window (SDL_Vulkan_LoadLibrary): it must be the one fm4recomp links
+    # (otool -L), named absolutely (a bare name would go through dyld's search path). The runtime compares the two
+    # vkGetInstanceProcAddr and stops (9) if they differ.
+    LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib
+    [ -f "$LOADER" ] || { echo "gpu_run: the Vulkan loader $LOADER is missing" >&2; exit 1; }
+    otool -L "$BIN" | grep -qF "$LOADER" || { echo "gpu_run: fm4recomp does not link $LOADER" >&2; exit 1; }
+    export SDL_VULKAN_LIBRARY="$LOADER"
+    shasum -a 256 "$LOADER" | tee -a "$OUT/binary.sha256"
+  fi
   # Negative control first: a deliberate, query-only misuse the layer must report (no device, no GPU work).
   CONTROL="$ROOT/build/native/tests/fm4_validation_control"
   perl -e 'alarm 30; exec @ARGV' "$CONTROL" > "$OUT/validation_control.log" 2>&1 || true
@@ -221,6 +235,10 @@ for i in $(seq 1 "$RUNS"); do
     fi
     echo "run $i: layer inserted, no validation message" | tee -a "$OUT/validation.txt"
     if [ "$RENDERER" = self-check ] && [ "$status" != 12 ]; then echo "run $i: the self-check did not pass (exit $status, expected 12)" >&2; exit 1; fi
+    if [ "$RENDERER" = window ]; then
+      grep -m1 '^\[window\] swapchain: ' "$OUT/run$i.err" | tee -a "$OUT/validation.txt" || { echo "run $i: no \"[window] swapchain:\" line in its log" >&2; exit 1; }
+      if [ "$status" = 14 ]; then echo "run $i: the window was closed by the user (stop 14)"; fi
+    fi
   fi
 done
 echo "gpu_run: $RUNS run(s), no lock-up evidence"

@@ -44,31 +44,40 @@ VkFormat HostDepthFormat(uint32_t xenosDepthFormat);
 class PipelineCache
 {
 public:
-    // Creates the descriptor set layout and the pipeline layout. `result` false (with the VkResult
-    // in the reason) means nothing usable was created and the renderer stops.
+    // Creates the layout of a pair that samples nothing (bindings 0-5 only), which checks the device accepts the fixed
+    // bindings before any draw. `result` false (with the VkResult in the reason) means nothing usable was created and the
+    // renderer stops. Every other layout is created at the first pipeline that needs it (LayoutFor).
     PipelineCache(VkDevice device, const PipelineDeviceFeatures& features, ShaderClass allowedClasses, KeyResult& result);
     ~PipelineCache();  // only after GpuGuard::Shutdown kept nothing
     PipelineCache(const PipelineCache&) = delete;
     PipelineCache& operator=(const PipelineCache&) = delete;
 
-    VkDescriptorSetLayout SetLayout() const { return setLayout_; }
-    VkPipelineLayout Layout() const { return layout_; }
+    // A descriptor set layout and its pipeline layout, per DescriptorPlan::layoutKey (pipeline_key.h): bindings 0-5 and
+    // 8 + slot for each slot the key names, visible to the stages it names. Created once, destroyed in the destructor.
+    struct Layouts
+    {
+        VkDescriptorSetLayout set = VK_NULL_HANDLE;
+        VkPipelineLayout pipeline = VK_NULL_HANDLE;
+    };
+    KeyResult LayoutFor(uint64_t layoutKey, Layouts& out);
 
     struct Entry
     {
         VkPipeline pipeline = VK_NULL_HANDLE;
         VkRenderPass renderPass = VK_NULL_HANDLE;
+        Layouts layouts;  // what the draw allocates its set from and binds with
     };
     // The pipeline of `key`, created at first use from the variants' SPIR-V (modules created at
     // their first use too). Refuses, before any Vulkan call: a class the allow-list does not cover
     // (naming both hashes and the classes); depth clamp without the feature; constant-alpha colour
-    // factors without the portability feature; a Vulkan creation failure (its VkResult).
+    // factors without the portability feature; a key whose samplerLayout is not the pair's own sampler usage (the
+    // translations' texture slots: a key built without PlanDescriptors' layoutKey); a Vulkan creation failure (its VkResult).
     KeyResult Get(const PipelineKey& key, const CachedShader& vs, ShaderVariant& vsVariant, const CachedShader& ps, ShaderVariant& psVariant,
                   Entry& out);
 
     struct Stats
     {
-        uint64_t pipelines = 0, renderPasses = 0, modules = 0, hits = 0, classRefusals = 0;
+        uint64_t pipelines = 0, renderPasses = 0, modules = 0, hits = 0, classRefusals = 0, layouts = 0;
     };
     const Stats& GetStats() const { return stats_; }
 
@@ -79,8 +88,7 @@ private:
     VkDevice device_;
     PipelineDeviceFeatures features_;
     ShaderClass allowed_;
-    VkDescriptorSetLayout setLayout_ = VK_NULL_HANDLE;
-    VkPipelineLayout layout_ = VK_NULL_HANDLE;
+    std::unordered_map<uint64_t, Layouts> layouts_;  // by DescriptorPlan::layoutKey
     std::unordered_map<PipelineKey, Entry, PipelineKey::Hasher> pipelines_;
     std::unordered_map<uint64_t, VkRenderPass> renderPasses_;  // by the attachment part of the key
     std::vector<VkShaderModule> modules_;                       // every module created, for the destructor

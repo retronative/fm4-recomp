@@ -25,6 +25,7 @@ enum class StopCode : int
     FirstSwap = 11,     // M3's goal: the command processor executed the first swap packet (VdSwap)
     GpuSelfCheck = 12,  // M4: fm4recomp --renderer self-check passed (runtime/video/renderer.h)
     GpuStranded = 13,   // M4: a GPU submission's completion is unknown: GPU_STOP written, resources kept
+    WindowClosed = 14,  // M4: the user closed the window (--renderer window; ForzaRecomp's WindowClosed, which was 12 there)
     Deadline = 124,     // no stop within the deadline (a hang)
 };
 

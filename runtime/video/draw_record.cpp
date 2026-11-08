@@ -44,7 +44,7 @@ KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const Cac
     case HostPrimitive::TriangleStrip: k.topology = uint8_t(Topology::TriangleStrip); break;
     case HostPrimitive::PointNoWrite: return Refuse("a point list that writes nothing has no pipeline");
     }
-    k.primitiveRestart = 0;  // DrawState refuses multi_prim_ib_ena on strips
+    k.primitiveRestart = uint8_t(d.indices.restart);  // a DMA-indexed strip with multi_prim_ib_ena (draw_state.h IndexBuffer::restart)
     k.cullFront = d.cullFront, k.cullBack = d.cullBack, k.frontClockwise = d.frontClockwise;  // every host primitive is polygonal
     k.depthBias = 0;  // DrawState refuses the poly offset enables
     k.depthClamp = d.viewport.clipDisabled;
@@ -122,6 +122,8 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
         else if (d.target.colorFormat == 3)
             psDefines.Add("XE_COLOR0_7E3");
     }
+    else
+        psDefines.Add("XE_NO_COLOR_OUTPUT");  // no colour attachment (the key's colorUsed is 0): the output is not declared
     return Accept();
 }
 
@@ -148,8 +150,17 @@ KeyResult BuildHostIndices(const DrawState& d, GuestIndexReader read, const void
         if (uint64_t(count) * (ib.is32Bit ? 4 : 2) > ib.bytes)
             return Refuse("the index buffer holds " + Num(ib.bytes) + " bytes, fewer than " + Num(count) + " " + (ib.is32Bit ? "32" : "16") + "-bit indices");
     }
+    // Primitive restart (draw_state.h IndexBuffer::restart; X primitive_processor.cc:829-950): an element whose swapped
+    // value (16-bit: whole; 32-bit: low 24 bits) equals the reset index, before the offset and the clamp, becomes the
+    // host's 0xFFFFFFFF (Vulkan's restart value for 32-bit indices; X ReplaceResetIndex32To24, primitive_processor.h:
+    // 422-434, and ReplaceResetIndex16To24). No other host index can be 0xFFFFFFFF: the rest are masked to 24 bits.
+    constexpr uint32_t kHostRestart = 0xFFFFFFFFu;
+    if (ib.restart && d.hostPrimitive != HostPrimitive::TriangleStrip)
+        return Refuse("primitive restart on a host primitive other than a triangle strip");
     const auto guest = [&](uint32_t i) {
         const uint32_t raw = ib.indexed ? SwapIndex(read(context, i), ib.is32Bit, ib.endian) : i;
+        if (ib.restart && (raw & 0xFFFFFFu) == ib.resetIndex)
+            return kHostRestart;
         return std::clamp((raw + d.indexOffset) & 0xFFFFFFu, d.minIndex, d.maxIndex);
     };
     const bool identity = !ib.indexed && d.indexOffset == 0 && d.minIndex == 0 && d.maxIndex >= count - 1;
@@ -194,7 +205,10 @@ KeyResult BuildHostIndices(const DrawState& d, GuestIndexReader read, const void
     case HostPrimitive::PointNoWrite:
         return Refuse("a point list that writes nothing is not drawn");
     }
-    out.highIndex = *std::max_element(out.indices.begin(), out.indices.end());
+    out.highIndex = 0;  // the largest real index (a draw made only of reset indices assembles nothing; its window is index 0)
+    for (const uint32_t index : out.indices)
+        if (index != kHostRestart)
+            out.highIndex = std::max(out.highIndex, index);
     return Accept();
 }
 

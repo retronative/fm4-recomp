@@ -249,7 +249,7 @@ void TestRefusals()
     const std::vector<Case> cases = {
         {"type 3 (vertex)", With(kYPlane, 0, 3u, 3u), {}, "not a texture"},
         {"type 0 (invalid)", With(kYPlane, 0, 3u, 0u), {}, "not a texture"},
-        {"dimension 3D", With(kYPlane, 5, 3u << 9, 2u << 9), {}, "dimension 2"},
+        {"dimension 3D", With(kYPlane, 5, 3u << 9, 2u << 9), {}, "constant's dimension is 2"},  // a 3D constant fetched as 2D (refused at binding)
         {"dimension cube", With(kYPlane, 5, 3u << 9, 3u << 9), {}, "dimension 3"},
         {"dimension 1D", With(kYPlane, 5, 3u << 9, 0u), {}, "dimension 0"},
         {"stacked", With(kYPlane, 1, 1u << 10, 1u << 10), {}, "stacked"},
