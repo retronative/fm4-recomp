@@ -552,6 +552,13 @@ void TestDescriptors()
     SetTextures(ps, {0, 1}, {1, 4});
     r = PlanDescriptors(vs, ps, m5, plan);
     Expect(!r && Has(r.reason, "out of range"), "a dimension beyond 3 is refused");
+    // FM4 Recomp: a 1D fetch (dimension 0) is a 2D binding (X FindOrAddTextureBinding maps k1D to
+    // k2D, spirv_shader_translator_fetch.cc:2328-2332): planned as 1, so it is bound (0 means unused) and shares a slot with a 2D fetch.
+    SetTextures(ps, {2}, {0});
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.dimension[2] == 1 && plan.psSlots == 1u << 2, "a 1D fetch of slot 2: planned as a 2D binding");
+    SetTextures(vs, {2}, {1});
+    Expect(PlanDescriptors(vs, ps, m5, plan).ok && plan.dimension[2] == 1, "a 1D and a 2D fetch of one slot: one 2D binding");
+    SetTextures(vs, {}, {});
     // The per-stage limit: 16 fragment samplers fit, 17 do not; the vertex stage counts separately (16 + 16 distinct slots fit).
     std::vector<uint32_t> s16, s17, d16(16, 1), d17(17, 1), v16;
     for (uint32_t i = 0; i < 16; i++)

@@ -41,8 +41,9 @@ namespace runtime::video {
 // ---- Vulkan numeric values this header mirrors (vulkan_core.h; the renderer static_asserts them) --
 namespace vk {
 constexpr uint32_t kFormatUndefined = 0, kFormatR8Unorm = 9, kFormatR8G8B8A8Unorm = 37, kFormatA2B10G10R10UnormPack32 = 64,
-                   kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133,
-                   kFormatBc3UnormBlock = 137;
+                   kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133, kFormatR16G16Unorm = 77, kFormatR16G16Snorm = 78,
+                   kFormatR8G8Unorm = 16, kFormatR8G8Snorm = 17,
+                   kFormatBc2UnormBlock = 135, kFormatBc3UnormBlock = 137, kFormatBc4UnormBlock = 139, kFormatBc5UnormBlock = 141;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipmapModeNearest = 0, kMipmapModeLinear = 1;
 constexpr uint32_t kAddressRepeat = 0, kAddressMirroredRepeat = 1, kAddressClampToEdge = 2, kAddressClampToBorder = 3;
@@ -77,6 +78,7 @@ struct TextureFetch
     uint32_t width, height;      // dword 2 (2D / cube): bits 0-12 and 13-25, each + 1
     uint32_t stackDepth;         // dword 2 bits 26-31 (2D)
     uint32_t width3D, height3D, depth3D;  // dword 2 read as size_3d: bits 0-10, 11-21, 22-31, each + 1
+    uint32_t width1D;            // FM4 Recomp: dword 2 read as size_1d: bits 0-23, + 1 (xenos.h size_1d; texture_util.cc:24-29)
     uint32_t numFormat;          // dword 3 bit 0 (0 fraction, 1 integer)
     uint32_t swizzle;            // dword 3 bits 1-12
     int32_t expAdjust;           // dword 3 bits 13-18, signed
@@ -116,6 +118,7 @@ constexpr TextureFetch DecodeTextureFetch(const uint32_t d[6])
     f.width3D = (d[2] & 0x7FF) + 1;
     f.height3D = ((d[2] >> 11) & 0x7FF) + 1;
     f.depth3D = (d[2] >> 22) + 1;
+    f.width1D = (d[2] & 0xFFFFFF) + 1;
     f.numFormat = d[3] & 1;
     f.swizzle = (d[3] >> 1) & 0xFFF;
     f.expAdjust = int32_t(((d[3] >> 13) & 0x3F) ^ 0x20) - 0x20;  // sign-extend 6 bits
@@ -167,11 +170,23 @@ struct HostFormat
     // XE_TEXTURE_LOAD_32BPB_TRANSFORM = XeFloat20e4To32(blocks >> 8), pixel_formats.xesli:622-638, no [0, 0.5) remap),
     // = edram_vk_plan.h ColorWordDepth(w, D24FS8). The stencil (bits 0-7) is not sampled.
     bool depth20e4 = false;
+    // FM4 Recomp: the host format for a fetch whose components are all signed (Xenia's format_signed: k_16_16 -> R16G16_SNORM,
+    // vulkan_texture_cache.cc:220-225), the same bits viewed signed; 0: none (signed components then refused unless signIgnored).
+    uint32_t vkFormatSigned = 0;
+    bool signedView = false;  // this description uses vkFormatSigned (every component signed)
 };
 bool HostFormatFor(uint32_t format, HostFormat& out);
+// FM4 Recomp: a fetch sampling every component signed from a format with a signed host format (Xenia's signed_separate
+// image view, vulkan_texture_cache.cc:987-1001): described and keyed separately from the unsigned one.
+inline bool SignedSeparate(const TextureFetch& f)
+{
+    HostFormat h;
+    return HostFormatFor(f.format, h) && h.vkFormatSigned != 0 && f.sign[0] == 1 && f.sign[1] == 1 && f.sign[2] == 1 && f.sign[3] == 1;
+}
 
 constexpr uint32_t kSwizzleRRRR = 0;                                 // 0 | 0 << 3 | 0 << 6 | 0 << 9
 constexpr uint32_t kSwizzleRGBA = 0 | 1 << 3 | 2 << 6 | 3 << 9;     // 0x688
+constexpr uint32_t kSwizzleRGGG = 0 | 1 << 3 | 1 << 6 | 1 << 9;     // k_8_8, k_16_16 (Xenia XE_GPU_TEXTURE_SWIZZLE_RGGG)
 constexpr uint32_t SwizzleComponent(uint32_t swizzle, uint32_t i) { return (swizzle >> (3 * i)) & 7; }
 
 // ---- One stored mip level (ForzaRecomp texture.h MipLevel) ---------------------------------------
@@ -185,7 +200,10 @@ struct MipLevel
     uint32_t widthTexels = 0, heightTexels = 0;  // the level's own size in texels (the host image level)
     uint32_t depth = 1;                // 3D: slices (the level's z extent); 1 otherwise
     uint32_t zStrideBlockRows = 0;     // 3D: the slice stride in block rows, aligned to 32 (texture_util.cc:328-333)
-    size_t extentBytes = 0;       // bytes from `address` the copy reads
+    // FM4 Recomp: cube: the bytes between faces (texture_util.cc:337-344 array_slice_stride_bytes: level 0 its row pitch x
+    // its height in block rows aligned to 32, a mip its stride; aligned to 4 KB); face k at address + k x faceStrideBytes.
+    size_t faceStrideBytes = 0;
+    size_t extentBytes = 0;       // bytes from `address` the copy reads (a cube: every face, :425-427)
     bool packed = false;
 };
 
@@ -210,7 +228,8 @@ struct TextureDescription
     uint32_t log2BytesPerBlock = 0;
     uint32_t width = 0, height = 0;       // level 0, texels
     uint32_t depth = 1;                   // 3D: slices; 1 for 2D
-    uint32_t dimension = 1;               // the fetch constant's (1 2D, 2 3D; others are refused)
+    uint32_t dimension = 1;               // the fetch constant's (1 2D, 2 3D, 3 cube; 1D and stacked are refused)
+    uint32_t layers = 1;                  // FM4 Recomp: cube 6 faces (array layers +X -X +Y -Y +Z -Z, texture_util.cc:220-221); else 1
     uint32_t levelCount = 0;              // host image levels, from level 0 (never a first level above 0)
     uint32_t packedLevel = UINT32_MAX;
     std::vector<MipLevel> levels;         // levelCount entries, level 0 first
@@ -254,6 +273,7 @@ struct TextureBinding
     // the fetch swizzle folded through the host format's swizzle (texture_cache.cc GuestToHostSwizzle).
     uint32_t components[4] = {vk::kSwizzleR, vk::kSwizzleG, vk::kSwizzleB, vk::kSwizzleA};
     bool gamma = false;        // XE_TEXTURE_<slot>_GAMMA: x, y, z after the swizzle are all sign 3
+    uint32_t biasedMask = 0;   // FM4 Recomp: XE_TEXTURE_<slot>_BIASED: bit i when result component i's source sign is 2 (v * 2 - 1)
     int32_t expAdjust = 0;     // XE_TEXTURE_<slot>_SCALE ldexp(1.0, expAdjust) when not 0
     float lodBias = 0.0f;      // XE_TEXTURE_<slot>_LOD_BIAS, in LODs (the field / 32)
     SamplerDescription sampler;

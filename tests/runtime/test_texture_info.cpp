@@ -133,8 +133,15 @@ void TestFormatsAndDescriptions()
            "host format: k_8_8_8_8 / _AS_16_16_16_16 -> R8G8B8A8_UNORM, k_2_10_10_10_AS_16_16_16_16 -> A2B10G10R10 (:121-125, :335-339, :355-360)");
     Expect(HostFormatFor(20, h) && h.vkFormat == 137 && h.blockCompressed && HostFormatFor(53, h) && h.vkFormat == 137,
            "host format: k_DXT4_5 and k_DXT4_5_AS_16_16_16_16 -> BC3_UNORM_BLOCK (137; :196-200, :350-354)");
-    Expect(!HostFormatFor(19, h) && !HostFormatFor(49, h) && !HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
-           "CONTROL: DXT3, DXN, 5_6_5 and 2_10_10_10 have no host mapping yet");
+    Expect(HostFormatFor(10, h) && h.vkFormat == 16 && h.vkFormatSigned == 17 && h.formatSwizzle == kSwizzleRGGG && !h.blockCompressed &&
+               !h.floatData && BytesPerBlock(GetFormatInfo(10)) == 2,
+           "host format: k_8_8 -> R8G8_UNORM (16), signed R8G8_SNORM (17), RGGG, 2-byte blocks (:141-145; texture_info_formats.inl:11)");
+    Expect(HostFormatFor(49, h) && h.vkFormat == 141 && h.formatSwizzle == kSwizzleRGGG && h.blockCompressed && h.vkFormatSigned == 0 &&
+               BytesPerBlock(GetFormatInfo(49)) == 16,
+           "host format: k_DXN -> BC5_UNORM (141), RGGG, no signed form, 16-byte 4x4 blocks (:330-333)");
+    Expect(HostFormatFor(19, h) && h.vkFormat == 135 && h.blockCompressed, "host format: k_DXT2_3 -> BC2_UNORM (135) (:191-195)");
+    Expect(!HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
+           "CONTROL: 5_6_5 and 2_10_10_10 have no host mapping yet");
 
     // The Y plane: level 0 only, extent 1280 * 719 + 1280 = 921,600 (texture_util.cc:420-423: rows - 1
     // pitches plus the last row; the base's pitch is the fetch constant's, 1280, not re-aligned).
@@ -252,11 +259,14 @@ void TestRefusals()
         {"type 3 (vertex)", With(kYPlane, 0, 3u, 3u), {}, "not a texture"},
         {"type 0 (invalid)", With(kYPlane, 0, 3u, 0u), {}, "not a texture"},
         {"dimension 3D", With(kYPlane, 5, 3u << 9, 2u << 9), {}, "constant's dimension is 2"},  // a 3D constant fetched as 2D (refused at binding)
-        {"dimension cube", With(kYPlane, 5, 3u << 9, 3u << 9), {}, "dimension 3"},
-        {"dimension 1D", With(kYPlane, 5, 3u << 9, 0u), {}, "dimension 0"},
+        {"dimension cube", With(kYPlane, 5, 3u << 9, 3u << 9), {}, "stack depth is 0"},  // a cube needs six faces (TestCube in test_texture_vk.cpp)
+        // FM4 Recomp: 1D constants are described (a height-1 image); size_1d is 24 bits, so the Y plane's dword 2 reads as a 5,891,328-texel
+        // row (0x0059E4FF + 1), past Xenia's 8192 limit (texture_cache.cc:902-907); a tiled 1D is refused like Xenia's (:908-914).
+        {"dimension 1D wider than 8192", With(kYPlane, 5, 3u << 9, 0u), {}, "5891328 texels wide"},
+        {"dimension 1D tiled", With(With(kYPlane, 5, 3u << 9, 0u), 0, 0, 1u << 31), {}, "1D texture that is tiled"},
         {"stacked", With(kYPlane, 1, 1u << 10, 1u << 10), {}, "stacked"},
         {"shader samples 3D", std::vector<uint32_t>(kYPlane, kYPlane + 6), ShaderFetch{3, 3, 3, 7, 2}, "dimension 2"},
-        {"format DXT3 (19)", With(kYPlane, 1, 0x3Fu, 19u), {}, "no host format"},
+        {"format 5_6_5 (4)", With(kYPlane, 1, 0x3Fu, 4u), {}, "no host format"},
         {"format 5_6_5 (4)", With(kYPlane, 1, 0x3Fu, 4u), {}, "no host format"},
         {"integer number format", With(kYPlane, 3, 1u, 1u), {}, "integer"},
         {"base address 0", With(kYPlane, 1, 0xFFFFF000u, 0u), {}, "base address 0"},
@@ -264,7 +274,7 @@ void TestRefusals()
         {"k_8 with endian 8in16", With(kYPlane, 1, 3u << 6, 1u << 6), {}, "1-byte blocks"},
         {"DXT1 with endian 16in32 (8-byte blocks take every endian)", With(kDxt1, 1, 3u << 6, 3u << 6), {}, nullptr},
         {"signed component", With(kYPlane, 0, 3u << 2, 1u << 2), {}, "signed component 0"},
-        {"biased component", With(kYPlane, 0, 3u << 2, 2u << 2), {}, "unsigned biased component 0"},
+        {"biased component (the shader's v * 2 - 1)", With(kYPlane, 0, 3u << 2, 2u << 2), {}, nullptr},
         {"mixed gamma (x only)", With(kRgba8Zyx1, 0, 0xFFu << 2, 3u << 2), {}, "mixed gamma"},
         {"gamma on w (XYZW, all four signs 3)", With(With(kRgba8Zyx1, 0, 0xFFu << 2, 0xFFu << 2), 3, 0xFFFu << 1, kSwizzleXYZW), {}, "gamma on the w"},
         {"swizzle value 6", With(kRgba8Zyx1, 3, 0xFFFu << 1, 6u << 1), {}, "undefined value 6"},
@@ -568,7 +578,7 @@ void TestCache()
     Expect(watch.Rearm(0x09000000u, 65536) && watch.GetStats().rearms == 15, "CONTROL: Rearm over unwatched pages protects nothing");
 
     // A refused fetch constant: no entry, the reason; a failing backend: Loaded false, the entry invalid.
-    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 19u).data());  // DXT3: no host format
+    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 4u).data());  // 5_6_5: no host format
     Expect(!bad.entry && Has(bad.error, "no host format") && cache.GetStats().refused == 1 && cache.Size() == 2, "CONTROL: a refused fetch constant makes no entry and names its reason");
     fake.fail = true;
     TextureCache::Lookup v = cache.Find(kUPlane);
@@ -593,6 +603,58 @@ void TestCache()
 
 }  // namespace
 
+// FM4 Recomp (FM4_WRITE_WATCH): the orderings the real backend depends on, by hand on host pages of 16 KB.
+struct OrderBackend final : WatchBackend
+{
+    WriteWatch* watch = nullptr;
+    bool fail = false;
+    std::vector<std::string> log;  // "ro <page> watched=<flag at the call>" / "rw <page> watched=<flag>"
+    bool Protect(uint32_t physical, uint32_t size, bool readOnly) override
+    {
+        for (uint32_t h = physical / 16384; h <= (physical + size - 1) / 16384; h++)
+            log.push_back(std::string(readOnly ? "ro " : "rw ") + std::to_string(h) + " watched=" + (watch->IsWatchedHostPage(h * 16384) ? "1" : "0"));
+        return !fail;
+    }
+};
+
+void TestWatchOrderings()
+{
+    OrderBackend b;
+    WriteWatch w(b);
+    b.watch = &w;
+    // Watch: the flags are set before the protection (a store faulting in between finds its page watched).
+    Expect(w.Watch(0x02000000u, 20000) && b.log.size() == 2 && b.log[0] == "ro 2048 watched=1" && b.log[1] == "ro 2049 watched=1",
+           "watch order: 20,000 bytes at 0x02000000 = host pages 2048, 2049, flagged before the protect call");
+    // A refused protection takes the flags back.
+    b.fail = true;
+    Expect(!w.Watch(0x02100000u, 16384) && !w.IsWatchedHostPage(0x02100000u), "watch order: a refused protect leaves the page unwatched");
+    b.fail = false;
+    b.log.clear();
+    // The hook's path: writable first (the flag still set at the call), then the sequence moves, then the flag clears; an unwatched
+    // page the heap means writable is handled the same (a concurrent second fault, or a heap recompute racing Watch).
+    const uint64_t before = w.Current();
+    Expect(w.OnProtectionFault(0x02000000u + 100) && b.log.size() == 1 && b.log[0] == "rw 2048 watched=1" && !w.IsWatchedHostPage(0x02000000u) &&
+               w.WriteSequence(0x02000000u, 16384) == before + 1 && w.WriteSequence(0x02004000u, 16384) == 0,
+           "fault: unprotect with the flag still set, then host page 2048's four guest pages at sequence 1, page 2049 untouched");
+    Expect(w.OnProtectionFault(0x02000000u + 200) && b.log.size() == 2 && b.log[1] == "rw 2048 watched=0" && w.WriteSequence(0x02000000u, 4096) == before + 2,
+           "fault: a second fault on the same page (already unwatched) is still taken and still moves the sequence");
+    Expect(!w.OnProtectionFault(0x20000000u), "CONTROL: an address past the 512 MB is not taken");
+    // The heap changes a watched page's access: unwatched, counted as written, no protect call (the heap sets the access).
+    b.log.clear();
+    w.HostAccessChanged(0x02004000u, 16384);
+    Expect(b.log.empty() && !w.IsWatchedHostPage(0x02004000u) && w.WriteSequence(0x02004000u, 16384) == before + 3,
+           "heap access change: page 2049 unwatched and written, no backend call");
+    // A system call is about to write: the watched pages it covers are made writable and unwatched first; unwatched ones untouched.
+    Expect(w.Watch(0x03000000u, 32768), "re-watch two pages for the host write");
+    b.log.clear();
+    w.BeforeHostWrite(0x03000000u + 100, 20000);
+    Expect(b.log.size() == 2 && b.log[0] == "rw 3072 watched=0" && b.log[1] == "rw 3073 watched=0" && w.WriteSequence(0x03000000u, 32768) == before + 4,
+           "host write: pages 3072 and 3073 unprotected (flag exchanged first) and written");
+    b.log.clear();
+    w.BeforeHostWrite(0x03000000u, 100);
+    Expect(b.log.empty(), "CONTROL: a host write over unwatched pages calls nothing");
+}
+
 int main()
 {
     TestDecode();
@@ -603,6 +665,7 @@ int main()
     TestEndian();
     TestCopies();
     TestCache();
+    TestWatchOrderings();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

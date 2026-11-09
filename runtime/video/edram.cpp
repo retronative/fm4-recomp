@@ -6,6 +6,7 @@
 // src/xenia/gpu unless another directory is named; BSD-3-Clause), re-derived here, never copied.
 #include "edram.h"
 #include "front_buffer.h"  // TiledOffset: X texture_util.cc:443-459 GetTiledOffset2D (reviewed)
+#include "texture_untile.h"  // TiledOffset2D, TiledAddressUpperBound2D (X texture_util.cc:443-458, :490-517) for 16 bpp destinations
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -55,9 +56,9 @@ bool SupportedKey(Key k, std::string& why)
         // FM4's HDR luminance reduction (RB_COLOR_INFO 000E0000).
         return true;
     case ColorFormat::k16_16:
-        // FM4 Recomp: 32 bpp (two signed 16-bit components, the guest range -32..32); FM4's intro, the local capture scenario11 (not distributed) draw
-        // 483247 (RB_COLOR_INFO 00540340). Host R16G16_SNORM (edram_vk_plan.h HostColorFormat). Its transfers and resolves stay
-        // refused by edram_vk_plan.cpp until a run needs them.
+        // FM4 Recomp: 32 bpp (two signed 16-bit components, the guest range -32..32); FM4's intro
+        // (RB_COLOR_INFO 00540340). Host R16G16_SNORM (edram_vk_plan.h HostColorFormat). Its transfers go through
+        // R16G16_UINT (edram_vk_plan.h TransferViewFormat); its resolves only into k_16_16 (DecodeResolve).
         return true;
     case ColorFormat::k16_16_Float:
         return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16_FLOAT) is not supported yet");
@@ -138,25 +139,18 @@ bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Tr
     // to the start (the whole EDRAM at most).
     const uint32_t first = (dest.Base() + start) & (kTileCount - 1), end = first + length;
     const uint32_t extents[2][2] = {{first, std::min(end, kTileCount)}, {0, end > kTileCount ? std::min(end & (kTileCount - 1), first) : 0}};
-    // Validate every tile before changing any (the header's reduction: no host-depth owners).
-    for (const auto& e : extents)
-        for (uint32_t t = e[0]; t < e[1]; t++)
-        {
-            const Key o = At(t);
-            if (o.Empty() || o == dest)
-                continue;
-            // Depth -> colour is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913) and needs no host-depth
-            // owner: X tracks those only for a depth destination (render_target_cache.cc:1553-1555, :1606-1609).
-            // Colour -> depth is X's kColorToDepth (vulkan_render_target_cache.cc:4904-4908) with, for kD24FS8 on a float32
-            // host, the range's host-depth owner as a second source (render_target_cache.cc:1553-1555, :1606-1611): X writes
-            // that owner's float32 depth where its 20e4 conversion equals the colour word's depth bits, else the 20e4 bits
-            // converted (vulkan_render_target_cache.cc:3741-4142). FM4 Recomp reduction (unit 6b restores it): no host-depth
-            // owners, always the converted bits. That differs from X only where the colour still holds the very depth bits
-            // the old depth target had, and then only below the 20e4 quantum (edram_vk_plan.h ColorToDepth).
-            if (dest.IsDepth() && o.IsDepth() && o.Format() != dest.Format())
-                return Refuse(refusal, "tile " + std::to_string(t) + " would transfer between depth formats (" + std::to_string(o.Format()) + " -> " +
-                                           std::to_string(dest.Format()) + "): not modelled (unit 6b)");
-        }
+    // Every owner change is accepted (FM4 Recomp: the depth-format refusal was the last one):
+    // Depth -> colour is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913) and needs no host-depth owner: X tracks
+    // those only for a depth destination (render_target_cache.cc:1553-1555, :1606-1609).
+    // Colour -> depth is X's kColorToDepth (vulkan_render_target_cache.cc:4904-4908) with, for kD24FS8 on a float32 host, the
+    // range's host-depth owner as a second source (render_target_cache.cc:1553-1555, :1606-1611): X writes that owner's float32
+    // depth where its 20e4 conversion equals the colour word's depth bits, else the 20e4 bits converted
+    // (vulkan_render_target_cache.cc:3741-4142). FM4 Recomp reduction: no host-depth owners, always the converted bits. That
+    // differs from X only where the colour still holds the very depth bits the old depth target had, and then only below the
+    // 20e4 quantum (edram_vk_plan.h ColorToDepth).
+    // Depth -> depth between the formats is X's kDepthToDepth with the guest bits reinterpreted (edram_vk_plan.h
+    // ConvertDepthFormat; FM4: tile 720, kD24FS8 -> kD24S8). X's host-depth owner refines only a kD24FS8
+    // destination, so kD24FS8 -> kD24S8 is exact against X and kD24S8 -> kD24FS8 APPROXIMATE as colour -> depth above.
     for (const auto& e : extents)
         for (uint32_t t = e[0]; t < e[1]; t++)
         {
@@ -519,15 +513,31 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
             return refuse(shape + "a resolve into a 3D (array) destination is not supported in M4");
         if (info.destEndian > 3)
             return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " (a 64/128-bit swap) is not supported in M4");
-        // 32 bpp destinations only; bitwise-equivalent to the accepted sources (X xenos.h:616-641) or the
+        // 32 bpp destinations, and 10 (k_8_8, 16 bpp); bitwise-equivalent to the accepted sources (X xenos.h:616-641) or the
         // 8_8_8_8 <-> 2_10_10_10 unorm conversion that FM4's menus may use (HYPOTHESIS).
         // 36 = k_32_FLOAT (xenos.h:604), the bitwise equivalent of a 32_FLOAT render target (xenos.h:634-635).
-        if (info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 50 && info.destFormat != 54 && info.destFormat != 36)
-            return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) + " is not supported in M4 (6, 7, 36, 50, 54 are)");
+        // 25 = k_16_16 (xenos.h:599) from a 16_16 source only (observed in FM4): never
+        // bitwise equivalent (xenos.h:616-641 has no 16_16 case), so always X's full resolve (draw_util.cc:1312-1347).
+        // 10 = k_8_8 (xenos.h:593; FM4: from an 8_8_8_8 source): never bitwise
+        // equivalent either, so X's full 16 bpp resolve (draw_util.cc:1333-1334 kFull16bpp, shaders/resolve_full_16bpp.xesli).
+        const bool rg16 = info.source.Format() == uint32_t(ColorFormat::k16_16);
+        if (info.destFormat == 25 ? !rg16
+                                  : info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 10 && info.destFormat != 50 &&
+                                        info.destFormat != 54 && info.destFormat != 36)
+            return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) +
+                          " is not supported in M4 (6, 7, 10, 36, 50, 54 are; 25 from a 16_16 source)");
+        // A 16 bpp store swaps with XeEndianSwap16 (resolve_full_16bpp.xesli:61-63), where only 8in16 does anything (endian.xesli
+        // :25-31, texture_untile.h EndianSwap16Pair); 8in32 and 16in32 would be silent no-ops there: refused until observed.
+        if (info.destFormat == 10 && info.destEndian > 1)
+            return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " on a 16 bpp destination (only 0 and 8in16 are supported)");
+        info.destBytesLog2 = info.destFormat == 10 ? 1 : 2;  // X draw_util.cc:1133 (texture_info_formats.inl:11 k_8_8: 16 bits)
         // RB_COPY_DEST_INFO copy_dest_number (X registers.h:819): Xenia 67f16c4 declares it and never reads it in its resolve path.
         // FM4 resolves its k_32_FLOAT target into texture format 36 with number 7 (kFloat, xenos.h:216-224; the local capture draw_loop2 (not distributed),
-        // draw 31424): the natural value for float data. Accepted for that pairing only; every other non-zero value stays refused.
-        if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36))
+        // draw 31424): the natural value for float data. FM4 resolves its 16_16 target into texture format 25 with number 3
+        // (kSignedInteger, xenos.h:221; the local capture scenario17 (not distributed) draw 484805); X packs UNORM whatever the number
+        // (pixel_formats.xesli:144-147, :236-239) and so does this port: what the hardware does with number 3 is UNRESOLVED.
+        // Accepted for those two pairings only; every other non-zero value stays refused.
+        if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36) && !(destNumber == 3 && info.destFormat == 25))
             return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
         // An exponent bias is X's full (converting) resolve's dest_exp_bias_factor (shaders/resolve.xesli:131-133), applied by
         // edram_vk_plan.cpp ResolveConvertToGuest; the range is the field's (6-bit signed, -32..31).
@@ -539,12 +549,25 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     // :1146-1178 with bpp_log2 2: the base granularity is 32x32 texels (X xenos.h:1188-1195), so the copy's
     // origin is the 32x32 tile of (x0, y0) and the offset within it; the extent is X texture_util.h:297-303
     // GetTiledAddressLowerBound2D to texture_util.cc:490-518 GetTiledAddressUpperBound2D (+ 0x400 << 2).
-    const uint32_t baseX = info.x0 & ~31u, baseY = info.y0 & ~31u;
-    info.destOffsetX = info.x0 & 31, info.destOffsetY = info.y0 & 31;
-    info.destBase = r.copyDestBase + TiledOffset(baseX, baseY, info.destPitch, 2);
-    info.destExtentStart = info.destBase;
-    const uint32_t extentEnd = r.copyDestBase + TiledOffset((info.x1 - 1) & ~31u, (info.y1 - 1) & ~31u, info.destPitch, 2) + (0x400u << 2);
-    info.destExtentLength = extentEnd - info.destExtentStart;
+    if (info.destBytesLog2 == 1)
+    {
+        // FM4 Recomp: a 16 bpp destination (k_8_8), the same lines with bpp_log2 1: the base granularity is 64x64 texels
+        // (xenos.h:1188-1195: 7 - min(2, 1) = 6), the lower bound stays the 32x32 tile of (x0, y0) (texture_util.h:297-303),
+        // the upper bound adds 0xC00 (texture_util.cc:507-511). texture_untile.h's token-for-token transcriptions.
+        info.destOffsetX = info.x0 & 63, info.destOffsetY = info.y0 & 63;
+        info.destBase = r.copyDestBase + TiledOffset2D(info.x0 & ~63u, info.y0 & ~63u, info.destPitch, 1);
+        info.destExtentStart = r.copyDestBase + TiledOffset2D(info.x0 & ~31u, info.y0 & ~31u, info.destPitch, 1);
+        info.destExtentLength = r.copyDestBase + TiledAddressUpperBound2D(info.x1, info.y1, info.destPitch, 1) - info.destExtentStart;
+    }
+    else
+    {
+        const uint32_t baseX = info.x0 & ~31u, baseY = info.y0 & ~31u;
+        info.destOffsetX = info.x0 & 31, info.destOffsetY = info.y0 & 31;
+        info.destBase = r.copyDestBase + TiledOffset(baseX, baseY, info.destPitch, 2);
+        info.destExtentStart = info.destBase;
+        const uint32_t extentEnd = r.copyDestBase + TiledOffset((info.x1 - 1) & ~31u, (info.y1 - 1) & ~31u, info.destPitch, 2) + (0x400u << 2);
+        info.destExtentLength = extentEnd - info.destExtentStart;
+    }
     info.copy = true;
 
     // The EDRAM span (:1202-1220, GetResolveEdramTileSpan :875-904).

@@ -144,6 +144,13 @@ const CachedShader* ShaderCache::Load(uint32_t type, const uint32_t* words, uint
         stats_.refusals++;
         reason = Name(*shader) + " (" + std::to_string(count) + " words, class " + ShaderClassName(shader->cls) + ") refused: " + error;
         refused_[hash] = reason;
+        // FM4_SHADER_DUMP: a refused shader's microcode as the census reads it (<vs|ps>_<hash>.bin, big-endian words, cp_trace.cpp's
+        // format), so the translator can be worked on offline without the CP trace.
+        std::string be(size_t(count) * 4, '\0');
+        for (uint32_t i = 0; i < count; i++)
+            for (uint32_t b = 0; b < 4; b++)
+                be[4 * i + b] = char(uint8_t(words[i] >> (24 - 8 * b)));
+        Dump(Name(*shader) + ".bin", be);
         return nullptr;
     }
     Dump(Name(*shader) + (pixel ? ".frag" : ".vert"), shader->t.glsl);

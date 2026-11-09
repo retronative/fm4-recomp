@@ -88,6 +88,17 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken);
 // IM_LOAD / IM_LOAD_IMMEDIATE: ShaderCache::Load (translation at a hash miss, class tag); a refused shader
 // stops naming its hash.
 void LoadShader(uint32_t type, const uint32_t* words, uint32_t count);
+// FM4 Recomp (FM4_RESOLVE_DEFER): before a command-processor packet the guest CPU can synchronise on, the pending resolves'
+// write-backs land in guest memory (a flush when any is pending; nothing otherwise).
+void SyncGuestWrites(uint32_t opcode);
+// FM4 Recomp (FM4_DEFER_FENCES=1, opt-in; needs FM4_RESOLVE_DEFER=1): the command stream's memory stores land at GPU completion
+// (command_processor.h deferStore / ringIdle / ApplyDeferredStores): DeferStore marks the 4 bytes pending while the slot is
+// open (true: queued); RingIdle submits and retires the open slot when the ring is drained with stores queued.
+bool DeferFences();
+bool DeferStore(uint32_t physical);
+void RingIdle();
+bool PendingAt(uint32_t physical, uint32_t bytes);
+bool WorkOpen();  // FM4_DEFER_FENCES: the slot holds recorded work not yet submitted  // a GPU write or deferred store over the range waits for the open slot  // opcode: the PM4 type-3 packet (counted per packet in the swap timing line)
 
 // Window mode, main thread only (window_sdl.cpp RunWindowLoop; defined in window_present.cpp). Waits up to `waitNs` for
 // the frame the command processor handed over and presents it: planner decision, bounded acquire, the blit submission

@@ -93,6 +93,7 @@ runtime::ThreadState mainThread;
 
 void* RunGuest(void*)
 {
+    pthread_setname_np("fm4 guest main");  // FM4 Recomp: thread_cpu.h roles
     runtime::UseFaultStackOnThisThread();
     PPCContext ctx{};
     ctx.r1.u64 = mainThread.stackBase - 0x100;  // room for the entry's back chain and save area
@@ -279,7 +280,14 @@ int main(int argc, char** argv)
     // thread), before the renderer creates the instance and the surface (also here, in Initialize).
     if (video.mode == runtime::video::Mode::Window)
         video.surface = runtime::video::window::OpenWindow();
-    static const runtime::gpu::RendererHooks hooks{runtime::video::Present, runtime::video::Draw, runtime::video::LoadShader};
+    // FM4_DEFER_FENCES (renderer.h DeferFences): the store and idle hooks only when on (the command processor then skips the
+    // sync before a store-only packet, which is right only when that store is deferred).
+    static const runtime::gpu::RendererHooks hooks{runtime::video::Present, runtime::video::Draw, runtime::video::LoadShader,
+                                                   runtime::video::SyncGuestWrites,
+                                                   runtime::video::DeferFences() ? runtime::video::DeferStore : nullptr,
+                                                   runtime::video::DeferFences() ? runtime::video::RingIdle : nullptr,
+                                                   runtime::video::DeferFences() ? runtime::video::PendingAt : nullptr,
+                                                   runtime::video::DeferFences() ? runtime::video::WorkOpen : nullptr};
     if (runtime::video::Initialize(video))
     {
         if (video.mode == runtime::video::Mode::SelfCheck)

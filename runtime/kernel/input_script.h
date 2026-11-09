@@ -34,7 +34,15 @@ struct Event
     uint8_t leftTrigger = 0, rightTrigger = 0;  // 0 or 0xFF (LT / RT named)
 };
 
-struct Script { std::vector<Event> events; };  // in vblank order
+// FM4 Recomp (M7 A/B harness): a line `@race` starts a second list whose vblanks count from the race start (Poller::RaceStarted;
+// renderer.cpp reports it), so the race inputs are the same whatever the load time. Before it the first list applies; from the
+// race start only the race list does (nothing held before its first event). Without `@race` RaceStarted changes nothing.
+struct Script
+{
+    std::vector<Event> events;  // in vblank order
+    std::vector<Event> race;    // in vblank order, relative to the race start
+    bool hasRace = false;
+};
 
 // Parses `text`; false with `error` ("line N: ...") on a malformed line, an unknown name or a vblank not above the
 // previous line's. A script with no events is valid (a connected pad with nothing pressed).
@@ -63,12 +71,19 @@ public:
     explicit Poller(Script script) : script_(std::move(script)) {}
     const Script& script() const { return script_; }
     Report Poll(uint64_t vblank);
+    // The race start at `vblank` (the first call counts; false when the script has no `@race` section or it was already set).
+    bool RaceStarted(uint64_t vblank);
 
 private:
     Script script_;
+    bool raced_ = false;
+    uint64_t raceStart_ = 0;
     uint32_t packet_ = 0;  // 0: never polled
     long event_ = -1;
 };
+
+// FM4 Recomp: Poller::RaceStarted on the loaded script, if any (imports_input.cpp; logged once). Any thread.
+void NotifyRaceStart(uint64_t vblank);
 
 // The names of the buttons held in a report, space-separated ("" when none), for the log.
 std::string Describe(uint16_t buttons, uint8_t leftTrigger, uint8_t rightTrigger);

@@ -9,6 +9,7 @@
 // (layout transitions, transfers) but never submit: GpuGuard owns the queue (gpu_guard.h).
 #pragma once
 #include "draw_state.h"
+#include "resolve_resident.h"
 #include <cstdint>
 #include <string>
 #include <vulkan/vulkan.h>
@@ -34,6 +35,16 @@ struct HostTargets
     uint32_t width = 0, height = 0, samples = 1;
 };
 
+// FM4 Recomp (FM4_PASS_MERGE=1): the renderer may leave a draw's render pass open for the next draw on the same framebuffer.
+// Every recording that must happen outside a render pass (barriers, copies, clears, the units' own passes) first calls
+// OutsideRenderPass, which ends it. renderer.cpp registers the function; it is null in the units' tests.
+inline void (*endOpenRenderPass)(VkCommandBuffer) = nullptr;
+inline void OutsideRenderPass(VkCommandBuffer c)
+{
+    if (endOpenRenderPass != nullptr)
+        endOpenRenderPass(c);
+}
+
 struct EdramHooks
 {
     // Before a Draw / DepthOnly draw is recorded: the host targets of `target` for the attachments the
@@ -53,6 +64,13 @@ struct EdramHooks
     // Renderer shutdown, only after GpuGuard::Shutdown kept nothing and after the renderer destroyed its
     // framebuffers (they reference the EDRAM unit's views): destroys every resource of the unit.
     void (*shutdown)();
+    // FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): the resolve `resolve` just recorded, as the texture unit sees it
+    // (false: it copied nothing), and when `out.converted` the unit's image holding its converted words (1x R32_UINT, in
+    // TRANSFER_SRC_OPTIMAL, the rectangle at (0, 0)), valid in `commands` until the next resolve is recorded.
+    bool (*lastResolve)(ResidentResolve& out, VkImage& words);
+    // FM4 Recomp (FM4_RESOLVE_RESIDENT): whether one more resolve fits the staging before the open submission retires (the
+    // EDRAM unit then keeps several read-back resolves pending; otherwise one).
+    bool (*resolveRoom)();
 };
 
 class UploadRing;  // pipeline_key.h
@@ -80,7 +98,14 @@ struct TextureHooks
     bool (*bind)(const TextureBindContext& context, const TextureSlot& slot, VkImageView& view, VkSampler& sampler, std::string& error);
     // The ring bytes `bind` will place for this slot (staging plus alignment), so the renderer can flush the slot before a draw
     // whose uploads would not fit; 0 when the texture cannot be prepared (bind then refuses it with the reason).
-    uint64_t (*stagingBytes)(const TextureSlot& slot);
+    uint64_t (*stagingBytes)(const TextureSlot& slot, const uint8_t* base);  // base: guest memory (the reuse hash, texture_upload.h ReservedStagingBytes)
+    // FM4 Recomp (FM4_RESOLVE_DEFER): whether the slot's texture reads a range a recorded resolve has not yet written back.
+    // FM4_RESOLVE_RESIDENT: false for an image that already holds the resolves' words (adoptResolve).
+    bool (*readsPendingWrite)(const TextureSlot& slot);
+    // FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): after every recorded resolve. Copies the resolve's converted words
+    // (`words`, EdramHooks::lastResolve) into each host image that takes them verbatim and is otherwise in step with guest
+    // memory; every other image over the resolve's range stops being resident. Returns the images written.
+    uint32_t (*adoptResolve)(VkCommandBuffer commands, const ResidentResolve& resolve, VkImage words);
 };
 
 }  // namespace runtime::video

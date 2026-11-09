@@ -477,6 +477,7 @@ constexpr VertexFetch DecodeVertexFetch(const uint32_t w[3])
 constexpr uint32_t kFilterUseFetchConst = 3;
 constexpr uint32_t kAnisoUseFetchConst = 7;
 constexpr uint32_t kArbitraryUseFetchConst = 7;
+constexpr uint32_t kDimension1D = 0;  // FM4 Recomp: sampled as a 2D image of height 1 at (s, 0) [X]
 constexpr uint32_t kDimension2D = 1;
 // 3D or stacked: the instruction cannot tell them apart; the fetch constant's dimension (dword 5
 // bits 9-10) decides at draw time [X].

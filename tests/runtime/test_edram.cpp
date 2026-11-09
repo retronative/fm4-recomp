@@ -211,7 +211,6 @@ void TestOwnership()
     CHECK(all.Change(kW, 0, 2048, t, why) && all.Count(kW) == 2048 && t.empty());
     // Colour over depth tiles is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913): accepted, one transfer
     // from the depth key (on a copy, so the checks below see the map unchanged).
-    const Ownership before = o;
     Ownership overDepth = o;
     t.clear();
     CHECK(overDepth.Change(Key::Color(720, 16, Msaa::X4, ColorFormat::k2_10_10_10), 16, 16, t, why) && t == T({{736, 752, kAd}}) &&
@@ -220,14 +219,13 @@ void TestOwnership()
     Ownership overColor = o;
     t.clear();
     CHECK(overColor.Change(Key::Depth(0, 16, Msaa::X4, DepthFormat::D24FS8), 0, 8, t, why) && t == T({{0, 8, kW}}));
-    // Refusals change nothing: kD24S8 over kD24FS8 tiles.
+    // FM4 Recomp: kD24S8 over kD24FS8 tiles is X's kDepthToDepth between formats (FM4, tile 720): accepted
+    // (on a copy), one transfer from the kD24FS8 owner (kAd) of tiles 736-751.
+    Ownership overFormat = o;
     t.clear();
-    CONTROL(o.Change(Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8), 16, 16, t, why));
-    CHECK(why.find("between depth formats") != std::string::npos);
-    // A refusal in the wrapped extent leaves the first extent unchanged too: base 2040, 760 tiles -> [2040, 2048) (kW
-    // colour: acceptable) and [0, 752), whose tiles 736-751 are kD24FS8 (kAd) under a kD24S8 claim.
-    CONTROL(o.Change(Key::Depth(2040, 16, Msaa::X1, DepthFormat::D24S8), 0, 760, t, why));
-    CHECK(o.At(2040) == before.At(2040) && o.At(0) == before.At(0) && t.empty() && why.find("between depth formats") != std::string::npos);
+    CHECK(overFormat.Change(Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8), 16, 16, t, why) && t == T({{736, 752, kAd}}) &&
+          overFormat.At(736) == Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8));
+    CONTROL(o.At(736) != kAd);  // the copy changed, not the original
     // Preconditions (X :1543-1547).
     CONTROL(o.Change(kAc, 2048, 1, t, why));
     CONTROL(o.Change(kAc, 0, 2049, t, why));
@@ -970,6 +968,23 @@ void TestResolveDecode()
         r = Fm4Resolve(), r.copyDestInfo = 2 | f << 7;
         CHECK(DecodeResolve(r).ok);
     }
+    // FM4's 16_16 resolve: RB_COLOR_INFO format 4 (bits 16-19), 4x, k0123,
+    // into texture format 25 (k_16_16, X xenos.h:599) with number 3 (kSignedInteger, xenos.h:221), exp bias 10, no swap,
+    // endian 1: DEST_INFO = 1 | 25 << 7 | 3 << 13 | 10 << 16 (X registers.h:812-826).
+    r = Fm4Resolve(), r.colorInfo[0] = 0x00040000, r.copyDestInfo = 1 | 25u << 7 | 3u << 13 | 10u << 16;
+    {
+        const ResolveInfo rg = DecodeResolve(r);
+        CHECK(rg.ok && rg.source == Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16) && rg.sampleSelect == SampleSelect::k0123 &&
+              rg.destFormat == 25 && rg.destExpBias == 10 && !rg.destSwap && rg.destEndian == 1);
+        // k_16_16 is 32 bpp (X texture_info_formats.inl:26): the same extent as the k_8_8_8_8 copy (TestResolveDecode: 983040).
+        CHECK(rg.destExtentLength == 983040);
+    }
+    // CONTROL: 25 from a source that is not 16_16 (Fm4Resolve's 2_10_10_10) stays refused.
+    r = Fm4Resolve(), r.copyDestInfo = 1 | 25u << 7 | 3u << 13 | 10u << 16;
+    CHECK(refused(r, "texture format 25 is not supported"));
+    // CONTROL: number 3 is accepted only with format 25 (a 16_16 source into k_8_8_8_8 with number 3 stays refused).
+    r = Fm4Resolve(), r.colorInfo[0] = 0x00040000, r.copyDestInfo = 2 | 6u << 7 | 3u << 13;
+    CHECK(refused(r, "number format 3"));
 }
 
 // Depth resolves (X draw_util.cc GetResolveInfo's depth path; no trace holds one yet: the local capture clip240_1 (not distributed) and clip240_2
@@ -1021,6 +1036,64 @@ void TestDepthResolve()
     ResolvePlan p = PrepareResolve(o, i);
     CHECK(p.ok && p.copy && p.copySource == kAd && p.copyRect == Rect{0, 0, 640, 360} && p.copyTransfers.empty());
     CHECK(p.hasDepthClear && !p.hasColorClear && p.depthClear.target == kAd && p.depthClear.rect == Rect{0, 0, 640, 360});
+}
+
+// FM4's k_8_8 resolve: colour 0 of RB_COLOR_INFO format 0 (8_8_8_8, storage 0),
+// 1x, sample select 0, into texture format 10 (k_8_8, X xenos.h:593) with number 0, exp bias 0, no swap, endian 1 (8in16),
+// command 1. The run logs no raw registers: Fm4Resolve's 640x360 rectangle stands in, on a 1x surface (0x0A000280: pitch 640,
+// msaa_samples 0), DEST_INFO 1 | 10 << 7 (X registers.h:812-826).
+void TestK88ResolveDecode()
+{
+    auto refused = [](ResolveRegisters rr, const char* text) {
+        const ResolveInfo x = DecodeResolve(rr);
+        return !x.ok && x.refusal.find(text) != std::string::npos;
+    };
+    ResolveRegisters r = Fm4Resolve();
+    r.surfaceInfo = 0x0A000280, r.colorInfo[0] = 0, r.copyControl = 1u << 20, r.copyDestInfo = 1 | 10u << 7;
+    const ResolveInfo k = DecodeResolve(r);
+    CHECK(k.ok && k.msaa == Msaa::X1 && k.source.Format() == uint32_t(ColorFormat::k8_8_8_8) && k.sampleSelect == SampleSelect::k0 &&
+          k.destFormat == 10 && k.destEndian == 1 && k.destExpBias == 0 && !k.destSwap && k.destBytesLog2 == 1);
+    // The extent with bpp_log2 1 (X draw_util.cc:1133-1180): lower bound TiledOffset2D(0, 0) = 0; upper bound (texture_util.cc
+    // :490-517) the tile of (639, 359) -> (608, 352): macro = (19 + 11 * 20) << (1 + 7) = 61184 = 119 * 512 + 256 (:448-449, pitch
+    // 640 / 32 = 20); micro 0; offset 61184; mix (:456-457): (61184 & ~0x1FF) << 3 = 487424, (352 & 16) << 7 = 0,
+    // (61184 & 0x1C0) << 2 = 1024, ((((352 & 8) >> 2) + (608 >> 3)) & 3) << 6 = (0 + 76) & 3 = 0, & 0x3F = 0 -> 488448;
+    // + 0xC00 (16 bpp, :507-511) = 491520, half the k_8_8_8_8 copy's 983040 (TestResolveDecode).
+    CHECK(k.destBase == 0x00800000u && k.destExtentStart == k.destBase && k.destOffsetX == 0 && k.destOffsetY == 0 && k.destExtentLength == 491520);
+    CONTROL(k.destExtentLength == 983040);  // the 32 bpp extent
+    {
+        ResolveRegisters r32 = r;
+        r32.copyDestInfo = 1 | 6u << 7;  // CONTROL: the same copy into k_8_8_8_8 keeps the 32 bpp layout
+        const ResolveInfo w = DecodeResolve(r32);
+        CHECK(w.ok && w.destBytesLog2 == 2 && w.destExtentLength == 983040);
+    }
+    // An origin at x0 = 32 (vertex x 31.5 + 0.5, X draw_util.cc:801-807): the 16 bpp base granularity is 64 texels
+    // (xenos.h:1188-1195: 7 - min(2, 1) = 6), so the base stays the (0, 0) tile and the offset is 32; the lower bound is the
+    // 32x32 tile of (32, 0) (texture_util.h:297-303): TiledOffset2D(32, 0, 640, 1): macro 1 << 8 = 256, offset 256 ->
+    // (256 & 0x1C0) << 2 = 1024, ((0 + 4) & 3) << 6 = 0 -> 1024. Length 491520 - 1024 = 490496.
+    const float v32[6] = {31.5f, -0.5f, 639.5f, -0.5f, 639.5f, 359.5f};
+    for (int i = 0; i < 6; i++)
+        r.vertexWords[i] = GuestFloat(v32[i]);
+    const ResolveInfo o = DecodeResolve(r);
+    CHECK(o.ok && o.x0 == 32 && o.destOffsetX == 32 && o.destBase == 0x00800000u && o.destExtentStart == 0x00800000u + 1024 &&
+          o.destExtentLength == 490496);
+    {
+        // CONTROL: at 32 bpp the granularity is 32 texels: offset 0, base = extent start = TiledOffset(32, 0, 640, 2):
+        // macro 1 << 9 = 512 -> (512 & ~0x1FF) << 3 = 4096.
+        ResolveRegisters r32 = r;
+        r32.copyDestInfo = 1 | 6u << 7;
+        const ResolveInfo w = DecodeResolve(r32);
+        CHECK(w.ok && w.destOffsetX == 0 && w.destBase == 0x00800000u + 4096 && w.destExtentStart == w.destBase);
+        CONTROL(o.destOffsetX == w.destOffsetX);
+    }
+    // XeEndianSwap16 swaps only under 8in16 (endian.xesli:25-31): 8in32 (2) and 16in32 (3) on k_8_8 are refused by name.
+    r = Fm4Resolve(), r.surfaceInfo = 0x0A000280, r.colorInfo[0] = 0, r.copyControl = 1u << 20, r.copyDestInfo = 2 | 10u << 7;
+    CHECK(refused(r, "endian 2 on a 16 bpp destination"));
+    r.copyDestInfo = 3 | 10u << 7;
+    CHECK(refused(r, "endian 3 on a 16 bpp destination"));
+    r.copyDestInfo = 0 | 10u << 7;  // no swap: decoded
+    CHECK(DecodeResolve(r).ok);
+    r.copyDestInfo = 1 | 10u << 7 | 1u << 13;  // CONTROL: a non-zero number format on k_8_8 stays refused
+    CHECK(refused(r, "number format 1"));
 }
 
 void TestResolvePlan()
@@ -1579,6 +1652,7 @@ int main(int argc, char** argv)
     TestResolveDecode();
     TestResolvePlan();
     TestDepthResolve();
+    TestK88ResolveDecode();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

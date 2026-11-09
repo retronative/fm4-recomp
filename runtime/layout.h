@@ -54,6 +54,19 @@ constexpr bool IsCodeAddress(uint32_t address, uint64_t codeBase, uint64_t codeS
 inline uint32_t Crc32(const uint8_t* data, size_t size)
 {
     uint32_t crc = 0xFFFFFFFFu;
+#if defined(__ARM_FEATURE_CRC32)
+    // FM4 Recomp (M7): the ARMv8 CRC32X / CRC32B instructions compute the same reflected polynomial (0xEDB88320) eight bytes
+    // (little-endian, first byte lowest) a step; the bitwise loop below cost ~20 ms on each 2.7 MB capture PNG.
+    for (; size >= 8; data += 8, size -= 8)
+    {
+        uint64_t v;
+        __builtin_memcpy(&v, data, 8);
+        crc = __builtin_arm_crc32d(crc, v);
+    }
+    for (; size > 0; data++, size--)
+        crc = __builtin_arm_crc32b(crc, *data);
+    return ~crc;
+#endif
     for (size_t i = 0; i < size; i++)
     {
         crc ^= data[i];

@@ -4,6 +4,7 @@
 // texture_upload.h (see its header comment).
 #include "texture_upload.h"
 #include "edram_vk_plan.h"
+#include <algorithm>
 #include <cstdio>
 
 namespace runtime::video {
@@ -18,7 +19,8 @@ std::string Hex(uint32_t v)
 
 }  // namespace
 
-PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device)
+PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
+                                          bool allowPending)
 {
     PreparedTexture p;
     TextureCache::Lookup lookup = cache_.Find(fetch);
@@ -32,7 +34,7 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
                               (d.dimension == 2 ? "x" + std::to_string(d.depth) + " (3D)" : std::string()) + " at " + Hex(d.base.physical);
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 20, 23, 36, 50, 51, 53, 54) this unit was checked for";
+        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 10, 18, 20, 23, 25, 36, 50, 51, 53, 54) this unit was checked for";
         return p;
     }
     // Every level the description holds (texture_info.cpp, Xenia's level range texture_util.cc:60-92 and layout :200-438,
@@ -51,8 +53,13 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
     }
     if (p.binding.sampler.anisotropyEnable)
     {
-        p.error = where + ": anisotropic filtering (the device feature is not enabled)";
-        return p;
+        if (!device.samplerAnisotropy)
+        {
+            p.error = where + ": anisotropic filtering (the device feature is not enabled)";
+            return p;
+        }
+        // X vulkan_texture_cache.cc:675, :2591-2596: clamped to the device's maximum.
+        p.binding.sampler.maxAnisotropy = std::min(p.binding.sampler.maxAnisotropy, device.maxAnisotropy);
     }
     if (!IdentityComponents(p.binding.components) && !device.imageViewFormatSwizzle)
     {
@@ -68,7 +75,7 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
         return p;
     }
     GuestRange hit;
-    if (log_.Overlaps(d.base.physical, d.base.size, hit) || log_.Overlaps(d.mips.physical, d.mips.size, hit))
+    if (!allowPending && (log_.Overlaps(d.base.physical, d.base.size, hit) || log_.Overlaps(d.mips.physical, d.mips.size, hit)))
     {
         p.error = where + ": its guest range was written by a resolve recorded into the open submission (" + Hex(hit.physical) + " + " +
                   std::to_string(hit.size) + " bytes) that is not confirmed complete; the renderer must retire it first";
@@ -95,7 +102,19 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
         if (source == nullptr)
             return false;
         uint8_t* level = out + plan.levelOffsets[i];
-        const bool ok = d.dimension == 2
+        // FM4 Recomp: a cube level holds its six faces, face k at k x faceStrideBytes in guest memory and k x the face's
+        // bytes in the staging (the host image's array layers in order; texture_util.cc:337-344, :425-436).
+        const size_t faceBytes = (size_t(l.widthBlocks) * l.heightBlocks) << d.log2BytesPerBlock;
+        bool ok = true;
+        for (uint32_t face = 1; ok && face < d.layers; face++)
+        {
+            const size_t skip = l.faceStrideBytes * face;
+            ok = d.fetch.tiled ? DetileBlocksAt(source + skip, l.extentBytes - skip, level + faceBytes * face, l.x, l.y, l.widthBlocks, l.heightBlocks,
+                                                l.pitchBlocks, d.log2BytesPerBlock, d.fetch.endian)
+                               : CopyLinearBlocksAt(source + skip, l.extentBytes - skip, level + faceBytes * face, l.x, l.y, l.widthBlocks,
+                                                    l.heightBlocks, l.rowPitchBytes, d.log2BytesPerBlock, d.fetch.endian);
+        }
+        ok = ok && (d.dimension == 2
                             ? (d.fetch.tiled ? DetileBlocks3D(source, l.extentBytes, level, l.widthBlocks, l.heightBlocks, l.depth, l.pitchBlocks,
                                                               l.zStrideBlockRows, d.log2BytesPerBlock, d.fetch.endian)
                                              : CopyLinearBlocks3D(source, l.extentBytes, level, l.widthBlocks, l.heightBlocks, l.depth, l.rowPitchBytes,
@@ -103,7 +122,7 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
                         : d.fetch.tiled ? DetileBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.pitchBlocks,
                                                        d.log2BytesPerBlock, d.fetch.endian)
                                       : CopyLinearBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.rowPitchBytes,
-                                                           d.log2BytesPerBlock, d.fetch.endian);
+                                                           d.log2BytesPerBlock, d.fetch.endian));
         if (!ok)
         {
             error = "level " + std::to_string(i) + " at " + Hex(l.address) + ": the " + (d.fetch.tiled ? "untile" : "linear copy") + " refused it";
@@ -125,7 +144,8 @@ std::vector<CopyRegion> CopyRegions(const TextureDescription& d, const LoadPlan&
 {
     std::vector<CopyRegion> regions;
     for (size_t i = 0; i < d.levels.size() && i < plan.levelOffsets.size(); i++)
-        regions.push_back({ringOffset + plan.levelOffsets[i], uint32_t(i), d.levels[i].widthTexels, d.levels[i].heightTexels, d.levels[i].depth});
+        regions.push_back({ringOffset + plan.levelOffsets[i], uint32_t(i), d.levels[i].widthTexels, d.levels[i].heightTexels, d.levels[i].depth,
+                           d.layers});
     return regions;
 }
 

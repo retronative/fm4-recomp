@@ -367,8 +367,10 @@ namespace {
 using namespace ucode;
 
 constexpr const char* kComponents = "xyzw";
-// Distinct bool constants a program may test: each doubles the analysis passes.
-constexpr size_t kMaxBools = 12;
+// Distinct bool constants, loops and predicate sets a program may test (the bits of an analysis assignment). FM4 Recomp: the
+// passes enumerate paths (TranslateShader), so nested regions cost their paths, not 2^dimensions; kMaxPaths bounds the work.
+constexpr size_t kMaxBools = 32;
+constexpr size_t kMaxPaths = 4096;
 
 std::string Num(uint32_t v) { return std::to_string(v); }
 
@@ -493,8 +495,19 @@ public:
     const std::vector<uint32_t>& Loops() const { return loops_; }
     const std::vector<uint32_t>& PredSets() const { return predSets_; }
     size_t Dimensions() const { return bools_.size() + loops_.size() + predSets_.size(); }
+    // Analyze: the assignment bits this pass consulted, in the order it first read them (TranslateShader's path enumeration).
+    const std::vector<uint32_t>& ConsultOrder() const { return consultOrder_; }
 
 private:
+    std::vector<uint32_t> consultOrder_;
+    uint32_t consulted_ = 0;
+    std::set<uint32_t> zeroReads_;  // Analyze, vertex: (instruction slot << 8 | register) read before any write on this path
+    bool Dim(uint32_t bit)
+    {
+        if (!(consulted_ >> bit & 1))
+            consulted_ |= 1u << bit, consultOrder_.push_back(bit);
+        return (assignment_ >> bit) & 1;
+    }
     const uint32_t* words_;
     uint32_t count_;
     bool pixel_;
@@ -519,6 +532,7 @@ private:
     bool execPredClean_ = false;  // the current exec claims not to modify p0
     bool inElse_ = false;         // in the region an unconditional jump at a jump region's end skips
     uint32_t instrKey_ = 0;       // control-flow index * 8 + position of the current instruction
+    uint32_t instructionSlot_ = 0;  // FM4 Recomp: the current instruction's slot (TranslatedShader::pathZeroReads)
     bool inConditional_ = false;
     bool inCondExec_ = false;  // inside a bool-constant conditional exec (opcode 13)
     bool inLoop_ = false;
@@ -535,6 +549,29 @@ private:
     uint32_t elsesToEnd_ = 0;  // Emit: `else` blocks opened at terminal regions' ends, still open
     bool kills_ = false;       // a kill op was emitted: xe_kill is declared and tested at main's end
     uint32_t jumpEnd_ = 0;
+    // FM4 Recomp: nested forward jumps. The fields above describe the innermost open jump region; a cond_jmp inside it pushes them
+    // here and the region's end (or its else's) pops them, innermost first (several regions may end at one instruction: FM4's
+    // early-out chains, vs_61a87c3560f0dd70: 16 predicated jumps to cf40).
+    struct JumpFrame
+    {
+        bool inJump, inConditional, inElse, inPredJump, terminal;
+        uint32_t end;
+    };
+    std::vector<JumpFrame> outerJumps_;
+    static constexpr size_t kMaxJumpDepth = 32;
+    void PushJump() { outerJumps_.push_back({inJump_, inConditional_, inElse_, inPredJump_, terminalRegion_, jumpEnd_}); }
+    void PopJump()
+    {
+        if (outerJumps_.empty())
+        {
+            inJump_ = inConditional_ = inElse_ = inPredJump_ = terminalRegion_ = false;
+            return;
+        }
+        const JumpFrame f = outerJumps_.back();
+        outerJumps_.pop_back();
+        inJump_ = f.inJump, inConditional_ = f.inConditional, inElse_ = f.inElse, inPredJump_ = f.inPredJump, terminalRegion_ = f.terminal;
+        jumpEnd_ = f.end;
+    }
     bool needDp3_ = false, needRcp_ = false, needRcpc_ = false, needHalf_ = false, needCube_ = false, needCubeDir_ = false;  // helpers emitted only when used
     uint32_t loopOrdinal_ = 0;          // loops walked so far
     std::vector<uint32_t> loopEnds_;    // the open loops' loop_end indices, innermost last (nesting up to kMaxLoopDepth)
@@ -548,6 +585,12 @@ private:
     uint8_t exported_[64] = {};  // export components written, by export register
     std::set<uint32_t> vertexSlots_, textureSlots_;
     std::map<uint32_t, std::pair<uint32_t, uint32_t>> vertexExtents_;  // slot -> (largest stride, largest element end), dwords
+    // FM4 Recomp: slots some full fetch indexes with anything but the untouched vertex index (r0.x before any write to it): the
+    // draw's indices do not bound such a fetch (ShaderTranslation::vertexFetchComputedIndex).
+    std::set<uint32_t> computedIndexSlots_;
+    bool predicatedFetchInPlace_ = false;
+    std::vector<std::string> vertexIndexVars_;  // Emit: the full fetches' index variables, declared at the top of main  // Exec: the current texture fetch is predicated in a predicated jump's region (its own `if`)
+    bool vertexIndexOverwritten_ = false;
     std::map<uint32_t, ShaderTranslation::Filters> textureFilters_;  // per slot: the instruction filters
     std::map<uint32_t, uint32_t> textureDimensions_;                  // per slot: kDimension2D or 3DOrStacked
     bool haveFullFetch_ = false;
@@ -594,21 +637,32 @@ private:
                 written_[r] = 0xF, usedTemps_ |= uint64_t(1) << r;
             return true;
         }
+        // FM4 Recomp: on an analysis path, a register the program writes earlier in program order (the Emit walk accepted this
+        // read) but not on this path reads the temp's initial zero, as Xenia (TranslatedShader::pathZeroReads).
+        if (mode_ == Mode::Analyze)
+        {
+            zeroReads_.insert(instructionSlot_ << 8 | reg);
+            return true;
+        }
         uint32_t c = 0;
         while (!(missing >> c & 1))
             c++;
-        return Fail("vertex shader reads r" + Num(reg) + "." + kComponents[c] + " before writing it");
+        return Fail("vertex shader reads r" + Num(reg) + "." + kComponents[c] + " before writing it (control-flow instruction " + Num(instrKey_ / 8) +
+                    ", position " + Num(instrKey_ % 8) + (mode_ == Mode::Analyze ? ", analysis path bits " + Num(assignment_) : std::string()) + ")");
     }
     void WriteTemp(uint32_t reg, uint32_t mask)
     {
         usedTemps_ |= uint64_t(1) << reg;
         written_[reg] |= uint8_t(mask);
+        if (!pixel_ && reg == 0 && (mask & 1))
+            vertexIndexOverwritten_ = true;  // r0.x no longer holds the vertex index (in program order, conservatively)
     }
 
     bool Exec(const CfExec& e, uint32_t index);
     bool Alu(const uint32_t w[3], uint32_t slot);
     bool AluOps(const AluInstruction& a, const std::string& where);
     bool PredicateSet(const AluInstruction& a, const std::string& where, std::string& operand);
+    bool PredicateSetBookkeeping(const std::string& where);
     bool ReadPredicate(const std::string& what, const std::string& where);
     static std::string PredicateTest(bool condition) { return condition ? "if (xe_p0)" : "if (!xe_p0)"; }
     bool VectorOperand(const AluInstruction& a, uint32_t n, uint32_t positions, std::string& out);
@@ -721,12 +775,12 @@ bool Translator::Alu(const uint32_t w[3], uint32_t slot)
 {
     const AluInstruction a = DecodeAlu(w);
     const std::string where = " (ALU instruction at slot " + Num(slot) + ")";
+    // FM4 Recomp: an unpredicated instruction inside a predicated exec runs under the exec's own guard (Emit: inside its `if`; Analyze:
+    // the exec is walked only where p0 equals its condition), as Xenia's (spirv_shader_translator.cc:820-839 UpdateExecConditionals
+    // opens one conditional for the exec; UpdateInstructionPredication :2229-2234 adds nothing for an unpredicated instruction;
+    // FM4's ps_3c8e7cdaf799e061 slot 58).
     if (!a.predicated)
-    {
-        if (inPredExec_)
-            return Fail("unpredicated ALU instruction inside a predicated exec" + where);
         return AluOps(a, where);
-    }
     if (!ReadPredicate("predicated ALU instruction", where))
         return false;
     if (inPredExec_)
@@ -759,6 +813,18 @@ bool Translator::PredicateSet(const AluInstruction& a, const std::string& where,
         return Fail("predicate set inside an exec whose predicate-clean hint says p0 is not modified" + where);
     if (!ScalarOperand(a, 3, operand))
         return false;
+    return PredicateSetBookkeeping(where);
+}
+
+// The predicate-set walk shared by the scalar PRED_SETs and the vector PRED_SET*_PUSHs (FM4 Recomp).
+bool Translator::PredicateSetBookkeeping(const std::string& where)
+{
+    if (inLoop_)
+        return Fail("predicate set inside a loop" + where);
+    if (inPredExec_)
+        return Fail("predicate set inside a predicated exec" + where);
+    if (execPredClean_)
+        return Fail("predicate set inside an exec whose predicate-clean hint says p0 is not modified" + where);
     dynLoopSetsPred_ = dynLoopSetsPred_ || inDynLoop_;
     if (mode_ == Mode::Emit)
     {
@@ -771,7 +837,7 @@ bool Translator::PredicateSet(const AluInstruction& a, const std::string& where,
         const size_t k = size_t(std::find(predSets_.begin(), predSets_.end(), instrKey_) - predSets_.begin());
         if (k == predSets_.size())
             return Fail("predicate set missing from the emit walk" + where);
-        pred_ = (assignment_ >> (bools_.size() + loops_.size() + k)) & 1;
+        pred_ = Dim(uint32_t(bools_.size() + loops_.size() + k));
     }
     predWritten_ = true;
     return true;
@@ -789,7 +855,7 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
     const uint32_t id = aluId_++;
 
     // Operands of both ops are read before either op writes.
-    std::string vector;
+    std::string vector, vectorPredLine;  // vectorPredLine: a PRED_SET*_PUSHv's p0 write
     std::string a0Source;  // MAXAs: the operand of its a0 write, emitted after every read
     switch (VectorOpcode(a.vectorOpcode))
     {
@@ -926,6 +992,28 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
             vector = "vec4(" + killed + " ? 1.0 : 0.0)";
         break;
     }
+    case VectorOpcode::SetpEqPush:
+    case VectorOpcode::SetpNePush:
+    case VectorOpcode::SetpGtPush:
+    case VectorOpcode::SetpGePush:
+    {
+        // FM4 Recomp: PRED_SETE/NE/GT/GTE_PUSHv (20-23; REFERENCE_DERIVED [X] spirv_shader_translator_alu.cc:745-795): p0 =
+        // src1.w == 0 && src2.w op 0; the result (every component) ((src1.x == 0 && src2.x op 0) ? -1 : src1.x) + 1. The compare
+        // is ordered (NaN false) except != (true for NaN), as the scalar PRED_SETs. Always runs (it sets p0).
+        if (!PredicateSetBookkeeping(where))
+            return false;
+        std::string s1, s2;
+        if (!VectorOperand(a, 1, vectorMask ? 0x9u : 0x8u, s1) || !VectorOperand(a, 2, vectorMask ? 0x9u : 0x8u, s2))
+            return false;
+        static constexpr const char* kPushCmp[] = {" == ", " != ", " > ", " >= "};
+        const char* cmp = kPushCmp[a.vectorOpcode - uint32_t(VectorOpcode::SetpEqPush)];
+        const std::string o1 = "xe_push" + Num(id) + "a", o2 = "xe_push" + Num(id) + "b";
+        Line("vec4 " + o1 + " = " + s1 + ", " + o2 + " = " + s2 + ";");
+        vectorPredLine = "xe_p0 = (" + o1 + ".w == 0.0 && " + o2 + ".w" + cmp + "0.0);";
+        if (vectorMask)
+            vector = "vec4(((" + o1 + ".x == 0.0 && " + o2 + ".x" + cmp + "0.0) ? -1.0 : " + o1 + ".x) + 1.0)";
+        break;
+    }
     case VectorOpcode::Dp2Add:
     {
         if (!vectorMask)
@@ -966,6 +1054,46 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
         predLine = "xe_p0 = (" + sa + cmp + "0.0);";
         if (runScalar)
             scalar = "(xe_p0 ? 0.0 : 1.0)";
+        break;
+    }
+    case uint32_t(ScalarOpcode::SetpInv):
+    case uint32_t(ScalarOpcode::SetpPop):
+    case uint32_t(ScalarOpcode::SetpRstr):
+    {
+        // FM4 Recomp: PRED_SET_INVs / PRED_SET_POPs / PRED_SET_RESTOREs (31, 32, 34; REFERENCE_DERIVED [X]
+        // spirv_shader_translator_alu.cc:1254-1295), ordered compares: INV p0 = a == 1, result p0 ? 0 : (a == 0 ? 1 : a); POP
+        // p0 = a - 1 <= 0, result p0 ? 0 : a - 1; RESTORE p0 = a == 0, result p0 ? 0 : a. Always runs (it sets p0).
+        std::string sa;
+        if (!PredicateSet(a, where, sa))
+            return false;
+        if (a.scalarOpcode == uint32_t(ScalarOpcode::SetpInv))
+        {
+            predLine = "xe_p0 = (" + sa + " == 1.0);";
+            if (runScalar)
+                scalar = "(xe_p0 ? 0.0 : (" + sa + " == 0.0 ? 1.0 : " + sa + "))";
+        }
+        else if (a.scalarOpcode == uint32_t(ScalarOpcode::SetpPop))
+        {
+            predLine = "xe_p0 = (" + sa + " - 1.0 <= 0.0);";
+            if (runScalar)
+                scalar = "(xe_p0 ? 0.0 : " + sa + " - 1.0)";
+        }
+        else
+        {
+            predLine = "xe_p0 = (" + sa + " == 0.0);";
+            if (runScalar)
+                scalar = "(xe_p0 ? 0.0 : " + sa + ")";
+        }
+        break;
+    }
+    case uint32_t(ScalarOpcode::SetpClr):
+    {
+        // FM4 Recomp: PRED_SET_CLRs (33; [X] :1282-1285): p0 = false, the result FLT_MAX (no operand read).
+        if (!PredicateSetBookkeeping(where))
+            return false;
+        predLine = "xe_p0 = false;";
+        if (runScalar)
+            scalar = "3.40282347e+38";
         break;
     }
     case uint32_t(ScalarOpcode::Sqrt):
@@ -1130,6 +1258,12 @@ bool Translator::AluOps(const AluInstruction& a, const std::string& where)
     std::string s = "xe_s" + Num(id);
     if (!vector.empty())
         Line("precise vec4 " + v + " = " + (a.vectorClamp ? "xe_sat(" + vector + ")" : vector) + ";");
+    if (!vectorPredLine.empty())
+    {
+        if (!predLine.empty())
+            return Fail("a vector PRED_SET*_PUSH and a scalar PRED_SET in one instruction" + where);
+        predLine = vectorPredLine;
+    }
     if (!predLine.empty())
         Line(predLine);
     if (!scalar.empty() && readsPs_ && !retain)
@@ -1241,8 +1375,12 @@ bool Translator::VertexFetchOp(const uint32_t w[3], uint32_t slot)
     // exec `if` does; on the hardware a whole group enters the exec when any invocation passes
     // ([X] ucode.h kCondExecPred), so its destination may also be written where p0 differs:
     // APPROXIMATE, exact when the compiler predicates the fetch too (as [X] says it does).
+    // FM4 Recomp: inside a jump's region (bool or predicated) or a bool conditional exec the fetch runs where that block runs, as
+    // Xenia's (no special case: its fetch sits in the block's conditional; FM4's vs_ae60266eed5bc373 slot 33). Its
+    // index variable is declared at the top of main, so mini fetches anywhere after it name it.
     const bool guarded = inPredExec_ && !inJump_;
-    if (inConditional_ && !guarded)
+    const bool inBlock = inJump_ || inCondExec_;
+    if (inConditional_ && !guarded && !inBlock)
         return Fail("vertex fetch inside a " + std::string(Conditional()) + where);
     if (inLoop_ || inDynLoop_)
         return Fail("vertex fetch inside a loop" + where);
@@ -1270,8 +1408,13 @@ bool Translator::VertexFetchOp(const uint32_t w[3], uint32_t slot)
         fullSlot_ = FetchConstantSlot(f);
         fullStride_ = f.stride;
         fullIndex_ = "xe_vidx" + Num(id);
+        if (pixel_ || f.srcReg != 0 || f.srcSwizzle != 0 || vertexIndexOverwritten_)
+            computedIndexSlots_.insert(fullSlot_);
         const std::string src = "r" + Num(f.srcReg) + "." + kComponents[f.srcSwizzle];
-        Line("int " + fullIndex_ + " = int(floor(" + src + (f.isIndexRounded ? " + 0.5" : "") + "));");
+        // FM4 Recomp: declared once at the top of main (Assemble), assigned here, so a mini fetch after a full fetch inside a
+        // conditional block names a declared variable (the hardware keeps the last full fetch's address).
+        vertexIndexVars_.push_back(fullIndex_);
+        Line(fullIndex_ + " = int(floor(" + src + (f.isIndexRounded ? " + 0.5" : "") + "));");
         vertexSlots_.insert(fullSlot_);
     }
     else if (!haveFullFetch_)
@@ -1382,14 +1525,20 @@ bool Translator::SetTextureLodOp(const uint32_t w[3], uint32_t slot)
 {
     const TextureFetch t = DecodeTextureFetch(w);
     const std::string where = " (setTextureLod at slot " + Num(slot) + ")";
-    if (t.predicated)
-        return Fail("predicated setTextureLod" + where);
     if (t.srcRelative)
         return Fail("relatively addressed setTextureLod register" + where);
+    // FM4 Recomp: predicated (word 1 bit 31, condition word 2 bit 31): the store happens where p0 equals the condition, as any
+    // predicated instruction ([X] stores the operand into var_main_tfetch_lod_, spirv_shader_translator_fetch.cc:523-528, under the
+    // instruction's predicate; the LOD starts at 0 in both). The disc census's two refused pixel shaders.
+    if (t.predicated && !ReadPredicate("predicated setTextureLod", where))
+        return false;
     const uint32_t c0 = TextureSourceComponent(t, 0);
     if (!ReadTemp(t.srcReg, 1u << c0))
         return false;
-    Line("xe_lod = r" + Num(t.srcReg) + "." + kComponents[c0] + ";");
+    if (t.predicated)
+        Line(PredicateTest(t.predicateCondition) + " xe_lod = r" + Num(t.srcReg) + "." + kComponents[c0] + ";");
+    else
+        Line("xe_lod = r" + Num(t.srcReg) + "." + kComponents[c0] + ";");
     lodWritten_ = true;
     return true;
 }
@@ -1408,21 +1557,29 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
     // flow (Divergent), so a fetch there samples in place, with defined implicit derivatives, and a
     // predicated exec inside a bool-constant jump region hoists its fetches into that region. Inside a
     // predicated jump's region the registers the fetch reads may have been written under p0 earlier in
-    // the region, so it can be neither hoisted nor sampled in place: refused.
-    // FM4 Recomp: inside a dynamic loop the fetch samples in place (see "Dynamic loops").
+    // the region, so it cannot be hoisted.
+    // FM4 Recomp: inside a dynamic loop the fetch samples in place (see "Dynamic loops"); so does one inside a predicated jump's
+    // region (FM4's ps_088082001beb55e5 slot 51), as Xenia samples every fetch in place with coarse derivatives of
+    // its coordinates (spirv_shader_translator_fetch.cc ProcessTextureFetchInstruction). APPROXIMATE: implicit derivatives in
+    // non-uniform control flow are undefined in Vulkan (the same caveat as the dynamic loops and as Xenia).
     const bool hoisted = inPredExec_ && !inPredJump_ && !inDynLoop_ && pixel_;
-    if (Divergent() && !hoisted && !inDynLoop_)
+    const bool inPlaceDivergent = inDynLoop_ || (inPredJump_ && !inPredExec_);
+    if (Divergent() && !hoisted && !inPlaceDivergent)
         return Fail("texture fetch inside a " + std::string(Conditional()) + where);
     // A predicated fetch inside a predicated exec on the same condition is the exec's own guard
     // (Xenia ucode.h TextureFetchInstruction is_predicated / pred_condition, word 1 bit 31 / word 2
     // bit 31, as ReCarbon xenos/ucode.h:784-879); any other predicated fetch is refused.
-    if (t.predicated && !(hoisted && t.predicateCondition == predExecCondition_))
+    if (t.predicated && !(hoisted && t.predicateCondition == predExecCondition_) && !predicatedFetchInPlace_)
         return Fail("predicated texture fetch" + where);
     if (t.srcRelative || t.destRelative)
         return Fail("relatively addressed texture fetch register" + where);
-    const bool volume = t.dimension == kDimension3DOrStacked, cube = t.dimension == kDimensionCube;
-    if (t.dimension != kDimension2D && !volume && !cube)
-        return Fail("texture fetch dimension " + Num(t.dimension) + " is not supported (2D, 3D and cube only)" + where);
+    const bool volume = t.dimension == kDimension3DOrStacked, cube = t.dimension == kDimensionCube, linear1D = t.dimension == kDimension1D;
+    if (t.dimension != kDimension2D && !volume && !cube && !linear1D)
+        return Fail("texture fetch dimension " + Num(t.dimension) + " is not supported (1D, 2D, 3D and cube only)" + where);
+    // FM4 Recomp: 1D (REFERENCE_DERIVED [X] spirv_shader_translator_fetch.cc:1051, :1107-1110, :2328-2332): a 2D image of height 1
+    // sampled at (s, 0) (only the first coordinate is read; the others stay 0). Offsets on it are refused (not observed).
+    if (linear1D && (t.offsetX != 0 || t.offsetY != 0 || t.offsetZ != 0))
+        return Fail("texture fetch offsets on a 1D fetch are not supported" + where);
     if (cube && (t.offsetX != 0 || t.offsetY != 0 || t.offsetZ != 0))
         return Fail("texture fetch offsets on a cube fetch are not supported" + where);
     if (t.unnormalized)
@@ -1462,18 +1619,18 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
         return Fail("texture fetch word 1 bit 30 set (meaning unknown)" + where);
 
     const uint32_t c0 = TextureSourceComponent(t, 0), c1 = TextureSourceComponent(t, 1), c2 = TextureSourceComponent(t, 2);
-    if (!ReadTemp(t.srcReg, (1u << c0) | (1u << c1) | (volume || cube ? 1u << c2 : 0u)))
+    if (!ReadTemp(t.srcReg, (1u << c0) | (linear1D ? 0u : 1u << c1) | (volume || cube ? 1u << c2 : 0u)))
         return false;
     // Volume filters do not apply to a 2D fetch: reported as 3 (see ShaderTranslation::Filters).
     const ShaderTranslation::Filters filters{t.magFilter, t.minFilter, volume ? t.volMagFilter : kFilterUseFetchConst,
-                                             volume ? t.volMinFilter : kFilterUseFetchConst, t.mipFilter};
+                                             volume ? t.volMinFilter : kFilterUseFetchConst, t.mipFilter, t.anisoFilter};
     if (textureSlots_.count(t.constIndex))
     {
         if (textureDimensions_[t.constIndex] != t.dimension)
             return Fail("fetches of texture slot " + Num(t.constIndex) + " use different dimensions" + where);
         const ShaderTranslation::Filters& seen = textureFilters_[t.constIndex];
         if (seen.mag != filters.mag || seen.min != filters.min || seen.volMag != filters.volMag || seen.volMin != filters.volMin ||
-            seen.mip != filters.mip)
+            seen.mip != filters.mip || seen.aniso != filters.aniso)
             return Fail("fetches of texture slot " + Num(t.constIndex) + " set different filters" + where);
     }
     textureSlots_.insert(t.constIndex);
@@ -1481,8 +1638,9 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
     textureDimensions_[t.constIndex] = t.dimension;
     const std::string value = "xe_texel" + Num(fetchId_++), src = "r" + Num(t.srcReg) + ".";
     const std::string sampler = "xe_texture_" + Num(t.constIndex), vec = volume || cube ? "vec3" : "vec2";
-    std::string coordinates = vec + "(" + src + kComponents[c0] + ", " + src + kComponents[c1] +
-                              (volume || cube ? ", " + src + kComponents[c2] : std::string()) + ")";
+    std::string coordinates = linear1D ? vec + "(" + src + kComponents[c0] + ", 0.0)"
+                                       : vec + "(" + src + kComponents[c0] + ", " + src + kComponents[c1] +
+                                             (volume || cube ? ", " + src + kComponents[c2] : std::string()) + ")";
     // A cube fetch's (sc, tc, face) in 1...2, 1...2, 0...5 as a direction (REFERENCE_DERIVED [X]
     // spirv_shader_translator_fetch.cc kCube: *2 - 3, face clamped and floored, CUBEv's axes inverted).
     if (cube)
@@ -1528,6 +1686,11 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
     body_ += "#ifdef XE_TEXTURE_" + Num(t.constIndex) + "_GAMMA\n";
     Line(value + ".xyz = xe_pwl_gamma_to_linear(" + value + ".xyz);");
     body_ += "#endif\n";
+    // Unsigned biased components (sign 2; the host defines a bvec4 of the result components): v * 2 - 1, after gamma and before
+    // the exponent bias (X spirv_shader_translator_fetch.cc:2167-2236).
+    body_ += "#ifdef XE_TEXTURE_" + Num(t.constIndex) + "_BIASED\n";
+    Line(value + " = mix(" + value + ", " + value + " * 2.0 - 1.0, XE_TEXTURE_" + Num(t.constIndex) + "_BIASED);");
+    body_ += "#endif\n";
     // The fetch constant's exponent bias (dword 3 bits 13-18), after the sign/gamma conversion,
     // on every component (REFERENCE_DERIVED: Xenia's fetch translation multiplies by
     // ldexp(1, bias)); the host defines the factor.
@@ -1543,6 +1706,7 @@ bool Translator::Exec(const CfExec& e, uint32_t index)
     {
         instrKey_ = index * 8 + k;
         const uint32_t slot = e.address + k;
+        instructionSlot_ = slot;
         const uint32_t* w;
         if (!ReadSlot(words_, count_, slot, w))
             return Fail("exec instruction slot " + Num(slot) + " lies past the end of the shader");
@@ -1556,6 +1720,33 @@ bool Translator::Exec(const CfExec& e, uint32_t index)
         if (op == kVertexFetch)
         {
             if (!VertexFetchOp(w, slot))
+                return false;
+        }
+        else if (op == kTextureFetch && DecodeTextureFetch(w).predicated && inPredJump_ && !inPredExec_ && !inDynLoop_)
+        {
+            // FM4 Recomp: a predicated texture fetch inside a predicated jump's region runs under its own predicate test, as Xenia's
+            // instruction-level conditional (spirv_shader_translator.cc:2229-2262 UpdateInstructionPredication) around the in-place
+            // sample (FM4's ps_088082001beb55e5 slot 51; APPROXIMATE implicit derivatives).
+            const TextureFetch tf = DecodeTextureFetch(w);
+            if (!ReadPredicate("predicated texture fetch", " (texture fetch at slot " + Num(slot) + ")"))
+                return false;
+            if (mode_ == Mode::Analyze && pred_ != tf.predicateCondition)
+                continue;
+            if (mode_ == Mode::Emit)
+            {
+                Line(PredicateTest(tf.predicateCondition));
+                Line("{");
+                indent_ += "    ";
+            }
+            predicatedFetchInPlace_ = true;
+            const bool ok = TextureFetchOp(w, slot);
+            predicatedFetchInPlace_ = false;
+            if (mode_ == Mode::Emit)
+            {
+                indent_.resize(indent_.size() - 4);
+                Line("}");
+            }
+            if (!ok)
                 return false;
         }
         else if (op == kTextureFetch)
@@ -1586,7 +1777,7 @@ bool Translator::Exec(const CfExec& e, uint32_t index)
 bool Translator::BoolTaken(uint32_t b, bool condition)
 {
     const size_t i = size_t(std::find(bools_.begin(), bools_.end(), b) - bools_.begin());
-    return (i < bools_.size() && (assignment_ >> i & 1)) == condition;
+    return (i < bools_.size() && Dim(uint32_t(i))) == condition;
 }
 
 // Emit: records bool constant b as a pass dimension.
@@ -1684,9 +1875,11 @@ bool Translator::Jump(uint32_t index, CfWords cf, uint32_t& next)
             return Fail("unconditional jump other than at the end of a conditional jump's region is not supported" + where);
         if (j.predicated || j.boolAddress != 0 || j.condition)
             return Fail("unconditional jump with predicate, bool constant or condition fields set is not supported" + where);
+        if (!outerJumps_.empty() && j.address > outerJumps_.back().end)
+            return Fail("an else that leaves its enclosing jump's region is not supported" + where);
         if (mode_ == Mode::Analyze)
         {
-            inJump_ = inConditional_ = inPredJump_ = false;
+            PopJump();  // the region ran; its else is skipped
             next = j.address - 1;
             return true;
         }
@@ -1717,6 +1910,17 @@ bool Translator::Jump(uint32_t index, CfWords cf, uint32_t& next)
         return Fail("predicated jump over an exec_end is not supported" + where);
     if (terminal && !pixel_)
         return Fail("jump over an exec_end in a vertex shader is not supported" + where);
+    if (inJump_)  // FM4 Recomp: a jump inside a jump's region must end inside it (well nested), not over an exec_end
+    {
+        if (terminal || terminalRegion_)
+            return Fail("a jump inside a jump region that ends the program is not supported" + where);
+        if (j.address > jumpEnd_)
+            return Fail("a jump that leaves its enclosing jump's region is not supported" + where);
+        if (outerJumps_.size() >= kMaxJumpDepth)
+            return Fail("jumps nested deeper than " + Num(uint32_t(kMaxJumpDepth)) + " are not supported" + where);
+        if (inDynLoop_)
+            return Fail("a forward jump inside a dynamic loop is not supported" + where);
+    }
     if (mode_ == Mode::Analyze)
     {
         if (j.predicated ? pred_ == j.condition : BoolTaken(j.boolAddress, j.condition))
@@ -1734,8 +1938,12 @@ bool Translator::Jump(uint32_t index, CfWords cf, uint32_t& next)
         Line("{");
         indent_ += "    ";
     }
+    const bool outerPredicated = inJump_ && inPredJump_;
+    if (inJump_)
+        PushJump();
     inJump_ = inConditional_ = true;
-    inPredJump_ = j.predicated;
+    inElse_ = false;
+    inPredJump_ = j.predicated || outerPredicated;
     terminalRegion_ = terminal;
     jumpEnd_ = j.address;
     next = index;
@@ -1848,7 +2056,7 @@ bool Translator::LoopStart(uint32_t index, CfWords cf, uint32_t& next)
     const uint32_t k = loopOrdinal_++;
     if (mode_ == Mode::Analyze)
     {
-        if (!(assignment_ >> (bools_.size() + k) & 1))
+        if (!Dim(uint32_t(bools_.size() + k)))
         {
             // The body is skipped (count 0): loops nested in it are not walked, but keep their ordinals.
             for (uint32_t j = index + 1; j + 1 < b.address; j++)
@@ -1895,14 +2103,15 @@ bool Translator::Run(std::string& error)
             Fail("control flow ends without exec_end");
             break;
         }
-        if (inJump_ && i == jumpEnd_)
+        while (inJump_ && i == jumpEnd_)  // FM4 Recomp: regions ending here close innermost first
         {
-            inJump_ = inConditional_ = inElse_ = inPredJump_ = false;
+            const bool terminalHere = terminalRegion_;
+            PopJump();
             if (mode_ == Mode::Emit)
             {
                 indent_.resize(indent_.size() - 4);
                 Line("}");
-                if (terminalRegion_)
+                if (terminalHere)
                 {
                     // The rest of the program runs only where the jump was taken.
                     Line("else");
@@ -1911,7 +2120,6 @@ bool Translator::Run(std::string& error)
                     elsesToEnd_++;
                 }
             }
-            terminalRegion_ = false;
         }
         if (dynLoops_.count(i) && !OpenDynamicLoop(i))
             break;
@@ -1922,6 +2130,7 @@ bool Translator::Run(std::string& error)
         // end in an unconditional jump; a terminal region also allocs and ends in its exec_end.
         if (inJump_ && op != CfOpcode::Exec && op != CfOpcode::CondExecPred && op != CfOpcode::CondExecPredClean &&
             !(op == CfOpcode::CondJmp && DecodeBranch(cf).unconditional && !inElse_ && i + 1 == jumpEnd_) &&
+            !(op == CfOpcode::CondJmp && !DecodeBranch(cf).unconditional && DecodeBranch(cf).address > i) &&  // nested: Jump checks it
             !(op == CfOpcode::CondJmp && inDynLoop_ && i == dynLoopEnd_) &&
             !(terminalRegion_ && (op == CfOpcode::Alloc || (op == CfOpcode::ExecEnd && i + 1 == jumpEnd_))))
         {
@@ -2035,17 +2244,23 @@ void Translator::Finish(const std::vector<Translator>& analyses, ShaderTranslati
     // shader's in a terminal jump region (colour 0, checked by each pass), so every vertex shader
     // pass exports the same registers and analyses[0]'s interpolator count holds for all.
     uint32_t interpolators = analyses[0].interpolators_;
+    std::set<uint32_t> zeroReads;
     for (const Translator& a : analyses)
+    {
         preloadCount_ = std::max(preloadCount_, a.preloadCount_);
+        zeroReads.insert(a.zeroReads_.begin(), a.zeroReads_.end());
+    }
     if (pixel_)
         interpolators = preloadCount_;
     out.glsl = Assemble(interpolators);
     out.interpolatorCount = interpolators;
+    out.pathZeroReads.assign(zeroReads.begin(), zeroReads.end());
     out.vertexFetchSlots.assign(vertexSlots_.begin(), vertexSlots_.end());
     for (uint32_t slot : out.vertexFetchSlots)
     {
         out.vertexFetchStrides.push_back(vertexExtents_[slot].first);
         out.vertexFetchEnds.push_back(vertexExtents_[slot].second);
+        out.vertexFetchComputedIndex.push_back(computedIndexSlots_.count(slot) ? 1 : 0);
     }
     out.textureSlots.assign(textureSlots_.begin(), textureSlots_.end());
     out.textureFilters.clear();
@@ -2314,7 +2529,11 @@ std::string Translator::Assemble(uint32_t interpolators) const
                 init = "xe_interp_" + Num(r);
             else if (!pixel_ && r == 0)
                 init = "vec4(float(xe_index), 0.0, 0.0, 0.0)";
-            temps += "    vec4 r" + Num(r) + " = " + init + ";\n";
+            if (pixel_ && r < preloadCount_)  // FM4 Recomp: XE_PARAM_GEN (the host's param_gen_pos) replaces this interpolator
+                temps += "#if defined(XE_PARAM_GEN) && XE_PARAM_GEN == " + Num(r) + "\n    vec4 r" + Num(r) + " = xe_param_gen();\n#else\n    vec4 r" +
+                         Num(r) + " = " + init + ";\n#endif\n";
+            else
+                temps += "    vec4 r" + Num(r) + " = " + init + ";\n";
         }
     // The previous scalar result; never read before a scalar op sets it (checked), so the
     // initial value is not observable.
@@ -2323,6 +2542,8 @@ std::string Translator::Assemble(uint32_t interpolators) const
     // The predicate p0; likewise never read before a predicate set sets it (checked).
     if (!predSets_.empty())
         temps += "    bool xe_p0 = false;\n";
+    for (const std::string& v : vertexIndexVars_)
+        temps += "    int " + v + " = 0;\n";
     // The register LOD; never read before setTextureLod sets it (checked).
     if (lodWritten_)
         temps += "    float xe_lod = 0.0;\n";
@@ -2354,6 +2575,12 @@ std::string Translator::Assemble(uint32_t interpolators) const
         g += "#ifdef XE_NO_COLOR_OUTPUT\nvec4 xe_color0;\n#else\nlayout(location = 0) out vec4 xe_color0;\n#endif\n";
         g += helpers;
         g += kGammaHelpers;
+        // FM4 Recomp: PsParamGen (REFERENCE_DERIVED [X] spirv_shader_translator.cc:2016-2135, registers.h:127-207), no point or
+        // line primitives here: x |floor(pixel x)| with the sign set for a back face of a polygonal primitive, y |floor(pixel y)|,
+        // z 0 (not a line), w 0 (no point coordinate).
+        g += "#ifdef XE_PARAM_GEN\nvec4 xe_param_gen()\n{\n    float x = abs(floor(gl_FragCoord.x)), y = abs(floor(gl_FragCoord.y));\n"
+             "#if XE_PARAM_GEN_POLYGONAL\n    if (!gl_FrontFacing)\n        x = uintBitsToFloat(floatBitsToUint(x) ^ (1u << 31));\n#endif\n"
+             "#ifdef XE_PARAM_GEN_LINE\n    return vec4(x, y, uintBitsToFloat(1u << 31), 0.0);\n#else\n    return vec4(x, y, 0.0, 0.0);\n#endif\n}\n#endif\n";
         // XE_ALPHA_TEST_QUANT: a diagnostic only (runtime/video/diag_alpha.h, FM4_DIAG_ALPHA_QUANT), never defined by default.
         g += "#ifdef XE_ALPHA_TEST\nbool xe_alpha_pass(float a, float r)\n{\n"
              "#ifdef XE_ALPHA_TEST_QUANT\n    a = round(clamp(a, 0.0, 1.0) * XE_ALPHA_TEST_QUANT) / XE_ALPHA_TEST_QUANT;\n#endif\n"
@@ -2368,6 +2595,22 @@ std::string Translator::Assemble(uint32_t interpolators) const
         // and the reference RB_ALPHA_REF): colour 0's alpha as exported, before any output
         // conversion; a failing pixel is discarded (REFERENCE_DERIVED: Xenia's translator).
         g += "#ifdef XE_ALPHA_TEST\n    if (!xe_alpha_pass(xe_color0.w, XE_ALPHA_REF))\n        discard;\n#endif\n";
+        // Alpha to mask (the host defines the 8 offset bits and the sample count): X dxbc_shader_translator_om.cc:1811-1955. The
+        // pixel's 2-bit offset o from index (x & 1) << 1 | (y & 1); sample covered when alpha >= base - o x scale (NaN: not
+        // covered): 1x base 1 scale 1/4; 2x guest samples 0 / 1 at 0.5 / 1, scale 1/8, native 2x host = guest ^ 1; 4x host 0-3 at
+        // 0.75 / 0.25 / 0.5 / 1, scale 1/16. No sample covered: discarded; MSAA: the coverage is the sample mask.
+        g += "#ifdef XE_ALPHA_TO_MASK\n    {\n        uvec2 xe_p = uvec2(gl_FragCoord.xy);\n"
+             "        float xe_o = float((XE_ALPHA_TO_MASK >> ((((xe_p.x & 1u) << 1u) | (xe_p.y & 1u)) << 1u)) & 3u), xe_a = xe_color0.w;\n"
+             "#if XE_ALPHA_TO_MASK_SAMPLES == 4\n"
+             "        int xe_m = (xe_a >= 0.75 - xe_o / 16.0 ? 1 : 0) | (xe_a >= 0.25 - xe_o / 16.0 ? 2 : 0) | (xe_a >= 0.5 - xe_o / 16.0 ? 4 : 0) |\n"
+             "                   (xe_a >= 1.0 - xe_o / 16.0 ? 8 : 0);\n"
+             "#elif XE_ALPHA_TO_MASK_SAMPLES == 2\n"
+             "        int xe_m = (xe_a >= 0.5 - xe_o / 8.0 ? 2 : 0) | (xe_a >= 1.0 - xe_o / 8.0 ? 1 : 0);\n"
+             "#else\n"
+             "        int xe_m = xe_a >= 1.0 - xe_o / 4.0 ? 1 : 0;\n"
+             "#endif\n"
+             "        if (xe_m == 0)\n            discard;\n"
+             "#if XE_ALPHA_TO_MASK_SAMPLES > 1\n        gl_SampleMask[0] = xe_m;\n#endif\n    }\n#endif\n";
         g += "#ifdef XE_COLOR0_GAMMA\n    xe_color0.xyz = xe_linear_to_pwl_gamma(xe_color0.xyz);\n#endif\n";
         g += "#ifdef XE_COLOR0_7E3\n    xe_color0 = mix(vec4(0.0), min(xe_color0, vec4(31.875, 31.875, 31.875, 1.0)), "
              "greaterThan(xe_color0, vec4(0.0)));\n#endif\n";
@@ -2383,6 +2626,13 @@ std::string Translator::Assemble(uint32_t interpolators) const
     g += SamplerDeclarations();
     for (uint32_t i = 0; i < interpolators; i++)
         g += "layout(location = " + Num(i) + ") out vec4 xe_interp_" + Num(i) + ";\n";
+    // FM4 Recomp: XE_PS_INTERPOLATORS (a variant define, draw_record.cpp): the pixel shader reads more interpolators than
+    // this shader exports; the others are declared and written as 0, as Xenia zeroes every interpolator a vertex shader
+    // does not write (spirv_shader_translator.cc, the interpolator outputs initialised to 0). Vulkan needs an output for
+    // every input the fragment stage reads.
+    g += "#ifndef XE_PS_INTERPOLATORS\n#define XE_PS_INTERPOLATORS 0\n#endif\n";
+    for (uint32_t i = interpolators; i < 16; i++)
+        g += "#if XE_PS_INTERPOLATORS > " + Num(i) + "\nlayout(location = " + Num(i) + ") out vec4 xe_interp_" + Num(i) + ";\n#endif\n";
     g += helpers;
     if (needHalf_)
         g += kHalfHelper;
@@ -2407,6 +2657,8 @@ std::string Translator::Assemble(uint32_t interpolators) const
     g += "    gl_Position = vec4(xe_ndc, q.w);\n";
     for (uint32_t i = 0; i < interpolators; i++)
         g += "    xe_interp_" + Num(i) + " = interp[" + Num(i) + "];\n";
+    for (uint32_t i = interpolators; i < 16; i++)
+        g += "#if XE_PS_INTERPOLATORS > " + Num(i) + "\n    xe_interp_" + Num(i) + " = vec4(0.0);\n#endif\n";
     g += "}\n";
     g += "#ifndef XE_RECT_LIST\nvoid main()\n{\n    vec4 p;\n    vec4 interp[" + n +
          "];\n    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n}\n#else\n";
@@ -2649,14 +2901,32 @@ bool TranslateShader(const uint32_t* words, size_t count, bool pixel, ShaderTran
     Translator emit(words, uint32_t(count), pixel, Mode::Emit);
     if (!emit.Run(error))
         return false;
-    // One analysis per assignment of the bool constants the conditional execs test, of each
-    // loop's body running (count >= 1) or not (count 0) and of the p0 each predicate set produces.
+    // One analysis per path through the bool constants the conditional execs test, each loop's body running (count >= 1) or not
+    // (count 0) and the p0 each predicate set produces. FM4 Recomp: paths, not every assignment: a pass records the bits it reads
+    // (ConsultOrder); for each bit it read first that its assignment did not fix, the bit flipped (from 0) with the bits read
+    // before it kept is another path. Unread bits are irrelevant to a pass, so each path runs once (an early-out chain of n
+    // predicated jumps is n + 1 paths); independent bits still give every combination.
     std::vector<Translator> analyses;
-    for (uint32_t a = 0; a < (1u << emit.Dimensions()); a++)
+    std::vector<std::pair<uint32_t, uint32_t>> pending{{0u, 0u}};  // (assignment, fixed bits)
+    while (!pending.empty())
     {
+        const auto [a, fixed] = pending.back();
+        pending.pop_back();
+        if (analyses.size() == kMaxPaths)
+        {
+            error = "more than " + std::to_string(kMaxPaths) + " analysis paths through the shader's bool constants, loops and predicate sets";
+            return false;
+        }
         analyses.emplace_back(words, uint32_t(count), pixel, Mode::Analyze, emit.Bools(), emit.Loops(), emit.PredSets(), a);
         if (!analyses.back().Run(error))
             return false;
+        uint32_t before = 0;
+        for (uint32_t bit : analyses.back().ConsultOrder())
+        {
+            if (!(fixed >> bit & 1))
+                pending.push_back({(a & before) | (1u << bit), before | (1u << bit)});
+            before |= 1u << bit;
+        }
     }
     emit.Finish(analyses, out);
     out.positionFetch = AnalyzePositionFetch(words, count, pixel);

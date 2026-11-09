@@ -9,6 +9,7 @@
 // negative control.
 //
 //   tests/run_draw_record_tests.sh
+#include <algorithm>
 #include "video/draw_record.h"
 
 #include <cstdio>
@@ -153,6 +154,8 @@ void TestKeys()
         Expect(KeyOf(t, vs, ps) == k, "a quad list keys as a triangle list (the indices are rewritten)");
         t = clear, t.hostPrimitive = HostPrimitive::TriangleStrip;
         Expect(KeyOf(t, vs, ps).topology == uint8_t(Topology::TriangleStrip), "a strip keys as a strip");
+        t = clear, t.hostPrimitive = HostPrimitive::LineList;  // FM4 Recomp
+        Expect(KeyOf(t, vs, ps).topology == uint8_t(Topology::LineList), "a line list keys as a line list");
         PipelineKey out;
         t = clear, t.kind = DrawKind::NoWrite;
         KeyResult r = KeyFromDrawState(t, vs, ps, 0, 0, out);
@@ -173,6 +176,23 @@ void TestKeys()
         Expect(KeyFromDrawState(clear, vs, ps, 7, 0, out).ok && out != k && KeyFromDrawState(clear, vs, ps, 0, 7, out).ok && out != k,
                "the variant ids are part of the key");
     }
+    {
+        // FM4 Recomp: polygon offset. The key's depth bias needs a depth attachment and a non-zero pair
+        // (X vulkan_pipeline_cache.cc:2083-2092); the factors as X vulkan_command_processor.cc:3276-3297: offset 4 on kD24FS8 ->
+        // 4 x 2^24 = 67,108,864; on kD24S8 -> 4 x (2^24 - 1) = 67,108,860; scale 2 -> slope 2 / 16 = 0.125.
+        DrawState t = clear;
+        t.polyOffsetScale = 2.0f, t.polyOffsetOffset = 4.0f;
+        Expect(k.depthBias == 0 && KeyOf(t, vs, ps).depthBias == 1, "a polygon offset with a depth attachment enables depth bias");
+        t.target.depthFormat = 1;
+        HostDepthBias b = DepthBiasFor(t);
+        Expect(b.constant == 67108864.0f && b.slope == 0.125f, "kD24FS8: constant 4 x 2^24, slope 2 / 16");
+        t.target.depthFormat = 0;
+        b = DepthBiasFor(t);
+        Expect(b.constant == 67108860.0f && b.slope == 0.125f, "kD24S8: constant 4 x (2^24 - 1)");
+        DrawState noDepth = ui;
+        noDepth.polyOffsetScale = 2.0f, noDepth.polyOffsetOffset = 4.0f;
+        Expect(KeyOf(noDepth, Vs({95}), Ps({0})).depthBias == 0, "CONTROL-PAIR: no depth attachment, no depth bias");
+    }
 }
 
 void TestVariants()
@@ -192,6 +212,24 @@ void TestVariants()
     d = Ui(), d.alphaTest.enabled = true, d.alphaTest.func = 4, d.alphaTest.ref = 0.5f;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_ALPHA_REF 0.5", "XE_ALPHA_TEST 4", "XE_TEXTURE_0_GAMMA"},
            "alpha test func 4 ref 0.5");
+    d = Ui(), d.alphaToMask = 0x1AA, d.target.samples = 4;  // AA000017 on a 4x target
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok &&
+               p.lines == std::vector<std::string>{"XE_ALPHA_TO_MASK 170u", "XE_ALPHA_TO_MASK_SAMPLES 4", "XE_TEXTURE_0_GAMMA"},
+           "alpha to mask 0x1AA on 4 samples: offsets 170u (0xAA, the enable bit dropped) and the sample count");
+    d = Ui(), d.textureSlots[0].gamma = false, d.textureSlots[0].biasedMask = 7;  // signs 2220, X Y Z W
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_BIASED bvec4(true, true, true, false)"},
+           "biased mask 7: XE_TEXTURE_0_BIASED bvec4(true, true, true, false)");
+    // FM4 Recomp: PsParamGen (X shader_translator.cc:329-347): the position and whether the primitive is
+    // polygonal (X draw_util.h:56-74: a triangle list is, a rect list is not); position 16 is never an interpolator.
+    d = Ui(), d.program.paramGen = true, d.program.paramGenPos = 3, d.primitiveType = 4;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok &&
+               p.lines == std::vector<std::string>{"XE_PARAM_GEN 3", "XE_PARAM_GEN_POLYGONAL 1", "XE_TEXTURE_0_GAMMA"},
+           "param_gen at 3 on a triangle list: XE_PARAM_GEN 3, polygonal");
+    d.primitiveType = 8;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[1] == "XE_PARAM_GEN_POLYGONAL 0", "a rect list is not polygonal");
+    d.program.paramGenPos = 16;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"},
+           "CONTROL-PAIR: param_gen_pos 16 (not an interpolator): no define");
     d = Ui(), d.target.colorFormat = 1;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_GAMMA", "storage format 1: XE_COLOR0_GAMMA");
     d = Ui(), d.target.colorFormat = 3;
@@ -206,6 +244,15 @@ void TestVariants()
            "DepthOnly with the decoded alpha test off: no XE_ALPHA_TEST");
     const CachedShader both = Vs({95}, {0});
     Expect(VariantsFromDrawState(Ui(), both, ups, v, p).ok && v.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"}, "a VS that lists the slot gets the define too");
+    // FM4 Recomp: a pixel shader reading 3 interpolators of a vertex shader exporting 1: XE_PS_INTERPOLATORS 3 on the VS (the
+    // others written as 0, shader_glsl.cpp); equal counts add nothing.
+    {
+        CachedShader ps3 = Ps({0});
+        ps3.t.interpolatorCount = 3;
+        Expect(VariantsFromDrawState(Ui(), uvs, ps3, v, p).ok && v.lines == std::vector<std::string>{"XE_PS_INTERPOLATORS 3"},
+               "a PS reading 3 interpolators of a VS exporting 1: XE_PS_INTERPOLATORS 3");
+        Expect(VariantsFromDrawState(Ui(), uvs, ups, v, p).ok && v.lines.empty(), "equal interpolator counts: no XE_PS_INTERPOLATORS");
+    }
 }
 
 struct FakeIndices
@@ -224,6 +271,20 @@ void TestIndices()
                h.indices[0] == 0 && h.indices[1] == 1 && h.indices[2] == 2 && h.indices[3] == 0 && h.indices[4] == 2 && h.indices[5] == 3 &&
                h.indices[42] == 28 && h.indices[47] == 31 && h.highIndex == 31,
            "an auto-indexed quad list of 32: (0 1 2)(0 2 3) per quad, 48 host indices, high 31");
+    {
+        // FM4 Recomp: an auto-indexed line list of 4 passes through as the triangle list does: 4 host vertices, high index 3.
+        DrawState l = Clear();
+        l.hostPrimitive = HostPrimitive::LineList, l.indices.count = 4;
+        Expect(BuildHostIndices(l, nullptr, nullptr, h).ok && h.kind == HostIndices::Kind::Direct && h.vertexCount == 4 && h.highIndex == 3,
+               "an auto-indexed line list of 4: drawn directly, 4 vertices, high index 3");
+        // Its pixel parameters mark a line (XE_PARAM_GEN_LINE, z's sign as Xenia).
+        l.program.paramGen = true, l.program.paramGenPos = 0, l.primitiveType = 2;
+        ShaderVariantDefines lv, lp;
+        Expect(VariantsFromDrawState(l, Vs({0}), Ps(), lv, lp).ok &&
+                   std::find(lp.lines.begin(), lp.lines.end(), "XE_PARAM_GEN_LINE 1") != lp.lines.end() &&
+                   std::find(lp.lines.begin(), lp.lines.end(), "XE_PARAM_GEN_POLYGONAL 0") != lp.lines.end(),
+               "a line list's param_gen: XE_PARAM_GEN_LINE 1, not polygonal");
+    }
     DrawState d = Clear();
     d.hostPrimitive = HostPrimitive::TriangleList, d.indices.count = 6;
     Expect(BuildHostIndices(d, nullptr, nullptr, h).ok && h.kind == HostIndices::Kind::Direct && h.vertexCount == 6 && h.indices.empty() && h.highIndex == 5,
@@ -323,7 +384,9 @@ void TestUploads()
                windows[2].baseDword == 22,
            "vertex windows: 11 + 11 dwords laid out consecutively, an invalid slot is an empty window");
     PlanVertexWindows(d, 100, windows, total);
-    Expect(windows[0].dwords == 12 && windows[1].dwords == 403 && total == 415, "a high index past the data clamps the window to the constant's size");
+    // High index 100: 100 * 4 + 3 = 403 for both, past slot 0's 12-dword constant (Xenia does not bound vertex fetch by the
+    // size, X spirv_shader_translator_fetch.cc:126-131); 403 + 403 = 806.
+    Expect(windows[0].dwords == 403 && windows[1].dwords == 403 && total == 806, "a high index past the data reaches past the constant's size");
 
     HostViewport hv;
     hv.scale[0] = 0.5f, hv.scale[1] = -0.5f, hv.scale[2] = 1.0f, hv.scale[3] = 1.0f;

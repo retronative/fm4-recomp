@@ -138,6 +138,7 @@ struct Decoder
         case 6: d.hostPrimitive = HostPrimitive::TriangleStrip; break;
         case 8: d.hostPrimitive = HostPrimitive::RectList; break;
         case 13: d.hostPrimitive = HostPrimitive::QuadList; break;
+        case 2: d.hostPrimitive = HostPrimitive::LineList; break;  // FM4 Recomp: X primitive_processor.cc passes a line list through
         case 1:
             if (!noWrite)  // point sprites: PA_SU_POINT_SIZE expansion (X primitive_processor.cc:379-385 kPointListAsTriangleStrip)
                 return Refuse("primitive type 1 (point list) that writes colour, depth or stencil: point sprites are not modelled (PA_SU_POINT_SIZE " +
@@ -170,9 +171,22 @@ struct Decoder
         if ((sc >> 3) & 3)  // poly_mode (:427): 1 dual mode with polymode_front/back_ptype; only filled triangles are modelled
             return Refuse("PA_SU_SC_MODE_CNTL " + Hex(sc) + ": polygon mode " + Num((sc >> 3) & 3) + " (front type " + Num((sc >> 5) & 7) +
                           ", back type " + Num((sc >> 8) & 7) + ") is not modelled");
-        if ((sc >> 11) & 7)  // poly_offset_front/back/para_enable (:430-432): PA_SU_POLY_OFFSET_*
-            return Refuse("PA_SU_SC_MODE_CNTL " + Hex(sc) + ": polygon offset (enables " + Num((sc >> 11) & 7) + ", PA_SU_POLY_OFFSET_FRONT_SCALE " +
-                          Hex(Reg(xr::kPaSuPolyOffsetFrontScale)) + ") is not modelled");
+        // poly_offset_front/back/para_enable (:430-432): X draw_util.cc:86-114; polygonal = X draw_util.h:56-74 (triangle list, fan,
+        // strip, with W flags, quad list, quad strip, polygon: 4-7, 13-15; not the rect list).
+        {
+            const bool polygonal = PrimitivePolygonal(d.primitiveType);
+            float scale = 0, offset = 0;
+            if (polygonal)
+            {
+                if (((sc >> 11) & 1) && !d.cullFront)
+                    scale = RegFloat(xr::kPaSuPolyOffsetFrontScale), offset = RegFloat(xr::kPaSuPolyOffsetFrontScale + 1);
+                if (((sc >> 12) & 1) && !d.cullBack && scale == 0 && offset == 0)
+                    scale = RegFloat(xr::kPaSuPolyOffsetFrontScale + 2), offset = RegFloat(xr::kPaSuPolyOffsetFrontScale + 3);
+            }
+            else if ((sc >> 13) & 1)
+                scale = RegFloat(xr::kPaSuPolyOffsetFrontScale), offset = RegFloat(xr::kPaSuPolyOffsetFrontScale + 1);
+            d.polyOffsetScale = scale, d.polyOffsetOffset = offset;
+        }
         if ((sc >> 20) & 1)  // persp_corr_dis (:439)
             return Refuse("PA_SU_SC_MODE_CNTL " + Hex(sc) + ": perspective correction disabled is not modelled");
         const uint32_t clip = Reg(xr::kPaClClipCntl);  // X registers.h:491-517
@@ -251,8 +265,6 @@ struct Decoder
         for (uint32_t i = 0; i < 4; i++)
             b.constant[i] = RegFloat(xr::kRbBlendRed + i);
         const uint32_t cc = Reg(xr::kRbColorControl);  // X registers.h:630-682
-        if ((cc >> 4) & 1)
-            return Refuse("RB_COLORCONTROL " + Hex(cc) + ": alpha to mask (coverage) is not modelled");
         d.alphaTest.func = cc & 7;
         // FM4 Recomp: no alpha test in kDepth (DepthOnly): Xenia runs no pixel shader there (xenos.h:903-925 "the pixel shader
         // is never used with kDepth"; vulkan_command_processor.cc:2196-2208 sets it only for kColorDepth; draw_util.cc:121-126),
@@ -262,6 +274,7 @@ struct Decoder
         // would still apply: APPROXIMATE against Xenia's no-fragment-stage pipeline).
         d.alphaTest.enabled = d.kind == DrawKind::Draw && ((cc >> 3) & 1) && d.alphaTest.func != 7;
         d.alphaTest.ref = RegFloat(xr::kRbAlphaRef);
+        d.alphaToMask = d.kind == DrawKind::Draw && ((cc >> 4) & 1) ? (cc >> 24) | 1u << 8 : 0;
         return true;
     }
 
@@ -279,8 +292,6 @@ struct Decoder
             return Refuse("SQ_PROGRAM_CNTL " + Hex(pc) + ": index generation (gen_index_vtx/pix) is not modelled");
         if (p.vsExportMode != 0)  // X xenos.h:832-842: sprite / edge / kill vectors, multipass
             return Refuse("SQ_PROGRAM_CNTL " + Hex(pc) + ": vertex export mode " + Num(p.vsExportMode) + " is not modelled (0, position only)");
-        if (p.paramGen)  // PsParamGen (X registers.h:133-207): the translator has no path for it
-            return Refuse("SQ_PROGRAM_CNTL " + Hex(pc) + ": pixel parameter generation (param_gen) is not modelled");
         const uint32_t misc = Reg(xr::kSqContextMisc);  // X registers.h:126-215
         p.scOutputScreenXy = (misc >> 1) & 1;
         p.sampleControl = (misc >> 2) & 3;
@@ -310,9 +321,10 @@ struct Decoder
         // bindings 2/3), as Xenia's backends do; a base saying otherwise is refused.
         if (p.vsConstBase != 0 || (p.psConstBase != 0 && p.psConstBase != 256))
             return Refuse("SQ_VS_CONST " + Hex(vsc) + " / SQ_PS_CONST " + Hex(psc) + ": a float constant base other than 0 / 256 is not modelled");
-        if (in.ps->interpolatorCount > in.vs->interpolatorCount)
-            return Refuse("the pixel shader reads " + Num(in.ps->interpolatorCount) + " interpolators, the vertex shader exports " +
-                          Num(in.vs->interpolatorCount));
+        // FM4 Recomp: a pixel shader reading more interpolators than the vertex shader exports reads 0 in the others (Xenia
+        // zeroes them); the vertex shader's variant declares them (draw_record.cpp XE_PS_INTERPOLATORS). 16 at most.
+        if (in.ps->interpolatorCount > 16)
+            return Refuse("the pixel shader reads " + Num(in.ps->interpolatorCount) + " interpolators (16 at most)");
         return true;
     }
 
@@ -409,6 +421,7 @@ struct Decoder
             s.endian = w1 & 3;
             s.stride = k < vs.vertexFetchStrides.size() ? vs.vertexFetchStrides[k] : 0;
             s.end = k < vs.vertexFetchEnds.size() ? vs.vertexFetchEnds[k] : 0;
+            s.computedIndex = k < vs.vertexFetchComputedIndex.size() && vs.vertexFetchComputedIndex[k] != 0;
             s.valid = (w0 & 3) == 3 && s.sizeWords != 0;
             if (s.valid)
             {
@@ -428,10 +441,14 @@ struct Decoder
         {
         case 2: case 6: case 50:   // k_8, k_8_8_8_8, k_8_8_8_8_AS_16_16_16_16
         case 18: case 51:          // k_DXT1, k_DXT1_AS_16_16_16_16
-        case 20: case 53:          // k_DXT4_5, k_DXT4_5_AS_16_16_16_16 (FM4 Recomp: the local capture dynloop1 (not distributed), scenario9)
+        case 20: case 53:          // k_DXT4_5, k_DXT4_5_AS_16_16_16_16 (FM4 Recomp)
+        case 19: case 52:          // k_DXT2_3, k_DXT2_3_AS_16_16_16_16 (FM4 Recomp)
         case 7: case 54:           // k_2_10_10_10, k_2_10_10_10_AS_16_16_16_16
         case 36: case 22: case 23: // k_32_FLOAT, k_24_8, k_24_8_FLOAT
+        case 10:                   // k_8_8 (FM4 Recomp: the k_8_8 resolve's destination)
         case 25:                   // k_16_16 (signed integer only)
+        case 49:                   // k_DXN (FM4 Recomp)
+        case 59:                   // k_DXT5A (FM4 Recomp)
         case 29: case 32:          // k_16_16_16_16_EXPAND, k_16_16_16_16_FLOAT
             return true;
         default:
@@ -450,7 +467,8 @@ struct Decoder
                 auto same = std::find_if(uses.begin(), uses.end(), [&](const Use& v) { return v.slot == u.slot; });
                 if (same == uses.end())
                     uses.push_back(u);
-                else if (same->dimension != u.dimension || same->filters.mag != u.filters.mag || same->filters.min != u.filters.min ||
+                // FM4 Recomp: 1D (0) and 2D (1) fetches of one slot share Xenia's 2D binding (spirv_shader_translator_fetch.cc:2328-2332).
+                else if ((same->dimension == 0 ? 1 : same->dimension) != (u.dimension == 0 ? 1 : u.dimension) || same->filters.mag != u.filters.mag || same->filters.min != u.filters.min ||
                          same->filters.volMag != u.filters.volMag || same->filters.volMin != u.filters.volMin || same->filters.mip != u.filters.mip)
                     return Refuse("texture slot " + Num(u.slot) + " is fetched with different filters or dimensions by the vertex and pixel shaders");
             }
@@ -498,7 +516,7 @@ struct Decoder
             t.swizzle = (t.words[3] >> 1) & 0xFFF;
             t.expAdjust = SignedField(t.words[3], 13, 6);
             const uint32_t cMag = (t.words[3] >> 19) & 3, cMin = (t.words[3] >> 21) & 3, cMip = (t.words[3] >> 23) & 3;
-            t.anisoFilter = (t.words[3] >> 25) & 7;
+            const uint32_t cAniso = (t.words[3] >> 25) & 7;
             t.arbitraryFilter = (t.words[3] >> 28) & 7;
             t.borderSize = t.words[3] >> 31;
             // :1285-1294 dword 4.
@@ -512,11 +530,19 @@ struct Decoder
             t.mipFilter = u.filters.mip != 3 ? u.filters.mip : cMip;
             t.volMagFilter = u.filters.volMag != 3 ? u.filters.volMag : cVolMag;
             t.volMinFilter = u.filters.volMin != 3 ? u.filters.volMin : cVolMin;
+            t.anisoFilter = u.filters.aniso != 7 ? u.filters.aniso : cAniso;  // X vulkan_texture_cache.cc:671-674
             t.fetchDimension = u.dimension;
             t.gamma = t.sign[0] == 3 && t.sign[1] == 3 && t.sign[2] == 3 && t.sign[3] == 0;
 
-            if (t.type != 2)  // X xenos.h:1124-1129; texture_cache.cc:867-889 (an invalid constant binds nothing in Xenia)
-                return Refuse(where + "fetch constant type " + Num(t.type) + " is not a texture (2)");
+            if (t.type != 2)  // X xenos.h:1124-1129; texture_cache.cc:857-889: an invalid constant binds Xenia's zero null image
+            {
+                t.null = true, t.gamma = false;  // the shader sees (0, 0, 0, 0) unconverted (X resets the signs to unsigned)
+                for (uint32_t& s : t.sign)
+                    s = 0;
+                t.expAdjust = 0, t.lodBias = 0, t.anisoFilter = 0;
+                d.textureSlots.push_back(t);
+                continue;
+            }
             if (t.physical == 0)  // X texture_cache.cc:896-899 "no texture data at all"
                 return Refuse(where + "base address 0");
             if (t.physical >= in.physicalBytes)
@@ -524,8 +550,12 @@ struct Decoder
             if (!FormatAccepted(t.format))
                 return Refuse(where + "texture format " + Num(t.format) + " is not modelled");
             // The shader's dimension against the constant's (shader_glsl.h textureDimensions): 1 needs a 2D that is not stacked, 2 a 3D, 3 a cube.
-            const uint32_t needed = u.dimension == 1 ? 1 : u.dimension == 2 ? 2 : u.dimension == 3 ? 3 : 0xFF;
-            if (needed == 0xFF || t.dimension != needed)
+            // FM4 Recomp: a 1D fetch (0) samples a 1D or a 2D constant at (s, 0): Xenia binds 1D and 2D fetches alike as 2D arrays
+            // (spirv_shader_translator_fetch.cc:2328-2332) and builds the texture from the constant's own dimension (FM4
+            // fetches a 256x1 2D constant as 1D).
+            const uint32_t needed = u.dimension <= 3 ? u.dimension : 0xFF;
+            const bool linearOf2D = u.dimension == 0 && t.dimension == 1;
+            if (needed == 0xFF || (t.dimension != needed && !linearOf2D))
                 return Refuse(where + "the shader fetches dimension " + Num(u.dimension) + " (1 2D, 2 3D, 3 cube) but the constant's dimension is " +
                               Num(t.dimension) + " (0 1D, 1 2D or stacked, 2 3D, 3 cube)");
             if (t.stacked)
@@ -545,8 +575,8 @@ struct Decoder
             }
             if (t.borderSize != 0)
                 return Refuse(where + "border_size 1 is not modelled");
-            if (t.anisoFilter != 0)  // X xenos.h:140-148
-                return Refuse(where + "anisotropic filtering " + Num(t.anisoFilter) + " is not modelled");
+            if (t.anisoFilter > 5)  // X xenos.h:140-148: 0 off, 1-5 1:1 to 16:1; 6 undefined, 7 (use the fetch constant) in the constant
+                return Refuse(where + "anisotropic filter " + Num(t.anisoFilter) + " is undefined");
             if (t.magFilter > 1 || t.minFilter > 1)  // X xenos.h:131-138: 2 (base map) and 3 (fetch constant) mean nothing here
                 return Refuse(where + "mag/min filter " + Num(t.magFilter) + "/" + Num(t.minFilter) + " is not point (0) or linear (1)");
             if (t.dimension == 2 && (t.volMagFilter != t.magFilter || t.volMinFilter != t.minFilter))  // shader_glsl.h Filters: one host filter for all axes
@@ -559,7 +589,6 @@ struct Decoder
             for (uint32_t i = 0; i < 4; i++)  // X xenos.h XE_GPU_TEXTURE_SWIZZLE: 0-3 components, 4 zero, 5 one
                 if (((t.swizzle >> (3 * i)) & 7) > 5)
                     return Refuse(where + "swizzle component " + Num((t.swizzle >> (3 * i)) & 7) + " is not modelled (X Y Z W 0 1 are)");
-            const bool unsignedAll = t.sign[0] == 0 && t.sign[1] == 0 && t.sign[2] == 0 && t.sign[3] == 0;
             const bool signedAll = t.sign[0] == 1 && t.sign[1] == 1 && t.sign[2] == 1 && t.sign[3] == 1;
             const bool floatFormat = t.format == 36 || t.format == 22 || t.format == 23 || t.format == 29 || t.format == 32;
             const bool int16 = t.format == 25;
@@ -567,9 +596,19 @@ struct Decoder
                 return Refuse(where + "k_16_16 is modelled only as a signed integer texture (signs 1, number format 1)");
             if (!int16 && t.numFormat != 0 && !floatFormat)
                 return Refuse(where + "integer number format with a normalized format is not modelled");
-            if (!(unsignedAll || (t.gamma && !floatFormat) || (signedAll && (floatFormat || int16))))
+            // FM4 Recomp: unsigned and unsigned-biased (2) components mixed, a normalized format: the biased ones as v * 2 - 1 on the
+            // result components their swizzle selects (X spirv_shader_translator_fetch.cc:2167-2236).
+            // Every component unsigned stays accepted for every format (float ones too: FM4's k_24_8_FLOAT).
+            const bool unsignedAll = t.sign[0] == 0 && t.sign[1] == 0 && t.sign[2] == 0 && t.sign[3] == 0;
+            bool unsignedOrBiased = !floatFormat && !int16;
+            for (uint32_t i = 0; i < 4; i++)
+                unsignedOrBiased = unsignedOrBiased && (t.sign[i] == 0 || t.sign[i] == 2);
+            if (!(unsignedAll || unsignedOrBiased || (t.gamma && !floatFormat) || (signedAll && (floatFormat || int16))))
                 return Refuse(where + "component signs " + Num(t.sign[0]) + Num(t.sign[1]) + Num(t.sign[2]) + Num(t.sign[3]) +
-                              " are not modelled (unsigned, x y z gamma, or signed float/int16)");
+                              " are not modelled (unsigned or unsigned biased, x y z gamma, or signed float/int16)");
+            for (uint32_t i = 0; i < 4; i++)
+                if (const uint32_t g = (t.swizzle >> (3 * i)) & 7; g < 4 && t.sign[g] == 2)
+                    t.biasedMask |= 1u << i;
             d.textureSlots.push_back(t);
         }
         return true;
@@ -660,8 +699,15 @@ uint32_t VertexWindowDwords(const VertexSlot& s, uint32_t highIndex)
 {
     if (!s.valid)
         return 0;
-    const uint64_t needed = uint64_t(highIndex) * s.stride + s.end;
-    return uint32_t(std::min<uint64_t>(needed, s.sizeWords));
+    // Xenia loads the guest words at the fetched index without bounding them by the constant's size (X
+    // spirv_shader_translator_fetch.cc:126-131, "Bound checking is not done here"); FM4 draws reach past it
+    // (indices up to 23 at stride 4 on a 12-dword constant). The window is what the indices reach.
+    uint64_t needed = uint64_t(highIndex) * s.stride + s.end;
+    // FM4 Recomp: a computed-index fetch reads where the shader says: the window holds at least the constant's whole declared data
+    // (Xenia reads guest memory directly; FM4's vs_2419997a1464c2fd slot 94 indexed by r0.w).
+    if (s.computedIndex)
+        needed = std::max<uint64_t>(needed, s.sizeWords);
+    return uint32_t(std::min<uint64_t>(needed, UINT32_MAX));
 }
 
 DrawState DecodeDrawState(const DrawInputs& in)

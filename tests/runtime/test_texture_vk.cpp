@@ -13,6 +13,10 @@
 //   tests/run_texture_vk_tests.sh
 #include "pipeline_key.h"
 #include "texture_upload.h"
+#include "edram.h"
+#include "edram_vk_plan.h"
+#include "resolve_resident.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -68,7 +72,7 @@ const uint32_t kDxt1SmallNoSwap[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 
 // A linear k_8 5x2, pitch 32 texels (1 << 22), at 0x00100000.
 const uint32_t kK8Small[6] = {2u | kClampEdgeXYZ | 1u << 22, 2u | kSmallBase, 4u | 1u << 13, kLinearMagMin | kMipBaseMap, 0, kDim2D};
 // Mapped by texture_info.cpp but outside the observed set: k_8_8_8_8 (6), 64x64 linear.
-// Format 18 (k_DXT1): mapped (texture_info.cpp) but not in the observed set: the observed-set control.
+// Format 18 (k_DXT1): mapped (texture_info.cpp), observed in FM4.
 const uint32_t kDxt1Format18[6] = {2u | kClampEdgeXYZ | 2u << 22, 18u | 0x04000000u, 63u | 63u << 13, kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
 const uint32_t kRgba8Format6[6] = {2u | kClampEdgeXYZ | 2u << 22, 6u | 0x04000000u, 63u | 63u << 13, kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
 // A tiled DXT1_AS_16_16_16_16 256x256 with mips 0..8 at 0x03000000 (mips at 0x03100000).
@@ -214,8 +218,11 @@ void TestRefusals()
     Expect(p.entry != nullptr, "an identity mapping needs no imageViewFormatSwizzle");
     p = m.Prepare(kUi, shader, false, kFull);
     Expect(p.entry == nullptr && Has(p.error, "gamma"), "CONTROL: a gamma decision that disagrees with DrawState's is refused");
+    // FM4 Recomp: format 18 (k_DXT1) joined the observed set: a 64x64 linear DXT1 is 16 x 16 blocks of
+    // 8 bytes = 2,048 bytes, BC1 as format 51.
     p = m.Prepare(kDxt1Format18, shader, false, kFull);
-    Expect(p.entry == nullptr && Has(p.error, "observed set"), "CONTROL: format 18 (mapped, not observed) is refused, named");
+    Expect(p.entry != nullptr && p.plan.stagingBytes == 2048 && p.entry->description.host.vkFormat == vk::kFormatBc1RgbaUnormBlock,
+           "format 18 (k_DXT1) 64x64 is accepted: BC1, 2,048 bytes");
     p = m.Prepare(kRgba8Format6, shader, false, kFull);
     Expect(p.entry != nullptr && p.plan.stagingBytes == 64u * 64u * 4u, "format 6 (k_8_8_8_8) 2D 64x64 is now accepted: 16,384 bytes");
     p = m.Prepare(kDxt1Mips, shader, false, kFull);
@@ -266,6 +273,19 @@ void TestValidity()
     Expect(m.Loaded(*p.entry, p.plan) && p.entry->generation == 2, "the reload is generation 2");
     p = m.Prepare(kComp, shader, true, kFull);
     Expect(p.entry != nullptr && !p.load, "and is valid again");
+}
+
+// FM4 Recomp (FM4_RESOLVE_DEFER): the model's pending queries. kUi's base at 11A8F000 (1280x720 DXT1, tiled): a resolve marked over
+// it makes the texture read a pending range; one just past its extent does not; retired, nothing is pending.
+void TestReadsPending()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    Expect(!m.ReadsPending(kUi), "nothing marked: the UI texture reads no pending range");
+    m.MarkWritten(0x11A8F000u + 0x100, 16);
+    Expect(m.ReadsPending(kUi) && m.OverlapsPending(0x11A8F000u + 0x10F, 1) && !m.OverlapsPending(0x11A8F000u + 0x110, 1),
+           "a resolve marked inside the UI texture: it reads a pending range; the range query's edges");
+    m.Retired();
+    Expect(!m.ReadsPending(kUi) && !m.OverlapsPending(0x11A8F000u + 0x100, 16), "retired: nothing pending");
 }
 
 void TestGuestWriteLog()
@@ -447,7 +467,7 @@ void Test3D()
     ShaderFetch cube;
     cube.dimension = 3;
     p = m.Prepare(kCube, cube, true, kFull);
-    Expect(p.entry == nullptr && Has(p.error, "dimension 3"), "CONTROL: a cube constant is refused");
+    Expect(p.entry == nullptr && Has(p.error, "stack depth is 0"), "CONTROL: a cube constant with one face (stack depth 0) is refused");
 }
 
 // Mipmaps: FM4's draw 61145 slot 0 (the local capture window4 (not distributed)), decoded by hand (Xenia 67f16c4e315f xenos.h:1206-1307):
@@ -665,6 +685,307 @@ void TestDxt5()
     Expect(out[16] == 33 && out[32] == 17, "small DXT5: block (1,0) comes from 32 and (0,1) from 16 (tiled, not row-major)");
 }
 
+// FM4 Recomp: k_16_16 (25), an FM4 texture (slot 0, the k_16_16 resolve's destination). Hand decode
+// (xenos.h:1206-1307): 84024956: type 2, signs (0x4956 >> 2) & 0xFF = 0x55 -> 1 1 1 1 (signed), pitch ((1u << 31 | 0x04024956) >> 22) &
+// 0x1FF = 0x10 -> 512, tiled. 1C1E3059: format 0x19 = 25, endian (0x59 >> 6) & 3 = 1 (8in16), base 1C1E3000. 003FE1FF: 512 x 512.
+// 01063211: number format 1 (ignored: Xenia never reads it), swizzle (0x3211 >> 1) & 0xFFF = 0x1908 -> X Y 0 0, point, base map.
+// Xenia vulkan_texture_cache.cc:220-225: R16G16_UNORM, signed R16G16_SNORM (78), RGGG -> R G ZERO ZERO; 512 x 512 x 4 = 1,048,576 bytes.
+const uint32_t kK16Signed[6] = {1u << 31 | 0x04024956u, 0x1C1E3059u, 0x003FE1FFu, 0x01063211u, 0x00000000u, 0x00000200u};
+
+void TestK16_16Texture()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kK16Signed, ShaderFetch{}, false, kFull);
+    Expect(p.entry != nullptr && p.entry->description.host.vkFormat == 78 && p.plan.stagingBytes == 1048576 &&
+               Components(p.binding, vk::kSwizzleR, vk::kSwizzleG, vk::kSwizzleZero, vk::kSwizzleZero),
+           "scenario19 k_16_16 texture: signed -> R16G16_SNORM (78), R G 0 0, 1,048,576 bytes");
+    uint32_t unsigned16[6];
+    std::memcpy(unsigned16, kK16Signed, sizeof unsigned16);
+    unsigned16[0] &= ~(0xFFu << 2);  // signs 0 0 0 0
+    const PreparedTexture u = m.Prepare(unsigned16, ShaderFetch{}, false, kFull);
+    Expect(u.entry != nullptr && u.entry->description.host.vkFormat == 77 && u.entry != p.entry,
+           "the same storage unsigned: R16G16_UNORM (77), another cache entry");
+    uint32_t mixed[6];
+    std::memcpy(mixed, kK16Signed, sizeof mixed);
+    mixed[0] &= ~(3u << 2);  // component x unsigned, y z w signed
+    Expect(m.Prepare(mixed, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: mixed signs on k_16_16 are refused");
+    uint32_t signedBase0[6];
+    std::memcpy(signedBase0, kK16Signed, sizeof signedBase0);
+    signedBase0[1] &= 0xFFFu;  // base address 0 (format and endian kept)
+    const PreparedTexture z = m.Prepare(signedBase0, ShaderFetch{}, false, kFull);
+    Expect(z.entry == nullptr && Has(z.error, "base address 0"), "a signed k_16_16 constant still meets the base-address checks (base 0 refused)");
+}
+
+// FM4 Recomp: k_8_8 (10), the destination of the k_8_8 resolve (no fetch of it observed
+// yet). A synthetic tiled 32x32 constant at 0x00100000, pitch 32 texels (1 << 22), endian 8in16 (dword 1 bits 6-7), X Y Z W,
+// unsigned. Xenia vulkan_texture_cache.cc:141-145: R8G8_UNORM (VkFormat 16), signed R8G8_SNORM (17), swizzle RGGG, the 16bpb
+// load. 2-byte blocks: 32 x 32 x 2 = 2,048 staging bytes; the tiled extent TiledAddressUpperBound2D(32, 32, 32, 1) = 0 + 0xC00
+// = 3,072 (texture_util.cc:507-511).
+const uint32_t kK88[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 10u | 1u << 6 | kSmallBase, 31u | 31u << 13,
+                          kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+
+// Anisotropy (X vulkan_texture_cache.cc:671-675 resolve and clamp, :798-802 maxAnisotropy = 1 << (aniso - 1), :2591-2598 the
+// device's samplerAnisotropy and limit): the k_DXT1 constant with aniso 3 (dword 3 bits 25-27) -> 4:1.
+void TestAnisotropy()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    uint32_t fetch[6];
+    std::copy(kDxt1Format18, kDxt1Format18 + 6, fetch);
+    fetch[3] |= 3u << 25;
+    const PreparedTexture off = m.Prepare(fetch, ShaderFetch{}, false, kFull);  // the device feature not enabled
+    Expect(off.entry == nullptr && off.error.find("anisotropic filtering") != std::string::npos, "aniso 3 without samplerAnisotropy is refused");
+    const PreparedTexture on = m.Prepare(fetch, ShaderFetch{}, false, TextureDeviceFeatures{true, true, true, 16.0f});
+    Expect(on.entry != nullptr && on.binding.sampler.anisotropyEnable && on.binding.sampler.maxAnisotropy == 4.0f, "aniso 3 -> 4:1");
+    const PreparedTexture clamped = m.Prepare(fetch, ShaderFetch{}, false, TextureDeviceFeatures{true, true, true, 2.0f});
+    Expect(clamped.entry != nullptr && clamped.binding.sampler.maxAnisotropy == 2.0f, "4:1 clamped to the device's 2");
+    ShaderFetch instructionOff{};
+    instructionOff.aniso = 0;
+    const PreparedTexture none = m.Prepare(fetch, instructionOff, false, kFull);
+    Expect(none.entry != nullptr && !none.binding.sampler.anisotropyEnable && none.binding.sampler.maxAnisotropy == 1.0f, "the instruction's 0: no anisotropy");
+    Expect(!(on.binding.sampler == none.binding.sampler), "CONTROL: the anisotropic sampler is a different key");
+}
+
+// FM4 Recomp: k_DXN (49), an FM4 texture (slot 3). Hand decode (xenos.h:1206-1307): 82000002: type 2, signs 0,
+// pitch (word 0 >> 22) & 0x1FF = 8 -> 256, tiled. 0DABF071: format 0x31 = 49, endian (0x71 >> 6) & 3 = 1 (8in16). 001FE0FF:
+// 256 x 256. 00A80D10: swizzle 0x688 = X Y Z W, mag / min / mip linear. 00000203: mip max (0x203 >> 6) & 0xF = 8 -> 9 levels
+// (256 .. 1). 0DAB2A18: 2D, packed mips. Host (Xenia vulkan_texture_cache.cc:330-333): BC5_UNORM (141), RGGG -> R G G G.
+const uint32_t kDxnObserved[6] = {1u << 31 | 0x02000002u, 0x0DABF071u, 0x001FE0FFu, 0x00A80D10u, 0x00000203u, 0x0DAB2A18u};
+// A tiled DXN 8x8 texels (2x2 blocks of 16 bytes), 8in16, pitch 32 texels, at 0x00100000 (the small DXT5's layout).
+const uint32_t kDxnSmall[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 49u | 1u << 6 | kSmallBase, 7u | 7u << 13,
+                               kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+void TestDxn()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture o = m.Prepare(kDxnObserved, ShaderFetch{}, false, kFull);
+    Expect(o.entry != nullptr && o.entry->description.host.vkFormat == 141 && o.entry->description.host.blockCompressed &&
+               o.entry->description.levelCount == 9 && Components(o.binding, vk::kSwizzleR, vk::kSwizzleG, vk::kSwizzleG, vk::kSwizzleG),
+           "scenario28 DXN: k_DXN (49) 256x256, 9 levels, BC5 (141), R G G G");
+    if (o.entry == nullptr)
+        std::printf("  (%s)\n", o.error.c_str());
+    const PreparedTexture noBc = m.Prepare(kDxnSmall, ShaderFetch{}, false, {false, true});
+    Expect(noBc.entry == nullptr && Has(noBc.error, "textureCompressionBC"), "CONTROL: DXN without textureCompressionBC is refused");
+    uint32_t signedDxn[6];
+    std::copy(kDxnSmall, kDxnSmall + 6, signedDxn);
+    signedDxn[0] |= 0x55u << 2;  // all four signs 1: Xenia has no signed DXN (:332 kLoadShaderIndexUnknown)
+    Expect(m.Prepare(signedDxn, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: a signed DXN is refused");
+    // The staging bytes as the small DXT5 (16-byte blocks, GetTiledOffset2D log2 4): blocks from 0, 32, 16, 48, 8in16.
+    const PreparedTexture s = m.Prepare(kDxnSmall, ShaderFetch{}, false, kFull);
+    Expect(s.entry != nullptr && s.plan.stagingBytes == 64, "small DXN: 2 x 2 blocks of 16 bytes = 64 staging bytes");
+    if (s.entry == nullptr)
+        return;
+    FakeGuest g = Pattern(kSmallBase, s.entry->description.levels[0].extentBytes);
+    std::vector<uint8_t> out(64, 0xEE);
+    std::string error;
+    const uint32_t offsets[4] = {0, 32, 16, 48};
+    bool all = FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    for (uint32_t k = 0; all && k < 4; k++)
+        for (uint32_t j = 0; j < 16; j++)
+            all = out[k * 16 + j] == uint8_t(offsets[k] + (j ^ 1));
+    Expect(all, "small DXN: each 16-byte block from its hand-computed tiled offset (0, 32, 16, 48), 8in16-swapped");
+}
+
+// FM4 Recomp: k_DXT5A (59), an FM4 texture (slot 0). Hand decode: 84004802: tiled, pitch (word 0 >> 22) & 0x1FF
+// = 0x10 -> 512, signs 0. 0D0F907B: format 0x3B = 59, endian (0x7B >> 6) & 3 = 1. 007FE1FF: 512 x 1024. 003D4283: mip max
+// (0x4283 >> 6) & 0xF = 10 -> 11 levels (1024 .. 1). 0D0E0A18: 2D, packed mips. Host (Xenia vulkan_texture_cache.cc:381-385):
+// BC4_UNORM (139), RRRR.
+const uint32_t kDxt5aObserved[6] = {1u << 31 | 0x04004802u, 0x0D0F907Bu, 0x007FE1FFu, 0x00A80D10u, 0x003D4283u, 0x0D0E0A18u};
+// A tiled DXT5A 8x8 texels (2x2 blocks of 8 bytes), 8in16, pitch 32 texels, at 0x00100000.
+const uint32_t kDxt5aSmall[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 59u | 1u << 6 | kSmallBase, 7u | 7u << 13,
+                                 kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+void TestDxt5a()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture o = m.Prepare(kDxt5aObserved, ShaderFetch{}, false, kFull);
+    Expect(o.entry != nullptr && o.entry->description.host.vkFormat == 139 && o.entry->description.host.blockCompressed &&
+               o.entry->description.levelCount == 11 && Components(o.binding, vk::kSwizzleR, vk::kSwizzleR, vk::kSwizzleR, vk::kSwizzleR),
+           "scenario31 DXT5A: k_DXT5A (59) 512x1024, 11 levels, BC4 (139), R R R R");
+    if (o.entry == nullptr)
+        std::printf("  (%s)\n", o.error.c_str());
+    uint32_t signedDxt5a[6];
+    std::copy(kDxt5aSmall, kDxt5aSmall + 6, signedDxt5a);
+    signedDxt5a[0] |= 0x55u << 2;  // all four signs 1: no signed BC4 in Xenia (:384 kLoadShaderIndexUnknown)
+    Expect(m.Prepare(signedDxt5a, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: a signed DXT5A is refused");
+    // GetTiledOffset2D (texture_util.cc:443-458) with 8-byte blocks (log2 3): micro = ((x & 7) + ((y & 0xE) << 2)) << 3, offset =
+    // ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4): (0,0) 0, (1,0) 8, (0,1) 16, (1,1) 24 (linear would put (0,1) at 64).
+    const PreparedTexture s = m.Prepare(kDxt5aSmall, ShaderFetch{}, false, kFull);
+    Expect(s.entry != nullptr && s.plan.stagingBytes == 32, "small DXT5A: 2 x 2 blocks of 8 bytes = 32 staging bytes");
+    if (s.entry == nullptr)
+        return;
+    FakeGuest g = Pattern(kSmallBase, std::max<size_t>(s.entry->description.levels[0].extentBytes, 64));
+    std::vector<uint8_t> out(32, 0xEE);
+    std::string error;
+    const uint32_t offsets[4] = {0, 8, 16, 24};
+    bool all = FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    for (uint32_t k = 0; all && k < 4; k++)
+        for (uint32_t j = 0; j < 8; j++)
+            all = out[k * 8 + j] == uint8_t(offsets[k] + (j ^ 1));
+    Expect(all, "small DXT5A: each 8-byte block from its hand-computed tiled offset (0, 8, 16, 24), 8in16-swapped");
+}
+
+// FM4 Recomp: a 1D texture: linear k_8 256 texels at 0x00100000, pitch 256 (8 << 22), dimension 0 (dword 5
+// bits 9-10 clear). A height-1 2D image (X texture_util.cc:207-213): 256 x 1 x 1 byte = 256 staging bytes, the row as stored.
+const uint32_t kLinear1D[6] = {2u | kClampEdgeXYZ | 8u << 22, 2u | kSmallBase, 255u, kLinearMagMin | kMipBaseMap, 0, 0};
+void Test1D()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    ShaderFetch fetch1D{};
+    fetch1D.dimension = 0;
+    const PreparedTexture p = m.Prepare(kLinear1D, fetch1D, false, kFull);
+    Expect(p.entry != nullptr && p.entry->description.width == 256 && p.entry->description.height == 1 && p.entry->description.levelCount == 1 &&
+               p.plan.stagingBytes == 256,
+           "1D k_8 256 texels: a 256 x 1 image, 256 staging bytes");
+    if (p.entry == nullptr)
+    {
+        std::printf("  (%s)\n", p.error.c_str());
+        return;
+    }
+    FakeGuest g = Pattern(kSmallBase, 256);
+    std::vector<uint8_t> out(256, 0xEE);
+    std::string error;
+    bool row = FillStaging(p.entry->description, p.plan, GuestOf, &g, out.data(), error);
+    for (uint32_t i = 0; row && i < 256; i++)
+        row = out[i] == uint8_t(i);
+    Expect(row, "1D: the row's bytes as stored (no endian swap, linear)");
+    Expect(m.Prepare(kLinear1D, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: a 2D fetch of a 1D constant is refused");
+    // FM4's slot 2: 02020002 117BA086 000000FF 01280C14 00000203 00000A00, a linear 2D constant (dword 5
+    // bits 9-10 = (0xA00 >> 9) & 3 = 1), 256 x 1 (000000FF: width 0xFF + 1, height 0 + 1), format 6 (k_8_8_8_8, 0x86 & 0x3F), fetched
+    // as 1D: Xenia samples it at (s, 0) through its 2D binding. A 256 x 1 2D image, 256 x 4 = 1024 staging bytes.
+    const uint32_t observed[6] = {0x02020002u, 0x117BA086u, 0x000000FFu, 0x01280C14u, 0x00000203u, 0x00000A00u};
+    const PreparedTexture o = m.Prepare(observed, fetch1D, false, kFull);
+    Expect(o.entry != nullptr && o.entry->description.dimension == 1 && o.entry->description.width == 256 && o.entry->description.height == 1 &&
+               o.plan.stagingBytes == 1024,
+           "scenario44: a 2D 256 x 1 constant fetched as 1D: its 2D image, 1024 staging bytes");
+    if (o.entry == nullptr)
+        std::printf("  (%s)\n", o.error.c_str());
+}
+
+// FM4 Recomp: k_DXT2_3 (19), an FM4 texture (slot 0): 810048FE (tiled, pitch (word 0 >> 22) & 0x1FF = 4 -> 128,
+// signs (0x48FE >> 2) & 0xFF = 0x3F: x y z gamma) 0A21F053 (format 0x13 = 19, endian 1) 0001E01F (32 x 16) 00A80D10 003E8143
+// 00000A18 (mip address 0: one level). Host (Xenia vulkan_texture_cache.cc:191-195): BC2_UNORM (135), RGBA, gamma.
+void TestDxt23()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const uint32_t observed[6] = {1u << 31 | 0x010048FEu, 0x0A21F053u, 0x0001E01Fu, 0x00A80D10u, 0x003E8143u, 0x00000A18u};
+    const PreparedTexture p = m.Prepare(observed, ShaderFetch{}, true, kFull);
+    Expect(p.entry != nullptr && p.entry->description.host.vkFormat == 135 && p.entry->description.host.blockCompressed &&
+               p.entry->description.levelCount == 1 && p.binding.gamma && p.plan.stagingBytes == 8 * 4 * 16,
+           "scenario54 DXT2_3: k_DXT2_3 (19) 32x16, BC2 (135), gamma, 8 x 4 blocks of 16 bytes = 512 staging bytes");
+    if (p.entry == nullptr)
+        std::printf("  (%s)\n", p.error.c_str());
+    Expect(m.Prepare(observed, ShaderFetch{}, true, {false, true}).entry == nullptr, "CONTROL: DXT2_3 without textureCompressionBC is refused");
+}
+
+// FM4 Recomp: FM4_TEXTURE_REUSE's content hash (texture_upload.h ContentHash): stable for equal bytes; one flipped bit anywhere (every
+// position of a 1,061-byte buffer: 33 whole 32-byte blocks and a 5-byte tail), the length or the seed changes it.
+void TestContentHash()
+{
+    std::vector<uint8_t> a(1061);
+    for (size_t i = 0; i < a.size(); i++)
+        a[i] = uint8_t(i * 37 + 11);
+    const uint64_t h = ContentHash(a.data(), a.size(), 7);
+    Expect(ContentHash(a.data(), a.size(), 7) == h, "content hash: equal bytes, equal hash");
+    bool all = true;
+    for (size_t i = 0; i < a.size() && all; i++)
+        for (uint32_t bit = 0; bit < 8 && all; bit++)
+        {
+            std::vector<uint8_t> b = a;
+            b[i] ^= uint8_t(1u << bit);
+            all = ContentHash(b.data(), b.size(), 7) != h;
+        }
+    Expect(all, "content hash: every single-bit change (8,488 of them, blocks and tail) changes it");
+    Expect(ContentHash(a.data(), a.size() - 1, 7) != h && ContentHash(a.data(), a.size(), 8) != h, "content hash: the length and the seed change it");
+}
+
+// FM4 Recomp: ReservedStagingBytes (texture_upload.h): a reused bind reserves 0 ring bytes; each other case its full staging.
+void TestReservedStagingBytes()
+{
+    Expect(ReservedStagingBytes(true, true, true, 0x1234, 0x1234, 4160) == 0, "ring reservation: an unchanged, hashed image reserves 0 bytes");
+    Expect(ReservedStagingBytes(true, true, true, 0x1234, 0x1235, 4160) == 4160 && ReservedStagingBytes(false, true, true, 0x1234, 0x1234, 4160) == 4160 &&
+               ReservedStagingBytes(true, false, true, 0x1234, 0x1234, 4160) == 4160 && ReservedStagingBytes(true, true, false, 0x1234, 0x1234, 4160) == 4160,
+           "CONTROL: changed bytes, reuse off, a never-hashed image or an unreadable range reserve the full 4,160 bytes");
+}
+
+void TestK88Texture()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kK88, ShaderFetch{}, false, kFull);
+    // X Y Z W through RGGG (texture_info.cpp DescribeBinding: guest component i reads the host format's swizzle of it): R G G G.
+    Expect(p.entry != nullptr && p.entry->description.host.vkFormat == 16 && p.plan.stagingBytes == 2048 &&
+               p.entry->description.levels[0].extentBytes == 3072 && Components(p.binding, vk::kSwizzleR, vk::kSwizzleG, vk::kSwizzleG, vk::kSwizzleG),
+           "k_8_8 32x32 tiled: R8G8_UNORM (16), R G G G, 2,048 staging bytes from a 3,072-byte extent");
+    if (p.entry == nullptr)
+        return;
+    // The staging bytes: texel (x, y) at (y * 32 + x) * 2 from TiledOffset2D(x, y, 32, 1), bytes swapped (8in16, endian.xesli
+    // :25-31). (9, 3) -> 114 (test_edram_vk.cpp TestK88Resolve's hand value), staged at 210; (0, 0) -> 0, staged at 0.
+    // The guest bytes there are the resolve's (22 11: the big-endian 16-bit 0x2211 of R 0x11, G 0x22), so R8G8 reads
+    // R = 0x11 at 210 and G = 0x22 at 211: the resolve and the texture agree (a wiring check, not an oracle).
+    FakeGuest g = Pattern(kSmallBase, 3072);
+    g.bytes[114] = 0x22, g.bytes[115] = 0x11;
+    std::vector<uint8_t> out(p.plan.stagingBytes, 0xEE);
+    std::string error;
+    Expect(FillStaging(p.entry->description, p.plan, GuestOf, &g, out.data(), error) && out[0] == 1 && out[1] == 0 && out[210] == 0x11 &&
+               out[211] == 0x22,
+           "k_8_8 staging: (0,0) from 0 and (9,3) from 114, 8in16-swapped: R 0x11, G 0x22");
+    Expect(!(out[210] == 210 && out[211] == 211), "CONTROL: (9,3) is not the row-major source byte 210");
+    Expect(!(out[210] == 0x22 && out[211] == 0x11), "CONTROL: the bytes are swapped (endian 1), not copied");
+    uint32_t signed88[6];
+    std::memcpy(signed88, kK88, sizeof signed88);
+    signed88[0] |= 0x55u << 2;  // signs 1 1 1 1
+    const PreparedTexture s = m.Prepare(signed88, ShaderFetch{}, false, kFull);
+    Expect(s.entry != nullptr && s.entry->description.host.vkFormat == 17 && s.entry != p.entry,
+           "k_8_8 every component signed: R8G8_SNORM (17), another cache entry");
+}
+
+// FM4 Recomp: a cube (dimension 3, reference/gpu/shader_census_forecast.md: 294 of 491 disc pixel shaders fetch cubes). Hand layout
+// (texture_util.cc:42-47, :220-221, :306-344, :425-427): k_8_8_8_8 (4-byte blocks) 32x32 tiled, pitch 32 texels (1 << 22),
+// size_2d stack depth 5 (bits 26-31); a face's row pitch 32 x 4 = 128 bytes, its height 32 rows (aligned to 32) -> stride
+// 128 x 32 = 4096 (already 4 KB-aligned); faces at base + k x 4096; the staging holds the six faces, 32 x 32 x 4 = 4096 each.
+const uint32_t kCube[6] = {2u | kClampEdgeXYZ | 1u << 22 | 1u << 31, 6u | 2u << 6 | 0x00200000u, 31u | 31u << 13 | 5u << 26,
+                           kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, 3u << 9};
+
+void TestCube()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    ShaderFetch cube{};
+    cube.dimension = 3;
+    const PreparedTexture p = m.Prepare(kCube, cube, false, kFull);
+    Expect(p.entry != nullptr && p.entry->description.layers == 6 && p.entry->description.levels[0].faceStrideBytes == 4096 &&
+               p.plan.stagingBytes == 6u * 4096u,
+           "cube 32x32 k_8_8_8_8: six layers, faces 4096 bytes apart, 24,576 staging bytes");
+    if (p.entry == nullptr)
+        return;
+    const MipLevel& l = p.entry->description.levels[0];
+    // The tiled extent of one face (GetTiledAddressUpperBound2D(32, 32, 32, log2 2): one 32x32 tile of 4-byte blocks = 4096) after
+    // the other five faces.
+    Expect(l.extentBytes == 5u * 4096u + 4096u, "cube: the extent covers five strides and the last face (24,576 bytes)");
+    FakeGuest g{0x00200000u, std::vector<uint8_t>(l.extentBytes, 0)};
+    for (uint32_t face = 0; face < 6; face++)
+        std::fill(g.bytes.begin() + face * 4096, g.bytes.begin() + face * 4096 + 4096, uint8_t(face + 1));
+    std::vector<uint8_t> out(p.plan.stagingBytes, 0xEE);
+    std::string error;
+    bool order = FillStaging(p.entry->description, p.plan, GuestOf, &g, out.data(), error);
+    for (uint32_t face = 0; order && face < 6; face++)
+        for (uint32_t i = 0; order && i < 4096; i++)
+            order = out[face * 4096 + i] == uint8_t(face + 1);
+    Expect(order, "cube: staging face k holds guest face k (+X -X +Y -Y +Z -Z, the host array layers in order)");
+    const std::vector<CopyRegion> r = CopyRegions(p.entry->description, p.plan, 0);
+    Expect(r.size() == 1 && r[0].layers == 6 && r[0].width == 32 && r[0].height == 32, "cube: one copy region of six layers");
+    uint32_t four[6];
+    std::memcpy(four, kCube, sizeof four);
+    four[2] = (four[2] & 0x03FFFFFFu) | 4u << 26;
+    Expect(m.Prepare(four, cube, false, kFull).entry == nullptr, "CONTROL: a cube constant with stack depth 4 (five faces) is refused");
+    Expect(m.Prepare(kCube, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: a 2D fetch of a cube constant is refused");
+    // FM4's cube texture (slot 1): 82024802 (tiled, pitch (word 0 >> 22) & 0x1FF = 8 -> 256) 0DA3C052 (format 0x12 =
+    // 18 k_DXT1, endian 1) 141FE0FF (256 x 256, stack depth 0x141FE0FF >> 26 = 5) 00A80D10 00000003 (one level) 00000618 (cube).
+    // DXT1: 64 x 64 blocks of 8 bytes: row pitch 512, 64 block rows (aligned to 32) -> face stride 32,768 (4 KB-aligned);
+    // staging 6 x 64 x 64 x 8 = 196,608 bytes.
+    const uint32_t observed[6] = {1u << 31 | 0x02024802u, 0x0DA3C052u, 0x141FE0FFu, 0x00A80D10u, 0x00000003u, 0x00000618u};
+    const PreparedTexture o = m.Prepare(observed, cube, false, kFull);
+    Expect(o.entry != nullptr && o.entry->description.host.vkFormat == 133 && o.entry->description.layers == 6 &&
+               o.entry->description.levelCount == 1 && o.entry->description.levels[0].faceStrideBytes == 32768 && o.plan.stagingBytes == 196608,
+           "scenario29 cube: k_DXT1 256x256, six faces 32,768 bytes apart, BC1, 196,608 staging bytes");
+}
+
 void TestGlow()
 {
     const uint32_t kGlow[6] = {1u << 31 | 0x064200FEu, 0x117D80B2u, 0x003E631Fu, 0x00280C14u, 0x00000003u, 0x00000A00u};
@@ -708,6 +1029,174 @@ void TestGlow()
 
 }  // namespace
 
+// FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): the traced HDR resolve (the local capture ach1 (not distributed), draws
+// 33684-33685: two bands into 1BB71000, 1280x512 then rows 512-719, k01 of a 2x 7e3 surface, k_2_10_10_10, exp bias -1, swap,
+// 8in32) and the texture the next draws sample there (kHdr: k_2_10_10_10_AS_16_16_16_16 1280x720, tiled, 8in32, pitch 1280).
+// The GPU path copies ResolveConvertPixel's word of rectangle pixel (x, y) to texel (x0 + x, y0 + y) of that texture's image;
+// the CPU path stores it into guest memory (ResolveConvertToGuest: endian swap, tiling) and the texture unit loads it from
+// there (FillStaging: untiling, endian swap). Both must give the image the same bytes. The words are pseudo-random 7e3 samples;
+// the expectation is ResolveConvertPixel of the same samples (test_edram_vk.cpp checks that function by hand), at the texel the
+// texture's row-major staging holds at (y * 1280 + x) * 4.
+uint32_t BigEndianFloat(float f)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    return __builtin_bswap32(bits);
+}
+
+edram::ResolveRegisters HdrBand(uint32_t y0, uint32_t y1, uint32_t destBase = 0x1BB71000)
+{
+    edram::ResolveRegisters r;
+    r.surfaceInfo = 0x14010500, r.colorInfo[0] = 0x000C0000, r.depthInfo = 0x00010400, r.modeControl = 6;
+    r.copyControl = 0x00100340, r.copyDestBase = destBase, r.copyDestPitch = 0x02D00500, r.copyDestInfo = 0x013F0382;
+    r.colorClear = r.colorClearLo = 0x08521485;
+    r.windowScissorBr = 0x02D00500, r.screenScissorBr = 0x20002000;
+    r.fetch0 = 0x11593203, r.fetch1 = 0x1000001A;
+    const float v[6] = {0.0f, float(y0), 1280.0f, float(y0), 1280.0f, float(y1)};
+    for (int i = 0; i < 6; i++)
+        r.vertexWords[i] = BigEndianFloat(v[i]);
+    return r;
+}
+
+// One band through both paths; returns the number of rectangle pixels whose staged texel differs from the GPU path's word.
+uint64_t ResidentBandMismatches(const edram::ResolveInfo& info, const uint32_t fetch[6], std::string& error, uint32_t cornerX = 0, uint32_t cornerY = 0)
+{
+    const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
+    const DumpLayout l = DumpLayoutFor(info.msaa, width, height);
+    std::vector<uint32_t> words(size_t(l.width) * l.columns * l.height * l.rows);
+    uint32_t seed = 0x12345678u;
+    for (uint32_t& w : words)
+        w = (seed = seed * 1664525u + 1013904223u);
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(fetch, ShaderFetch{}, false, kFull);
+    if (p.entry == nullptr)
+    {
+        error = p.error;
+        return ~0ull;
+    }
+    const TextureDescription& d = p.entry->description;
+    FakeGuest g{d.base.physical, std::vector<uint8_t>(d.levels[0].extentBytes, 0)};
+    if (info.destExtentStart < g.physical || info.destExtentStart - g.physical + uint64_t(info.destExtentLength) > g.bytes.size() ||
+        !ResolveConvertToGuest(info, 3, words.data(), g.bytes.data() + (info.destExtentStart - g.physical), info.destExtentLength, error))
+        return ~0ull;
+    std::vector<uint8_t> out(p.plan.stagingBytes);
+    if (!FillStaging(d, p.plan, GuestOf, &g, out.data(), error))
+        return ~0ull;
+    uint64_t mismatches = 0;
+    for (uint32_t y = 0; y < height; y++)
+        for (uint32_t x = 0; x < width; x++)
+        {
+            uint32_t samples[4] = {};
+            for (uint32_t s = 0; s < l.samples; s++)
+                samples[s] = words[l.Word(x, y, s)];
+            uint32_t staged;
+            std::memcpy(&staged, out.data() + (size_t(cornerY + info.y0 + y) * d.width + cornerX + info.x0 + x) * 4, 4);
+            mismatches += staged != ResolveConvertPixel(info, 3, samples);
+        }
+    return mismatches;
+}
+
+void TestResidentResolve()
+{
+    std::string error;
+    const edram::ResolveInfo top = edram::DecodeResolve(HdrBand(0, 512)), bottom = edram::DecodeResolve(HdrBand(512, 720));
+    Expect(top.ok && top.copy && top.x0 == 0 && top.y0 == 0 && top.x1 == 1280 && top.y1 == 512 && top.destFormat == 7 && top.destEndian == 2 &&
+               top.msaa == edram::Msaa::X2 && ResidentConvertible(3, top.destFormat, top.destBytesLog2),
+           "resident: the HDR resolve's top band decodes to 1280x512 at 0,0, format 7, 8in32, 2x, convertible");
+    Expect(bottom.ok && bottom.copy && bottom.y0 == 512 && bottom.y1 == 720 && bottom.destBase != 0x1BB71000u,
+           "resident: the bottom band decodes to rows 512-719, its tile base past the texture's base");
+    Expect(ResidentBandMismatches(top, kHdr, error) == 0, "resident: top band, CPU write-back then texture load == the GPU word at (x0 + x, y0 + y), every pixel");
+    Expect(ResidentBandMismatches(bottom, kHdr, error) == 0, "resident: bottom band (y0 512): the same, every pixel");
+    // CONTROL: the texture read with endian 0 (no swap) does not reproduce the words: the endian equality matters.
+    uint32_t noSwap[6];
+    std::memcpy(noSwap, kHdr, sizeof noSwap);
+    noSwap[1] &= ~(3u << 6);
+    const uint64_t wrong = ResidentBandMismatches(top, noSwap, error);
+    Expect(wrong != 0 && wrong != ~0ull, "CONTROL: a texture without the 8in32 swap stages other words");
+
+    // The image match (ResidentTextureMatches) on kHdr's shape, then one field off at a time.
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kHdr, ShaderFetch{}, false, kFull);
+    if (p.entry == nullptr)
+        return Expect(false, "resident: kHdr prepares");
+    const TextureDescription& d = p.entry->description;
+    const ResidentTextureShape shape{d.base.physical, d.width, d.height, d.fetch.pitchTexels, d.fetch.format, d.fetch.endian, d.levelCount,
+                                     d.dimension, d.depth, d.fetch.tiled, d.fetch.stacked, d.fetch.packedMips};
+    ResidentResolve r{true, bottom.destExtentStart, bottom.destExtentLength, 0x1BB71000u, 7, 1280, 2, 0, 512, 1280, 208};
+    Expect(ResidentTextureMatches(shape, r), "resident: the bottom band's words go to kHdr's image (format 7 into 54, 8in32, pitch 1280)");
+    std::string why;
+    ResidentResolve x = r;
+    x.converted = false;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "the resolve has no GPU words", "CONTROL: a resolve without GPU words");
+    x = r, x.textureBase += 0x800;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "another base", "CONTROL: a base delta that is not a whole 32x32 tile");
+    x = r, x.textureBase -= 0x1000;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "another base", "CONTROL: a base below the texture's");
+
+    // The race's HDR bands: RB_COPY_DEST_BASE moved down by whole tile rows, the rectangle at 0,0. Rows
+    // 256-511 of a pitch-1280 32 bpp texture start at macro tile (256 >> 5) * (1280 >> 5) = 320, so the base is 1BB71000 +
+    // (320 << 12) = 1BCB1000 (the hand value of GetTiledOffset2D (0, 256): macro 320 << 9 = 0x28000, << 3 = 0x140000).
+    const edram::ResolveInfo moved = edram::DecodeResolve(HdrBand(0, 256, 0x1BB71000u + 0x140000u));
+    Expect(moved.ok && moved.copy && moved.y0 == 0 && moved.y1 == 256 && moved.destExtentStart == 0x1BCB1000u,
+           "resident: a band at 1BCB1000, rows 0-255 of its own base");
+    Expect(ResidentBandMismatches(moved, kHdr, error, 0, 256) == 0, "resident: that band's CPU write-back read through kHdr == the GPU word at texel (x, 256 + y)");
+    const uint64_t shifted = ResidentBandMismatches(moved, kHdr, error, 0, 0);
+    Expect(shifted != 0 && shifted != ~0ull, "CONTROL: the same words at texel (x, y) do not match (the corner matters)");
+    uint32_t cx = 99, cy = 99;
+    x = r, x.textureBase = 0x1BB71000u + 0x140000u, x.y0 = 0, x.height = 256;
+    Expect(ResidentTextureMatches(shape, x, &why, &cx, &cy) && cx == 0 && cy == 256, "resident: the moved base's corner is texel (0, 256)");
+    x.textureBase = 0x1BB71000u + (41u << 12);  // macro 41: tile (1, 1) -> (32, 32)
+    x.width = 32, x.height = 32;
+    Expect(ResidentTextureMatches(shape, x, &why, &cx, &cy) && cx == 32 && cy == 32, "resident: macro tile 41 at pitch 1280 is texel (32, 32)");
+    x.textureBase = 0x1BB71000u + (320u << 12), x.width = 1280, x.height = 465;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "the rectangle exceeds the texture", "CONTROL: rows 256 + 465 pass the 720-row texture");
+    x = r, x.destPitch = 1536;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "another pitch", "CONTROL: another pitch");
+    x = r, x.destEndian = 0;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "another endian", "CONTROL: another endian");
+    x = r, x.destFormat = 6;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "a format whose texel is not the resolve's word", "CONTROL: an 8_8_8_8 resolve into a 2_10_10_10 texture");
+    x = r, x.height = 209;
+    Expect(!ResidentTextureMatches(shape, x, &why) && why == "the rectangle exceeds the texture", "CONTROL: one row past the texture");
+    ResidentTextureShape t = shape;
+    t.levels = 2;
+    Expect(!ResidentTextureMatches(t, r, &why) && why == "more than one level", "CONTROL: a texture with mips");
+    t = shape, t.tiled = false;
+    Expect(!ResidentTextureMatches(t, r, &why) && why == "linear", "CONTROL: a linear texture");
+    Expect(ResidentFormatPair(6, 50) && ResidentFormatPair(54, 7) && !ResidentFormatPair(7, 6) && !ResidentFormatPair(36, 36) &&
+               ResidentConvertible(0, 6, 2) && !ResidentConvertible(4, 25, 2) && !ResidentConvertible(3, 10, 1) && !ResidentConvertible(14, 36, 2),
+           "resident: format pairs (6/50, 7/54) and the convertible storages and formats");
+
+    // The earlier-pending query (texture_upload.h GuestWriteLog::OverlapsEarlier): the last mark does not count.
+    GuestWriteLog log;
+    log.Mark(0x1BB71000u, 0x1000);
+    Expect(!log.OverlapsEarlier(0x1BB71000u, 1), "resident: one mark: nothing earlier overlaps");
+    log.Mark(0x1C000000u, 0x1000);
+    Expect(log.OverlapsEarlier(0x1BB71000u, 1) && !log.OverlapsEarlier(0x1C000000u, 1), "resident: two marks: only the first counts as earlier");
+}
+
+// FM4 Recomp (FM4_WRITE_WATCH): with a protecting backend the cache's own bookkeeping protects nothing (a run stopped
+// at draw 3843 when Loaded protected through it), arming goes through the second watch, and GPU writes move both.
+struct CountingBackend final : WatchBackend
+{
+    int calls = 0;
+    bool Protect(uint32_t, uint32_t, bool) override { return ++calls, true; }
+};
+void TestProtectingWatch()
+{
+    CountingBackend b;
+    TextureUnitModel m(TextureValidity::ReloadEveryBind, &b);
+    PreparedTexture p = m.Prepare(kUi, ShaderFetch{}, true, kFull);  // the UI constant is gamma (DrawState's define then agrees)
+    Expect(p.entry != nullptr && m.Loaded(*p.entry, p.plan) && b.calls == 0, "protecting watch: the cache's Loaded calls no backend");
+    Expect(m.ProtectingWatch() != nullptr && m.ProtectingWatch()->Watch(0x11A8F000u, 16384) && b.calls == 1, "protecting watch: arming protects through it");
+    const uint64_t before = m.ProtectingWatch()->WriteSequence(0x11A8F000u, 4096);
+    m.MarkWritten(0x11A8F000u, 64);
+    Expect(m.ProtectingWatch()->WriteSequence(0x11A8F000u, 4096) > before && m.Watch().WriteSequence(0x11A8F000u, 4096) > 0,
+           "protecting watch: a GPU write moves both watches' sequences");
+    TextureUnitModel plain(TextureValidity::ReloadEveryBind);
+    Expect(plain.ProtectingWatch() == nullptr, "CONTROL: without a backend there is no protecting watch");
+}
+
 int main()
 {
     TestStagingPlacement();
@@ -715,12 +1204,25 @@ int main()
     TestRefusals();
     TestValidity();
     TestGuestWriteLog();
+    TestReadsPending();
     TestStagingBytes();
     Test3D();
     TestMips();
     TestGlow();
     TestDepthFloat();
     TestDxt5();
+    TestK16_16Texture();
+    TestK88Texture();
+    TestAnisotropy();
+    TestDxn();
+    TestDxt5a();
+    Test1D();
+    TestDxt23();
+    TestContentHash();
+    TestReservedStagingBytes();
+    TestCube();
+    TestResidentResolve();
+    TestProtectingWatch();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

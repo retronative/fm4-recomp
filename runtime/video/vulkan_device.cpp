@@ -29,15 +29,25 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
 {
     // The one known false positive, matched exactly: MoltenVK 1.4.2 MVKPipeline.mm:1994-1995 (v1.4.2 tag) reports
     // "Blending is enabled" for every colour attachment whose format Metal cannot blend, whether blendEnable is set or not.
-    // The renderer's R32_UINT attachment (the EDRAM resolve's sample dump, edram_vk.cpp) has blendEnable VK_FALSE. Logged
-    // once under another prefix (scripts/gpu_run.sh's check is not fooled into passing anything else) and not counted.
-    static constexpr const char* kMvkBlendFalsePositive =
-        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R32_UINT, which does not support it.";
+    // The renderer's integer attachments all have blendEnable VK_FALSE: R32_UINT (the EDRAM resolve's sample dump and the
+    // storage-14 transfer view) and R16G16_UINT (FM4 Recomp: the storage-4 k_16_16 transfer view, edram_vk.cpp Pipeline, blend{});
+    // draw pipelines never use an integer format (pipeline_cache.cpp HostColorFormat). Logged once per format under another
+    // prefix (scripts/gpu_run.sh's check is not fooled into passing anything else) and not counted.
+    static constexpr const char* kMvkBlendFalsePositives[] = {
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R32_UINT, which does not support it.",
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16G16_UINT, which does not support it."};
+    const auto knownFalsePositive = [&] {
+        for (const char* text : kMvkBlendFalsePositives)
+            if (!std::strcmp(data->pMessage, text))
+                return true;
+        return false;
+    };
     if (severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && data && data->pMessageIdName && data->pMessage &&
-        !std::strcmp(data->pMessageIdName, "mvk-warn") && !std::strcmp(data->pMessage, kMvkBlendFalsePositive))
+        !std::strcmp(data->pMessageIdName, "mvk-warn") && knownFalsePositive())
     {
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true))
+        static std::atomic<unsigned> logged{0};
+        const unsigned bit = std::strstr(data->pMessage, "R16G16_UINT") ? 2u : 1u;
+        if (!(logged.fetch_or(bit) & bit))
             std::fprintf(stderr, "[vulkan known false positive] mvk-warn: %s (MoltenVK 1.4.2 MVKPipeline.mm:1994; blendEnable is false)\n", data->pMessage);
         return VK_FALSE;
     }
@@ -210,7 +220,9 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
     if (features.features.vertexPipelineStoresAndAtomics != VK_TRUE)
         Stop(StopCode::Setup, "vulkan: the device lacks vertexPipelineStoresAndAtomics, which the translated vertex shaders need (XeErrors)");
     d.imageViewFormatSwizzle = portabilityOffered && portability.imageViewFormatSwizzle == VK_TRUE;
+    d.samplerAnisotropy = features.features.samplerAnisotropy == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.samplerAnisotropy = d.samplerAnisotropy ? VK_TRUE : VK_FALSE;
     enabledFeatures.textureCompressionBC = d.textureCompressionBC ? VK_TRUE : VK_FALSE;
     enabledFeatures.depthClamp = d.depthClamp ? VK_TRUE : VK_FALSE;
     enabledFeatures.independentBlend = d.independentBlend ? VK_TRUE : VK_FALSE;
@@ -236,8 +248,9 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
     vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
     // The formats the first screens need, as the device reports them:
     // S sampled, C colour attachment, D depth/stencil attachment, B blit destination, T transfer destination (optimal tiling).
-    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s (portability subset %s)\n",
-                 d.textureCompressionBC ? "yes" : "NO", d.depthClamp ? "yes" : "NO", d.independentBlend ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
+    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s, samplerAnisotropy %s (portability subset %s)\n",
+                 d.textureCompressionBC ? "yes" : "NO", d.depthClamp ? "yes" : "NO", d.independentBlend ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO",
+                 d.samplerAnisotropy ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
     static constexpr struct { VkFormat format; const char* name; } kFormats[] = {
         {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1_RGBA_UNORM (Xenos DXT1)"}, {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM (k_8_8_8_8)"},
         {VK_FORMAT_R8_UNORM, "R8_UNORM (k_8)"}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, "A2B10G10R10_UNORM (2_10_10_10 targets, format 54 front buffer)"},

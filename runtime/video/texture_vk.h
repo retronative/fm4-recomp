@@ -23,5 +23,8 @@ const TextureHooks* InitializeTextureUnit(const VulkanDevice& device);
 void ShutdownTextureUnit();
 // One line for the renderer's [gpu] swap log (counts since the previous call, and totals).
 std::string TextureUnitSummary();
+// FM4 Recomp: at each swap, only after its RetireSlot (every submission confirmed complete): destroys idle images above the
+// thresholds (texture_vk.cpp kEvictAbove).
+void EvictIdleTextures();
 
 }  // namespace runtime::video

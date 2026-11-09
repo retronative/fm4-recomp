@@ -8,6 +8,7 @@
 #include "stops.h"
 #include "guest_memory.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -28,6 +29,18 @@ bool Writable(uint32_t protect)
     return protect & (page::kReadWrite | page::kWriteCopy | page::kExecuteReadWrite | page::kExecuteWriteCopy);
 }
 bool Readable(uint32_t protect) { return !(protect & page::kNoAccess) && protect != 0; }
+
+// FM4 Recomp (FM4_WRITE_WATCH): the guest memory base, the heap's intended write access per shared physical host page (set by
+// SetHostAccess; read lock-free by the fault hook), and the watch's observers.
+uint8_t* membaseAll = nullptr;
+std::atomic<uint8_t> physicalWritable[kPhysicalSize / kWatchHostPage];
+std::atomic<PhysicalRangeObserver> accessObserver{nullptr}, hostWriteObserver{nullptr};
+
+void AccessChanged(uint32_t physical, uint32_t size)
+{
+    if (const PhysicalRangeObserver o = accessObserver.load(std::memory_order_acquire))
+        o(physical, size);
+}
 
 }  // namespace
 
@@ -66,6 +79,17 @@ void Heap::SetHostAccess(uint32_t first, uint32_t count)
             if (p.state & mem::kCommit)
                 access |= Writable(p.protect) ? PROT_READ | PROT_WRITE : Readable(p.protect) ? PROT_READ : PROT_NONE;
         }
+        // FM4 Recomp (FM4_WRITE_WATCH): the watch learns of the change first (the range counts as written, unwatched); the
+        // intended access is published after a grant and before a revocation, so the fault hook never makes a page writable the
+        // heap no longer means writable.
+        const bool shared = kind_ == Kind::SharedPhysical && host == kWatchHostPage;
+        const uint32_t physical = uint32_t(h - base_);
+        if (shared)
+        {
+            AccessChanged(physical, uint32_t(host));
+            if (!(access & PROT_WRITE))
+                physicalWritable[physical / kWatchHostPage].store(0, std::memory_order_release);
+        }
         if (mprotect(membase_ + h, host, access) != 0)
             Stop(StopCode::Setup, "cannot set guest page access at %08llX", (unsigned long long)h);
         // Physical memory is seen through every view: the same access at the same offset of the
@@ -73,6 +97,8 @@ void Heap::SetHostAccess(uint32_t first, uint32_t count)
         for (const uint32_t view : {0xA0000000u, 0xC0000000u})
             if (kind_ == Kind::SharedPhysical && view != base_ && mprotect(membase_ + view + (h - base_), host, access) != 0)
                 Stop(StopCode::Setup, "cannot set guest page access at %08llX", (unsigned long long)(view + (h - base_)));
+        if (shared && (access & PROT_WRITE))
+            physicalWritable[physical / kWatchHostPage].store(1, std::memory_order_release);
     }
 }
 
@@ -83,6 +109,8 @@ void Heap::Zero(uint32_t first, uint32_t count)
     const uint64_t host = uint64_t(getpagesize());
     const uint64_t address = uint64_t(base_) + uint64_t(first) * pageSize_, size = uint64_t(count) * pageSize_;
     const uint64_t start = address & ~(host - 1), end = (address + size + host - 1) & ~(host - 1);
+    if (kind_ == Kind::SharedPhysical)  // FM4 Recomp (FM4_WRITE_WATCH): a host write the watch cannot see as a fault
+        AccessChanged(uint32_t(start - base_), uint32_t(end - start));
     if (mprotect(membase_ + start, end - start, PROT_READ | PROT_WRITE) != 0)
         Stop(StopCode::Setup, "cannot clear guest memory at %08llX", (unsigned long long)address);
     std::memset(membase_ + address, 0, size);
@@ -239,6 +267,7 @@ bool Heap::IsCommitted(uint32_t address, uint32_t size) const
 
 void InitializeHeaps(uint8_t* membase)
 {
+    membaseAll = membase;
     v00000000 = std::make_unique<Heap>(membase, 0x00000000u, 0x40000000u, 4096);
     v40000000 = std::make_unique<Heap>(membase, 0x40000000u, 0x30000000u, 64 * 1024);
     const uint32_t views[] = {0xA0000000u, 0xC0000000u};
@@ -277,11 +306,86 @@ bool PhysicalToGuest(uint32_t physical, uint32_t& address)
     return true;
 }
 
+bool PhysicalRangeToGuest(uint32_t physical, uint32_t bytes, uint32_t& address)
+{
+    if (bytes == 0 || physical >= kPhysicalSize || bytes > kPhysicalSize - physical)
+        return false;
+    std::lock_guard guard(lock);
+    const uint32_t view = frames[physical / kFrame];
+    if (view == 0)
+        return false;
+    for (uint32_t f = physical / kFrame + 1; f <= (physical + bytes - 1) / kFrame; f++)
+        if (frames[f] != view)
+            return false;
+    address = view == 0xE0000000u ? view + physical - 0x1000 : view + physical;
+    return true;
+}
+
 Heap* VirtualHeap(uint32_t pageSize) { return pageSize <= 4096 ? v00000000.get() : v40000000.get(); }
 
 Heap* PhysicalHeap(uint32_t pageSize)
 {
     return pageSize <= 4096 ? vE0000000.get() : pageSize <= 64 * 1024 ? vA0000000.get() : vC0000000.get();
+}
+
+
+
+// ---- FM4 Recomp (FM4_WRITE_WATCH): the write watch's side of the heaps (virtual_memory.h) ----------------------------------
+
+bool WatchAvailable() { return membaseAll != nullptr && uint32_t(getpagesize()) == kWatchHostPage; }
+
+bool PhysicalHostWritable(uint32_t physical)
+{
+    return physical < kPhysicalSize && physicalWritable[physical / kWatchHostPage].load(std::memory_order_acquire) != 0;
+}
+
+bool WatchProtect(uint32_t physical, uint32_t size)
+{
+    if (!WatchAvailable() || size == 0 || physical % kWatchHostPage || size % kWatchHostPage || uint64_t(physical) + size > kPhysicalSize)
+        return false;
+    std::lock_guard guard(lock);
+    for (uint32_t f = physical / kFrame; f < (physical + size) / kFrame; f++)
+        if (frames[f] != 0xA0000000u && frames[f] != 0xC0000000u)
+            return false;
+    for (uint32_t p = physical; p < physical + size; p += kWatchHostPage)
+        if (!PhysicalHostWritable(p))
+            return false;
+    for (const uint32_t view : {0xA0000000u, 0xC0000000u})
+        if (mprotect(membaseAll + view + physical, size, PROT_READ) != 0)
+            Stop(StopCode::Setup, "write watch: cannot protect %08X + %u bytes", view + physical, size);
+    return true;
+}
+
+bool WatchUnprotect(uint32_t physical, uint32_t size)
+{
+    if (membaseAll == nullptr || size == 0 || physical % kWatchHostPage || uint64_t(physical) + size > kPhysicalSize)
+        return false;
+    for (uint32_t p = physical; p < physical + size; p += kWatchHostPage)
+    {
+        if (!PhysicalHostWritable(p))
+            return false;
+        for (const uint32_t view : {0xA0000000u, 0xC0000000u})
+            if (mprotect(membaseAll + view + p, kWatchHostPage, PROT_READ | PROT_WRITE) != 0)
+                return false;
+    }
+    return true;
+}
+
+void SetWatchObservers(PhysicalRangeObserver accessChanged, PhysicalRangeObserver hostWrite)
+{
+    accessObserver.store(accessChanged, std::memory_order_release);
+    hostWriteObserver.store(hostWrite, std::memory_order_release);
+}
+
+void BeforeHostWrite(const uint8_t* host, uint32_t size)
+{
+    const PhysicalRangeObserver o = hostWriteObserver.load(std::memory_order_acquire);
+    if (o == nullptr || membaseAll == nullptr || size == 0 || host < membaseAll || uint64_t(host - membaseAll) + size > (1ull << 32))
+        return;
+    const uint32_t guest = uint32_t(host - membaseAll);
+    if (guest < 0xA0000000u || guest >= 0xE0000000u)
+        return;  // the E0000000 view and the virtual heaps are never watched
+    o(guest & (kPhysicalSize - 1), size);
 }
 
 }  // namespace runtime

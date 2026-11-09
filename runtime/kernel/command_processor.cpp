@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -26,7 +27,7 @@ enum : uint32_t {
     kNop = 0x10, kRegRmw = 0x21, kDrawIndx = 0x22, kVizQuery = 0x23, kWaitForIdle = 0x26, kImLoad = 0x27, kImLoadImmediate = 0x2B,
     kSetConstant = 0x2D, kLoadAluConstant = 0x2F, kDrawIndx2 = 0x36, kIndirectBufferPfd = 0x37, kInvalidateState = 0x3B, kWaitRegMem = 0x3C,
     kMemWrite = 0x3D, kRegToMem = 0x3E, kIndirectBuffer = 0x3F, kCondWrite = 0x45, kEventWrite = 0x46, kMeInit = 0x48,
-    kSetBinMask = 0x50, kSetBinSelect = 0x51, kInterrupt = 0x54, kSetConstant2 = 0x55, kEventWriteShd = 0x58, kEventWriteExt = 0x5A,
+    kSetBinMask = 0x50, kSetBinSelect = 0x51, kInterrupt = 0x54, kSetConstant2 = 0x55, kEventWriteShd = 0x58, kEventWriteExt = 0x5A, kEventWriteZpd = 0x5B,
     kContextUpdate = 0x5E, kSetBinMaskLo = 0x60, kSetBinMaskHi = 0x61, kSetBinSelectLo = 0x62, kSetBinSelectHi = 0x63,
     kXeSwap = 0x64,
 };
@@ -105,12 +106,85 @@ void StoreGpu(uint8_t* base, uint32_t address, uint32_t value)
     std::memcpy(base + PhysicalToGuest(address & ~3u), &raw, 4);
 }
 
+// FM4 Recomp (FM4_DEFER_FENCES): a store of the command stream (MEM_WRITE, EVENT_WRITE_SHD, COND_WRITE, REG_TO_MEM) lands when
+// the GPU work recorded before it is complete, after that work's resolve write-backs, in packet order: the CPU never sees a fence
+// before the data it covers (ReCarbon runtime/gpu/command_processor.cpp QueueStore, :168-180, :833-880). Queued while
+// the renderer has open work; once queued, every later store queues too (order).
+struct DeferredStore { uint32_t address, value; bool interrupt = false; };  // interrupt: `value` is the CPU mask
+std::vector<DeferredStore> deferredStores;
+uint8_t* deferredBase = nullptr;
+std::atomic<uint64_t> cpIdleNs{0}, selfWaits{0}, immediateWaits{0}, memWaits{0}, syncedWaits{0}, memWaitNs{0}, immediateInterrupts{0}, graceSyncs{0};
+// FM4 Recomp (FM4_DIAG_MEMWAIT=1, diagnostic): each memory WAIT_REG_MEM that is not satisfied at once, on every 50th swap (at
+// most 4,000 lines): its word, reference, the value before and after the sync, what was pending, and where the time went.
+bool MemWaitDiag()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_MEMWAIT");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[cp] diagnostic FM4_DIAG_MEMWAIT=1: memory waits that sync, every 50th swap\n");
+        return enabled;
+    }();
+    return on;
+}
+// FM4 Recomp (opt-in FM4_IMMEDIATE_INTERRUPTS=1, with FM4_DEFER_FENCES): an INTERRUPT is raised when the command processor
+// reaches it, as Xenia and ShiftGlue's split recording (ShiftGlue SDK src/graphics/command_processor.cpp:2496-
+// 2499) do, unless the CPU could learn from it that earlier GPU work finished: a stream store is queued before it (fence order), or
+// D3D asked for idle with a WAIT_UNTIL since the last interrupt (FM4's callback emitter writes WAIT_UNTIL 0x20000 only for its idle
+// flag; reference/perf/memory_waits.md). A memory wait whose word nothing pending writes, with no store queued, polls for a
+// grace period before it syncs: the CPU writes such words (the interrupt handler's acknowledgement), not the GPU.
+int immediateInterruptsOverride = -1;  // SetImmediateInterrupts (tests)
+bool ImmediateInterruptsOn()
+{
+    if (immediateInterruptsOverride >= 0)
+        return immediateInterruptsOverride == 1;
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_IMMEDIATE_INTERRUPTS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[cp] immediate interrupts on (FM4_IMMEDIATE_INTERRUPTS=1): raised when reached unless a store is queued or idle was asked\n");
+        return enabled;
+    }();
+    return on;
+}
+bool idleAsked = false;  // a nonzero WAIT_UNTIL since the last INTERRUPT (command-processor thread)
+constexpr uint64_t kCpuWordGraceNs = 2000000;
+uint64_t NowNs()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void RaiseInterrupts(uint32_t mask)
+{
+    for (int n = 0; n < 6; n++)
+        if (mask & (1u << n))
+            RequestInterrupt(1, true);
+}
+
+void CpStore(uint8_t* base, uint32_t address, uint32_t value)
+{
+    if (!deferredStores.empty() || (renderer && renderer->deferStore && renderer->deferStore(address & ~3u)))
+    {
+        deferredStores.push_back({address, value}), deferredBase = base;
+        return;
+    }
+    StoreGpu(base, address, value);
+}
+// The packets whose only CPU-visible effect is such a store: no sync before them when stores are deferred.
+bool StoreOnly(uint32_t opcode) { return opcode == 0x3D || opcode == 0x3E || opcode == 0x58; }
+void SyncBefore(uint32_t opcode)
+{
+    if (renderer && renderer->syncGuestWrites && !(StoreOnly(opcode) && renderer->deferStore))
+        renderer->syncGuestWrites(opcode);  // FM4 Recomp: pending GPU writes land before a CPU sync point
+}
+
 void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value)
 {
     if (index >= kRegisterCount)
         Stop(StopCode::Unimplemented, "GPU: a write to register %X, past the register file", index);
     if (index == reg::kCoherStatusHost)
         value |= 1u << 31;  // the status bit (command_processor.cc:465-467)
+    if (index == reg::kWaitUntil && value != 0)
+        idleAsked = true;
     WriteRegister(base, index, value);
     OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);  // DC_LUT_* only (command_processor.cc:469-574)
     if (index >= reg::kScratchReg0 && index < reg::kScratchReg0 + 8 &&
@@ -218,9 +292,22 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         case kInterrupt:  // per CPU bit, interrupt source 1 (:630-641)
         {
             const uint32_t mask = next();
-            for (int n = 0; n < 6; n++)
-                if (mask & (1u << n))
-                    RequestInterrupt(1, true);
+            // FM4 Recomp (FM4_DEFER_FENCES): raised when the work before it completes, in order behind the queued stores.
+            const bool idle = idleAsked;
+            idleAsked = false;
+            if (renderer && renderer->workOpen && deferredStores.empty() && !idle && ImmediateInterruptsOn())
+            {
+                immediateInterrupts++;
+                RaiseInterrupts(mask);
+                break;
+            }
+            if (renderer && renderer->workOpen && (!deferredStores.empty() || renderer->workOpen()))
+            {
+                deferredStores.push_back({0, mask, true}), deferredBase = base;
+                break;
+            }
+            SyncBefore(opcode);
+            RaiseInterrupts(mask);
             break;
         }
         case kXeSwap:  // (:644-668)
@@ -252,6 +339,46 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         case kWaitRegMem:  // (:700-753), bounded at 10 s
         {
             const uint32_t info = next(), poll = next(), ref = next(), mask = next(), wait = next();
+            // FM4 Recomp (FM4_DEFER_FENCES, ReCarbon command_processor.cpp:168-180): a wait on memory that a queued store of
+            // this stream will satisfy (D3D's drain idiom: EVENT_WRITE_SHD, then wait for it) proceeds now: everything recorded after it
+            // executes after it in queue order, and its CPU-visible effects stay queued behind it. The newest queued store to the word
+            // decides, read as LoadGpu would read it after StoreGpu.
+            if (info & 0x10)
+            {
+                const DeferredStore* last = nullptr;
+                for (const DeferredStore& d : deferredStores)
+                    if ((d.address & ~3u) == (poll & ~3u))
+                        last = &d;
+                if (last != nullptr && Matches(GpuSwap(GpuSwap(last->value, last->address & 3), poll & 3) & mask, ref, info))
+                {
+                    selfWaits++;
+                    break;
+                }
+            }
+            // FM4 Recomp: only a wait on memory can observe a pending GPU write or a deferred store; a register wait (MakeCoherent's
+            // COHER_STATUS_HOST) cannot, so it needs no sync. A memory wait whose word nothing pending writes polls at once and syncs
+            // only if it is not satisfied yet (ReCarbon command_processor.cpp:735-750: most such waits pass at once).
+            if (info & 0x10)
+            {
+                const bool pending = !(renderer && renderer->pendingAt) || renderer->pendingAt(poll & ~3u, 4);
+                if (!pending && Matches(LoadGpu(base, poll) & mask, ref, info))
+                {
+                    immediateWaits++;
+                    break;
+                }
+            }
+            const uint64_t waitStart = (info & 0x10) ? NowNs() : 0;
+            const uint32_t entryValue = (info & 0x10) ? LoadGpu(base, poll) : 0;
+            const size_t queuedAtEntry = deferredStores.size();
+            const bool overlapAtEntry = (info & 0x10) && renderer && renderer->pendingAt && renderer->pendingAt(poll & ~3u, 4);
+            // FM4 Recomp (FM4_IMMEDIATE_INTERRUPTS): a word only the CPU writes gets the grace period before the sync.
+            const bool cpuWord = (info & 0x10) && ImmediateInterruptsOn() && renderer && renderer->pendingAt && !overlapAtEntry && deferredStores.empty();
+            if ((info & 0x10) && !cpuWord)
+                SyncBefore(opcode);
+            bool synced = !cpuWord;
+            const uint64_t syncNs = (info & 0x10) ? NowNs() - waitStart : 0;
+            const uint32_t afterSync = (info & 0x10) ? LoadGpu(base, poll) : 0;
+            uint32_t polls = 0, idleFlushes = 0;
             state.waitingOn = poll;
             const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             for (;;)
@@ -267,12 +394,44 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 }
                 if (Matches(value & mask, ref, info))
                     break;
+                polls++;
+                if (!synced && NowNs() - waitStart > kCpuWordGraceNs)
+                {
+                    synced = true, graceSyncs++;
+                    SyncBefore(opcode);
+                    continue;
+                }
+                // FM4 Recomp (FM4_DEFER_FENCES): the queued stores and interrupts may be what the guest CPU needs before it writes what
+                // this waits for (observed: an INTERRUPT queued, then a wait for the CPU to clear 08D4D002, stop 7 after
+                // 10 s). Submit and retire the open work, which applies them, before waiting (ReCarbon command_processor.cpp:745-750).
+                if (!deferredStores.empty() && renderer && renderer->ringIdle)
+                {
+                    renderer->ringIdle();
+                    idleFlushes++;
+                    continue;
+                }
                 if (std::chrono::steady_clock::now() > give_up)
                     Stop(StopCode::Unimplemented, "GPU: WAIT_REG_MEM on %s %08X (value %08X & %08X, reference %08X, function %u) never satisfied",
                          info & 0x10 ? "memory" : "register", poll, value, mask, ref, info & 7);
                 std::this_thread::sleep_for(wait >= 0x100 ? std::chrono::microseconds(1000 * (wait / 0x100)) : std::chrono::microseconds(100));
             }
             state.waitingOn = 0;
+            if (info & 0x10)
+            {
+                const uint64_t totalNs = NowNs() - waitStart;
+                memWaits++, memWaitNs += totalNs, syncedWaits += synced ? 1 : 0;
+                static std::atomic<uint32_t> lines{0};
+                if (MemWaitDiag() && state.swaps % 50 == 0 && lines.fetch_add(1) < 4000)
+                {
+                    const uint32_t final = LoadGpu(base, poll);
+                    std::fprintf(stderr, "[cp] memwait swap %llu: %08X & %08X func %u ref %08X: entry %08X, after sync %08X, final %08X; "
+                                         "overlap %d, queued %zu; sync %.3f ms, total %.3f ms, %u poll(s), %u idle flush(es); %s\n",
+                                 (unsigned long long)state.swaps, poll, mask, info & 7, ref, entryValue, afterSync, final, overlapAtEntry ? 1 : 0,
+                                 queuedAtEntry, syncNs / 1e6, totalNs / 1e6, polls, idleFlushes,
+                                 Matches(entryValue & mask, ref, info) ? "satisfied at entry"
+                                 : Matches(afterSync & mask, ref, info) ? "satisfied by the sync" : "satisfied later");
+                }
+            }
             break;
         }
         case kRegRmw:  // (:755-779)
@@ -286,44 +445,51 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         }
         case kRegToMem:  // (:781-801)
         {
+            SyncBefore(opcode);
             const uint32_t index = next(), address = next();
-            StoreGpu(base, address, Register(base, index));
+            CpStore(base, address, Register(base, index));
             break;
         }
         case kMemWrite:  // (:803-818)
         {
+            SyncBefore(opcode);
             uint32_t address = next();
             while (remaining)
             {
-                StoreGpu(base, address, next());
+                CpStore(base, address, next());
                 address += 4;
             }
             break;
         }
         case kCondWrite:  // (:820-862)
         {
+            SyncBefore(opcode);
             const uint32_t info = next(), poll = next(), ref = next(), mask = next(), target = next(), data = next();
             const uint32_t value = (info & 0x10) ? LoadGpu(base, poll) : Register(base, poll);
             if (Matches(value & mask, ref, info))
             {
                 if (info & 0x100)
-                    StoreGpu(base, target, data);
+                    CpStore(base, target, data);
                 else
                     CpWriteRegister(base, target, data);
             }
             break;
         }
         case kEventWrite:  // (:864-879)
+            // FM4 Recomp: no sync point. The packet only sets VGT_EVENT_INITIATOR (no guest memory store, no interrupt), so the guest
+            // CPU cannot learn from it that earlier GPU work finished. FM4 issues one after nearly every resolve (every
+            // "CPU sync" flush, 25-39 a swap, was this packet).
             WriteRegister(base, reg::kVgtEventInitiator, next() & 0x3F);
             break;
         case kEventWriteShd:  // (:881-913)
         {
+            SyncBefore(opcode);
             const uint32_t initiator = next(), address = next(), value = next();
             WriteRegister(base, reg::kVgtEventInitiator, initiator & 0x3F);
             if ((address & ~3u) > 0x1FFFFFFFu && Register(base, reg::kWritebackBase) != 0)
                 Stop(StopCode::Unimplemented, "GPU: EVENT_WRITE_SHD to the write-back window (%08X) is not modelled", address);
             // Bit 31: the counter (vblanks and swaps; Xenia counter_, graphics_system.cc:292-297).
-            StoreGpu(base, address, (initiator >> 31) ? uint32_t(VblankCount() + state.swaps) : value);
+            CpStore(base, address, (initiator >> 31) ? uint32_t(VblankCount() + state.swaps) : value);
             break;
         }
         case kSetConstant:  // (:1127-1168): ALU 4000, fetch 4800, bool 4900, loop 4908, registers 2000
@@ -348,6 +514,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         }
         case kEventWriteExt:  // {initiator, address | endian}: the screen extents of earlier draws (:915-949)
         {
+            SyncBefore(opcode);
             // Nothing is drawn here, so the extents are Xenia's conservative answer: the whole surface (x and y
             // 0-8192 in units of 8, z 0-1), six 16-bit values stored big-endian as its byte_swap leaves them. Xenia
             // asserts the 8in16 swap; another one stops (7).
@@ -359,6 +526,32 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             const uint32_t at = PhysicalToGuest(address & ~3u);
             for (uint32_t i = 0; i < 6; i++)
                 base[at + 2 * i] = uint8_t(extents[i] >> 8), base[at + 2 * i + 1] = uint8_t(extents[i]);
+            break;
+        }
+        case kEventWriteZpd:  // {initiator}: the z-pass-done event of an occlusion query (:951-982)
+        {
+            SyncBefore(opcode);
+            // FM4 Recomp, APPROXIMATE (Xenia's workaround, not the hardware's count): Xenia counts no samples; it clears the guest's
+            // xe_gpu_depth_sample_counts (8 little-endian dwords at RB_SAMPLE_COUNT_ADDR: Total, ZFail, ZPass, StencilFail, A and B;
+            // xenos.h:1547-1560) and, when D3D has marked the query finished (0xFFFFFEED stored big-endian in both ZPass words, or in
+            // both ZFail words: bytes FF FF FE ED), reports query_occlusion_fake_sample_count = 1000 passed samples (gpu_flags.cc:47-51,
+            // "If set to -1 no sample counts are written, games may hang") in ZPass_A and Total_A. Real Vulkan occlusion queries: later.
+            WriteRegister(base, reg::kVgtEventInitiator, next() & 0x3F);
+            const uint32_t address = ReadRegister(base, reg::kRbSampleCountAddr);
+            if ((address & 0x1FFFFFFFu) == 0)
+                Stop(StopCode::Unimplemented, "GPU: EVENT_WRITE_ZPD with RB_SAMPLE_COUNT_ADDR %08X", address);
+            uint8_t* counts = base + PhysicalToGuest(address & 0x1FFFFFFCu);
+            const auto finished = [&](uint32_t word) {
+                return counts[4 * word] == 0xFF && counts[4 * word + 1] == 0xFF && counts[4 * word + 2] == 0xFE && counts[4 * word + 3] == 0xED;
+            };
+            const bool end = (finished(4) && finished(5)) || (finished(2) && finished(3));
+            std::memset(counts, 0, 32);
+            if (end)
+                for (const uint32_t word : {4u, 0u})  // ZPass_A, Total_A, little-endian
+                    counts[4 * word] = 1000 & 0xFF, counts[4 * word + 1] = 1000 >> 8;
+            static bool named = false;
+            if (!named)
+                named = true, std::fprintf(stderr, "[gpu] occlusion queries (EVENT_WRITE_ZPD): Xenia's fixed result, 1000 samples passed (APPROXIMATE)\n");
             break;
         }
         case kSetConstant2:  // (:1170-1179)
@@ -382,6 +575,28 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
 }
 
 void SetStopAtSwap(uint32_t n) { stopAtSwap = n; }
+
+void ApplyDeferredStores()
+{
+    // Taken first: an interrupt's guest callback may run on the interrupt thread while this thread goes on.
+    const std::vector<DeferredStore> queued = std::move(deferredStores);
+    deferredStores.clear();
+    for (const DeferredStore& d : queued)
+        if (!d.interrupt)
+            StoreGpu(deferredBase, d.address, d.value);
+        else
+            RaiseInterrupts(d.value);
+}
+bool DeferredStoresPending() { return !deferredStores.empty(); }
+uint64_t CpIdleNs() { return cpIdleNs.load(); }
+uint64_t SelfWaits() { return selfWaits.load(); }
+uint64_t ImmediateWaits() { return immediateWaits.load(); }
+uint64_t SyncedWaits() { return syncedWaits.load(); }
+uint64_t MemWaits() { return memWaits.load(); }
+uint64_t MemWaitNs() { return memWaitNs.load(); }
+uint64_t ImmediateInterrupts() { return immediateInterrupts.load(); }
+uint64_t GraceSyncs() { return graceSyncs.load(); }
+void SetImmediateInterrupts(bool on) { immediateInterruptsOverride = on ? 1 : 0; }
 void SetRendererHooks(const RendererHooks* hooks) { renderer = hooks; }
 
 void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
@@ -394,12 +609,21 @@ void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
     ringWords = bytes / 4;
     ringStart = PhysicalToGuest(physical);
     std::thread([base] {
+        pthread_setname_np("fm4 gpu cp");  // FM4 Recomp: thread_cpu.h roles
         for (;;)
         {
             const uint32_t size = ringWords.load(), write = ReadRegister(base, reg::kCpRbWptr) % size, read = readIndex.load();
             if (write == read)
             {
+                if (!deferredStores.empty() && renderer && renderer->ringIdle)
+                {
+                    std::lock_guard guard(stateLock);
+                    renderer->ringIdle();  // FM4_DEFER_FENCES: a guest thread may poll a queued fence
+                    continue;
+                }
+                const auto idleFrom = std::chrono::steady_clock::now();
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
+                cpIdleNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idleFrom).count());
                 continue;
             }
             {

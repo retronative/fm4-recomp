@@ -73,6 +73,28 @@ private:
 
 // The heap holding a guest address, or null (outside the managed ranges).
 Heap* LookupHeap(uint32_t address);
+
+// FM4 Recomp (FM4_WRITE_WATCH, runtime/video/texture_cache.h WriteWatch): the page write watch's side of the heaps. Only the
+// shared physical memory (A0000000 and C0000000, one host mapping seen through both views) is watched; the E0000000 view has its
+// own memory and is never protected for the watch. Host pages are 16 KB (kWatchHostPage; WatchAvailable is false on any other
+// host page size).
+constexpr uint32_t kWatchHostPage = 16384;
+bool WatchAvailable();
+// Whether the heap means the host page holding `physical` to be writable (lock-free; read by the fault hook).
+bool PhysicalHostWritable(uint32_t physical);
+// Under the heap lock: every 4 KB frame of [physical, physical + size) is owned by the A0000000 or C0000000 view and every host
+// page of it is meant writable; then the host pages read-only in both views. False (nothing protected): not watchable.
+bool WatchProtect(uint32_t physical, uint32_t size);
+// Signal-safe (no lock, mprotect only): the host pages of [physical, physical + size) the heap means writable get read-write
+// back in both views. False: an mprotect failed or a page is not meant writable.
+bool WatchUnprotect(uint32_t physical, uint32_t size);
+// The watch's observers (null: none): `accessChanged` before the heap sets a shared physical host page's access or clears it
+// (Zero); `hostWrite` before host code writes guest memory through a system call (BeforeHostWrite), which cannot fault.
+using PhysicalRangeObserver = void (*)(uint32_t physical, uint32_t size);
+void SetWatchObservers(PhysicalRangeObserver accessChanged, PhysicalRangeObserver hostWrite);
+// Before a system call writes `size` bytes at host address `host` (pread into a guest buffer): the watched pages it covers are
+// made writable and counted as written. Nothing for memory outside the shared physical views.
+void BeforeHostWrite(const uint8_t* host, uint32_t size);
 // The general-purpose virtual heap for a page size (4 KB or 64 KB).
 Heap* VirtualHeap(uint32_t pageSize);
 // The physical heap Xenia uses for a page size (4 KB -> 0xE0000000, 64 KB -> 0xA0000000, 16 MB -> 0xC0000000).
@@ -87,5 +109,8 @@ bool PhysicalAddress(uint32_t address, uint32_t& physical);
 // The guest address through which a physical address is reached: the view whose allocation
 // holds its frame; false if no view holds it.
 bool PhysicalToGuest(uint32_t physical, uint32_t& address);
+// FM4 Recomp (M7): PhysicalToGuest for a whole range under one lock: true only when every frame of [physical, physical + bytes)
+// is held by the same view, so the range is contiguous at `address` (false for bytes 0 or any frame elsewhere or free).
+bool PhysicalRangeToGuest(uint32_t physical, uint32_t bytes, uint32_t& address);
 
 }  // namespace runtime

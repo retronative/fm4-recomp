@@ -19,6 +19,8 @@ local and not distributed: they hold data derived from the game.
 | GPU | [edram.md](gpu/edram.md), [edram_extent.md](gpu/edram_extent.md), [edram_xaspect.md](gpu/edram_xaspect.md) | The EDRAM render-target model, the draw extent, depth/colour transfers |
 | GPU | [texture.md](gpu/texture.md) | The texture cache's CPU side and the fetch constants FM4 uses |
 | GPU | [front_buffer.md](gpu/front_buffer.md) | Front-buffer detiling and the PNG writer |
+| GPU | [shader_census_forecast.md](gpu/shader_census_forecast.md) | What the disc's shaders need before the first race |
+| Performance | [memory_waits.md](perf/memory_waits.md) | FM4's GPU memory waits and the race frame |
 
 ## Sources FM4 copies or adapts code from
 

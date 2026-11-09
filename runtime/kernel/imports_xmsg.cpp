@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <mutex>
 #include <vector>
 
@@ -85,6 +86,11 @@ namespace {
 // XGI (app 0xFB; Xenia apps/xgi_app.cc:25-58): the user's rich-presence contexts and properties as the title sets them.
 // They are kept (per user, by id), not sent anywhere: offline there is no LIVE presence service to read them.
 constexpr uint32_t kXgiApp = 0xFB, kXgiSetContext = 0x000B0006, kXgiSetProperty = 0x000B0007;
+// FM4 Recomp: XGIUserWriteAchievements (Xenia apps/xgi_app.cc:57-71): {count, X_XUSER_ACHIEVEMENT* {user index, achievement id}};
+// Xenia's EarnAchievement (achievement_manager.cc:27-63) logs the unlock (and a notification) and keeps nothing at this commit;
+// here each one is logged and kept in memory for the run (not saved: no fabricated profile state).
+constexpr uint32_t kXgiWriteAchievements = 0x000B0008;
+std::set<std::pair<uint32_t, uint32_t>> xgiAchievements;  // (user, achievement id) earned this run
 std::mutex xgiLock;
 std::map<std::pair<uint32_t, uint32_t>, uint32_t> xgiContexts;                  // (user, context id) -> value
 std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> xgiProperties;    // (user, property id) -> value bytes
@@ -95,10 +101,27 @@ uint32_t XgiMessage(const uint8_t* base, uint32_t message, uint32_t buffer, uint
     // XGIUserSetContextEx: {user index, unused, 0 (64 bits), context id +16, value +20}, 24 bytes (or length 0, Xenia).
     // XGIUserSetPropertyEx: {user index, ..., property id +16, value size +20, value* +24}. User index 4 or more, a
     // wrong length or a property over 4 KB stops (7).
+    std::lock_guard guard(xgiLock);
+    if (message == kXgiWriteAchievements)
+    {
+        if (length != 0 && length != 8)
+            Stop(StopCode::Unimplemented, "XGIUserWriteAchievements with a %u-byte record", length);
+        const uint32_t count = Load32(base, buffer), records = Load32(base, buffer + 4);
+        if (count > 64 || (count && !records))
+            Stop(StopCode::Unimplemented, "XGIUserWriteAchievements of %u achievement(s) at %08X", count, records);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t user = Load32(base, records + 8 * i), id = Load32(base, records + 8 * i + 4);
+            if (user >= 4)
+                Stop(StopCode::Unimplemented, "XGIUserWriteAchievements for user index %u", user);
+            if (xgiAchievements.insert({user, id}).second)
+                std::fprintf(stderr, "[xam] XGIUserWriteAchievements(user %u, achievement %u): unlocked (kept for this run, not saved)\n", user, id);
+        }
+        return 0;
+    }
     const uint32_t user = Load32(base, buffer);
     if (user >= 4)
         Stop(StopCode::Unimplemented, "XGI message %08X for user index %u", message, user);
-    std::lock_guard guard(xgiLock);
     if (message == kXgiSetContext)
     {
         if (length != 0 && length != 24)
@@ -125,7 +148,7 @@ void StartIORequest(PPCContext& ctx, uint8_t* base, const char* import)
     // at once (CompleteOverlappedImmediate) and the call returns ERROR_IO_PENDING; the last error is cleared on success or IO_PENDING.
     using namespace runtime;
     const uint32_t app = ctx.r3.u32, message = ctx.r4.u32, overlapped = ctx.r5.u32, buffer = ctx.r6.u32, length = ctx.r7.u32;
-    const bool xgi = app == kXgiApp && (message == kXgiSetContext || message == kXgiSetProperty);
+    const bool xgi = app == kXgiApp && (message == kXgiSetContext || message == kXgiSetProperty || message == kXgiWriteAchievements);
     if (overlapped && !xgi)  // only the XGI messages have been seen with one
         Stop(StopCode::Unimplemented, "%s(app %X, message %08X) with an XOVERLAPPED is not implemented", import, app, message);
     uint32_t result;

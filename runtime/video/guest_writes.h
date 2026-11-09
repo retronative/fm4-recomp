@@ -31,5 +31,7 @@ namespace runtime::video {
 void MarkGuestWritten(uint32_t physical, uint32_t bytes);
 bool GuestWritesPending();
 void GuestWritesRetired();
+// FM4 Recomp (FM4_RESOLVE_DEFER): whether [physical, physical + bytes) shares a byte with a pending range.
+bool GuestWritesOverlap(uint32_t physical, uint32_t bytes);
 
 }  // namespace runtime::video

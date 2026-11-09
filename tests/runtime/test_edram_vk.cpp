@@ -11,6 +11,7 @@
 #include "draw_state.h"
 #include "edram.h"
 #include "edram_vk_plan.h"
+#include "front_buffer.h"  // TiledOffset (the serial reference scan)
 #include "render_targets_vk.h"
 #include <cmath>
 #include <cstdio>
@@ -79,7 +80,8 @@ void TestClassify()
     CHECK(ClassifyTransfer(kA7, kBc2, why) == TransferKind::Color && ClassifyTransfer(kBc0, kA7, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(kA7, kB7, why) == TransferKind::Color && ClassifyTransfer(kB7, kA7, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(kA7, kA7, why) == TransferKind::Refused && why.find("own source") != std::string::npos);
-    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), kA7, why) == TransferKind::Refused &&
+    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), kA7, why) == TransferKind::Color);  // TestK16_16
+    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_Float), kA7, why) == TransferKind::Refused &&
           why.find("storage format other than") != std::string::npos);
     CHECK(ClassifyTransfer(kA7, Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why) == TransferKind::Color);  // TestFloat32
     CHECK(ClassifyTransfer(kA7, Key::Color(0, 16, Msaa::X1, ColorFormat::k32_32_Float), why) == TransferKind::Refused);
@@ -89,8 +91,19 @@ void TestClassify()
     // Different pitches: X's separate source pitch (:2956-2987) for every mode (TestDepthPitch).
     CHECK(ClassifyTransfer(Key::Color(0, 8, Msaa::X4, ColorFormat::k2_10_10_10), kBc2, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(Key::Depth(720, 8, Msaa::X1, DepthFormat::D24FS8), kAd, why) == TransferKind::Depth);
-    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10), kBc2, why) == TransferKind::Refused && why.find("2x") != std::string::npos);
-    CHECK(ClassifyTransfer(Key::Depth(720, 16, Msaa::X1, DepthFormat::D24S8), kAd, why) == TransferKind::Refused);
+    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10), kBc2, why) == TransferKind::Color);  // 2x -> 1x (X :2868-2886)
+    // FM4 Recomp: between depth formats: Depth (the shader reinterprets the guest bits, ConvertDepthFormat).
+    CHECK(ClassifyTransfer(Key::Depth(720, 16, Msaa::X1, DepthFormat::D24S8), kAd, why) == TransferKind::Depth);
+    // ConvertDepthFormat by hand (X :3591-3604 pack, :4100-4124 read):
+    //   1.0 kD24FS8 -> 20e4 0xF00000 (exponent 15, mantissa 0) -> as unorm24 n = 0xF00000: (n + (n >> 23)) * 2^-24 = 15728641 / 2^24.
+    //   0.5 kD24S8 -> RoundEven(0.5 * 16777215 = 8388607.5) = 8388608 = 0x800000 -> as 20e4: exponent 8, mantissa 0 = 2^(8-15) = 2^-7.
+    //   2^-13 kD24FS8 -> 0x200000 (exponent 2) -> unorm24 2^21 / 2^24 = 0.125 (the depth self-check's x = 0, row 0 sample).
+    CHECK(ConvertDepthFormat(1.0f, DepthFormat::D24FS8, DepthFormat::D24S8) == 15728641.0f / 16777216.0f);
+    CHECK(ConvertDepthFormat(0.5f, DepthFormat::D24S8, DepthFormat::D24FS8) == 0.0078125f);
+    CHECK(ConvertDepthFormat(1.0f / 8192.0f, DepthFormat::D24FS8, DepthFormat::D24S8) == 0.125f);
+    CHECK(ConvertDepthFormat(0.0f, DepthFormat::D24FS8, DepthFormat::D24S8) == 0.0f && ConvertDepthFormat(0.0f, DepthFormat::D24S8, DepthFormat::D24FS8) == 0.0f);
+    CHECK(ConvertDepthFormat(0.3f, DepthFormat::D24S8, DepthFormat::D24S8) == 0.3f);  // the same format: the float as is (X :3587-3590)
+    CONTROL(ConvertDepthFormat(1.0f, DepthFormat::D24FS8, DepthFormat::D24S8) == 1.0f);  // a reinterpretation, not a value copy
     CHECK(ClassifyTransfer(kBd, kAc, why) == TransferKind::DepthToColor);  // X kDepthToColor (TestDepthToColor)
     CHECK(ClassifyTransfer(kAc, kBd, why) == TransferKind::ColorToDepth);  // X kColorToDepth (TestColorToDepth)
     CONTROL(ClassifyTransfer(kAc, kAc, why) != TransferKind::Refused);  // a key is never its own source
@@ -103,12 +116,14 @@ void TestDepthToColor()
     std::string why;
     CHECK(ClassifyTransfer(kBd, kA7, why) == TransferKind::DepthToColor);
     CHECK(ClassifyTransfer(kBd, kB7, why) == TransferKind::DepthToColor && ClassifyTransfer(kBd, kBc0, why) == TransferKind::DepthToColor);
-    // A multisampled or kD24S8 depth source (TestDepthToColorMs); 1x <-> 2x stays refused.
+    // A multisampled or kD24S8 depth source (TestDepthToColorMs); FM4 Recomp: depth -> colour 1x <-> 2x too (MapTransferTexel's rule).
     CHECK(ClassifyTransfer(kAd, kA7, why) == TransferKind::DepthToColor);
     CHECK(ClassifyTransfer(Key::Depth(720, 16, Msaa::X1, DepthFormat::D24S8), kA7, why) == TransferKind::DepthToColor);
-    CHECK(ClassifyTransfer(Key::Depth(720, 16, Msaa::X2, DepthFormat::D24FS8), kB7, why) == TransferKind::Refused && why.find("1x and 2x") != std::string::npos);
+    CHECK(ClassifyTransfer(Key::Depth(720, 16, Msaa::X2, DepthFormat::D24FS8), kB7, why) == TransferKind::DepthToColor);  // 2x -> 1x (FM4 Recomp)
+    CHECK(ClassifyTransfer(Key{0x602040u}, Key{0x082800u}, why) == TransferKind::DepthToColor);  // 1x depth -> 2x colour
     CHECK(ClassifyTransfer(kBd, Key::Color(0, 8, Msaa::X4, ColorFormat::k2_10_10_10_Float), why) == TransferKind::DepthToColor);  // TestDepthToColorPitch
-    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), why) == TransferKind::Refused);
+    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), why) == TransferKind::DepthToColor);  // TestK16_16
+    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X4, ColorFormat::k32_Float), why) == TransferKind::Refused);
 
     // The texel mapping, by hand from X (vulkan_render_target_cache.cc:2516-2577, :2823-2828, :2857-2864, :2916-2954):
     // destination 4x tiles are 40x8 pixels, source 1x tiles 80x16; source tile = destination tile + 0 - 720; the
@@ -339,17 +354,14 @@ void TestClears()
           c[3] == 1 * (1.0f / 3));
     CHECK(DecodeColorClear(0x44332211u, 0, c) && c[0] == 0x11 * (1.0f / 255) && c[3] == 0x44 * (1.0f / 255));
     // 7e3 (X :5383-5390 with the shader-form decode): R 0x1C0 = 1.5, G 0x080 = 0.25, B 0x001 = 2^-9, alpha 2 -> 2/3.
-    // FM4 Recomp: storage 4 (16_16): halves as signed 16-bit / 32767. 0x7FFF8001: R = 0x8001 = -32767 -> -1, G = 0x7FFF = 32767 -> 1;
-    // 0x00004000: R = 16384 -> 16384 / 32767, G = 0; a 0x8000 half (-32768) is refused (it would come back as 0x8001).
-    CHECK(DecodeColorClear(0x7FFF8001u, 4, c) && c[0] == -1.0f && c[1] == 1.0f && c[2] == 0.0f && c[3] == 0.0f);
-    CHECK(DecodeColorClear(0x00004000u, 4, c) && c[0] == 16384.0f / 32767.0f && c[1] == 0.0f);
-    CONTROL(DecodeColorClear(1u << 31, 4, c));  // G = 0x8000 (-32768)
+    // Storage 4 (16_16) clears through its R16G16_UINT view (DecodeColorClearUint, TestK16_16), never as floats.
+    CONTROL(DecodeColorClear(0x7FFF8001u, 4, c));
     CHECK(DecodeColorClear((2u << 30 | 0x001201C0u), 3, c) && c[0] == 1.5f && c[1] == 0.25f && c[2] == 0.001953125f && c[3] == 2 * (1.0f / 3));
     // CONTROL: X's CPU xenos.cc:117 form, (3 + 124) << 23 | 64 << 3 = 0x3F800200 = 1.00006104, is not what is decoded.
     CONTROL(c[0] == 1.0f + std::ldexp(1.0f, -14));
     CHECK(DecodeColorClear(0u, 3, c) && c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f && c[3] == 0.0f);
     CHECK(DecodeColorClear(0xFFFFFFFFu, 3, c) && c[0] == 31.875f && c[1] == 31.875f && c[2] == 31.875f && c[3] == 1.0f);
-    CONTROL(DecodeColorClear(0u, 14, c));  // 32_FLOAT clears through DecodeColorClearUint (16_16: FM4 Recomp, below)
+    CONTROL(DecodeColorClear(0u, 14, c));  // 32_FLOAT clears through DecodeColorClearUint (TestFloat32)
     float d = -1.0f;
     uint32_t s = 99;
     DecodeDepthClear(0u, DepthFormat::D24FS8, d, s);  // trace12 RB_DEPTH_CLEAR 00000000
@@ -423,6 +435,40 @@ uint32_t WordAt(const std::vector<uint8_t>& b, uint32_t offset)
     return w;
 }
 
+// FM4 Recomp (M7, edram_vk.cpp Resolve: FM4_RESOLVE_RESIDENT converts fast resolves too): for the fast-path pairs the resident
+// conversion accepts (storage 0 k_8_8_8_8 -> format 6, storage 2 k_2_10_10_10 -> 7, 1x, exp bias 0) the converting path's word,
+// ResolveConvertPixel (packed before the endian swap), equals the fast path's (ResolveToGuest: the texel, swapped when the
+// destination asks, before the endian swap; X resolve.xesli:769-797). Hand vector: 0x44332211 with swap -> 0x44112233 (the swap
+// exchanges bytes 0 and 2). Every 8-bit channel value, and every 10-bit value of the 2_10_10_10 colour channels, with alpha.
+void TestFastResidentWords()
+{
+    std::string why;
+    const edram::ResolveInfo tex = edram::DecodeResolve(Trace12Resolve(0x00000000, 0x00100100, 0x13F2B000, 0x01000302, 0xFFFFFFFF));
+    const edram::ResolveInfo fb = edram::DecodeResolve(Trace12Resolve(0x00020000, 0x00100300, 0x1B441000, 0x01000380, 0));
+    CHECK(ResolveUsesFastPath(tex, 0) && ResolveFullConvertible(tex, 0, why) && ResolveUsesFastPath(fb, 2) && ResolveFullConvertible(fb, 2, why));
+    auto fast = [](const edram::ResolveInfo& info, bool is8888, uint32_t w) {
+        if (info.destSwap)
+            w = is8888 ? (w & ~0x00FF00FFu) | (w & 0xFFu) << 16 | ((w >> 16) & 0xFFu) : (w & ~0x3FF003FFu) | (w & 0x3FFu) << 20 | ((w >> 20) & 0x3FFu);
+        return w;
+    };
+    const uint32_t hand = 0x44332211u;
+    CHECK(ResolveConvertPixel(tex, 0, &hand) == 0x44112233u && fast(tex, true, hand) == 0x44112233u);
+    bool same8 = true, same10 = true;
+    for (uint32_t v = 0; v < 256; v++)
+        for (uint32_t channel = 0; channel < 4; channel++)
+        {
+            const uint32_t texel = (v << (8 * channel)) | (0x5Au << (8 * ((channel + 1) % 4)));
+            same8 = same8 && ResolveConvertPixel(tex, 0, &texel) == fast(tex, true, texel);
+        }
+    for (uint32_t v = 0; v < 1024; v++)
+        for (uint32_t channel = 0; channel < 3; channel++)
+        {
+            const uint32_t texel = (v << (10 * channel)) | (uint32_t(v & 3) << 30);
+            same10 = same10 && ResolveConvertPixel(fb, 2, &texel) == fast(fb, false, texel);
+        }
+    CHECK(same8 && same10);
+}
+
 void TestResolveToGuest()
 {
     std::string why;
@@ -484,6 +530,17 @@ void TestResolveToGuest()
     const edram::ResolveInfo cross = edram::DecodeResolve(Trace12Resolve(0x00020000, 0x00100100, 0x13F2B000, 0x01000302, 0));
     CHECK(cross.ok && !ResolveConvertible(cross, 2, why) && why.find("converting resolve") != std::string::npos);  // storage 2 -> format 6
     CONTROL(ResolveToGuest(fb, 2, texels.data(), dest3.data(), 3766140, why));  // the last texel would land past the buffer
+    // FM4 Recomp (M7, parallel_rows.h): the bound check runs by rows in parallel; the refusal still names the first texel in
+    // row-major order that does not fit, found here by a serial scan over TiledOffset (several texels of rows 718 and 719 land
+    // past 3766140 bytes in the tiled layout, so the first is not the last texel).
+    {
+        std::string first;
+        for (uint32_t y = 0; y < 720 && first.empty(); y++)
+            for (uint32_t x = 0; x < 1280 && first.empty(); x++)
+                if (uint64_t(TiledOffset(x, y, 1280, 2)) + 4 > 3766140)
+                    first = "(" + std::to_string(x) + ", " + std::to_string(y) + ")";
+        CHECK(!first.empty() && why.find(first) != std::string::npos);
+    }
     size_t touched = 0;
     for (uint8_t b : dest3)
         touched += b != 0xEE;
@@ -626,9 +683,11 @@ void TestColorToDepth()
     CHECK(ClassifyTransfer(d2, kAd, why) == TransferKind::Depth);  // a 2x depth source (usampler2DMS / sampler2DMS)
     CHECK(ClassifyTransfer(kA7, kAd, why) == TransferKind::ColorToDepth && ClassifyTransfer(kBc2, kBd, why) == TransferKind::ColorToDepth);
     CHECK(ClassifyTransfer(c2, Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8), why) == TransferKind::ColorToDepth);  // TestColorToUnorm24
-    CHECK(ClassifyTransfer(kA7, d2, why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
-    CHECK(ClassifyTransfer(kB7, Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::Refused);
-    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), kAd, why) == TransferKind::Refused);
+    // Colour -> 2x depth: 4x -> 2x and 1x -> 2x through MapTransferTexel.
+    CHECK(ClassifyTransfer(kA7, d2, why) == TransferKind::ColorToDepth);
+    CHECK(ClassifyTransfer(kB7, Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::ColorToDepth);
+    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16), kAd, why) == TransferKind::ColorToDepth);  // TestK16_16
+    CHECK(ClassifyTransfer(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_Float), kAd, why) == TransferKind::Refused);
 
     // Which tiles move (X ChangeOwnership): c2 holds 0-1023 (the HDR resolve's span), d2 1024-1439; the 4x clear (360 rows:
     // 720 tiles each) takes 0-719 for the 4x 7e3 colour key from c2, 720-1023 for kAd from c2 and 1024-1439 from d2.
@@ -784,7 +843,27 @@ void TestHdrResolve()
 
     // 2x keys and the 4x <-> 2x transfers (the copy needs the 4x 7e3 target's 1024 tiles in the 2x key).
     CHECK(ClassifyTransfer(kA7, k2, why) == TransferKind::Color && ClassifyTransfer(k2, kA7, why) == TransferKind::Color);
-    CHECK(ClassifyTransfer(kB7, k2, why) == TransferKind::Refused && why.find("2x MSAA") != std::string::npos);
+    // 1x <-> 2x (X :2868-2898). EDRAM check as below: 2x pixel (x, y) guest sample g is
+    // EDRAM sample (x, 2y + g), 1x pixel (x, y) is (x, y), host 2x sample = guest ^ 1.
+    CHECK(ClassifyTransfer(kB7, k2, why) == TransferKind::Color && ClassifyTransfer(k2, kB7, why) == TransferKind::Color);
+    {
+        auto at = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
+        CHECK(at(MapTransferTexel(5, 3, 0, Msaa::X1, Msaa::X2), 5, 7, 0));  // host 0 = guest 1: EDRAM (5, 2 * 3 + 1) = 1x (5, 7)
+        CHECK(at(MapTransferTexel(5, 3, 1, Msaa::X1, Msaa::X2), 5, 6, 0));  // host 1 = guest 0: (5, 6)
+        CHECK(at(MapTransferTexel(5, 7, 0, Msaa::X2, Msaa::X1), 5, 3, 0));  // 1x (5, 7) = 2x (5, 3) guest 1 = host 0
+        CHECK(at(MapTransferTexel(5, 6, 0, Msaa::X2, Msaa::X1), 5, 3, 1));  // 1x (5, 6) = 2x (5, 3) guest 0 = host 1
+        CHECK(at(MapTransferTexel(79, 15, 0, Msaa::X2, Msaa::X1), 79, 7, 0));  // the tile's last 1x row is the 2x tile's last row
+        bool round = true;
+        for (uint32_t y = 0; y < 8; y++)
+            for (uint32_t h = 0; h < 2; h++)
+            {
+                const SourceTexel s = MapTransferTexel(3, y, h, Msaa::X1, Msaa::X2);
+                const SourceTexel back = MapTransferTexel(s.x, s.y, s.sample, Msaa::X2, Msaa::X1);
+                round = round && s.y < 16 && at(back, 3, y, h);
+            }
+        CHECK(round);
+        CONTROL(at(MapTransferTexel(5, 3, 0, Msaa::X1, Msaa::X2), 5, 6, 0));  // without the native ^ 1 the rows swap
+    }
     CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8), Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8), why) ==
           TransferKind::Depth);  // TestDepth4xTo2x
     // 4x -> 2x (X :2786-2802, native 2x: guest g = host ^ 1). EDRAM check by shaders/edram.xesli:23-33: 2x pixel (x, y)
@@ -995,7 +1074,10 @@ void TestDepthToColorMs()
     CHECK(ClassifyTransfer(d24, c7, why) == TransferKind::DepthToColor);
     CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8), kA7, why) == TransferKind::DepthToColor);  // 2x -> 4x
     CHECK(ClassifyTransfer(kAd, Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float), why) == TransferKind::DepthToColor);  // 4x -> 2x
-    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float), why) == TransferKind::Refused && why.find("1x and 2x") != std::string::npos);
+    // FM4 Recomp: 1x depth -> 2x colour is accepted (MapTransferTexel 1x -> 2x), its texel mapping as the
+    // colour pairs': 2x destination (5, 3) host sample 0 = guest 1 -> 1x source (5, 7) before the colour <-> depth column swap.
+    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float), why) == TransferKind::DepthToColor);
+    CHECK(MapTransferTexel(5, 3, 0, Msaa::X1, Msaa::X2).y == 7);
     // Every distinct transfer pair of the draw_pred3 replay (test_edram <cp.txt> "pairs:", 17 of them) is one the unit executes.
     const uint32_t pairs[17][2] = {{0x908000, 0x808000}, {0x6082D0, 0x7082D0}, {0x808000, 0x908000}, {0x908000, 0x008000}, {0x008000, 0x908000},
                                    {0x6082D0, 0x708400}, {0x808000, 0xD08000}, {0x6082D0, 0xD08000}, {0xD08000, 0xC88000}, {0xC88000, 0x7082D0},
@@ -1203,12 +1285,12 @@ void TestDepth4xTo2x()
               k2 = Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8);
     CHECK(k4.packed == 0x708400u && k2.packed == 0x688400u);  // the keys the stop names
     CHECK(ClassifyTransfer(k4, k2, why) == TransferKind::Depth && ClassifyTransfer(kAd, k2, why) == TransferKind::Depth);
-    // Still refused: colour -> 2x depth, 1x or 2x depth -> 2x depth, another depth format.
-    CHECK(ClassifyTransfer(kA7, k2, why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
-    CHECK(ClassifyTransfer(k1, k2, why) == TransferKind::Refused);
+    // Colour -> 2x depth (TestColorToDepth) and 1x depth -> 2x depth are accepted; 2x -> 2x stays refused.
+    CHECK(ClassifyTransfer(kA7, k2, why) == TransferKind::ColorToDepth);
+    CHECK(ClassifyTransfer(k1, k2, why) == TransferKind::Depth);
     CHECK(ClassifyTransfer(Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), k2, why) == TransferKind::Refused && why.find("2x depth") != std::string::npos);
-    CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24S8), k2, why) == TransferKind::Refused);
-    CONTROL(ClassifyTransfer(k1, k2, why) != TransferKind::Refused);
+    CHECK(ClassifyTransfer(Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24S8), k2, why) == TransferKind::Depth);  // FM4 Recomp: 4x kD24S8 -> 2x kD24FS8, format change
+    CONTROL(ClassifyTransfer(Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), k2, why) != TransferKind::Refused);
 
     // The ownership model: the 4x key owns 1024-1439 (26 rows of 16 tiles); binding the 2x key (1280 pixels, 208 rows)
     // claims (208 << 1) / 16 * 16 = 416 tiles from 1024: one transfer {1024, 1440, k4}, classified Depth.
@@ -1297,6 +1379,255 @@ void TestDepth4xTo2x()
     CHECK(preserved);
 }
 
+// Storage 4 (16_16) through its R16G16_UINT transfer view (X vulkan_render_target_cache.cc:1628-1653, :3545-3576,
+// :3692-3711, :5393-5404). The stop that motivates it: the
+// 1x kD24FS8 depth key 6082D0 (base 720, 16 tiles a row) into the 4x 16_16 colour key 1106B40 (base 832, 13 tiles a row).
+void TestK16_16()
+{
+    std::string why;
+    // The keys by hand (edram.h Key: base bits 0-10, pitch 11-18, msaa 19-20, depth bit 21, format 22-25): depth 1 << 22 |
+    // 1 << 21 | 16 << 11 | 720 = 0x400000 + 0x200000 + 0x8000 + 0x2D0; colour 4 << 22 | 2 << 19 | 13 << 11 | 832 = 0x1000000 +
+    // 0x100000 + 0x6800 + 0x340.
+    const Key d = Key::Depth(720, 16, Msaa::X1, DepthFormat::D24FS8), c4 = Key::Color(832, 13, Msaa::X4, ColorFormat::k16_16);
+    CHECK(d.packed == 0x6082D0u && c4.packed == 0x1106B40u);
+    CHECK(ClassifyTransfer(d, c4, why) == TransferKind::DepthToColor);
+    // Colour 4 -> depth, 4 <-> 0 / 2 / 3 / 14 and 4 -> 4 (another sample count), the MSAA rules unchanged.
+    const Key c4b = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16), c4a = Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16);
+    CHECK(ClassifyTransfer(c4a, kAd, why) == TransferKind::ColorToDepth && ClassifyTransfer(c4b, kBd, why) == TransferKind::ColorToDepth);
+    CHECK(ClassifyTransfer(c4a, kBc0, why) == TransferKind::Color && ClassifyTransfer(c4a, kBc2, why) == TransferKind::Color &&
+          ClassifyTransfer(c4a, kB7, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(kBc0, c4a, why) == TransferKind::Color && ClassifyTransfer(kAc, c4b, why) == TransferKind::Color &&
+          ClassifyTransfer(kA7, c4b, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(c4a, c4b, why) == TransferKind::Color && ClassifyTransfer(c4b, c4a, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(c4b, Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), why) == TransferKind::Color);
+    CONTROL(ClassifyTransfer(c4a, c4a, why) != TransferKind::Refused);  // still a key as its own source
+    CHECK(ClassifyTransfer(c4b, Key::Color(0, 16, Msaa::X2, ColorFormat::k16_16), why) == TransferKind::Color);  // 1x -> 2x (X :2887-2898)
+    CHECK(ClassifyTransfer(c4b, Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::ColorToDepth);  // colour -> 2x depth
+    CHECK(ClassifyTransfer(kBd, Key::Depth(0, 16, Msaa::X2, DepthFormat::D24FS8), why) == TransferKind::Depth);  // 1x depth -> 2x
+
+    // The transfer view (X :1637-1639, :1643-1644); the attachment stays R16G16_SNORM (X :1604-1608).
+    CHECK(TransferViewFormat(ColorFormat::k16_16) == VK_FORMAT_R16G16_UINT && TransferViewFormat(ColorFormat::k32_Float) == VK_FORMAT_R32_UINT);
+    CHECK(HostColorFormat(ColorFormat::k16_16) == VK_FORMAT_R16G16_SNORM);
+    CONTROL(TransferViewFormat(ColorFormat::k2_10_10_10) != VK_FORMAT_UNDEFINED);  // transfers as floats
+
+    // The word (X :3567-3574 BitFieldInsert(r, g, 16, 16)): halves r 0x1234, g 0xABCD -> 0xABCD1234; back (X :3701-3711).
+    const uint32_t h[4] = {0x1234u, 0xABCDu, 0, 0};
+    uint32_t u[4] = {9, 9, 9, 9};
+    CHECK(PackTransferUint(h, 4) == 0xABCD1234u);
+    UnpackTransferUint(0xABCD1234u, 4, u);
+    CHECK(u[0] == 0x1234u && u[1] == 0xABCDu && u[2] == 0 && u[3] == 0);
+    CONTROL(PackTransferUint(h, 14) == 0xABCD1234u);  // the R32_UINT texel is the word itself: 0x1234
+    CONTROL(PackTransferUint(h, 2) == 0xABCD1234u);   // no transfer view: 0
+    // 4 -> 4 passes 0x8000 (-32768, which an SNORM float path would return as 0x8001) through exactly.
+    const uint32_t m[4] = {0x8000u, 0x8000u, 0, 0};
+    const uint32_t mw = 0x8000u << 16 | 0x8000u;
+    CHECK(PackTransferUint(m, 4) == mw);
+    UnpackTransferUint(mw, 4, u);
+    CHECK(u[0] == 0x8000u && u[1] == 0x8000u);
+
+    // Depth -> 4 (the observed stop): kD24FS8 1.0 with stencil 0x5A -> word 0xF00000 << 8 | 0x5A = 0xF000005A (X :3605-3617)
+    // -> r = word & 0xFFFF = 0x005A, g = word >> 16 = 0xF000.
+    const uint32_t w = PackDepthStencilWord(1.0f, 0x5A);
+    CHECK(w == (0xF00000u << 8 | 0x5Au));
+    UnpackTransferUint(w, 4, u);
+    CHECK(u[0] == 0x005Au && u[1] == 0xF000u && u[2] == 0 && u[3] == 0);
+    CONTROL(u[0] == 0xF000u && u[1] == 0x005Au);  // halves swapped
+    // 4 -> depth: those halves -> the same word; bits 8-31 0xF00000 as 20e4 (e 15, m 0) = 1.0, stencil 0x5A (X :4120-4124,
+    // :4145-4152); as kD24S8, X :4102-4119 (n + (n >> 23)) * 2^-24 with n = 0xF00000: 0xF00001 * 2^-24.
+    const uint32_t back[4] = {0x005Au, 0xF000u, 0, 0};
+    const uint32_t bw = PackTransferUint(back, 4);
+    CHECK(bw == 0xF000005Au && ColorWordDepth(bw) == 1.0f && ColorWordStencil(bw) == 0x5Au);
+    CHECK(ColorWordDepth(bw, DepthFormat::D24S8) == std::ldexp(float(0xF00001u), -24));
+
+    // 4 -> 0 (X :3627-3645 unpack by bytes): word 0xABCD1234 -> bytes 0x34, 0x12, 0xCD, 0xAB / 255, which pack back to it.
+    float c[4];
+    UnpackTransferColor(0xABCD1234u, 0, c);
+    CHECK(c[0] == 0x34 * (1.0f / 255.0f) && c[1] == 0x12 * (1.0f / 255.0f) && c[2] == 0xCD * (1.0f / 255.0f) && c[3] == 0xAB * (1.0f / 255.0f));
+    CHECK(PackTransferColor(c, 0) == 0xABCD1234u);
+    // 0 -> 4: the 8_8_8_8 word 0x44332211 (TestPack) -> r 0x2211, g 0x4433.
+    const float v8[4] = {0x11 / 255.0f, 0x22 / 255.0f, 0x33 / 255.0f, 0x44 / 255.0f};
+    UnpackTransferUint(PackTransferColor(v8, 0), 4, u);
+    CHECK(u[0] == 0x2211u && u[1] == 0x4433u);
+
+    // Clears (X :5393-5404): uint32[j] = (value >> 16j) & 0xFFFF. 0x7FFF8001 -> {0x8001, 0x7FFF}; 1 << 31 -> {0, 0x8000}
+    // (the G = -32768 the float path refused); 0x8000 in both halves survives.
+    uint32_t k[4] = {9, 9, 9, 9};
+    CHECK(DecodeColorClearUint(0x7FFF8001u, 4, k) && k[0] == 0x8001u && k[1] == 0x7FFFu && k[2] == 0 && k[3] == 0);
+    CHECK(DecodeColorClearUint(1u << 31, 4, k) && k[0] == 0 && k[1] == 0x8000u);
+    CHECK(DecodeColorClearUint(mw, 4, k) && k[0] == 0x8000u && k[1] == 0x8000u);
+    CONTROL(DecodeColorClearUint(0x7FFF8001u, 4, k) && k[0] == 0x7FFF8001u);  // not the 32_FLOAT form
+    CONTROL(DecodeColorClearUint(0x7FFF8001u, 2, k));
+}
+
+// The 16_16 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 4
+// (storage 4), 4x, sample select 6 (k0123), into texture format 25 (k_16_16) with number 3, exp bias 10, no swap, endian 1
+// (k8in16). The registers are a stand-in of that shape (the run logs no raw values): a 32x32 rectangle of a pitch-80
+// surface, colour base 0, DEST_INFO 1 | 25 << 7 | 3 << 13 | 10 << 16 (X registers.h:812-826).
+edram::ResolveRegisters Rg16Resolve(uint32_t surfaceInfo, uint32_t copyControl, uint32_t destInfo)
+{
+    edram::ResolveRegisters r = Float32Resolve(destInfo);
+    r.surfaceInfo = surfaceInfo, r.colorInfo[0] = 0x00040000, r.copyControl = copyControl;
+    return r;
+}
+
+void TestRg16Resolve()
+{
+    std::string why;
+    const uint32_t destInfo = 1 | 25u << 7 | 3u << 13 | 10u << 16;
+    // Surface 00020050: pitch 80, msaa_samples 2 (4x); RB_COPY_CONTROL 00100060: convert, copy_sample_select 6 (k0123).
+    const edram::ResolveInfo rg = edram::DecodeResolve(Rg16Resolve(0x00020050, 0x00100060, destInfo));
+    // The key: 80 pixels at 4x = 160 samples = 2 tiles a row (edram.h PitchTilesAt32bpp).
+    CHECK(rg.ok && rg.source == Key::Color(0, 2, Msaa::X4, ColorFormat::k16_16) && rg.sampleSelect == edram::SampleSelect::k0123 &&
+          rg.destFormat == 25 && rg.destExpBias == 10 && !rg.destSwap && rg.destEndian == 1 && rg.x1 == 32 && rg.y1 == 32);
+    // Always X's full resolve: xenos.h:616-641 has no 16_16 case, so draw_util.cc:1312-1318 never takes the fast shader.
+    CHECK(!ResolveUsesFastPath(rg, 4) && ResolveFullConvertible(rg, 4, why));
+    uint32_t idx[4], n = 0;
+    CHECK(ResolveSamples(rg, idx, n) && n == 4 && idx[0] == 0 && idx[1] == 1 && idx[2] == 2 && idx[3] == 3);
+    // Even a 1x copy of sample 0 without a bias (the fast path's other conditions) is refused by the fast path (negative
+    // control: storage 4 is never bitwise equivalent) and taken by the full one.
+    const edram::ResolveInfo one = edram::DecodeResolve(Rg16Resolve(0x00000050, 0x00100000, 1 | 25u << 7));
+    CHECK(one.ok && one.source == Key::Color(0, 1, Msaa::X1, ColorFormat::k16_16) && one.sampleSelect == edram::SampleSelect::k0 &&
+          one.destExpBias == 0);
+    CONTROL(ResolveUsesFastPath(one, 4) || ResolveConvertible(one, 4, why));
+    CHECK(ResolveFullConvertible(one, 4, why));
+    // Pairings: storage 4 only into 25, 25 only from storage 4; the read-back storage must be the key's.
+    edram::ResolveInfo into6 = rg;
+    into6.destFormat = 6;
+    CONTROL(ResolveFullConvertible(into6, 4, why));
+    CONTROL(ResolveFullConvertible(rg, 2, why));
+
+    // The scale by hand: X's 32.0 / 32767.0 (pixel_formats.xesli:367-371) = 2^5 / (2^15 - 1) = 2^-10 / (1 - 2^-15)
+    // = 2^-10 (1 + 2^-15 + 2^-30 + ...); as a float (23 fraction bits) the 2^-30 term is below half an ulp:
+    // c = 2^-10 (1 + 2^-15). The bias factor (resolve.xesli:131-133) 2^10, halved twice for k0123 (:651, :670): 256.
+    // Pixel A, guest samples (by guest index) 0x00010001, 0x00010000, 0x00010000, 0 (red the low half, :367-371):
+    // red one unit, c * 256 = 0.25 + 2^-17; * 65535 = 16384.24999 (float 16384.25), + 0.5, truncated: 16384 = 0x4000
+    // (pixel_formats.xesli:144-147). Green three units: 0.75 (1 + 2^-15) * 65535 = 49152.74998 (float 49152.75) + 0.5 ->
+    // 49153 = 0xC001. Word 0xC001 << 16 | 0x4000.
+    const uint32_t a[4] = {0x00010001u, 0x00010000u, 0x00010000u, 0};
+    CHECK(ResolveConvertPixel(rg, 4, a) == 0xC0014000u);
+    CONTROL(ResolveConvertPixel(rg, 4, a) == 0x4000C001u);  // red in the high half
+    // A wrong scale, 1 / 32767 (the guest range as -1..1, i.e. X's +5 bias case, draw_util.cc:1258-1266, which the
+    // full-range default turns off): red 256 / 32767 * 65535 = 512.0078 -> 512, green 1536.02 -> 1536: 0x06000200.
+    CONTROL(ResolveConvertPixel(rg, 4, a) == 0x06000200u);
+    // Pixel B, the clamp max(-1, ...) after the scale: sample 0 red 0x8001 (-32767 c = -(2^30 - 1) / 2^25, about -32) -> -1;
+    // sample 1 red 0x0400 (1024 c = 1 + 2^-15 exactly); sum ((-1 + 1 + 2^-15) + 0) + 0 = 2^-15, * 256 = 2^-7; * 65535 =
+    // 511.9921875 + 0.5 = 512.4921875 -> 512 = 0x200 (green 0). Without the clamp the sum is negative: 0.
+    const uint32_t b[4] = {0x00008001u, 0x00000400u, 0, 0};
+    CHECK(ResolveConvertPixel(rg, 4, b) == 0x00000200u);
+    CONTROL(ResolveConvertPixel(rg, 4, b) == 0u);  // the clamp missing
+    const uint32_t b0[4] = {0x00008000u, 0x00000400u, 0, 0};  // -32768 c is also below -1: the same result
+    CHECK(ResolveConvertPixel(rg, 4, b0) == 0x00000200u);
+    // A negative green half alone: 0xFFFF = -1 unit -> -c * 256 < 0 -> saturated to 0; red one unit -> 0x4000.
+    const uint32_t d[4] = {0xFFFF0001u, 0, 0, 0};
+    CHECK(ResolveConvertPixel(rg, 4, d) == 0x00004000u);
+    // Saturation (r 0x0400, g 0x7FFF in every sample): red 4 (1 + 2^-15) * 256 and green 4 * 32 (1 + 2^-15) ... * 256, both
+    // above 1 -> 65535 each.
+    const uint32_t s[4] = {0x7FFF0400u, 0x7FFF0400u, 0x7FFF0400u, 0x7FFF0400u};
+    CHECK(ResolveConvertPixel(rg, 4, s) == 0xFFFFFFFFu);
+    // The swap (DEST_INFO bit 24; resolve.xesli:699-704 .bgra before the pack): (r, g, 0, 0) -> (0, g, r, 0), and k_16_16
+    // packs red and green (pixel_formats.xesli:236-239): pixel A -> red 0, green 0xC001.
+    const edram::ResolveInfo swapped = edram::DecodeResolve(Rg16Resolve(0x00020050, 0x00100060, destInfo | 1u << 24));
+    CHECK(swapped.ok && swapped.destSwap && ResolveConvertPixel(swapped, 4, a) == 0xC0010000u);
+
+    // The rectangle into guest bytes (DumpLayout of 4x 32x32): pixel A at (0, 0), pixel B at (2, 3), every other sample 0.
+    // Endian 1, k8in16 (X xenos.h:1070-1086; resolve_full_32bpp.xesli:62-65): 0xC0014000 -> 0x01C00040, stored little-endian
+    // at TiledOffset 0: bytes 40 00 C0 01; 0x00000200 -> 0x00000002 at TiledOffset(2, 3) = 280 (TestHdrResolve: only the
+    // macro row term depends on the pitch, 0 for y < 32); (1, 0) at 4 is 0.
+    const DumpLayout l = DumpLayoutFor(Msaa::X4, 32, 32);
+    std::vector<uint32_t> words(size_t(l.width) * l.columns * l.height * l.rows, 0);
+    for (uint32_t g = 0; g < 4; g++)
+        words[l.Word(0, 0, g)] = a[g], words[l.Word(2, 3, g)] = b[g];
+    std::vector<uint8_t> dest(rg.destExtentLength, 0xEE);
+    CHECK(ResolveConvertToGuest(rg, 4, words.data(), dest.data(), uint32_t(dest.size()), why));
+    CHECK(dest[0] == 0x40 && dest[1] == 0x00 && dest[2] == 0xC0 && dest[3] == 0x01);
+    CHECK(WordAt(dest, 280) == 0x00000002u && WordAt(dest, 4) == 0u);
+    CONTROL(WordAt(dest, 0) == 0xC0014000u);  // without the endian swap
+}
+
+// The k_8_8 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 0
+// (storage 0, 8_8_8_8), 1x, sample select 0, into texture format 10 (k_8_8) with number 0, exp bias 0, no swap, endian 1.
+// The registers are a stand-in of that shape (the run logs no raw values): Float32Resolve's 32x32 rectangle of a pitch-80
+// 1x surface, colour format 0, RB_COPY_CONTROL 00100000 (convert, k0).
+edram::ResolveRegisters K88Resolve(uint32_t destInfo)
+{
+    edram::ResolveRegisters r = Float32Resolve(destInfo);
+    r.surfaceInfo = 0x00000050, r.colorInfo[0] = 0, r.copyControl = 0x00100000;
+    return r;
+}
+
+void TestK88Resolve()
+{
+    std::string why;
+    const edram::ResolveInfo k = edram::DecodeResolve(K88Resolve(1 | 10u << 7));
+    // 16 bpp (texture_info_formats.inl:11): the extent of a 32x32 copy at pitch 32 is TiledOffset2D(0, 0) + 0xC00 = 3072
+    // (texture_util.cc:507-511), not the 32 bpp 0x1000.
+    CHECK(k.ok && k.source == Key::Color(0, 1, Msaa::X1, ColorFormat::k8_8_8_8) && k.destFormat == 10 && k.destEndian == 1 &&
+          k.destBytesLog2 == 1 && k.x1 == 32 && k.y1 == 32 && k.destExtentLength == 3072);
+    // Never bitwise equivalent (xenos.h:616-641 lists no k_8_8): X's full 16 bpp shader (draw_util.cc:1333-1334).
+    CHECK(!ResolveUsesFastPath(k, 0) && ResolveFullConvertible(k, 0, why));
+    CONTROL(ResolveConvertible(k, 0, why));
+
+    // The pack (pixel_formats.xesli:177-180, XePackR8G8B8A8UNorm :116-119): the 8_8_8_8 word 0x44332211 unpacks with red in
+    // bits 0-7 (XeUnpackR8G8B8A8UNorm; R8G8B8A8_UNORM's first byte): r = 0x11 / 255, g = 0x22 / 255, b = 0x33 / 255.
+    // uint(r * 255 + 0.5) = 17 = 0x11, g -> 0x22: the 16 bits r | g << 8 = 0x2211.
+    const uint32_t p[1] = {0x44332211u};
+    CHECK(ResolveConvertPixel(k, 0, p) == 0x2211u);
+    CONTROL(ResolveConvertPixel(k, 0, p) == 0x1122u);      // red in the high byte
+    CONTROL(ResolveConvertPixel(k, 0, p) == 0x44332211u);  // the 32 bpp k_8_8_8_8 pack
+    // The swap (DEST_INFO bit 24; resolve.xesli:699-704 .bgra before the pack): red takes blue 0x33, green stays: 0x2233.
+    const edram::ResolveInfo swapped = edram::DecodeResolve(K88Resolve(1 | 10u << 7 | 1u << 24));
+    CHECK(swapped.ok && swapped.destSwap && ResolveConvertPixel(swapped, 0, p) == 0x2233u);
+    // Saturation with exp bias 1 (bits 16-21; resolve.xesli:131-133 factor 2): word 0x0000C040: red 0x40 -> 64 / 255 * 2 * 255
+    // + 0.5 = 128.5 -> 128 = 0x80; green 0xC0 -> 384 / 255 > 1 -> saturated to 255 (:116-119). 0xFF80.
+    const edram::ResolveInfo biased = edram::DecodeResolve(K88Resolve(1 | 10u << 7 | 1u << 16));
+    const uint32_t q[1] = {0x0000C040u};
+    CHECK(biased.ok && ResolveFullConvertible(biased, 0, why) && ResolveConvertPixel(biased, 0, q) == 0xFF80u);
+    CONTROL(ResolveConvertPixel(biased, 0, q) == 0x18080u);  // no saturation: green 384 = 0x180
+
+    // Pairings: a 16_16 (storage 4) source only into 25; a 32_FLOAT (storage 14) source never into k_8_8; a decoded
+    // destination whose bytes per texel disagree with the format is refused (the store would use the wrong layout).
+    const edram::ResolveInfo rg = edram::DecodeResolve(Rg16Resolve(0x00000050, 0x00100000, 1 | 10u << 7));
+    CHECK(rg.ok && rg.destFormat == 10);
+    CONTROL(ResolveFullConvertible(rg, 4, why));
+    const edram::ResolveInfo f32 = edram::DecodeResolve(Float32Resolve(1 | 10u << 7));
+    CHECK(f32.ok && f32.source.Format() == uint32_t(ColorFormat::k32_Float));
+    CONTROL(ResolveFullConvertible(f32, 14, why));
+    edram::ResolveInfo wrong = k;
+    wrong.destBytesLog2 = 2;
+    CONTROL(ResolveFullConvertible(wrong, 0, why));
+
+    // The rectangle into guest bytes (a 1x 32x32 read-back, DumpLayoutFor(X1): word y * 32 + x), 0x44332211 at (0, 0) and
+    // (9, 3), every other texel 0. 0x2211 under 8in16 (endian.xesli:25-31 XeEndianSwap16) is 0x1122, stored little-endian:
+    // bytes 22 11, i.e. the guest's big-endian 16-bit 0x2211.
+    // TiledOffset2D(9, 3, 32, 1) by hand (texture_util.cc:443-458): macro 0; micro = ((9 & 7) + ((3 & 0xE) << 2)) << 1 =
+    // (1 + 8) * 2 = 18; offset = ((18 & ~0xF) << 1) + (18 & 0xF) + ((3 & 1) << 4) = 32 + 2 + 16 = 50; mix: (50 & ~0x1FF) << 3
+    // = 0, (3 & 16) << 7 = 0, (50 & 0x1C0) << 2 = 0, ((((3 & 8) >> 2) + (9 >> 3)) & 3) << 6 = 64, 50 & 0x3F = 50 -> 114.
+    // The 32 bpp offset of the same texel (CONTROL): micro 9 << 2 = 36, offset 32 * 2 + 4 + 16 = 84, (84 & 0x1C0) << 2 = 256,
+    // + 64 + (84 & 0x3F) 20 = 340.
+    std::vector<uint32_t> texels(32 * 32, 0);
+    texels[0] = texels[3 * 32 + 9] = 0x44332211u;
+    std::vector<uint8_t> dest(k.destExtentLength, 0xEE);
+    CHECK(ResolveConvertToGuest(k, 0, texels.data(), dest.data(), uint32_t(dest.size()), why));
+    CHECK(dest[0] == 0x22 && dest[1] == 0x11 && dest[114] == 0x22 && dest[115] == 0x11);
+    CONTROL(dest[0] == 0x11 && dest[1] == 0x22);      // without the endian swap
+    CONTROL(dest[340] == 0x22 && dest[341] == 0x11);  // the 32 bpp address
+    // Every texel is 2 bytes at a distinct tiled address: 32 * 32 * 2 = 2048 bytes written, the rest of the 0xC00 extent
+    // untouched; texel (1, 0) at TiledOffset2D(1, 0, 32, 1) = 2 is 0.
+    size_t written = 0;
+    for (uint8_t b : dest)
+        written += b != 0xEE;
+    CHECK(written == 2048 && dest[2] == 0x00 && dest[3] == 0x00);
+    // Endian 0 (no swap) stores 0x2211 little-endian: bytes 11 22.
+    const edram::ResolveInfo plain = edram::DecodeResolve(K88Resolve(10u << 7));
+    std::vector<uint8_t> dest0(plain.destExtentLength, 0xEE);
+    CHECK(plain.ok && ResolveConvertToGuest(plain, 0, texels.data(), dest0.data(), uint32_t(dest0.size()), why) && dest0[0] == 0x11 &&
+          dest0[1] == 0x22);
+    // A destination too short for texel (31, 31) (TiledOffset2D 2942, below the 0xC00 bound): refused, nothing written.
+    std::vector<uint8_t> shortDest(2048, 0xEE);
+    CONTROL(ResolveConvertToGuest(k, 0, texels.data(), shortDest.data(), uint32_t(shortDest.size()), why));
+    CHECK(shortDest[0] == 0xEE);
+}
+
 int main()
 {
     TestFormats();
@@ -1309,6 +1640,7 @@ int main()
     TestClears();
     TestGather();
     TestResolveToGuest();
+    TestFastResidentWords();
     TestTrace12Frame();
     Test7e3Frame();
     TestBases();
@@ -1320,6 +1652,9 @@ int main()
     TestDepthPitch();
     TestDepthResolveVk();
     TestDepth4xTo2x();
+    TestK16_16();
+    TestRg16Resolve();
+    TestK88Resolve();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -248,7 +248,9 @@ KeyResult PlanDescriptors(const CachedShader& vs, const CachedShader& ps, const 
     for (const CachedShader* shader : {&vs, &ps})
         for (size_t i = 0; i < shader->t.textureSlots.size(); i++)
         {
-            const uint32_t slot = shader->t.textureSlots[i], d = shader->t.textureDimensions[i];
+            // FM4 Recomp: a 1D fetch (0) is a 2D binding (the shader's sampler2D at (s, 0); X spirv_shader_translator_fetch.cc:2328-2332
+            // FindOrAddTextureBinding maps k1D to k2D); 0 stays this plan's "unused".
+            const uint32_t slot = shader->t.textureSlots[i], fetched = shader->t.textureDimensions[i], d = fetched == 0 ? 1 : fetched;
             if (slot >= kTextureBindings || d < 1 || d > 3)
                 return Refuse(std::string(shader->pixel ? "pixel" : "vertex") + " shader texture slot " + std::to_string(slot) + " dimension " +
                               std::to_string(d) + " is out of range");

@@ -50,9 +50,13 @@ const EdramHooks* InitializeEdramVk(const VulkanDevice& device, SpirvCompiler& c
 // complete, VerifyDepthSelfCheck compares every dumped word with its expectation.
 constexpr uint32_t kDepthSelfCheckWidth = 1280, kDepthSelfCheckRows1x = 32;
 constexpr uint64_t kDepthSelfCheckDump4x = 1ull << 20, kDepthSelfCheckDump2x = 2ull << 20;  // staging offsets (the upload is below 1 MiB)
+// FM4 Recomp: then the 1x kD24FS8 key into the 1x kD24S8 key at the same tiles and back (depth -> depth between formats),
+// each dumped (1280x32, one sample) at these offsets.
+constexpr uint64_t kDepthSelfCheckDumpS8 = 3ull << 20, kDepthSelfCheckDumpRoundTrip = 4ull << 20;
 struct DepthSelfCheckResult
 {
     uint64_t checked4x = 0, checked2x = 0, mismatches4x = 0, mismatches2x = 0;
+    uint64_t checkedS8 = 0, mismatchesS8 = 0, checkedRoundTrip = 0, mismatchesRoundTrip = 0;
     std::string first;  // the first mismatch, if any
 };
 bool RecordDepthSelfCheck(VkCommandBuffer commands, std::string& error);

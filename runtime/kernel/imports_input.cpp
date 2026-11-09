@@ -58,6 +58,14 @@ void LoadScript(const char* path)
     std::fprintf(stderr, "[input] script %s: %zu events\n", path, events);
 }
 
+void NotifyRaceStart(uint64_t vblank)
+{
+    std::lock_guard guard(lock);
+    if (poller && poller->RaceStarted(vblank))
+        std::fprintf(stderr, "[input] race start at vblank %llu: the script's @race section (%zu events) runs from here\n",
+                     (unsigned long long)vblank, poller->script().race.size());
+}
+
 bool ScriptLoaded()
 {
     std::lock_guard guard(lock);
@@ -85,11 +93,19 @@ GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-121; a 
         Stop(StopCode::Unimplemented, "XamInputGetState(user 0, flags %u) without a state pointer while a pad is connected is not modelled", flags);
     {
         const runtime::input::Report report = poller->Poll(runtime::gpu::VblankCount());
+        // FM4 Recomp: indices past the first list are the @race list's (input_script.h Poller::Poll); its "nothing held yet" state
+        // (index events + race) is logged by NotifyRaceStart, and the jump to the race skips the first list's unreached events.
+        const auto& script = poller->script();
+        if (report.event >= long(script.events.size()) && logged < long(script.events.size()) - 1)
+            logged = long(script.events.size()) - 1;
         for (; logged < report.event; logged++)
         {
-            const runtime::input::Event& e = poller->script().events[size_t(logged + 1)];
+            const size_t next = size_t(logged + 1), first = script.events.size();
+            if (next >= first + script.race.size())
+                continue;
+            const runtime::input::Event& e = next < first ? script.events[next] : script.race[next - first];
             const std::string held = runtime::input::Describe(e.buttons, e.leftTrigger, e.rightTrigger);
-            std::fprintf(stderr, "[input] event %ld at vblank %llu: %s\n", logged + 1, (unsigned long long)e.vblank,
+            std::fprintf(stderr, "[input] event %ld at %svblank %llu: %s\n", logged + 1, next < first ? "" : "race ", (unsigned long long)e.vblank,
                          held.empty() ? "released" : held.c_str());
         }
         runtime::Store32(base, state, report.packet);

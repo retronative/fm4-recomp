@@ -23,42 +23,59 @@ inline std::vector<uint8_t> EncodePngRgb8(uint32_t width, uint32_t height, const
 {
     if (width == 0 || height == 0 || rgb.size() != size_t(width) * height * 3)
         return {};
-    std::vector<uint8_t> raw;
-    raw.reserve(size_t(height) * (size_t(width) * 3 + 1));
-    for (uint32_t y = 0; y < height; y++)
-    {
-        raw.push_back(0);  // filter: none
-        raw.insert(raw.end(), rgb.begin() + size_t(y) * width * 3, rgb.begin() + size_t(y + 1) * width * 3);
-    }
-    std::vector<uint8_t> z{0x78, 0x01};
-    for (size_t at = 0; at < raw.size(); at += 65535)
-    {
-        const uint16_t n = uint16_t(std::min<size_t>(65535, raw.size() - at));
-        z.push_back(at + n == raw.size());
-        z.insert(z.end(), {uint8_t(n), uint8_t(n >> 8), uint8_t(~n), uint8_t(~n >> 8)});
-        z.insert(z.end(), raw.begin() + at, raw.begin() + at + n);
-    }
-    uint32_t a = 1, b = 0;
-    for (uint8_t v : raw)
-    {
-        a = (a + v) % 65521;
-        b = (b + a) % 65521;
-    }
-    const uint32_t adler = b << 16 | a;
-    z.insert(z.end(), {uint8_t(adler >> 24), uint8_t(adler >> 16), uint8_t(adler >> 8), uint8_t(adler)});
-    std::vector<uint8_t> png{0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
-    auto chunk = [&](const char* type, const std::vector<uint8_t>& data) {
-        std::vector<uint8_t> body(type, type + 4);
-        body.insert(body.end(), data.begin(), data.end());
-        const uint32_t n = uint32_t(data.size()), crc = runtime::Crc32(body.data(), body.size());
-        png.insert(png.end(), {uint8_t(n >> 24), uint8_t(n >> 16), uint8_t(n >> 8), uint8_t(n)});
-        png.insert(png.end(), body.begin(), body.end());
-        png.insert(png.end(), {uint8_t(crc >> 24), uint8_t(crc >> 16), uint8_t(crc >> 8), uint8_t(crc)});
+    // FM4 Recomp (M7): written straight into the file buffer (one copy of the pixels), Adler-32 with the modulo deferred to every
+    // 5552 bytes (zlib adler32.c NMAX: the largest n with 255 n (n + 1) / 2 + (n + 1) (65520) < 2^32), CRC-32 over the chunk in place.
+    const size_t rowBytes = size_t(width) * 3, rawBytes = size_t(height) * (rowBytes + 1), blocks = (rawBytes + 65534) / 65535;
+    const size_t idatBytes = 2 + blocks * 5 + rawBytes + 4;
+    std::vector<uint8_t> png;
+    png.reserve(8 + 25 + 12 + idatBytes + 12);
+    png.insert(png.end(), {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'});
+    auto put32 = [&](uint32_t v) { png.insert(png.end(), {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}); };
+    auto chunk = [&](const char* type, auto&& body) {
+        put32(uint32_t(0));
+        const size_t at = png.size();
+        png.insert(png.end(), type, type + 4);
+        body();
+        const uint32_t n = uint32_t(png.size() - at - 4);
+        png[at - 4] = uint8_t(n >> 24), png[at - 3] = uint8_t(n >> 16), png[at - 2] = uint8_t(n >> 8), png[at - 1] = uint8_t(n);
+        put32(runtime::Crc32(png.data() + at, png.size() - at));
     };
-    chunk("IHDR", {uint8_t(width >> 24), uint8_t(width >> 16), uint8_t(width >> 8), uint8_t(width), uint8_t(height >> 24),
-                   uint8_t(height >> 16), uint8_t(height >> 8), uint8_t(height), 8, 2, 0, 0, 0});
-    chunk("IDAT", z);
-    chunk("IEND", {});
+    chunk("IHDR", [&] {
+        png.insert(png.end(), {uint8_t(width >> 24), uint8_t(width >> 16), uint8_t(width >> 8), uint8_t(width), uint8_t(height >> 24),
+                               uint8_t(height >> 16), uint8_t(height >> 8), uint8_t(height), 8, 2, 0, 0, 0});
+    });
+    chunk("IDAT", [&] {
+        png.insert(png.end(), {0x78, 0x01});
+        uint32_t a = 1, b = 0, pending = 0;
+        size_t left = rawBytes, block = 0, row = 0, col = 0;  // col: position within the current scanline (0 = its filter byte)
+        while (left > 0)
+        {
+            const uint16_t n = uint16_t(std::min<size_t>(65535, left));
+            left -= n, block = n;
+            png.insert(png.end(), {uint8_t(left == 0), uint8_t(n), uint8_t(n >> 8), uint8_t(~n), uint8_t(~n >> 8)});
+            while (block > 0)
+            {
+                // The next run: the filter byte (none, 0) or the rest of the scanline, at most what the block holds.
+                const uint8_t zero = 0;
+                const uint8_t* from = col == 0 ? &zero : rgb.data() + row * rowBytes + (col - 1);
+                const size_t take = col == 0 ? 1 : std::min(block, rowBytes + 1 - col);
+                png.insert(png.end(), from, from + take);
+                for (size_t i = 0; i < take; i++)
+                {
+                    a += from[i], b += a;
+                    if (++pending == 5552)
+                        a %= 65521, b %= 65521, pending = 0;
+                }
+                block -= take, col += take;
+                if (col == rowBytes + 1)
+                    col = 0, row++;
+            }
+        }
+        a %= 65521, b %= 65521;
+        const uint32_t adler = b << 16 | a;
+        png.insert(png.end(), {uint8_t(adler >> 24), uint8_t(adler >> 16), uint8_t(adler >> 8), uint8_t(adler)});
+    });
+    chunk("IEND", [] {});
     return png;
 }
 

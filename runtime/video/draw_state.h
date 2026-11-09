@@ -97,6 +97,7 @@ enum class HostPrimitive : uint32_t
     RectList,       // the vertex shader expands it (XE_RECT_LIST, xe_indices)
     QuadList,       // the host rewrites the indices as triangle lists
     PointNoWrite,   // a point list of a NoWrite draw: nothing to render
+    LineList,       // FM4 Recomp: native (Xenia draws a guest line list as a host one, width 1)
 };
 
 enum class DrawKind : uint32_t
@@ -235,7 +236,9 @@ struct RenderTarget
 
 // A vertex fetch constant the vertex shader uses (X xenos.h:1135-1146 xe_gpu_vertex_fetch_t): the
 // host copies [0, VertexWindowDwords(slot, high)) dwords of it for a draw whose largest index is
-// `high` and binds that window as the slot's size (shader_glsl.h bindings 0 and 1). A constant whose
+// `high` (high * stride + end, past the constant's size when the indices reach past it: Xenia does not
+// bound vertex fetch by it, X spirv_shader_translator_fetch.cc:126-131) and binds that window as the
+// slot's size (shader_glsl.h bindings 0 and 1). A constant whose
 // type is not 3 (kVertex) or whose size is 0 is an empty window and not a refusal: the shader lists
 // slots it may never fetch (conditional execs, loops), and FM4 leaves such slots as 00000001
 // 00000000 (kInvalidVertex; FR render.cpp:541-548); an executed fetch of an empty window fails the
@@ -249,6 +252,7 @@ struct VertexSlot
     uint32_t sizeWords = 0;    // word 1 bits 2-25
     uint32_t endian = 0;       // word 1 bits 0-1 (the shader swaps)
     uint32_t stride = 0, end = 0;  // the translation's largest stride and element end for the slot, dwords
+    bool computedIndex = false;    // FM4 Recomp: a fetch of it is indexed by a computed value (shader_glsl.h vertexFetchComputedIndex)
 };
 uint32_t VertexWindowDwords(const VertexSlot& s, uint32_t highIndex);
 
@@ -294,10 +298,21 @@ struct TextureSlot
     uint32_t mipPhysical = 0;   // bits 12-31 << 12
     uint32_t fetchDimension = 0;  // the shader's (ucode.h kDimension2D 1, 3DOrStacked 2, Cube 3)
     bool gamma = false;         // x y z sign 3: XE_TEXTURE_<slot>_GAMMA
+    // FM4 Recomp: a fetch constant whose type is not 2 (texture): Xenia binds its null image, cleared to 0 (X texture_cache.cc:
+    // 857-889 leaves the key invalid; vulkan_texture_cache.cc:485-512, :587-607), signs unsigned; nothing else of it is read.
+    bool null = false;
+    uint32_t biasedMask = 0;    // FM4 Recomp: bit i when result component i's swizzled source sign is 2: XE_TEXTURE_<slot>_BIASED
 };
 
 // SQ_PROGRAM_CNTL (X registers.h:104-124), SQ_CONTEXT_MISC (:126-215), SQ_INTERPOLATOR_CNTL
 // (:217-227), SQ_VS_CONST / SQ_PS_CONST (:229-252).
+// FM4 Recomp: X draw_util.h:56-74 EncodeIsPrimitivePolygonalTable: triangle list, fan, strip, with W flags (4-7), quad list,
+// quad strip, polygon (13-15); not the rect list (8), points or lines.
+constexpr bool PrimitivePolygonal(uint32_t primitiveType)
+{
+    return (primitiveType >= 4 && primitiveType <= 7) || (primitiveType >= 13 && primitiveType <= 15);
+}
+
 struct Program
 {
     uint32_t vsNumReg = 0, psNumReg = 0;  // bits 0-7, 8-15: temporaries (0x80: none; X registers.h:107-110)
@@ -305,7 +320,7 @@ struct Program
     uint32_t vsExportCount = 0;           // bits 20-23
     uint32_t vsExportMode = 0;            // bits 24-26 (xenos.h:832-842): only 0, position as one vector, is modelled
     uint32_t psExportMode = 0;            // bits 27-30
-    bool paramGen = false;                // bit 18: pixel parameter generation (refused: not in the translator)
+    bool paramGen = false;                // bit 18: pixel parameter generation (PsParamGen at paramGenPos when below 16: XE_PARAM_GEN)
     uint32_t paramGenPos = 0;             // SQ_CONTEXT_MISC bits 8-15
     bool scOutputScreenXy = false;        // SQ_CONTEXT_MISC bit 1
     uint32_t sampleControl = 0;           // SQ_CONTEXT_MISC bits 2-3 (xenos.h:846-850)
@@ -337,10 +352,17 @@ struct DrawState
     uint32_t systemFlags = 0;     // XeSystem.xe_flags (shader_glsl.h kFlag*): the position format from PA_CL_VTE_CNTL bits 8-10
     Scissor scissor;
     bool cullFront = false, cullBack = false, frontClockwise = false, msaaEnable = false;  // PA_SU_SC_MODE_CNTL bits 0, 1, 2, 15
+    // FM4 Recomp: the polygon offset Xenia picks (X draw_util.cc:86-114 GetPreferredFacePolygonOffset): polygonal primitives the
+    // front pair when enabled and front faces are not culled, else the back pair; others the front pair under para_enable.
+    // PA_SU_POLY_OFFSET_* floats, guest units (HostDepthBias in draw_record.h converts them).
+    float polyOffsetScale = 0, polyOffsetOffset = 0;
     bool provokingVertexLast = false;  // bit 19 (flat shading only, which is refused)
     DepthStencil depthStencil;
     Blend blend;
     AlphaTest alphaTest;
+    // FM4 Recomp: alpha to mask (RB_COLORCONTROL bit 4) as Xenia's D3D12 path (X d3d12_command_processor.cc:3933-3935): the
+    // dither offsets (bits 24-31) | 1 << 8 when enabled, 0 off; Draw only (no pixel shader in kDepth, as the alpha test).
+    uint32_t alphaToMask = 0;
     uint32_t colorWriteMask = 0;  // RB_COLOR_MASK bits 0-3 for colour 0 (the translator exports colour 0 only); 0 in DepthOnly
     uint32_t aaMask = 0;          // PA_SC_AA_MASK (recorded; not modelled)
     RenderTarget target;

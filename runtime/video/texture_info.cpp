@@ -94,14 +94,18 @@ bool LevelLayout(TextureDescription& d, uint32_t level, MipLevel& out)
         const uint32_t stored = std::min(level, d.packedLevel);
         uint64_t offset = 0;
         for (uint32_t k = 1; k < stored; k++)
-            offset += MipStorageOf(f, fi, k).strideBytes;
+            offset += MipStorageOf(f, fi, k).strideBytes * d.layers;  // every face of a level, then the next (texture_util.cc:432-436)
         const MipStorage s = MipStorageOf(f, fi, stored);
         if (uint64_t(f.mipAddress) + offset > 0xFFFFFFFFull)
             return Refuse(d, "mip level " + std::to_string(level) + " address overflows");
         out.address = uint32_t(f.mipAddress + offset);
         out.pitchBlocks = s.pitchBlocks;
         out.rowPitchBytes = s.pitchBytes;
+        out.faceStrideBytes = s.strideBytes;
     }
+    if (level == 0 && d.layers > 1)  // texture_util.cc:306-308, :328-344: the base's own pitch and height, aligned to 4 KB
+        out.faceStrideBytes = (size_t(out.rowPitchBytes) * AlignUp(AlignUp(d.height, fi.blockHeight) / fi.blockHeight, kTileWidthHeight) + 4095) &
+                              ~size_t(4095);
     if (out.packed)
     {
         uint32_t xTexels = 0, yTexels = 0;
@@ -121,6 +125,7 @@ bool LevelLayout(TextureDescription& d, uint32_t level, MipLevel& out)
         out.extentBytes = TiledAddressUpperBound2D(out.x + out.widthBlocks, out.y + out.heightBlocks, out.pitchBlocks, log2);
     else
         out.extentBytes = size_t(out.rowPitchBytes) * out.y + LinearExtent(out.x + out.widthBlocks, out.heightBlocks, out.rowPitchBytes, log2);
+    out.extentBytes += out.faceStrideBytes * (d.layers - 1);  // the other faces (texture_util.cc:425-427)
     if (uint64_t(out.address) + out.extentBytes > kPhysicalSize)
         return Refuse(d, "level " + std::to_string(level) + " ends past the physical memory");
     return true;
@@ -141,9 +146,18 @@ bool HostFormatFor(uint32_t format, HostFormat& out)
     case 6: case 50: out = {vk::kFormatR8G8B8A8Unorm, kSwizzleRGBA, false}; return true;      // k_8_8_8_8 (+ AS_16_16_16_16)
     case 18: case 51: out = {vk::kFormatBc1RgbaUnormBlock, kSwizzleRGBA, true}; return true;  // k_DXT1 (+ AS_16_16_16_16)
     case 54: out = {vk::kFormatA2B10G10R10UnormPack32, kSwizzleRGBA, false}; return true;    // k_2_10_10_10_AS_16_16_16_16
+    case 19: case 52: out = {vk::kFormatBc2UnormBlock, kSwizzleRGBA, true}; return true;      // k_DXT2_3 :191-195, k_DXT2_3_AS_16_16_16_16 :345 (BC2, 128bpb load)
     case 20: case 53: out = {vk::kFormatBc3UnormBlock, kSwizzleRGBA, true}; return true;      // k_DXT4_5 :196-200, k_DXT4_5_AS_16_16_16_16 :350-354 (BC3, 128bpb load)
+    case 59: out = {vk::kFormatBc4UnormBlock, kSwizzleRRRR, true}; return true;               // k_DXT5A :381-385 (BC4, 64bpb load, RRRR; no signed form)
+    case 49: out = {vk::kFormatBc5UnormBlock, kSwizzleRGGG, true}; return true;               // k_DXN :330-333 (BC5, 128bpb load, RGGG; no signed form)
     case 36: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, true, true}; return true;      // k_32_FLOAT :275-279 (R32_SFLOAT, RRRR)
     case 23: out = {vk::kFormatR32Sfloat, kSwizzleRRRR, false, false, true, true}; return true; // k_24_8_FLOAT :210-213 (depth float load)
+    case 10:  // k_8_8 :141-145: R8G8_UNORM, signed R8G8_SNORM, RGGG (16bpb load); the number-format bit still refused (never observed)
+        out = {vk::kFormatR8G8Unorm, kSwizzleRGGG, false, false, false, false, vk::kFormatR8G8Snorm, false};
+        return true;
+    case 25:  // k_16_16 :220-225: R16G16_UNORM, signed R16G16_SNORM, RGGG; the number-format bit ignored (Xenia never reads it)
+        out = {vk::kFormatR16G16Unorm, kSwizzleRGGG, false, false, true, false, vk::kFormatR16G16Snorm, false};
+        return true;
     default: out = {}; return false;
     }
 }
@@ -183,8 +197,12 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
 
     if (f.type != 2)
         Refuse(d, "fetch constant type " + std::to_string(f.type) + " is not a texture (2)");
-    else if (f.dimension != 1 && f.dimension != 2)
-        Refuse(d, "texture dimension " + std::to_string(f.dimension) + " (0 1D, 3 cube) is not supported; only 2D (1) and 3D (2)");
+    else if (f.dimension == 0 && (f.tiled || f.packedMips))  // FM4 Recomp: X texture_cache.cc:900-925 ignores both as wrong
+        Refuse(d, "a 1D texture that is tiled or has packed mips (Xenia ignores both, texture_cache.cc:900-925)");
+    else if (f.dimension == 0 && f.width1D > 8192)  // X :902-907: wider than kTexture2DCubeMaxWidthHeight
+        Refuse(d, "a 1D texture " + std::to_string(f.width1D) + " texels wide (Xenia's 2D limit is 8192)");
+    else if (f.dimension == 3 && f.stackDepth != 5)  // FM4 Recomp: Xenia asserts six faces (texture_util.cc:42-47)
+        Refuse(d, "a cube texture whose size_2d stack depth is " + std::to_string(f.stackDepth) + ", not 5 (six faces)");
     else if (f.stacked)
         Refuse(d, "a stacked 2D texture (" + std::to_string(f.stackDepth + 1) + " layers) is not supported");
     else if (!HostFormatFor(f.format, d.host))
@@ -195,6 +213,8 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
         Refuse(d, "base address past the 512 MB physical memory");
     if (!d.error.empty())
         return d;
+    if (d.host.vkFormatSigned != 0 && SignedSeparate(f))  // FM4 Recomp: every component signed: the signed view (Xenia), after every check
+        d.host.vkFormat = d.host.vkFormatSigned, d.host.signedView = true;
 
     const uint32_t bytesPerBlock = BytesPerBlock(d.info);
     d.log2BytesPerBlock = Log2Floor(bytesPerBlock);
@@ -211,6 +231,9 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
     const bool volume = f.dimension == 2;
     d.dimension = f.dimension;
     d.width = volume ? f.width3D : f.width, d.height = volume ? f.height3D : f.height, d.depth = volume ? f.depth3D : 1;
+    if (f.dimension == 0)  // FM4 Recomp: 1D as a 2D image of height 1 (X texture_util.cc:207-213, spirv_shader_translator_fetch.cc:2328-2332)
+        d.width = f.width1D, d.height = 1;
+    d.layers = f.dimension == 3 ? 6 : 1;  // FM4 Recomp: a cube's six faces (size_2d; texture_util.cc:42-47, :220-221)
     // Levels (texture_util.cc:60-92; the longest axis includes the depth for 3D, :61-65).
     const uint32_t sizeMax = Log2Floor(std::max(std::max(d.width, d.height), d.depth));
     uint32_t first = 0, last = 0;
@@ -235,6 +258,11 @@ TextureDescription DescribeTexture(const uint32_t fetch[6])
         return d;
     }
     d.levelCount = last + 1;
+    if (f.dimension == 0 && d.levelCount > 1)  // MipStorageOf sizes mips from size_2d: 1D mips need their own rule (not observed)
+    {
+        Refuse(d, "a 1D texture with mip levels is not supported");
+        return d;
+    }
     d.packedLevel = PackedMipLevel(d.width, d.height, f.packedMips);
     if (volume && d.packedLevel == 0)
     {
@@ -264,10 +292,11 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
     const TextureFetch f = DecodeTextureFetch(fetch);
     // ucode fetch dimension 1 (2D) needs a 2D constant (dimension 1), 2 (3D or stacked) a 3D constant (dimension 2): a stacked
     // 2D array sampled as 3D is refused by the storage description (stacked), a cube (3) by both.
-    if (!((shader.dimension == 1 && f.dimension == 1) || (shader.dimension == 2 && f.dimension == 2)))
+    if (!((shader.dimension == 1 && f.dimension == 1) || (shader.dimension == 2 && f.dimension == 2) || (shader.dimension == 3 && f.dimension == 3) ||
+          (shader.dimension == 0 && (f.dimension == 0 || f.dimension == 1))))  // FM4 Recomp: 1D of a 2D constant, row 0 (X :2328-2332)
     {
         Refuse(b, "the shader samples with dimension " + std::to_string(shader.dimension) + " but the constant's dimension is " +
-                      std::to_string(f.dimension) + "; only 2D fetches of 2D constants and 3D fetches of 3D constants are supported");
+                      std::to_string(f.dimension) + "; only 2D, 3D and cube fetches of constants of the same dimension are supported");
         return b;
     }
     // The number-format bit (dword 3 bit 0): Xenia 67f16c4 declares it (xenos.h:1274) but neither its texture cache nor its
@@ -296,11 +325,14 @@ TextureBinding DescribeBinding(const uint32_t fetch[6], const HostFormat& host, 
         }
         b.components[i] = vk::kSwizzleR + SwizzleComponent(host.formatSwizzle, g);
         const uint32_t sign = f.sign[g];
-        if ((sign == 1 || sign == 2) && !host.signIgnored)
+        if (sign == 1 && !host.signedView && !host.signIgnored)
         {
-            Refuse(b, std::string(sign == 1 ? "signed" : "unsigned biased") + " component " + std::to_string(g) + " is not supported");
+            Refuse(b, "signed component " + std::to_string(g) + " is not supported");
             return b;
         }
+        // Unsigned biased: the shader's v * 2 - 1 on this result component (X spirv_shader_translator_fetch.cc:2167-2236).
+        if (sign == 2 && !host.signIgnored)
+            b.biasedMask |= 1u << i;
         if (i == 3)
         {
             if (sign == 3)

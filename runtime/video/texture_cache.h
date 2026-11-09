@@ -76,9 +76,9 @@ struct WatchBackend
 class WriteWatch
 {
 public:
-    struct Stats
+    struct Stats  // FM4 Recomp: atomics (faults are counted inside the signal handler)
     {
-        uint64_t faults = 0, protects = 0, unprotects = 0, rearms = 0, marked = 0;
+        std::atomic<uint64_t> faults{0}, protects{0}, unprotects{0}, rearms{0}, marked{0};
     };
 
     explicit WriteWatch(WatchBackend& backend, uint32_t hostPageSize = 16384)
@@ -110,10 +110,16 @@ public:
         if (!InRange(physical, size))
             return false;
         const uint32_t first = physical / hostPage_, last = (physical + size - 1) / hostPage_;
-        if (!backend_.Protect(first * hostPage_, (last - first + 1) * hostPage_, true))
-            return false;
+        // FM4 Recomp: the flags first, then the protection (a store that faults in between must find its page watched); a refusal
+        // takes them back.
         for (uint32_t h = first; h <= last; h++)
             watched_[h].store(1, std::memory_order_release);
+        if (!backend_.Protect(first * hostPage_, (last - first + 1) * hostPage_, true))
+        {
+            for (uint32_t h = first; h <= last; h++)
+                watched_[h].store(0, std::memory_order_release);
+            return false;
+        }
         stats_.protects += last - first + 1;
         return true;
     }
@@ -132,6 +138,46 @@ public:
         watched_[h].store(0, std::memory_order_release);
         stats_.faults++, stats_.unprotects++;
         return backend_.Protect(h * hostPage_, hostPage_, false);
+    }
+
+    // FM4 Recomp (FM4_WRITE_WATCH; the guest fault hook, texture_vk.cpp): a write fault on a host page the heap means to be
+    // writable, so only the watch can have protected it, whether or not its flag still says so (a concurrent fault, or a heap
+    // recompute racing a Watch). Writable again first (backend Protect false: signal-safe), then the sequences and the epoch move,
+    // then the flag clears: concurrent faulters on one page all take this path and all return true. Atomics and mprotect only.
+    bool OnProtectionFault(uint32_t physical)
+    {
+        if (physical >= kGuestPageCount * uint64_t(kGuestPageSize))
+            return false;
+        const uint32_t h = physical / hostPage_;
+        if (!backend_.Protect(h * hostPage_, hostPage_, false))
+            return false;
+        BumpHostPage(h);
+        watched_[h].store(0, std::memory_order_release);
+        stats_.faults++, stats_.unprotects++;
+        return true;
+    }
+
+    // FM4 Recomp: the heap changes the host access of [physical, physical + size) (a commit, decommit, release, protect or a
+    // zeroing clear): its protection is the heap's from now on, so the range counts as written and is no longer watched.
+    void HostAccessChanged(uint32_t physical, uint32_t size)
+    {
+        if (size == 0 || !InRange(physical, size))
+            return;
+        for (uint32_t h = physical / hostPage_; h <= (physical + size - 1) / hostPage_; h++)
+            watched_[h].store(0, std::memory_order_release);
+        MarkWritten(physical, size);
+    }
+
+    // FM4 Recomp: before a system call writes [physical, physical + size) (pread: it cannot fault, it would return EFAULT): its
+    // watched host pages are made writable and unwatched, and the range counts as written.
+    void BeforeHostWrite(uint32_t physical, uint32_t size)
+    {
+        if (size == 0 || !InRange(physical, size))
+            return;
+        for (uint32_t h = physical / hostPage_; h <= (physical + size - 1) / hostPage_; h++)
+            if (watched_[h].exchange(0, std::memory_order_acq_rel) != 0)
+                backend_.Protect(h * hostPage_, hostPage_, false);
+        MarkWritten(physical, size);
     }
 
     // A GPU write (a resolve) into [physical, physical + size): the guest pages' sequences move; the
@@ -218,16 +264,20 @@ struct TextureKey
     uint32_t pitch = 0;                  // texels
     uint32_t format = 0, endian = 0, mipMaxLevel = 0;
     bool tiled = false, packedMips = false;
-    uint32_t depth = 1, dimension = 1;   // 3D (dimension 2): size_3d's depth; width / height from size_3d too
+    uint32_t depth = 1, dimension = 1;   // 3D (dimension 2): size_3d's depth; width / height from size_3d too; FM4 Recomp: a cube
+                                         // (dimension 3): size_2d's stack depth + 1, so a constant of other face count never reuses it
     bool stacked = false;                // dword 1 bit 10: an array, other storage (refused by DescribeTexture; keyed so a
                                          // stacked constant never reuses a non-stacked entry with the same fields)
+    bool signedData = false;             // FM4 Recomp: every component signed (texture_info.h SignedSeparate): another host image
     bool operator==(const TextureKey&) const = default;
 };
 inline TextureKey KeyOf(const TextureFetch& f)
 {
     const bool volume = f.dimension == 2;  // xenos.h:1255-1271: dword 2 is size_3d for 3D
-    return {f.baseAddress, f.mipAddress, volume ? f.width3D : f.width, volume ? f.height3D : f.height, f.pitchTexels, f.format, f.endian,
-            f.mipMaxLevel, f.tiled, f.packedMips, volume ? f.depth3D : 1, f.dimension, f.stacked};
+    return {f.baseAddress, f.mipAddress, volume ? f.width3D : f.dimension == 0 ? f.width1D : f.width, volume ? f.height3D : f.dimension == 0 ? 1 : f.height,
+            f.pitchTexels, f.format, f.endian,
+            f.mipMaxLevel, f.tiled, f.packedMips, volume ? f.depth3D : f.dimension == 3 ? f.stackDepth + 1 : 1, f.dimension, f.stacked,
+            SignedSeparate(f)};
 }
 struct TextureKeyHash
 {
@@ -235,7 +285,7 @@ struct TextureKeyHash
     {
         uint64_t h = 0xcbf29ce484222325ull;
         for (uint64_t v : {uint64_t(k.base), uint64_t(k.mip), uint64_t(k.width) << 32 | k.height, uint64_t(k.pitch) << 32 | k.format,
-                           uint64_t(k.endian) << 32 | k.mipMaxLevel, uint64_t(k.tiled) << 1 | k.packedMips, uint64_t(k.depth) << 32 | k.dimension, uint64_t(k.stacked)})
+                           uint64_t(k.endian) << 32 | k.mipMaxLevel, uint64_t(k.tiled) << 1 | k.packedMips, uint64_t(k.depth) << 32 | k.dimension, uint64_t(k.stacked) | uint64_t(k.signedData) << 1})
             h = (h ^ v) * 0x100000001b3ull;
         return size_t(h);
     }
@@ -310,7 +360,7 @@ public:
         for (const MipLevel& l : e.description.levels)
         {
             p.levelOffsets.push_back(p.stagingBytes);
-            const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks * l.depth) << e.description.log2BytesPerBlock;
+            const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks * l.depth * e.description.layers) << e.description.log2BytesPerBlock;
             p.levelBytes.push_back(bytes);
             p.stagingBytes += (bytes + 15) & ~size_t(15);
         }

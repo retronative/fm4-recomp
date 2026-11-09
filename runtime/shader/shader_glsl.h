@@ -103,6 +103,11 @@ struct ShaderTranslation
     // shader reads (registers r0..r(n-1) read before written, preloaded from xe_interp_i); the
     // host must check the paired VS exports at least this many.
     uint32_t interpolatorCount = 0;
+    // FM4 Recomp: vertex shader register reads that some analysis path reaches before any write on it (the program writes the
+    // register earlier on another path, e.g. under a predicate): they read the zero every temp starts at, as Xenia zeroes its
+    // registers "to prevent crashes when the game references them after only initializing them conditionally"
+    // (spirv_shader_translator.cc:1243-1251). Distinct sites, each instruction slot << 8 | register, ascending.
+    std::vector<uint32_t> pathZeroReads;
     std::vector<uint32_t> vertexFetchSlots;  // distinct vertex fetch constant slots (0-95), ascending
     // Per vertex fetch slot (vertexFetchSlots order): the largest stride of its fetches and the
     // largest dword just past an element (offset + components), in dwords. A fetch of vertex index i
@@ -110,6 +115,9 @@ struct ShaderTranslation
     // slot's data for a draw whose largest index is `high` (shader-computed indices beyond it then
     // fail the bounds check and stop the draw).
     std::vector<uint32_t> vertexFetchStrides, vertexFetchEnds;
+    // FM4 Recomp: per slot (vertexFetchSlots order), 1 when some fetch of it is indexed by a value the shader computes (not the
+    // untouched vertex index r0.x): the host cannot bound it by the draw's indices and copies the constant's whole data as well.
+    std::vector<uint8_t> vertexFetchComputedIndex;
     std::vector<uint32_t> textureSlots;      // distinct texture fetch constants (0-31), ascending; FM4
                                              // Recomp: including fetches in loops and bool-constant
                                              // conditionals a draw may skip
@@ -125,7 +133,7 @@ struct ShaderTranslation
     // mag/min filter.
     // mip: the instruction's mip filter (0 point, 1 linear, 2 base map, 3 the fetch constant's),
     // which matters for textures with more than one level.
-    struct Filters { uint32_t mag = 3, min = 3, volMag = 3, volMin = 3, mip = 3; };
+    struct Filters { uint32_t mag = 3, min = 3, volMag = 3, volMin = 3, mip = 3, aniso = 7; };  // aniso: 0 off or 7 the fetch constant's
     std::vector<Filters> textureFilters;
     // The dimension each slot's fetches use, one entry per slot in textureSlots order
     // (ucode::kDimension2D = 1: sampler2D; ucode::kDimension3DOrStacked = 2: sampler3D;

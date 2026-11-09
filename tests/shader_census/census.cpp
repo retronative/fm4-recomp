@@ -22,6 +22,7 @@
 // bytes: survey/fxobj.py shader_hash) is recomputed from the raw bytes and must equal the file
 // name's; the translator gets the byte-swapped (host-order) words, as its header requires.
 #include "shader/shader_glsl.h"
+#include "shader/ucode.h"
 
 #include <spawn.h>
 #include <sys/wait.h>
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -254,6 +256,38 @@ struct Tools
     int deadline;
 };
 
+// FM4 Recomp, analysis only: CENSUS_STUB_VFETCH_FORMAT=<n> rewrites every vertex fetch whose format field is 0 to n in the census's
+// own copy (after the hash check). The disc and zip shaders carry format 0 there because D3D patches vertex formats at bind
+// (reference/gpu/shader_census_forecast.md (d)), which hides every later refusal of a vertex shader; with a stub format the census
+// reaches them. A stubbed shader's outcome says nothing about its real vertex format.
+uint32_t StubbedVertexFetches(std::vector<uint32_t>& words)
+{
+    const char* env = std::getenv("CENSUS_STUB_VFETCH_FORMAT");
+    if (env == nullptr || *env == '\0')
+        return 0;
+    const uint32_t format = uint32_t(std::stoul(env));
+    using namespace runtime::shader::ucode;
+    uint32_t stubbed = 0, firstInstruction = uint32_t(words.size() / 3);
+    CfWords cf;
+    for (uint32_t i = 0; i / 2 < firstInstruction && ReadCf(words.data(), uint32_t(words.size()), i, cf); i++)
+    {
+        const CfOpcode op = CfOpcodeOf(cf);
+        if (!IsExec(op))
+            continue;
+        const CfExec e = DecodeExec(cf);
+        firstInstruction = std::min(firstInstruction, e.address);
+        for (uint32_t k = 0; k < e.count; k++)
+        {
+            const size_t at = size_t(e.address + k) * 3;
+            if (!IsFetch(e, k) || at + 3 > words.size() || FetchOpcodeOf(&words[at]) != 0)
+                continue;
+            if (((words[at + 1] >> 16) & 0x3F) == 0)
+                words[at + 1] |= (format & 0x3F) << 16, stubbed++;
+        }
+    }
+    return stubbed;
+}
+
 Result Examine(const Shader& s, const fs::path& work, const Tools& tools)
 {
     Result r;
@@ -265,7 +299,8 @@ Result Examine(const Shader& s, const fs::path& work, const Tools& tools)
     std::snprintf(hex, sizeof hex, "%016llx", static_cast<unsigned long long>(ShaderHash(raw, type)));
     if (s.hash != hex)
         throw Fatal(s.path.string() + ": microcode hashes to " + hex);
-    const std::vector<uint32_t> words = HostWords(raw);
+    std::vector<uint32_t> words = HostWords(raw);
+    StubbedVertexFetches(words);
     r.dwords = words.size();
     std::string error;
     if (!runtime::shader::TranslateShader(words.data(), words.size(), type == 1, r.t, error))

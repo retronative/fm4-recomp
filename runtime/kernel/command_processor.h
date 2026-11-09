@@ -43,7 +43,44 @@ struct RendererHooks
     // writes them, pm4_command_processor_implement.h:1003-1034); `vizQueryToken` is DRAW_INDX's first word, 0 for DRAW_INDX_2.
     void (*draw)(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken);
     void (*loadShader)(uint32_t type, const uint32_t* words, uint32_t count);  // IM_LOAD(_IMMEDIATE), host order
+    // FM4 Recomp: before a packet the guest CPU can synchronise on (interrupt, REG_TO_MEM, MEM_WRITE, COND_WRITE, WAIT_REG_MEM,
+    // EVENT_WRITE_SHD/EXT/ZPD): GPU writes still pending land in guest memory first (renderer.h SyncGuestWrites). Not before a
+    // plain EVENT_WRITE: it sets VGT_EVENT_INITIATOR only and stores nothing the CPU can poll. Nullable.
+    void (*syncGuestWrites)(uint32_t opcode);
+    // FM4 Recomp (FM4_DEFER_FENCES, ReCarbon's model: memory stores of the command stream land at GPU completion): true when the
+    // store of the 4 bytes at `physical` waits for the open submission (the renderer marked them pending); then the command
+    // processor queues it (ApplyDeferredStores). Nullable.
+    bool (*deferStore)(uint32_t physical);
+    // FM4 Recomp: the ring is drained while deferred stores wait; the renderer submits and retires its open work, so a guest
+    // thread polling one of them (a D3D fence) sees it. Nullable.
+    void (*ringIdle)();
+    // FM4 Recomp: whether a GPU write or a deferred store to [physical, physical + bytes) still waits for the open submission (a
+    // memory WAIT_REG_MEM on other memory polls at once and syncs only if unsatisfied). Nullable: then every memory wait syncs.
+    bool (*pendingAt)(uint32_t physical, uint32_t bytes);
+    // FM4 Recomp (FM4_DEFER_FENCES): true while the renderer has recorded work not yet submitted; an INTERRUPT then waits in the
+    // deferred queue (raised at the retire, after the stores before it; ReCarbon command_processor.cpp:480-496). Nullable.
+    bool (*workOpen)();
 };
+// FM4 Recomp (FM4_DEFER_FENCES): the queued stores in packet order, into guest memory (the renderer, after the submission that
+// was open when they were queued is confirmed complete and its resolve write-backs landed). Command-processor thread.
+void ApplyDeferredStores();
+bool DeferredStoresPending();
+// FM4 Recomp (diagnostic): nanoseconds the command processor spent with nothing to execute (the ring drained), since start.
+uint64_t CpIdleNs();
+// FM4 Recomp (FM4_DEFER_FENCES): WAIT_REG_MEM packets a queued store of the stream satisfied without a flush, since start.
+uint64_t SelfWaits();
+// FM4 Recomp: memory WAIT_REG_MEM packets satisfied at the first poll with nothing pending at their word (no flush), since start.
+uint64_t ImmediateWaits();
+// FM4 Recomp: memory WAIT_REG_MEM packets that were not satisfied at once, their total time, and how many of them synced
+// (submitted and waited for the open work), since start.
+uint64_t MemWaits();
+uint64_t MemWaitNs();
+uint64_t SyncedWaits();
+// FM4 Recomp (FM4_IMMEDIATE_INTERRUPTS): INTERRUPT packets raised when reached, and CPU-word waits that synced after the grace.
+uint64_t ImmediateInterrupts();
+uint64_t GraceSyncs();
+// Overrides FM4_IMMEDIATE_INTERRUPTS (tests).
+void SetImmediateInterrupts(bool on);
 void SetRendererHooks(const RendererHooks* hooks);
 
 // The run stops (11) at swap number `n` (fm4recomp --stop-at-swap n, required; M3's evidence is n = 1).

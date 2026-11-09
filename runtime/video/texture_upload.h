@@ -30,6 +30,7 @@
 //    mapping without imageViewFormatSwizzle, anisotropy, a gamma decision that disagrees with DrawState's,
 //    a guest range that is not wholly in one committed view.
 #pragma once
+#include <memory>
 #include "texture_cache.h"
 #include "texture_info.h"
 #include "texture_untile.h"
@@ -49,6 +50,40 @@ struct UnprotectedWatchBackend final : WatchBackend
 {
     bool Protect(uint32_t, uint32_t, bool) override { return true; }
 };
+
+// FM4 Recomp: the content hash of guest texture bytes for FM4_TEXTURE_REUSE (texture_vk.cpp SourceHash): four 64-bit lanes
+// (multiply-xor-rotate) over 32-byte blocks, the tail byte-wise, the length and seed mixed in, a final avalanche. Change detection
+// of guest data (not adversarial input): any change of a byte changes the hash except with ~2^-64 probability.
+inline uint64_t ContentHash(const uint8_t* p, size_t n, uint64_t seed)
+{
+    constexpr uint64_t k = 0x9E3779B97F4A7C15ull;
+    uint64_t a = seed ^ k, b = seed + k, c = ~seed, d = seed * k + 1;
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32)
+    {
+        uint64_t w[4];
+        std::memcpy(w, p + i, 32);
+        a = ((a ^ w[0]) * k), a = (a << 31) | (a >> 33);
+        b = ((b ^ w[1]) * k), b = (b << 29) | (b >> 35);
+        c = ((c ^ w[2]) * k), c = (c << 27) | (c >> 37);
+        d = ((d ^ w[3]) * k), d = (d << 25) | (d >> 39);
+    }
+    uint64_t h = a ^ (b * 3) ^ (c * 5) ^ (d * 7) ^ n;
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    h ^= h >> 33, h *= 0xFF51AFD7ED558CCDull, h ^= h >> 33;
+    return h;
+}
+
+// FM4 Recomp: the ring bytes a texture bind reserves before its draw (FM4_TEXTURE_REUSE). A bind whose existing image was loaded
+// from guest bytes with the same hash reuses it and uploads nothing, so it reserves nothing; every other bind (reuse off, a new or
+// never-hashed image, an unreadable range or changed bytes) reserves its full staging plus alignment padding. The bind then decides
+// from this same hash, so it never uploads into space it did not reserve. Measured before: race swaps with ~20 MB uploaded flushed
+// the ring 29-33 times because every reused bind reserved its full staging.
+inline uint64_t ReservedStagingBytes(bool reuse, bool imageHashed, bool hashRead, uint64_t hash, uint64_t imageHash, uint64_t fullBytes)
+{
+    return reuse && imageHashed && hashRead && hash == imageHash ? 0 : fullBytes;
+}
 
 // Ranges a recorded resolve writes, pending until their submission is confirmed complete.
 class GuestWriteLog
@@ -75,6 +110,15 @@ public:
             }
         return false;
     }
+    // FM4 Recomp (FM4_RESOLVE_RESIDENT): as Overlaps, over every pending range but the last marked one.
+    bool OverlapsEarlier(uint32_t physical, uint32_t bytes) const
+    {
+        GuestRange hit;
+        GuestWriteLog earlier;
+        if (pending_.size() > 1)
+            earlier.pending_.assign(pending_.begin(), pending_.end() - 1);
+        return earlier.Overlaps(physical, bytes, hit);
+    }
     void Retired() { pending_.clear(); }
     uint64_t Marks() const { return marks_; }
 
@@ -86,17 +130,20 @@ private:
 // The formats the first screens sample: k_8 (2),
 // k_8_8_8_8_AS_16_16_16_16 (50), k_DXT1_AS_16_16_16_16 (51). texture_info.cpp also maps 6, 18 and 54 (the
 // same host formats as 50 / 51, and A2B10G10R10); each joins this list when a run first needs it.
-// 54 (k_2_10_10_10_AS_16_16_16_16): the HDR resolve's destination at 1BB71000, sampled from draw 27039 (the local capture draw_c2d1 (not distributed)).
-// 36 (k_32_FLOAT): a 32x32 float texture the HDR luminance pass samples (the local capture draw_loop1 (not distributed) draw 22725 tex 1).
-// 6 (k_8_8_8_8): a 16x16x16 3D lookup texture (the local capture draw_tex3d1 (not distributed) draw 33248 slot 7).
-// 23 (k_24_8_FLOAT): a 1280x720 depth texture at 1C421000 the intro race's first a0-relative PS samples (the local capture scenario6 (not distributed)
-// draw 452279 slot 1).
-// 53 (k_DXT4_5_AS_16_16_16_16): a 256x128 gamma DXT5 texture at 11946000 (the local capture scenario9 (not distributed) draw 459668 slot 0).
+// 54 (k_2_10_10_10_AS_16_16_16_16): the HDR resolve's destination at 1BB71000.
+// 36 (k_32_FLOAT): a 32x32 float texture the HDR luminance pass samples.
+// 6 (k_8_8_8_8): a 16x16x16 3D lookup texture.
+// 23 (k_24_8_FLOAT): a 1280x720 depth texture at 1C421000 the intro race's first a0-relative PS samples.
+// 53 (k_DXT4_5_AS_16_16_16_16): a 256x128 gamma DXT5 texture at 11946000.
+// 18 (k_DXT1): a 128x256 DXT1 with mips at 0DE6F000 (BC1 as its AS_16_16_16_16 twin 51).
+// 25 (k_16_16): a 512x512 signed texture at 1C1E3000, the k_16_16 resolve's destination.
+// 10 (k_8_8): the k_8_8 resolve's destination (an 8_8_8_8 source); admitted with that
+// resolve, not yet observed as a fetch.
 // 20 (k_DXT4_5): a 512x512 gamma DXT5 with 10 levels at 0A98E000, sampled by the dynamic-loop PS.
 constexpr bool ObservedFormat(uint32_t format)
 {
-    return format == 2 || format == 6 || format == 20 || format == 23 || format == 36 || format == 50 || format == 51 || format == 53 ||
-           format == 54;
+    return format == 2 || format == 6 || format == 10 || format == 18 || format == 20 || format == 23 || format == 25 || format == 36 || format == 49 ||
+           format == 50 || format == 51 || format == 53 || format == 54 || format == 59 || format == 19 || format == 52;
 }
 
 // VkComponentMapping {R, G, B, A}: what a view may use without imageViewFormatSwizzle (the portability
@@ -120,37 +167,70 @@ struct PreparedTexture
 struct TextureDeviceFeatures
 {
     bool textureCompressionBC = false, imageViewFormatSwizzle = false;
+    bool samplerAnisotropy = false;  // the device feature, enabled at vkCreateDevice when offered
+    float maxAnisotropy = 1.0f;      // VkPhysicalDeviceLimits::maxSamplerAnisotropy
 };
 
 class TextureUnitModel
 {
 public:
-    explicit TextureUnitModel(TextureValidity validity) : watch_(backend_), cache_(watch_), validity_(validity) {}
+    // FM4 Recomp: `backend` (FM4_WRITE_WATCH: texture_vk.cpp's mprotect backend) drives a second WriteWatch, the protecting one
+    // (ProtectingWatch: arming, the fault hook, the heaps' observers); the cache keeps its bookkeeping watch on the unprotected
+    // backend (with ReloadEveryBind its Loaded must not protect anything).
+    explicit TextureUnitModel(TextureValidity validity, WatchBackend* backend = nullptr) : watch_(backend_), cache_(watch_), validity_(validity)
+    {
+        if (backend != nullptr)
+            protecting_ = std::make_unique<WriteWatch>(*backend);
+    }
     TextureUnitModel(const TextureUnitModel&) = delete;
     TextureUnitModel& operator=(const TextureUnitModel&) = delete;
 
     // `fetch`: the draw's six fetch-constant words (TextureSlot::words); `shader`: the resolved filters and
     // the shader's dimension; `drawStateGamma`: TextureSlot::gamma (draw_record.h emits the shader define
     // from it; the binding must agree).
-    PreparedTexture Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device);
+    // `allowPending` (FM4_RESOLVE_RESIDENT): no refusal of a range a recorded resolve has not written back; the caller binds
+    // a host image that already holds the resolve's words (texture_vk.cpp) or refuses itself.
+    PreparedTexture Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
+                            bool allowPending = false);
     // After the copies are recorded (texture_cache.h rule 2).
     bool Loaded(TextureEntry& e, const LoadPlan& plan) { return cache_.Loaded(e, plan); }
 
     void MarkWritten(uint32_t physical, uint32_t bytes)
     {
         watch_.MarkWritten(physical, bytes);
+        if (protecting_)
+            protecting_->MarkWritten(physical, bytes);
         log_.Mark(physical, bytes);
     }
     bool Pending() const { return log_.Pending(); }
     void Retired() { log_.Retired(); }
+    // FM4 Recomp (FM4_RESOLVE_DEFER): whether a texture's guest ranges share a byte with a range a recorded resolve has not yet
+    // written back (the renderer flushes before the draw that binds it); false for a constant the cache cannot describe.
+    bool ReadsPending(const uint32_t fetch[6])
+    {
+        const TextureCache::Lookup lookup = cache_.Find(fetch);
+        if (lookup.entry == nullptr)
+            return false;
+        const TextureDescription& d = lookup.entry->description;
+        GuestRange hit;
+        return log_.Overlaps(d.base.physical, d.base.size, hit) || log_.Overlaps(d.mips.physical, d.mips.size, hit);
+    }
+    bool OverlapsPending(uint32_t physical, uint32_t bytes) const
+    {
+        GuestRange hit;
+        return log_.Overlaps(physical, bytes, hit);
+    }
+    bool OverlapsEarlierPending(uint32_t physical, uint32_t bytes) const { return log_.OverlapsEarlier(physical, bytes); }
 
     const TextureCache& Cache() const { return cache_; }
     const WriteWatch& Watch() const { return watch_; }
+    WriteWatch* ProtectingWatch() { return protecting_.get(); }  // FM4 Recomp (FM4_WRITE_WATCH); null without a backend
     const GuestWriteLog& Log() const { return log_; }
 
 private:
     UnprotectedWatchBackend backend_;
     WriteWatch watch_;
+    std::unique_ptr<WriteWatch> protecting_;  // FM4 Recomp (FM4_WRITE_WATCH)
     TextureCache cache_;
     GuestWriteLog log_;
     const TextureValidity validity_;
@@ -204,6 +284,7 @@ struct CopyRegion
     uint64_t bufferOffset = 0;
     uint32_t level = 0, width = 0, height = 0;  // texels (the host image level's extent)
     uint32_t depth = 1;                         // 3D: slices (imageExtent.depth); 1 for 2D
+    uint32_t layers = 1;                        // FM4 Recomp: cube 6 (the faces, consecutive in the buffer); else 1
 };
 std::vector<CopyRegion> CopyRegions(const TextureDescription& d, const LoadPlan& plan, uint64_t ringOffset);
 

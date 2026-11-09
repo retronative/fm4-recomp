@@ -24,6 +24,7 @@
 #include "kernel/ldi.h"
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
+#include "kernel/thread_cpu.h"
 #include "kernel/cp_trace.h"
 #include "kernel/loader.h"
 #include "kernel/critical_section.h"
@@ -36,6 +37,7 @@
 #include "kernel/objects.h"
 #include "kernel/threads.h"
 #include <atomic>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <chrono>
 #include <thread>
@@ -272,6 +274,40 @@ int main(int, char** argv)
            !IsCodeAddress(0x1100, 0x1000, 0x100) && !IsCodeAddress(0xFFC, 0x1000, 0x100), "code address: inside, aligned");
     const uint8_t check[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
     Expect(Crc32(check, sizeof(check)) == 0xCBF43926u, "CRC-32 check value (123456789)");
+    // Longer and odd-length inputs (the 8-byte instruction steps and the byte tail): zlib.crc32 of bytes (3 i + 7) & 0xFF,
+    // i < 1003, is 5F6DC4CA, and of the same bytes from i = 1 (unaligned start), 4AEF0711 (Python 3.15 zlib).
+    {
+        std::vector<uint8_t> bytes(1003);
+        for (size_t i = 0; i < bytes.size(); i++)
+            bytes[i] = uint8_t(3 * i + 7);
+        Expect(Crc32(bytes.data(), bytes.size()) == 0x5F6DC4CAu && Crc32(bytes.data() + 1, bytes.size() - 1) == 0x4AEF0711u,
+               "CRC-32 of 1003 and 1002 bytes (unaligned): zlib.crc32's 5F6DC4CA and 4AEF0711");
+    }
+    // FM4_DIAG_THREAD_CPU (kernel/thread_cpu.h): roles by thread name, and a named thread's CPU time charged to its role. The
+    // thread spins 50 ms of CPU, then stays alive until measured (an exited thread's last part is not counted).
+    Expect(ThreadRole("fm4 guest 00012000") == 0 && ThreadRole("fm4 guest main") == 0 && ThreadRole("fm4 gpu cp") == 1 &&
+               ThreadRole("") == 2 && ThreadRole("fm4 gpu cpx") == 2 && ThreadRole("fm4 gues") == 2,
+           "thread roles: fm4 guest* guest, fm4 gpu cp the command processor, anything else other");
+    {
+        (void)ThreadCpuSince();
+        std::atomic<bool> spun{false}, release{false};
+        std::thread spinner([&] {
+            pthread_setname_np("fm4 guest test");
+            const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            volatile uint64_t n = 0;
+            while (std::chrono::steady_clock::now() < end)
+                n = n + 1;
+            spun = true;
+            while (!release)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+        while (!spun)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const ThreadCpu cpu = ThreadCpuSince();
+        release = true;
+        spinner.join();
+        Expect(cpu.guestThreads >= 1 && cpu.guestMs >= 20.0, "ThreadCpuSince: a named guest thread's 50 ms spin is charged to the guest role");
+    }
 
     uint8_t* base = ReserveGuestMemory();
     CommitGuestMemory(base, PPC_IMAGE_BASE, 0x1000);
@@ -744,6 +780,40 @@ int main(int, char** argv)
             const bool e2 = !input::ParseScript("10 A\n10 B\n", bad, error) && error == "line 2: vblank is not above the previous line's '10'";
             const bool e3 = !input::ParseScript("1 A\n\n3 FOO A\n", bad, error) && error == "line 3: unknown button 'FOO'";
             Expect(e1 && e2 && e3, "input script: errors name the line: non-numeric vblank, non-increasing vblank, unknown button");
+        }
+        {
+            // FM4 Recomp (M7 harness): "100 A / 200 B / @race / 0 RT / 50" — the race list counts from RaceStarted. Before it the
+            // first list applies (A at 150); after a race start at 1000, B (still active by vblank) is dropped: at 1000 RT (race 0),
+            // at 1049 RT, at 1050 released (race 1); event numbers continue after the first list (2, 3). A race list whose first
+            // event is later holds nothing until it (event 2 + 1 = 3, the "nothing yet" state). RaceStarted counts once; a script
+            // without @race ignores it. Errors: a second @race, words after it.
+            input::Script script;
+            std::string error;
+            const bool parsed = input::ParseScript("100 A\n200 B\n@race\n0 RT\n50\n", script, error) && script.hasRace && script.events.size() == 2 &&
+                                script.race.size() == 2 && script.race[0].rightTrigger == 0xFF && script.race[1].vblank == 50;
+            input::Poller poller(script);
+            const input::Report before = poller.Poll(150);
+            const bool first = poller.RaceStarted(1000), again = poller.RaceStarted(2000);
+            const input::Report r0 = poller.Poll(1000), r1 = poller.Poll(1049), r2 = poller.Poll(1050);
+            Expect(parsed && before.buttons == 0x1000 && first && !again && r0.rightTrigger == 0xFF && r0.buttons == 0 && r0.event == 2 &&
+                       r1.rightTrigger == 0xFF && r2.rightTrigger == 0 && r2.event == 3 && r2.packet == r0.packet + 1,
+                   "input script @race: the first list until RaceStarted, then the race list relative to it (RT at +0, released at +50)");
+            input::Script late;
+            input::ParseScript("100 A\n@race\n30 RT\n", late, error);
+            input::Poller waiting(late);
+            (void)waiting.Poll(150);
+            waiting.RaceStarted(1000);
+            const input::Report w0 = waiting.Poll(1010), w1 = waiting.Poll(1030);
+            input::Script plain;
+            input::ParseScript("100 A\n", plain, error);
+            input::Poller ignoring(plain);
+            input::Script bad;
+            const bool e1 = !input::ParseScript("@race\n@race\n", bad, error) && error.starts_with("line 2: a second @race");
+            const bool e2 = !input::ParseScript("@race 5\n", bad, error) && error.starts_with("line 1: a second @race");
+            Expect(w0.buttons == 0 && w0.rightTrigger == 0 && w0.event == 2 && w1.rightTrigger == 0xFF && w1.event == 1 && !ignoring.RaceStarted(5) &&
+                       ignoring.Poll(150).buttons == 0x1000 && e1 && e2,
+                   "CONTROL: nothing held before the race list's first event; RaceStarted without @race changes nothing; a second @race and words "
+                   "after it are errors");
         }
         {
             // The imports with a script, in a child (the parent never loads one). The vblank counter stays 0 here (no
@@ -1313,6 +1383,15 @@ int main(int, char** argv)
                 const XmaPassResult r6 = run(w6, st6);
                 Expect(r6.ok && r6.frames == 2 && seenBits[1] == secondLength && ReadBits(seen[1].data(), secondLength - 4, 4) == 0x5,
                        "a frame ending 4 bits past its packet: split, its last 4 bits (0101) taken from input 1");
+                // 11b. FM4 Recomp: the same with input 1's header offset 0x7FFF (no frame begins in that packet):
+                //      the 4 bits still complete the frame, and the padding after them ends the packet.
+                header(in1, 0, 0, 0x7FFF); putBits(in1, 32, 0x5, 4);
+                seen.clear(); silentFirst = 0;
+                auto w6b = words(1, true, 1, true, 8, 0, 0);
+                XmaContextState st6b;
+                const XmaPassResult r6b = run(w6b, st6b);
+                Expect(r6b.ok && r6b.frames == 2 && seenBits[1] == secondLength && ReadBits(seen[1].data(), secondLength - 4, 4) == 0x5,
+                       "input 1's header 0x7FFF (no frame begins there): the split frame's last 4 bits still come from it");
             }
             {
                 // 13. Review findings: a new buffer that begins with bits of a frame never started; a
@@ -2784,6 +2863,17 @@ int main(int, char** argv)
     Expect(physicalOf(large) == 0x1C800000 && physicalOf(huge + 0x10) == 0x1B000010 && PhysicalToGuest(0x1C800000, viaPhysical) &&
            viaPhysical == large && PhysicalToGuest(0x1B000010, viaPhysical) && viaPhysical == huge + 0x10 && !PhysicalToGuest(0x100000, viaPhysical),
            "MmGetPhysicalAddress: the offset in the view; a physical address maps back through its view; a free frame does not");
+    // PhysicalRangeToGuest (M7): one view for every frame of the range, or false. small holds physical 0x1C7FD000-0x1C7FE7FF
+    // (E0000000, + 0x1000 both ways), large starts at 0x1C800000 (A0000000), huge 0x1B000000-0x1BFFFFFF (C0000000).
+    {
+        uint32_t at = 0, untouched = 0x12345678;
+        Expect(PhysicalRangeToGuest(0x1C7FD010, 0x17F0, at) && at == small + 0x10 && PhysicalRangeToGuest(0x1B000010, 0xFFFFF0, at) &&
+                   at == huge + 0x10 && PhysicalRangeToGuest(0x1C800000, 0x2000, at) && at == large,
+               "PhysicalRangeToGuest: a range inside one view maps like PhysicalToGuest of its start");
+        Expect(!PhysicalRangeToGuest(0x1BFFFFF0, 0x20, untouched) && !PhysicalRangeToGuest(0x1C7FE000, 0x2004, untouched) &&
+                   !PhysicalRangeToGuest(0x1C7FD000, 0, untouched) && !PhysicalRangeToGuest(0x1FFFFFFF, 2, untouched) && untouched == 0x12345678,
+               "CONTROL: a range past its view (into another or a free frame), an empty range and one past physical memory are refused");
+    }
     base[small] = 3;
     Expect(ExitCodeOf([&] { (void)*(volatile uint8_t*)(base + 0xA0000000u + 0x1C7FD000); }) == int(StopCode::GuestFault) &&
            ExitCodeOf([&] { (void)*(volatile uint8_t*)(base + 0xC0000000u + 0x1C7FD000); }) == int(StopCode::GuestFault),
@@ -2796,6 +2886,59 @@ int main(int, char** argv)
            PhysicalHeap(64 * 1024)->AllocFixed(0xBB000000u, 0x10000, mem::kReserve | mem::kCommit, page::kReadWrite) &&
            PhysicalHeap(64 * 1024)->Release(0xBB000000u, nullptr),
            "a released view's physical frames can be taken by the other view");
+    // FM4 Recomp (FM4_WRITE_WATCH): virtual_memory.h's watch side on the real mappings. 0xBB000000 is the A0000000 view at physical
+    // 0x1B000000 (64 KB = four 16 KB host pages); the C0000000 view maps the same memory at 0xDB000000.
+    {
+        static std::vector<std::pair<uint32_t, uint32_t>> changed, hostWrites;
+        changed.clear(), hostWrites.clear();
+        SetWatchObservers([](uint32_t p, uint32_t n) { changed.push_back({p, n}); }, [](uint32_t p, uint32_t n) { hostWrites.push_back({p, n}); });
+        Heap* a = PhysicalHeap(64 * 1024);
+        Expect(WatchAvailable() && a->AllocFixed(0xBB000000u, 0x10000, mem::kReserve | mem::kCommit, page::kReadWrite) &&
+                   PhysicalHostWritable(0x1B000000u) && PhysicalHostWritable(0x1B00C000u) && !PhysicalHostWritable(0x1B010000u),
+               "watch: 16 KB host pages; a committed read-write A0000000 block is meant writable host page by host page, the next page not");
+        Expect(changed.size() == 4 && changed[0] == std::make_pair(0x1B000000u, 16384u) && changed[3] == std::make_pair(0x1B00C000u, 16384u),
+               "watch: the commit told the observer about each of its four host pages");
+        Expect(!WatchProtect(0x1B010000u, 16384) && !WatchProtect(0x00100000u, 16384) && !WatchProtect(0x1B000100u, 16384),
+               "CONTROL: an uncommitted page, a frame no shared view owns, and an unaligned start are refused");
+        // In a child: protected through both views; a store through the C0000000 view faults, the hook (the renderer's rule: the heap
+        // means the page writable, so the fault is the watch's) makes it writable in both views, and the next store through the A0000000
+        // view does not fault.
+        static std::atomic<int> watchHookCalls{0};
+        const int watchChild = ExitCodeOf([&] {
+                   base[0xBB000000u + 4] = 0x11;
+                   if (!WatchProtect(0x1B000000u, 16384))
+                       _exit(2);
+                   SetGuestWriteFaultHook([](uint32_t guest) {
+                       if (guest < 0xA0000000u || guest >= 0xE0000000u || !PhysicalHostWritable(guest & 0x1FFFFFFFu))
+                           return false;
+                       watchHookCalls++;
+                       return WatchUnprotect((guest & 0x1FFFFFFFu) & ~0x3FFFu, 0x4000);
+                   });
+                   *(volatile uint8_t*)(base + 0xDB000000u + 5) = 0x22;
+                   *(volatile uint8_t*)(base + 0xBB000000u + 6) = 0x33;
+                   // (A forked child's views are private copies, guest_memory.cpp MapPhysicalMemory, so each store is read back through
+                   // its own view here; the views alias in the run.)
+                   _exit(base[0xBB000000u + 4] == 0x11 && base[0xDB000000u + 5] == 0x22 && base[0xBB000000u + 6] == 0x33 && watchHookCalls == 1 ? 0 : 1);
+               });
+        Expect(watchChild == 0, "watch: a store through the C0000000 view faults once; the page is then writable in both views (the A0000000 store does not fault)");
+        Expect(ExitCodeOf([&] {
+                   SetGuestWriteFaultHook([](uint32_t guest) {
+                       return guest >= 0xA0000000u && guest < 0xE0000000u && PhysicalHostWritable(guest & 0x1FFFFFFFu) &&
+                              WatchUnprotect((guest & 0x1FFFFFFFu) & ~0x3FFFu, 0x4000);
+                   });
+                   *(volatile uint8_t*)(base + 0xBB010000u) = 1;
+               }) == int(StopCode::GuestFault),
+               "CONTROL: a store past the block (not meant writable) is declined by the same rule and still stops (5)");
+        BeforeHostWrite(base + 0xBB000000u + 100, 5000);
+        BeforeHostWrite(base + 0x40000000u, 100);
+        Expect(hostWrites.size() == 1 && hostWrites[0] == std::make_pair(0x1B000064u, 5000u),
+               "watch: a host write into the A0000000 view reaches the observer as physical 0x1B000064 + 5000; one into a virtual heap does not");
+        changed.clear();
+        Expect(a->Decommit(0xBB000000u, 0x10000) && !PhysicalHostWritable(0x1B000000u) && !changed.empty(),
+               "watch: a decommit tells the observer and the pages are no longer meant writable");
+        Expect(a->Release(0xBB000000u, nullptr), "watch: the block released");
+        SetWatchObservers(nullptr, nullptr);
+    }
     {
         const uint32_t block = physical(0, 0x10000, mem::kLargePages | page::kReadWrite, 0, 0xFFFFFFFF, 0);
         PPCContext c{};
@@ -3325,7 +3468,7 @@ int main(int, char** argv)
             // XGI (app 0xFB, Xenia apps/xgi_app.cc:34-56): XGIUserSetContextEx 000B0006 {user, 0, 0, 0, context id, value} (24
             // bytes) and XGIUserSetPropertyEx 000B0007 {user, ..., id +16, size +20, value* +24}: 0; with an XOVERLAPPED
             // (Xenia xam_msg.cc:62-65): ERROR_IO_PENDING, completed {0, 0} (CompleteOverlappedImmediate), last error 0. User 4
-            // or a 20-byte context record stops (7); another XGI message (000B0008, achievements) still stops (7).
+            // or a 20-byte context record stops (7); another XGI message (000B0009) still stops (7).
             const uint32_t rec = ArenaAlloc(base, 32), val = ArenaAlloc(base, 8), xov = ArenaAlloc(base, 0x1C);
             auto xgi = [&](uint32_t message, uint32_t user, uint32_t length, uint32_t overlapped) {
                 std::memset(base + rec, 0, 32);
@@ -3343,9 +3486,28 @@ int main(int, char** argv)
             const bool pending = xgi(0x000B0006, 1, 24, xov) == 0x3E5 && be32(xov) == 0 && be32(xov + 0x18) == 0 && be32(xov + 4) == 0;
             Expect(context && property && pending && ExitCodeOf([&] { (void)xgi(0x000B0006, 4, 24, 0); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { (void)xgi(0x000B0006, 0, 20, 0); }) == int(StopCode::Unimplemented) &&
-                       ExitCodeOf([&] { (void)xgi(0x000B0008, 0, 8, 0); }) == int(StopCode::Unimplemented),
+                       ExitCodeOf([&] { (void)xgi(0x000B0009, 0, 8, 0); }) == int(StopCode::Unimplemented),
                    "XGI SetContextEx / SetPropertyEx: kept, 0; with an XOVERLAPPED IO_PENDING completed {0, 0}; user 4, a 20-byte "
-                   "record or achievements (000B0008) stop (7)");
+                   "record or another XGI message (000B0009) stop (7)");
+            // FM4 Recomp: XGIUserWriteAchievements 000B0008 {count, X_XUSER_ACHIEVEMENT* {user, id}} (Xenia apps/xgi_app.cc:57-71):
+            // 0; with an XOVERLAPPED ERROR_IO_PENDING completed {0, 0}; a user index 4 or a 12-byte record
+            // stops (7).
+            auto achievements = [&](uint32_t user, uint32_t length, uint32_t overlapped) {
+                const uint32_t list = ArenaAlloc(base, 16), req = ArenaAlloc(base, 8);
+                Store32(base, list, user), Store32(base, list + 4, 7), Store32(base, list + 8, 0), Store32(base, list + 12, 9);
+                Store32(base, req, 2), Store32(base, req + 4, list);
+                std::memset(base + xov, 0xAA, 0x1C), std::memset(base + xov + 0x08, 0, 0x10);
+                PPCContext c{};
+                c.r13.u64 = t.pcr;
+                c.r3.u32 = 0xFB, c.r4.u32 = 0x000B0008, c.r5.u32 = overlapped, c.r6.u32 = req, c.r7.u32 = length;
+                imp("XMsgStartIORequest")(c, base);
+                return c.r3.u32;
+            };
+            Expect(achievements(0, 8, 0) == 0 && achievements(0, 8, xov) == 0x3E5 && be32(xov) == 0 && be32(xov + 4) == 0 &&
+                       ExitCodeOf([&] { (void)achievements(4, 8, 0); }) == int(StopCode::Unimplemented) &&
+                       ExitCodeOf([&] { (void)achievements(0, 12, 0); }) == int(StopCode::Unimplemented),
+                   "XGIUserWriteAchievements: 0 (logged, kept for the run); with an XOVERLAPPED IO_PENDING completed {0, 0}; user 4 or "
+                   "a 12-byte record stops (7)");
         }
         {
             // Runtime-local UDP sockets, no link (offline-sockets compatibility policy). Expected values from
@@ -4108,6 +4270,202 @@ int main(int, char** argv)
                    be32(page + 0x608) == 0x00000001 &&
                    ExitCodeOf([&] { CpState c; Execute(base, page + 0x5D0, 3, 0, 3, c); }) == int(StopCode::Unimplemented),
                "PM4 EVENT_WRITE_EXT: whole-surface extents (Xenia's conservative answer), big-endian 16-bit; another endian stops (7)");
+        // FM4 Recomp: EVENT_WRITE_ZPD (opcode 5B; Xenia :951-982, gpu_flags.cc:47-51): initiator 0x15 -> VGT_EVENT_
+        // INITIATOR; the 8-dword sample counts at RB_SAMPLE_COUNT_ADDR (+0x700). A finished query (0xFFFFFEED big-endian in ZPass_A and
+        // ZPass_B, words 4 and 5) is cleared, then Total_A and ZPass_A = 1000 little-endian: bytes E8 03 00 00 = big-endian 0xE8030000;
+        // a query begin (no marker) is only cleared (StencilFail 7 -> 0). Address 0 stops (7). Header C0005B00: 1 word.
+        put(0x700, {0x11, 0x22, 0, 0, 0xFFFFFEED, 0xFFFFFEED, 7, 7});
+        put(0x740, {0xC0005B00, 0x15});
+        WriteRegister(base, reg::kRbSampleCountAddr, phys + 0x700);
+        CpState zpd;
+        if (mapped)
+            Execute(base, page + 0x740, 2, 0, 2, zpd);
+        Expect(ReadRegister(base, reg::kVgtEventInitiator) == 0x15 && be32(page + 0x700) == 0xE8030000u && be32(page + 0x704) == 0 &&
+                   be32(page + 0x710) == 0xE8030000u && be32(page + 0x714) == 0 && be32(page + 0x718) == 0 && be32(page + 0x71C) == 0,
+               "PM4 EVENT_WRITE_ZPD: a finished occlusion query reports Xenia's 1000 samples (Total_A, ZPass_A little-endian), the rest 0");
+        put(0x700, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 7, 7});
+        if (mapped)
+            Execute(base, page + 0x740, 2, 0, 2, zpd);
+        Expect(be32(page + 0x700) == 0 && be32(page + 0x710) == 0 && be32(page + 0x718) == 0, "PM4 EVENT_WRITE_ZPD: a query begin is cleared, no count");
+        WriteRegister(base, reg::kRbSampleCountAddr, 0);
+        Expect(ExitCodeOf([&] { CpState c; Execute(base, page + 0x740, 2, 0, 2, c); }) == int(StopCode::Unimplemented),
+               "PM4 EVENT_WRITE_ZPD with RB_SAMPLE_COUNT_ADDR 0 stops (7)");
+        {
+            // FM4 Recomp: the renderer's sync hook (command_processor.h syncGuestWrites) runs before the packets that store to guest
+            // memory or wait on it (MEM_WRITE 3D, EVENT_WRITE_SHD 58, WAIT_REG_MEM 3C on memory), not before a plain EVENT_WRITE 46,
+            // which only sets VGT_EVENT_INITIATOR, nor before a WAIT_REG_MEM on a register (info bit 4 clear:
+            // it cannot observe guest memory). Headers: C0004600 (1 word), C0013D00 (2), C0025800 (3), C0043C00 (5). The memory wait
+            // polls phys + 8 (EVENT_WRITE_SHD stored BEEF there) for BEEF (info 0x13: memory, function 3 equal).
+            static std::vector<uint32_t> synced;
+            synced.clear();
+            static const RendererHooks counting{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); }, nullptr, nullptr, nullptr, nullptr};
+            put(0x780, {0xC0004600, 0x16, 0xC0013D00, phys | 2, 0x5A5A, 0xC0025800, 0x14, (phys + 8) | 2, 0xBEEF,
+                        0xC0043C00, 3, 0x2003, 7, 0xFFFFFFFF, 0, 0xC0043C00, 0x13, (phys + 8) | 2, 0xBEEF, 0xFFFFFFFF, 0, 0xC0004600, 0x17});
+            SetRendererHooks(&counting);
+            CpState hooked;
+            if (mapped)
+                Execute(base, page + 0x780, 23, 0, 23, hooked);
+            SetRendererHooks(nullptr);
+            Expect(synced == std::vector<uint32_t>{0x3D, 0x58, 0x3C} && ReadRegister(base, reg::kVgtEventInitiator) == 0x17 && be32(page) == 0x5A5A,
+                   "PM4 sync hook: before MEM_WRITE, EVENT_WRITE_SHD and a memory WAIT_REG_MEM; not before a register WAIT_REG_MEM nor "
+                   "either plain EVENT_WRITE (which still sets VGT_EVENT_INITIATOR)");
+        }
+        {
+            // FM4 Recomp (FM4_DEFER_FENCES): with a deferStore hook that accepts, MEM_WRITE 1111 then 2222 to phys and EVENT_WRITE_SHD
+            // BEEF to phys + 8 store nothing until ApplyDeferredStores, which applies them in packet order (phys ends 2222); no sync
+            // hook runs before these store-only packets. Control: a hook that declines (the renderer has no open work) stores at once.
+            static std::vector<uint32_t> synced;
+            synced.clear();
+            static bool accept = true;
+            static const RendererHooks deferring{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
+                                                 [](uint32_t) { return accept; }, nullptr, nullptr, nullptr};
+            put(0x7C0, {0xC0013D00, phys | 2, 0x1111, 0xC0013D00, phys | 2, 0x2222, 0xC0025800, 0x14, (phys + 8) | 2, 0xBEEF});
+            Store32(base, page, 0x0BAD0BAD), Store32(base, page + 8, 0x0BAD0BAD);
+            SetRendererHooks(&deferring);
+            CpState deferred;
+            if (mapped)
+                Execute(base, page + 0x7C0, 10, 0, 10, deferred);
+            const bool held = be32(page) == 0x0BAD0BAD && be32(page + 8) == 0x0BAD0BAD && DeferredStoresPending() && synced.empty();
+            ApplyDeferredStores();
+            Expect(mapped && held && be32(page) == 0x2222 && be32(page + 8) == 0xBEEF && !DeferredStoresPending(),
+                   "PM4 deferred stores: MEM_WRITE / EVENT_WRITE_SHD held until ApplyDeferredStores, then applied in packet order; no sync hook");
+            accept = false;
+            put(0x7C0, {0xC0013D00, phys | 2, 0x3333});
+            if (mapped)
+                Execute(base, page + 0x7C0, 3, 0, 3, deferred);
+            SetRendererHooks(nullptr);
+            Expect(be32(page) == 0x3333 && !DeferredStoresPending(), "CONTROL: a declining deferStore hook (no open work) stores at once");
+            // Self-wait: MEM_WRITE 7 to phys + 0x18 queued, then WAIT_REG_MEM on memory phys + 0x18 equal 7 (info 0x13) passes with
+            // no sync and the store still queued. Control: a memory wait on phys + 0x14 (no queued store; memory already 9) syncs.
+            synced.clear();
+            accept = true;
+            Store32(base, page + 0x14, 9), Store32(base, page + 0x18, 0);
+            put(0x7C0, {0xC0013D00, (phys + 0x18) | 2, 7, 0xC0043C00, 0x13, (phys + 0x18) | 2, 7, 0xFFFFFFFF, 0x10,
+                        0xC0043C00, 0x13, (phys + 0x14) | 2, 9, 0xFFFFFFFF, 0x10});
+            const uint64_t selfBefore = SelfWaits();
+            SetRendererHooks(&deferring);
+            if (mapped)
+                Execute(base, page + 0x7C0, 15, 0, 15, deferred);
+            SetRendererHooks(nullptr);
+            const bool selfWaited = SelfWaits() == selfBefore + 1 && be32(page + 0x18) == 0 && DeferredStoresPending() && synced == std::vector<uint32_t>{0x3C};
+            ApplyDeferredStores();
+            Expect(mapped && selfWaited && be32(page + 0x18) == 7,
+                   "PM4 self-wait: a memory WAIT_REG_MEM satisfied by a queued store passes without a sync; one with no queued store syncs (CONTROL)");
+            // With a pendingAt hook: a memory wait on phys + 0x14 (memory 9, nothing pending there) is satisfied at the first poll and
+            // passes without a sync; CONTROL: the same wait with pendingAt reporting the word pending syncs first.
+            static bool pendingHere = false;
+            static const RendererHooks polling{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
+                                               [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return pendingHere; }, nullptr};
+            put(0x7C0, {0xC0043C00, 0x13, (phys + 0x14) | 2, 9, 0xFFFFFFFF, 0x10});
+            synced.clear();
+            const uint64_t immediateBefore = ImmediateWaits();
+            SetRendererHooks(&polling);
+            if (mapped)
+                Execute(base, page + 0x7C0, 6, 0, 6, deferred);
+            const bool immediate = synced.empty() && ImmediateWaits() == immediateBefore + 1;
+            pendingHere = true;
+            const uint64_t syncedBefore = SyncedWaits();
+            if (mapped)
+                Execute(base, page + 0x7C0, 6, 0, 6, deferred);
+            SetRendererHooks(nullptr);
+            Expect(mapped && SyncedWaits() == syncedBefore + 1, "PM4 memory wait counters: a wait whose word is pending counts once as a synced wait");
+            Expect(mapped && immediate && synced == std::vector<uint32_t>{0x3C},
+                   "PM4 memory wait with nothing pending at its word: polled at once, no sync; with its word pending it syncs first (CONTROL)");
+            // INTERRUPT (C0005400, mask 0: no CPU bit, so nothing is raised in this process) with work open: queued behind the MEM_WRITE
+            // before it, no sync; ApplyDeferredStores lands the store. CONTROL: no open work and an empty queue: it syncs as before.
+            static bool open = true;
+            static const RendererHooks interrupting{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
+                                                    [](uint32_t) { return open; }, nullptr, nullptr, [] { return open; }};
+            Store32(base, page + 0x1C, 0);
+            put(0x7C0, {0xC0013D00, (phys + 0x1C) | 2, 0x77, 0xC0005400, 0});
+            synced.clear();
+            SetRendererHooks(&interrupting);
+            if (mapped)
+                Execute(base, page + 0x7C0, 5, 0, 5, deferred);
+            const bool queuedIrq = synced.empty() && DeferredStoresPending() && be32(page + 0x1C) == 0;
+            ApplyDeferredStores();
+            const bool landed = be32(page + 0x1C) == 0x77 && !DeferredStoresPending();
+            open = false;
+            put(0x7C0, {0xC0005400, 0});
+            if (mapped)
+                Execute(base, page + 0x7C0, 2, 0, 2, deferred);
+            SetRendererHooks(nullptr);
+            Expect(mapped && queuedIrq && landed && synced == std::vector<uint32_t>{0x54},
+                   "PM4 INTERRUPT with work open waits in the deferred queue behind the stores (no sync); with none open it syncs (CONTROL)");
+            // A deadlock seen in FM4: an INTERRUPT queued with work open, then a memory WAIT_REG_MEM for a word only the guest CPU
+            // clears after the interrupt (here 4 -> 0). The wait submits the open work first (ringIdle; the stub applies the queue and
+            // plays the CPU, clearing the word), so it is satisfied at once instead of stopping (7) after 10 s.
+            static uint8_t* idleBase = nullptr;
+            static uint32_t idleWord = 0;
+            static int idles = 0;
+            idleBase = base, idleWord = page + 0x20, idles = 0, open = true;
+            static const RendererHooks unblocking{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
+                                                  [](uint32_t) { return open; },
+                                                  [] { idles++; ApplyDeferredStores(); Store32(idleBase, idleWord, 0); },
+                                                  [](uint32_t, uint32_t) { return false; }, [] { return open; }};
+            Store32(base, page + 0x20, 4);
+            put(0x7C0, {0xC0005400, 0, 0xC0043C00, 0x13, (phys + 0x20) | 2, 0, 0xFFFFFFFF, 0x10});
+            SetRendererHooks(&unblocking);
+            const auto started = std::chrono::steady_clock::now();
+            if (mapped)
+                Execute(base, page + 0x7C0, 8, 0, 8, deferred);
+            SetRendererHooks(nullptr);
+            Expect(mapped && idles == 1 && !DeferredStoresPending() && be32(page + 0x20) == 0 &&
+                       std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+                   "PM4 wait after a queued INTERRUPT: the open work is submitted (stores and interrupts applied) before waiting, no deadlock");
+            // FM4_IMMEDIATE_INTERRUPTS (PM4: the CP raises INTERRUPT when it reaches it; X command_processor.cc INTERRUPT): with work
+            // open and nothing queued, raised at once (no queue, no sync). CONTROLS: a WAIT_UNTIL (type-0 to 0x5C8, value 0x20000)
+            // before it, or a MEM_WRITE queued before it, keeps it in the deferred queue.
+            SetImmediateInterrupts(true);
+            open = true;
+            synced.clear();
+            const uint64_t raisedBefore = ImmediateInterrupts();
+            put(0x7C0, {0xC0005400, 0});
+            SetRendererHooks(&interrupting);
+            if (mapped)
+                Execute(base, page + 0x7C0, 2, 0, 2, deferred);
+            const bool raisedNow = ImmediateInterrupts() == raisedBefore + 1 && !DeferredStoresPending() && synced.empty();
+            put(0x7C0, {0x000005C8, 0x20000, 0xC0005400, 0});
+            if (mapped)
+                Execute(base, page + 0x7C0, 4, 0, 4, deferred);
+            const bool idleQueued = DeferredStoresPending() && ImmediateInterrupts() == raisedBefore + 1;
+            ApplyDeferredStores();
+            put(0x7C0, {0xC0005400, 0});  // the WAIT_UNTIL counts only up to the next INTERRUPT
+            if (mapped)
+                Execute(base, page + 0x7C0, 2, 0, 2, deferred);
+            const bool idleReset = !DeferredStoresPending() && ImmediateInterrupts() == raisedBefore + 2;
+            put(0x7C0, {0xC0013D00, (phys + 0x1C) | 2, 0x78, 0xC0005400, 0});
+            if (mapped)
+                Execute(base, page + 0x7C0, 5, 0, 5, deferred);
+            const bool storeQueued = DeferredStoresPending() && ImmediateInterrupts() == raisedBefore + 2 && be32(page + 0x1C) == 0x77;
+            ApplyDeferredStores();
+            SetRendererHooks(nullptr);
+            Expect(mapped && raisedNow, "FM4_IMMEDIATE_INTERRUPTS: an INTERRUPT with work open and nothing queued is raised at once, no sync");
+            Expect(mapped && idleQueued && idleReset, "FM4_IMMEDIATE_INTERRUPTS: a WAIT_UNTIL before it defers it (CONTROL); the next one is immediate again");
+            Expect(mapped && storeQueued && be32(page + 0x1C) == 0x78, "FM4_IMMEDIATE_INTERRUPTS: a store queued before it defers it behind the store (CONTROL)");
+            // A memory wait on a word nothing pending writes, with no store queued (the interrupt handler's acknowledgement): it polls
+            // for the 2 ms grace before it syncs. The sync hook plays the CPU (clears the word), so the wait ends after exactly one
+            // sync, no earlier than the grace. CONTROL above: with its word pending it syncs at once.
+            static uint8_t* cpuBase = nullptr;
+            static uint32_t cpuWordAt = 0;
+            cpuBase = base, cpuWordAt = page + 0x24;
+            static const RendererHooks acknowledging{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); Store32(cpuBase, cpuWordAt, 0); },
+                                                     [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return false; }, [] { return true; }};
+            Store32(base, page + 0x24, 4);
+            synced.clear();
+            const uint64_t graceBefore = GraceSyncs(), memBefore = MemWaits();
+            put(0x7C0, {0xC0043C00, 0x13, (phys + 0x24) | 2, 0, 0xFFFFFFFF, 0x10});
+            SetRendererHooks(&acknowledging);
+            const auto graceStart = std::chrono::steady_clock::now();
+            if (mapped)
+                Execute(base, page + 0x7C0, 6, 0, 6, deferred);
+            const auto graceTook = std::chrono::steady_clock::now() - graceStart;
+            SetRendererHooks(nullptr);
+            SetImmediateInterrupts(false);
+            Expect(mapped && synced == std::vector<uint32_t>{0x3C} && GraceSyncs() == graceBefore + 1 && MemWaits() == memBefore + 1 &&
+                       graceTook >= std::chrono::milliseconds(2) && be32(page + 0x24) == 0,
+                   "FM4_IMMEDIATE_INTERRUPTS: a wait on a CPU-written word polls for the 2 ms grace, then syncs once");
+        }
         // A ring of 4 words read from word 3 with wraparound: a type-0 header at word 3, its values at words 0 and 1.
         put(0x300, {0x22, 0x33, 0, 0x00012004});
         CpState ring;

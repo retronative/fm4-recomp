@@ -37,6 +37,14 @@ constexpr NoWriteDraws kNoWriteDraws = NoWriteDraws::Skip;
 // needs it), colour 0 when the draw writes colour (DrawKind::Draw with a non-zero mask).
 KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, uint64_t vsVariant, uint64_t psVariant, PipelineKey& out);
 
+// FM4 Recomp: vkCmdSetDepthBias's constant and slope factors (clamp 0) for DrawState's polygon offset, as Xenia's host render
+// target path (draw_record.cpp DepthBiasFor).
+struct HostDepthBias
+{
+    float constant = 0, slope = 0;
+};
+HostDepthBias DepthBiasFor(const DrawState& d);
+
 // The host defines (shader_glsl.h) of each stage for this draw: XE_RECT_LIST for a rect list;
 // XE_TEXTURE_<slot>_GAMMA (TextureSlot::gamma: x y z sign 3, w 0), _SCALE for a non-zero exp_adjust,
 // _LOD_BIAS for a non-zero lod_bias (/ 32), for the stage(s) whose translation lists the slot;

@@ -280,6 +280,14 @@ void TestPointDraws()
     g[xr::kRbModeControl] = 4;
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::Draw && d.alphaTest.enabled && d.alphaTest.func == 4, "CONTROL-PAIR: mode 4 with the same RB_COLORCONTROL: alpha test GREATER");
+    // Alpha to mask, FM4's RB_COLORCONTROL AA000017 (bit 4 on, offsets 2 2 2 2): the offsets | 1 << 8
+    // = 0x1AA in mode 4 (X d3d12_command_processor.cc:3933-3935); in mode 5 (no pixel shader) none.
+    g[xr::kRbColorControl] = 0xAAu << 24 | 0x17;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.alphaToMask == 0x1AA && !d.alphaTest.enabled, "mode 4, RB_COLORCONTROL AA000017: alpha to mask 0x1AA, no alpha test (func 7)");
+    g[xr::kRbModeControl] = 5;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::DepthOnly && d.alphaToMask == 0, "mode 5 (kDepth) with AA000017: no alpha to mask");
     g[xr::kRbModeControl] = 5, g[xr::kRbColorControl] = 0;
     // Mode 6 is a resolve, handed off; modes 0-3 and 7 are refused.
     g[xr::kRbModeControl] = 6;
@@ -331,8 +339,19 @@ void TestRectClear()
     Expect(d.vertexSlots.size() == 1 && d.vertexSlots[0].valid && d.vertexSlots[0].physical == 0x1B400000 && d.vertexSlots[0].sizeWords == 12 &&
                d.vertexSlots[0].endian == 2 && d.vertexSlots[0].stride == 4 && d.vertexSlots[0].end == 4,
            "vertex slot 0 decoded");
-    Expect(VertexWindowDwords(d.vertexSlots[0], 2) == 12 && VertexWindowDwords(d.vertexSlots[0], 1) == 8 && VertexWindowDwords(d.vertexSlots[0], 5) == 12,
-           "vertex window: high 2 -> 12, high 1 -> 8, high 5 capped at the size");
+    // Past the constant's 12 words the window follows the indices (Xenia does not bound vertex fetch by the size:
+    // X spirv_shader_translator_fetch.cc:126-131): high 5 -> 5 * 4 + 4 = 24; FM4's draw, high 23 -> 23 * 4 + 4 = 96.
+    Expect(VertexWindowDwords(d.vertexSlots[0], 2) == 12 && VertexWindowDwords(d.vertexSlots[0], 1) == 8 && VertexWindowDwords(d.vertexSlots[0], 5) == 24 &&
+               VertexWindowDwords(d.vertexSlots[0], 23) == 96,
+           "vertex window: high 2 -> 12, high 1 -> 8, high 5 -> 24 and high 23 -> 96 past the size");
+    {
+        // FM4 Recomp: a computed-index slot holds at least the constant's 12 words: high 1 -> max(8, 12) = 12;
+        // high 5 -> max(24, 12) = 24.
+        VertexSlot computed = d.vertexSlots[0];
+        computed.computedIndex = true;
+        Expect(VertexWindowDwords(computed, 1) == 12 && VertexWindowDwords(computed, 5) == 24 && VertexWindowDwords(d.vertexSlots[0], 1) == 8,
+               "computed-index window: the whole constant (12) at high 1, 24 at high 5; the vertex-indexed one stays 8");
+    }
     Expect(d.aluConstants.size() == 2048 && d.aluConstants[0] == F(1.0f) && d.aluConstants[1024] == F(2.0f) && d.boolConstants[0] == 1 &&
                d.loopConstants[0] == 0x40,
            "ALU, bool and loop constants copied in register order");
@@ -378,12 +397,18 @@ void TestRectClear()
     CONTROL(Decode(g, vs, ps), "blend factor 2");
     g = RectClear(), g[xr::kRbBlendControl0] = 0x000100A1;  // op 5 (bits 5-7)
     CONTROL(Decode(g, vs, ps), "blend operation 5");
-    g = RectClear(), g[xr::kRbColorControl] = 0x10;
-    CONTROL(Decode(g, vs, ps), "alpha to mask");
+    g = RectClear(), g[xr::kRbColorControl] = 0x10;  // alpha to mask with offsets 0 0 0 0: accepted (0x100)
+    Expect(Decode(g, vs, ps).alphaToMask == 0x100, "alpha to mask, offsets 0: 0x100");
     g = RectClear(), g[xr::kPaSuScModeCntl] = 0x8;  // poly_mode 1
     CONTROL(Decode(g, vs, ps), "polygon mode");
-    g = RectClear(), g[xr::kPaSuScModeCntl] = 0x800;  // poly_offset_front_enable
-    CONTROL(Decode(g, vs, ps), "polygon offset");
+    // Polygon offset (X draw_util.cc:86-114). A rect list is not polygonal (X draw_util.h:56-74): front_enable does nothing there,
+    // para_enable takes the front pair.
+    g = RectClear(), g[xr::kPaSuScModeCntl] = 0x800, g[xr::kPaSuPolyOffsetFrontScale] = F(2.0f), g[xr::kPaSuPolyOffsetFrontScale + 1] = F(4.0f);
+    d = Decode(g, vs, ps);
+    Expect(d.kind != DrawKind::Refused && d.polyOffsetScale == 0 && d.polyOffsetOffset == 0, "rect list, front_enable: no offset (not polygonal)");
+    g[xr::kPaSuScModeCntl] = 0x2000;  // poly_offset_para_enable
+    d = Decode(g, vs, ps);
+    Expect(d.polyOffsetScale == 2.0f && d.polyOffsetOffset == 4.0f, "rect list, para_enable: the front pair 2 / 4");
     g = RectClear(), g[xr::kPaSuScModeCntl] = 0x100000;  // persp_corr_dis
     CONTROL(Decode(g, vs, ps), "perspective correction");
     g = RectClear(), g[xr::kPaClClipCntl] = 0x00090001;  // ucp_ena_0
@@ -400,8 +425,11 @@ void TestRectClear()
     Expect(Decode(g, vs, ps).systemFlags == 0, "vte 0000003F: xe_flags 0");
     g = RectClear(), g[xr::kPaClVteCntl] = 0x200;
     Expect(Decode(g, vs, ps).systemFlags == 2, "vte 00000200: xe_flags 2 (z only)");
-    g = RectClear(), g[xr::kSqProgramCntl] = 1u << 18;  // param_gen
-    CONTROL(Decode(g, vs, ps), "param_gen");
+    // FM4 Recomp: param_gen (FM4's SQ_PROGRAM_CNTL 10650D0F) is decoded with SQ_CONTEXT_MISC's position
+    // (bits 8-15) for the pixel shader variant (draw_record.cpp XE_PARAM_GEN).
+    g = RectClear(), g[xr::kSqProgramCntl] = 1u << 18, g[xr::kSqContextMisc] = 3u << 8;
+    d = Decode(g, vs, ps);
+    Expect(d.kind != DrawKind::Refused && d.program.paramGen && d.program.paramGenPos == 3, "param_gen at interpolator 3: decoded");
     g = RectClear(), g[xr::kSqProgramCntl] = 4u << 24;  // vs_export_mode 4 (position 2 vectors, kill)
     CONTROL(Decode(g, vs, ps), "vertex export mode 4");
     g = RectClear(), g[xr::kSqProgramCntl] = 1u << 31;  // gen_index_vtx
@@ -416,7 +444,10 @@ void TestRectClear()
     g = RectClear(), g[xr::kSqVsConst] = 1;
     CONTROL(Decode(g, vs, ps), "SQ_VS_CONST");
     g = RectClear();
-    CONTROL(Decode(g, Vs({0}, {4}, {4}, 1), Ps(2)), "the pixel shader reads 2 interpolators");
+    // FM4 Recomp: a pixel shader reading more interpolators than the vertex shader exports is accepted (the others read 0,
+    // draw_record.cpp XE_PS_INTERPOLATORS); more than 16 is refused.
+    Expect(Decode(g, Vs({0}, {4}, {4}, 1), Ps(2)).kind == DrawKind::Draw, "a pixel shader reading 2 interpolators of a vertex shader exporting 1");
+    CONTROL(Decode(g, Vs({0}, {4}, {4}, 1), Ps(17)), "the pixel shader reads 17 interpolators");
     g = RectClear(), g[xr::kPaScVizQuery] = 1;
     CONTROL(Decode(g, vs, ps), "PA_SC_VIZ_QUERY");
     g = RectClear(), g[xr::kVgtOutputPathCntl] = 1;
@@ -427,6 +458,10 @@ void TestRectClear()
     CONTROL(Decode(g, vs, ps), "0 indices");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030085;  // triangle fan
     CONTROL(Decode(g, vs, ps), "triangle fan");
+    // FM4 Recomp: a line list (2), auto index (2 << 6), 4 indices: drawn as a host line list.
+    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00040082;
+    d = Decode(g, vs, ps);
+    Expect(d.kind != DrawKind::Refused && d.primitiveType == 2 && d.hostPrimitive == HostPrimitive::LineList, "line list (2): a host line list");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030090;  // type 0x10
     CONTROL(Decode(g, vs, ps), "primitive type 16");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030188;  // major mode 1
@@ -621,12 +656,21 @@ void TestTextured()
 
     // Texture controls (each on slot 1 unless named).
     auto word = [](File& h, uint32_t slot, uint32_t i) -> uint32_t& { return h[xr::kFetchConstants + 6 * slot + i]; };
-    g = Textured(), word(g, 1, 0) = 0x02004800;  // type 0
-    CONTROL(Decode(g, vs, ps), "type 0 is not a texture");
+    // A type-0 (invalid texture) constant observed in FM4 (810200A8 ...: signs 2220, DXT1): Xenia binds its
+    // zero null image (X texture_cache.cc:857-889), signs unsigned, nothing else read: a null slot, no conversions, the draw kept.
+    g = Textured(), word(g, 1, 0) = 0x02004800 | (2u << 2) | (2u << 4) | (2u << 6), word(g, 1, 1) = 0;  // type 0, format 0 (unmodelled)
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].null && !d.textureSlots[0].gamma && d.textureSlots[0].biasedMask == 0 &&
+               d.textureSlots[0].sign[0] == 0 && d.textureSlots[0].expAdjust == 0,
+           "type 0: a null slot (zero texture, unsigned, no conversions), even with signs 2220 and format 0");
+    g = Textured();
+    Expect(!Decode(g, vs, ps).textureSlots[0].null, "CONTROL-PAIR: a type-2 constant is not null");
     g = Textured(), word(g, 1, 1) = 0x00000086;  // base 0
     CONTROL(Decode(g, vs, ps), "base address 0");
-    g = Textured(), word(g, 1, 1) = 0x1B600093;  // format 19 (DXT2_3; 20 and 53, DXT4_5, are modelled)
-    CONTROL(Decode(g, vs, ps), "texture format 19");
+    g = Textured(), word(g, 1, 1) = 0x1B600084;  // format 4 (5_6_5; FM4 Recomp: DXT2_3, 19, is modelled)
+    CONTROL(Decode(g, vs, ps), "texture format 4");
+    g = Textured(), word(g, 1, 1) = 0x1B60004A;  // format 10 (k_8_8, the k_8_8 resolve's destination), endian 1
+    Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "texture format 10 (k_8_8) is modelled");
     g = Textured(), word(g, 1, 5) = 0x400;  // dimension 2 (3D) while the shader fetches 2D
     CONTROL(Decode(g, vs, ps), "the shader fetches dimension 1");
     g = Textured(), word(g, 1, 1) = 0x1B600486;  // stacked
@@ -637,8 +681,45 @@ void TestTextured()
     CONTROL(Decode(g, vs, ps), "border colour 2");
     g = Textured(), word(g, 1, 0) = 0x02005802, word(g, 1, 5) = 0x201;  // border white: accepted
     Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "clamp to a white border is accepted");
-    g = Textured(), word(g, 1, 3) = 0x01280D10 | (1u << 25);  // aniso 1
-    CONTROL(Decode(g, vs, ps), "anisotropic");
+    // Anisotropy (X xenos.h:140-148; X vulkan_texture_cache.cc:671-674: the instruction's unless 7, then the constant's).
+    g = Textured(), word(g, 1, 3) = 0x01280D10 | (3u << 25);  // aniso 3 (4:1); the instruction says 7
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].anisoFilter == 3, "aniso 3 from the fetch constant");
+    {
+        ShaderTranslation vsPlain = Vs({0}, {5}, {5}, 2), psOff = Ps(2);
+        Sample(psOff, 1, 1, {3, 3, 3, 3, 3, 0});  // the instruction turns anisotropy off
+        d = Decode(g, vsPlain, psOff);
+        Expect(d.kind == DrawKind::Draw && d.textureSlots[0].anisoFilter == 0, "the instruction's aniso 0 wins over the constant's 3");
+    }
+    g = Textured(), word(g, 1, 3) = 0x01280D10 | (6u << 25);  // aniso 6: undefined
+    CONTROL(Decode(g, vs, ps), "anisotropic filter 6");
+    {
+        // FM4 Recomp: a 1D fetch of slot 1's 2D constant: accepted, sampled at (s, 0) as Xenia's
+        // shared 1D / 2D binding (X spirv_shader_translator_fetch.cc:2328-2332); a 1D fetch of a 3D constant stays refused.
+        ShaderTranslation vs1 = Vs({0}, {5}, {5}, 2), ps1 = Ps(2);
+        Sample(ps1, 1, 0);
+        File h = Textured();
+        Expect(Decode(h, vs1, ps1).kind == DrawKind::Draw, "a 1D fetch of a 2D constant: accepted");
+        ShaderTranslation vs2 = Vs({0}, {5}, {5}, 2);
+        Sample(vs2, 1, 1);  // the vertex shader fetches slot 1 as 2D, the pixel shader as 1D: one binding (Xenia's)
+        Expect(Decode(h, vs2, ps1).kind == DrawKind::Draw, "slot 1 fetched as 2D (VS) and 1D (PS): accepted");
+        word(h, 1, 5) = (word(h, 1, 5) & ~(3u << 9)) | (2u << 9);
+        CONTROL(Decode(h, vs1, ps1), "the shader fetches dimension 0");
+    }
+    // Polygon offset on a triangle list: front pair unless front faces are culled, then the back pair; FM4's
+    // PA_SU_SC_MODE_CNTL 00219802 (cull back, front and back enabled) with a zero front pair falls through to the back pair.
+    g = Textured(), g[xr::kPaSuScModeCntl] = 0x1800;
+    g[xr::kPaSuPolyOffsetFrontScale] = F(2.0f), g[xr::kPaSuPolyOffsetFrontScale + 1] = F(4.0f);
+    g[xr::kPaSuPolyOffsetFrontScale + 2] = F(3.0f), g[xr::kPaSuPolyOffsetFrontScale + 3] = F(5.0f);
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.polyOffsetScale == 2.0f && d.polyOffsetOffset == 4.0f, "triangles, front and back enabled: the front pair");
+    g[xr::kPaSuScModeCntl] = 0x1801;  // cull front
+    d = Decode(g, vs, ps);
+    Expect(d.polyOffsetScale == 3.0f && d.polyOffsetOffset == 5.0f, "triangles, front culled: the back pair");
+    g[xr::kPaSuScModeCntl] = 0x00219802 & ~(1u << 21), g[xr::kPaSuPolyOffsetFrontScale] = 0, g[xr::kPaSuPolyOffsetFrontScale + 1] = 0;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.polyOffsetScale == 0 && d.polyOffsetOffset == 0,
+           "scenario35's enables with back faces culled and a zero front pair: no offset (the back pair needs unculled back faces)");
     g = Textured(), word(g, 1, 3) = 0x01280D10 | (1u << 31);  // border_size
     CONTROL(Decode(g, vs, ps), "border_size");
     g = Textured(), word(g, 1, 3) = 0x00A80D10;  // mag 1, min 1, mip 1 (linear) ...
@@ -653,7 +734,27 @@ void TestTextured()
     CONTROL(Decode(g, vs, ps), "mip_min_level 2 above");
     g = Textured(), word(g, 1, 3) = 0x01280000 | (0x6 << 1);  // swizzle component 0 = 6
     CONTROL(Decode(g, vs, ps), "swizzle component 6");
-    g = Textured(), word(g, 1, 0) = 0x02004802 | (2u << 2);  // sign x biased
+    // Unsigned biased (sign 2; X spirv_shader_translator_fetch.cc:2167-2236): the mask is of result components, through the
+    // swizzle. Slot 1's swizzle 0x688 is X Y Z W: sign x biased -> bit 0; FM4's signs 2220 -> 0b0111.
+    g = Textured(), word(g, 1, 0) = 0x02004802 | (2u << 2);
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].biasedMask == 1, "sign x biased: result x biased (mask 1)");
+    g = Textured(), word(g, 1, 0) = 0x02004802 | (2u << 2) | (2u << 4) | (2u << 6);
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].biasedMask == 7, "signs 2220: result x y z biased (mask 7)");
+    g = Textured(), word(g, 1, 0) = 0x02004802 | (2u << 2), word(g, 1, 3) = 0x01280000 | (0x000 << 1);  // swizzle X X X X
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].biasedMask == 0xF, "sign x biased under swizzle X X X X: every result component (mask F)");
+    g = Textured(), word(g, 1, 0) = 0x02004802 | (1u << 2) | (2u << 4);  // x signed, y biased: not modelled
+    CONTROL(Decode(g, vs, ps), "component signs");
+    // Regression: an all-unsigned float texture (k_24_8_FLOAT, 23, number format 1) stays
+    // accepted; a biased float component is not modelled.
+    g = Textured(), word(g, 1, 1) = 0x1B600097, word(g, 1, 3) = 0x01000D11;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.textureSlots[0].format == 23 && d.textureSlots[0].biasedMask == 0, "unsigned k_24_8_FLOAT: accepted");
+    if (d.kind != DrawKind::Draw)
+        std::printf("  (%s)\n", d.error.c_str());
+    g = Textured(), word(g, 1, 1) = 0x1B600097, word(g, 1, 3) = 0x01000D11, word(g, 1, 0) = 0x02004802 | (2u << 2);
     CONTROL(Decode(g, vs, ps), "component signs");
     g = Textured(), word(g, 1, 0) = 0x02004802 | (3u << 2) | (3u << 4);  // gamma on x y only
     CONTROL(Decode(g, vs, ps), "component signs");

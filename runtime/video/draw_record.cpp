@@ -42,11 +42,11 @@ KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const Cac
     {
     case HostPrimitive::TriangleList: case HostPrimitive::RectList: case HostPrimitive::QuadList: k.topology = uint8_t(Topology::TriangleList); break;
     case HostPrimitive::TriangleStrip: k.topology = uint8_t(Topology::TriangleStrip); break;
+    case HostPrimitive::LineList: k.topology = uint8_t(Topology::LineList); break;
     case HostPrimitive::PointNoWrite: return Refuse("a point list that writes nothing has no pipeline");
     }
     k.primitiveRestart = uint8_t(d.indices.restart);  // a DMA-indexed strip with multi_prim_ib_ena (draw_state.h IndexBuffer::restart)
     k.cullFront = d.cullFront, k.cullBack = d.cullBack, k.frontClockwise = d.frontClockwise;  // every host primitive is polygonal
-    k.depthBias = 0;  // DrawState refuses the poly offset enables
     k.depthClamp = d.viewport.clipDisabled;
     if (d.target.samples != 1 && d.target.samples != 2 && d.target.samples != 4)
         return Refuse("RB_SURFACE_INFO: " + Num(d.target.samples) + " samples");
@@ -85,8 +85,21 @@ KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const Cac
     }
     if (!k.colorUsed && !k.depthUsed)
         return Refuse("a draw with neither a colour write nor a depth or stencil test has no attachment");
+    // FM4 Recomp: depth bias on with a depth attachment and a non-zero offset (X vulkan_pipeline_cache.cc:2083-2092 enables it with
+    // any depth attachment; the values are dynamic, HostDepthBias).
+    k.depthBias = uint8_t(k.depthUsed && (d.polyOffsetScale != 0 || d.polyOffsetOffset != 0));
     out = k;
     return Accept();
+}
+
+HostDepthBias DepthBiasFor(const DrawState& d)
+{
+    // X vulkan_command_processor.cc:3276-3297: the constant factor times 2^24 - 1 for kD24S8 (draw_util.h:180-181) or 2^24 for
+    // kD24FS8 (:212-213); the slope times 1/16 (xenos.h:448 kPolygonOffsetScaleSubpixelUnit; resolution scale 1).
+    HostDepthBias b;
+    b.constant = d.polyOffsetOffset * (d.target.depthFormat == 0 ? float((1u << 24) - 1) : float(1u << 24));
+    b.slope = d.polyOffsetScale * (1.0f / 16.0f);
+    return b;
 }
 
 KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, ShaderVariantDefines& vsDefines,
@@ -95,6 +108,10 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
     vsDefines = {}, psDefines = {};
     if (d.hostPrimitive == HostPrimitive::RectList)
         vsDefines.Add("XE_RECT_LIST");
+    // FM4 Recomp: the pixel shader reads interpolators the vertex shader does not export: they are declared and written as 0
+    // (shader_glsl.cpp XE_PS_INTERPOLATORS; Xenia zeroes unwritten interpolators).
+    if (ps.t.interpolatorCount > vs.t.interpolatorCount)
+        vsDefines.Add("XE_PS_INTERPOLATORS " + Num(ps.t.interpolatorCount));
     for (const TextureSlot& t : d.textureSlots)
     {
         const std::string name = "XE_TEXTURE_" + Num(t.slot);
@@ -104,6 +121,13 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
                 continue;
             if (t.gamma)
                 defines->Add(name + "_GAMMA");
+            if (t.biasedMask != 0)
+            {
+                std::string mask = "bvec4(";
+                for (uint32_t i = 0; i < 4; i++)
+                    mask += std::string((t.biasedMask >> i) & 1 ? "true" : "false") + (i < 3 ? ", " : ")");
+                defines->Add(name + "_BIASED " + mask);
+            }
             if (t.expAdjust != 0)
                 defines->Add(name + "_SCALE ldexp(1.0, " + std::to_string(t.expAdjust) + ")");
             if (t.lodBias != 0)
@@ -114,6 +138,20 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
     {
         psDefines.Add("XE_ALPHA_TEST " + Num(d.alphaTest.func));
         psDefines.Add("XE_ALPHA_REF " + FloatLiteral(d.alphaTest.ref));
+    }
+    // FM4 Recomp: PsParamGen (X shader_translator.cc:329-347: param_gen with param_gen_pos below the interpolator count; the
+    // register then holds the pixel parameters, spirv_shader_translator.cc:2016-2135). Positions 16 and up are never interpolators.
+    if (d.program.paramGen && d.program.paramGenPos < 16)
+    {
+        psDefines.Add("XE_PARAM_GEN " + Num(d.program.paramGenPos));
+        psDefines.Add(std::string("XE_PARAM_GEN_POLYGONAL ") + (PrimitivePolygonal(d.primitiveType) ? "1" : "0"));
+        if (d.hostPrimitive == HostPrimitive::LineList)
+            psDefines.Add("XE_PARAM_GEN_LINE 1");  // z's sign set: X spirv_shader_translator.cc:2107-2120
+    }
+    if (d.alphaToMask != 0)  // the offsets and the target's sample count (shader_glsl.cpp XE_ALPHA_TO_MASK)
+    {
+        psDefines.Add("XE_ALPHA_TO_MASK " + Num(d.alphaToMask & 0xFF) + "u");
+        psDefines.Add("XE_ALPHA_TO_MASK_SAMPLES " + Num(d.target.samples));
     }
     if (d.kind == DrawKind::Draw && d.colorWriteMask != 0)
     {
@@ -188,7 +226,7 @@ KeyResult BuildHostIndices(const DrawState& d, GuestIndexReader read, const void
         }
         out.vertexCount = count / 4 * 6;
         break;
-    case HostPrimitive::TriangleList: case HostPrimitive::TriangleStrip:
+    case HostPrimitive::TriangleList: case HostPrimitive::TriangleStrip: case HostPrimitive::LineList:
         if (identity)
         {
             out.kind = HostIndices::Kind::Direct;

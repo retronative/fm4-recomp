@@ -333,7 +333,12 @@ struct ResolveInfo
     int32_t destExpBias = 0;
     bool destSwap = false;      // red/blue exchange (copy_dest_swap)
     uint32_t destPitch = 0, destHeight = 0;  // texels (RB_COPY_DEST_PITCH)
-    uint32_t destBase = 0;      // physical address of the 32x32 tile holding (x0, y0): X draw_util.cc:1166-1178
+    // Bytes per destination texel, log2 (X draw_util.cc:1133 bpp_log2 from texture_info_formats.inl): 2 (32 bpp), or 1 for
+    // texture format 10 (k_8_8, 16 bpp, texture_info_formats.inl:11). A depth resolve: 2.
+    uint32_t destBytesLog2 = 2;
+    // Physical address of the base-granularity tile holding (x0, y0): X draw_util.cc:1134-1173 (32x32 texels at 32 bpp, 64x64
+    // at 16 bpp, xenos.h:1188-1195).
+    uint32_t destBase = 0;
     uint32_t destOffsetX = 0, destOffsetY = 0;  // (x0, y0) within that tile, pixels
     uint32_t destExtentStart = 0, destExtentLength = 0;  // the guest bytes the copy may write (for the write watch, unit 7)
     bool clearColor = false, clearDepth = false;

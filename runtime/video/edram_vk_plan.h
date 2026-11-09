@@ -61,9 +61,9 @@ enum class TransferKind
 // when the formats differ (a format-only reinterpretation through the 32-bit packing, X :3387-3700; not traced yet:
 // FM4's 7e3 scene shares base 0 with the 2_10_10_10 targets); depth 1x -> 4x of the same format.
 // Any bases (MapEdramTexel's tile offset; observed: the 1x kD24FS8 key at 720 -> the 4x
-// kD24FS8 key at 1024), any pitches (MapEdramTexel). Everything else is refused with its name: a key as its own
-// source, 2x MSAA, depth 4x -> 1x, a depth
-// format change or a colour -> depth change (edram::Ownership::Change already refuses those two).
+// kD24FS8 key at 1024), any pitches (MapEdramTexel). FM4 Recomp: depth -> depth between kD24FS8 and kD24S8 is Depth too,
+// the shader reinterpreting the guest bits (ConvertDepthFormat). Everything else is refused with its name: a key as its own
+// source, 2x MSAA, depth 4x -> 1x.
 // Depth -> colour (DepthToColor; observed: tiles 720-1023 of the 1x kD24FS8
 // key at base 720, which the front-buffer resolve's depth clear last claimed, move to the 4x 7e3 colour key at base
 // 0): accepted from a kD24FS8 or kD24S8 (observed: the 4x kD24S8 key 308000 into
@@ -71,6 +71,9 @@ enum class TransferKind
 // 16 -> 32 tiles a row; MapEdramTexel), any bases and any MSAA
 // pair MapTransferTexel implements (a multisampled source read per sample with sampler2DMS / usampler2DMS, X
 // :2307-2358, :3052-3080); 1x <-> 2x is refused by name as for colour.
+// Storage 4 (16_16) as source or destination of Color, DepthToColor and ColorToDepth, with the same rules, through its
+// R16G16_UINT transfer view (X :1628-1653, :3545-3576, :3692-3711; observed: the 1x kD24FS8 key
+// 6082D0 into the 4x 16_16 key 1106B40). Storage 14 (32_FLOAT) stays colour <-> colour only.
 TransferKind ClassifyTransfer(edram::Key source, edram::Key dest, std::string& why);
 
 // The guest's 32-bit depth/stencil word from the host's float depth and 8-bit stencil (X :3605-3617): kD24FS8 depth
@@ -93,6 +96,11 @@ uint32_t PackDepthStencilWord(float depth, uint32_t stencil, edram::DepthFormat 
 // 1.0 / 0xFFFFFF produces an incorrect result (for 0xC00000 ...)"), = UNorm24To32 (X xenos.h:432-438). Exact in float32
 // (an integer <= 2^24 times a power of two), so the D32_SFLOAT_S8_UINT stand-in holds it bit for bit.
 float ColorWordDepth(uint32_t word, edram::DepthFormat format = edram::DepthFormat::D24FS8);
+// FM4 Recomp: the depth a depth -> depth transfer between formats writes (X kDepthToDepth: the source depth packed to the
+// guest's 24 bits by its format, :3591-3604, then read by the destination's, :4100-4124): ColorWordDepth(PackDepthStencilWord(
+// depth, 0, from), to); the same format returns `depth` unchanged (X :3587-3590). kD24FS8 -> kD24S8 is exact against X;
+// kD24S8 -> kD24FS8 differs from X only below the 20e4 quantum (no host-depth owner, edram.cpp Ownership::Change).
+float ConvertDepthFormat(float depth, edram::DepthFormat from, edram::DepthFormat to);
 constexpr uint32_t ColorWordStencil(uint32_t word) { return word & 0xFF; }
 
 // The source texel of a destination sample (X vulkan_render_target_cache.cc:2597-2601 "First sample bit at 4x
@@ -129,6 +137,19 @@ SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, e
 uint32_t PackTransferColor(const float rgba[4], uint32_t storage);
 void UnpackTransferColor(uint32_t word, uint32_t storage, float rgba[4]);
 
+// The transfer view of a colour storage format whose transfers and clears move raw integers (X
+// vulkan_render_target_cache.cc:1628-1653 GetColorOwnershipTransferVulkanFormat: "Floating-point numbers have NaNs ... and
+// SNORM has two representations of -1"): storage 14 (32_FLOAT) -> R32_UINT, storage 4 (16_16) -> R16G16_UINT; the target is
+// created MUTABLE_FORMAT with that view (edram_vk.cpp). VK_FORMAT_UNDEFINED for the rest (they transfer as floats).
+VkFormat TransferViewFormat(edram::ColorFormat storage);
+// The 32-bit guest word of a texel read through a transfer view, and back (the GLSL XePackUint / XeUnpackUint in
+// edram_vk.cpp kTransferPacking are the same): storage 14 the R32_UINT texel itself (X :3579-3585, :3713-3726); storage 4
+// the R16G16_UINT halves, word = r | g << 16 (X :3567-3574 BitFieldInsert(r, g, 16, 16)) and r = word & 0xFFFF, g = word
+// >> 16 (X :3701-3711 BitFieldUExtract at 0 and 16, width 16); 4 -> 4 passes the halves through (X :3556-3566). The other
+// texel components are 0. 0 / {0, 0, 0, 0} for a storage without a transfer view.
+uint32_t PackTransferUint(const uint32_t texel[4], uint32_t storage);
+void UnpackTransferUint(uint32_t word, uint32_t storage, uint32_t texel[4]);
+
 // 7e3, the Xenos 10-bit unsigned float of colour formats 3 and 12 (X xenos.h:303 "7e3 [0, 32) RGB, unorm alpha"): bits
 // 7-9 the exponent e (bias 3), bits 0-6 the mantissa m; e > 0: 2^(e - 3) * (1 + m / 128), e == 0: m / 512. Range
 // [0, 31.875] (0x3FF); every value is exact in float16 and float32.
@@ -149,12 +170,12 @@ float Float7e3To32(uint32_t f10);
 
 // X vulkan_render_target_cache.cc:5366-5395: storage 0: byte j / 255; storage 2: 10-bit j / 1023, alpha bits 30-31 / 3;
 // storage 3: 7e3 j (Float7e3To32, the shader form: X :5388 calls the CPU xenos.cc form, whose mantissa shift is wrong,
-// see above), alpha bits 30-31 / 3. Every value is exact in R16G16B16A16_SFLOAT. FM4 Recomp: storage 4 (16_16): each signed
-// half s as s / 32767 into R16G16_SNORM, exact for s >= -32767; false for a half of 0x8000 (X clears the raw bits through
-// R16G16_UINT, :5393-5404). False for another storage format.
+// see above), alpha bits 30-31 / 3. Every value is exact in R16G16B16A16_SFLOAT. False for another storage format (4 and
+// 14 clear through DecodeColorClearUint).
 bool DecodeColorClear(uint32_t value, uint32_t storage, float rgba[4]);
-// Storage 14 (32_FLOAT) clears through its R32_UINT view with the raw word (X vulkan_render_target_cache.cc:5417-5421
-// "Using uint for proper denormal and NaN handling"); false for every other storage (they use DecodeColorClear).
+// The clears through a transfer view (TransferViewFormat): storage 14 (32_FLOAT) the raw word in uint32[0] (X
+// vulkan_render_target_cache.cc:5417-5421 "Using uint for proper denormal and NaN handling"); storage 4 (16_16) the raw
+// halves, uint32[j] = (value >> 16j) & 0xFFFF (X :5393-5404, so a 0x8000 half survives); false for every other storage.
 bool DecodeColorClearUint(uint32_t value, uint32_t storage, uint32_t rgba[4]);
 // X :5346-5363 without X's [0, 2) -> [0, 1) halving of 20e4 depth: unit 8's viewport does not halve (FoldViewport,
 // draw_state.h) and edram::PrepareResolve refuses a 20e4 clear above 1.0 instead.
@@ -198,12 +219,12 @@ bool ResolveConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, 
 // X takes its fast (bit-copy) shader only when there is no exponent bias, one sample is selected and the formats are
 // bitwise equivalent (draw_util.cc:1312-1318); everything else goes through the full shader: per sample unpack the
 // EDRAM word to float (resolve.xesli:273-321 XeResolveUnpack32bpp4Samples: 8_8_8_8 / 2_10_10_10 UNORM, 7e3 through
-// pixel_formats.xesli:328-349 XeUnpackR10G10B10A2Float), sum the selected samples (resolve.xesli:632-694: the first
+// pixel_formats.xesli:328-349 XeUnpackR10G10B10A2Float, 16_16 through :367-371 XeUnpackR16G16Edram), sum the selected samples (resolve.xesli:632-694: the first
 // sample XeResolveFirstSampleIndex :206-216; k01 / k23 add the next sample row (+80 ints: the guest sample with y + 1),
 // k0123 also the next sample column (+1 int) and its next row), multiply by dest_exp_bias_factor = 2^bias (:131-133)
 // halved once for k01 / k23 and twice for k0123 (:651, :670), swap red and blue (.bgra, :699-704), pack to the
 // destination format (pixel_formats.xesli:200-256 XePack32bpp4Pixels: :116-125 saturate, * 255 or 1023 / 3, + 0.5,
-// truncate), endian swap (resolve_full_32bpp.xesli:62-65), store at the tiled address (resolve.xesli:161-184).
+// truncate; k_16_16 :236-239 red and green * 65535), endian swap (resolve_full_32bpp.xesli:62-65), store at the tiled address (resolve.xesli:161-184).
 
 // FM4 Recomp's fast path (ResolveToGuest): a 1x source, sample k0, no bias, bitwise-equivalent formats.
 bool ResolveUsesFastPath(const edram::ResolveInfo& info, uint32_t sourceStorage);
@@ -216,8 +237,8 @@ uint32_t GuestSampleOfHost(edram::Msaa msaa, uint32_t host);
 
 // The sample dump's layout (edram_vk.cpp kResolveDump, then vkCmdCopyImageToBuffer, tightly packed): the rectangle's
 // `width` x `height` pixels, guest sample g of pixel (x, y) at word (y + height * (g >> 1)) * (width * columns) +
-// x + width * (g & 1); columns = 2 for 2x and 4x (else 1), rows = 2 for 4x (else 1). A 1x copy of a storage 0 / 2 host
-// image (whose words are the guest's) has the same layout.
+// x + width * (g & 1); columns = 2 for 2x and 4x (else 1), rows = 2 for 4x (else 1). A 1x copy of a storage 0 / 2 / 4 / 14 host
+// image (whose words are the guest's; storage 4: R16G16_SNORM's raw halves, R | G << 16 little-endian) has the same layout.
 struct DumpLayout
 {
     uint32_t width = 0, height = 0, samples = 1, columns = 1, rows = 1;
@@ -239,6 +260,9 @@ uint32_t DepthSelfCheckStencil(uint32_t x, uint32_t row);
 uint32_t DepthSelfCheckWord(uint32_t x, uint32_t row);  // the 1x pixel's word
 uint32_t DepthSelfCheckExpected4x(uint32_t x, uint32_t y, uint32_t guestSample);
 uint32_t DepthSelfCheckExpected2x(uint32_t x, uint32_t y, uint32_t guestSample);
+// FM4 Recomp: the 1x key's pixel after kD24FS8 -> kD24S8 (dumped as kD24S8) and after the way back (dumped as kD24FS8).
+uint32_t DepthSelfCheckExpectedS8(uint32_t x, uint32_t row);
+uint32_t DepthSelfCheckExpectedRoundTrip(uint32_t x, uint32_t row);
 
 // The guest samples the resolve reads and how they are summed (resolve.xesli:206-216, :632-694); false for a sample the
 // source does not have (DecodeResolve sanitizes, draw_util.cc:495-545). `count` 1, 2 or 4, `indices` in summation order.
@@ -247,9 +271,13 @@ bool ResolveSamples(const edram::ResolveInfo& info, uint32_t indices[4], uint32_
 // One destination word (before the endian swap) from the guest words of one pixel's samples, indexed by guest sample.
 uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* samplesByGuestIndex);
 
-// The checks of the full path that do not need the words: storage 0, 2 or 3; destination format 6, 7, 50, 54 (the 32bpp
-// formats DecodeResolve accepts; XePack32bpp4Pixels :205-220); the selected samples exist; a non-empty rectangle whose base
-// is its extent's start. Refusals name the copy's shape.
+// The checks of the full path that do not need the words: storage 0, 2, 3 or 14 into destination format 6, 7, 36, 50, 54,
+// storage 4 (16_16) into 25 (k_16_16) only (the 32bpp formats DecodeResolve accepts; XePack32bpp4Pixels :205-252); storage
+// 0, 2 or 3 into 10 (k_8_8, 16 bpp: XePack16bpp4PixelsInUInt2 :177-180, endian 0 or 8in16); the selected samples exist; a
+// non-empty rectangle whose base is its extent's start. Refusals name the copy's shape.
+// FM4 Recomp: a 16 bpp destination (info.destBytesLog2 1) is stored 2 bytes a texel: ResolveConvertPixel's low 16 bits,
+// XeEndianSwap16 (resolve_full_16bpp.xesli:61-63, texture_untile.h EndianSwap16Pair), at TiledOffset2D(destOffsetX + x,
+// destOffsetY + y, destPitch, 1).
 bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, std::string& why);
 // Every pixel of the rectangle from `words` (DumpLayoutFor(info.msaa, ...)) into `dest` as ResolveToGuest does; nothing
 // written on a refusal.

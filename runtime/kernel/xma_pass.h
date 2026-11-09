@@ -296,7 +296,11 @@ inline XmaPassResult XmaPass(uint32_t (&w)[16], XmaContextState& state, const Xm
             const uint32_t need = length - state.partialBits;
             if (need > packetEnd - position)
                 return fail("a frame spanning more than two packets is not implemented");
-            if (header.frameOffsetBits != need)
+            // FM4 Recomp: a first-frame offset past the payload (0x7FFF, seen in FM4's context 7) says no frame begins in
+            // this packet: the split frame's rest still opens it, and padding follows (Xenia copies the rest without checking the
+            // offset, xma_context.cc:482-519, its assert at :509-510 commented out; xma_helpers.h:27-36 "no data in this packet").
+            const bool noFrameBegins = header.frameOffsetBits > kXmaPacketBits - kXmaPacketHeaderBits;
+            if (header.frameOffsetBits != need && !noFrameBegins)
                 return fail("the packet header's previous-frame bits (" + std::to_string(header.frameOffsetBits) + ") differ from the rest of the split frame (" + std::to_string(need) + ")");
             AppendBits(state.partial, state.partialBits, in, position, need);
             frame = state.partial;

@@ -16,7 +16,10 @@ target_include_directories(fm4_ppc PUBLIC
 # Every indirect call goes through the runtime's checked lookup (recomp/indirect.h): a missing target
 # stops with its guest address instead of calling a null host pointer. Device accesses the translator marks
 # (eieio-ordered stores, lwbrx) go through the runtime too (recomp/mmio.h).
-target_compile_options(fm4_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
+# -fvisibility=hidden (FM4 Recomp, M7): the translated functions are weak (PPC_WEAK_FUNC); with default visibility the
+# executable exports them and every call between them goes through a dyld stub (a sampled race:
+# about 12% of the game thread in DYLD-STUB$$ entries). Hidden, they still resolve weak/strong at the static link, called directly.
+target_compile_options(fm4_ppc PRIVATE -O2 -fvisibility=hidden -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
   "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h" "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h")
 
 # Each module default.xex loads, as its own library from game/modules/<name>/ppc, with the same flags.
@@ -30,7 +33,7 @@ foreach(module IN LISTS FM4_MODULES)
   target_include_directories(${module}_ppc PRIVATE
     ${PROJECT_SOURCE_DIR}/game/modules/${module}/ppc
     ${PROJECT_SOURCE_DIR}/tools/XenonRecomp/thirdparty/simde)
-  target_compile_options(${module}_ppc PRIVATE -O2 -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
+  target_compile_options(${module}_ppc PRIVATE -O2 -fvisibility=hidden -fwrapv -fno-strict-aliasing -Werror -Werror=asm-operand-widths
     "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/indirect.h" "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/mmio.h"
     "SHELL:-include ${FM4_GENERATED}/${module}_symbols.h")
   add_dependencies(${module}_ppc fm4_generated)

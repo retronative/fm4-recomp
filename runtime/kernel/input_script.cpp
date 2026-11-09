@@ -3,6 +3,7 @@
 //
 // The scripted gamepad's parser and poller (input_script.h). Tested by tests/runtime/test_runtime.cpp.
 #include "input_script.h"
+#include <algorithm>
 #include <cstdio>
 
 namespace runtime::input {
@@ -55,7 +56,7 @@ bool Fail(std::string& error, unsigned line, const char* what, std::string_view 
 
 bool ParseScript(std::string_view text, Script& out, std::string& error)
 {
-    out.events.clear();
+    out.events.clear(), out.race.clear(), out.hasRace = false;
     error.clear();
     unsigned number = 0;
     while (!text.empty())
@@ -70,10 +71,18 @@ bool ParseScript(std::string_view text, Script& out, std::string& error)
         const std::string_view first = Token(line, at);
         if (first.empty())
             continue;
+        if (first == "@race")
+        {
+            if (out.hasRace || !Token(line, at).empty())
+                return Fail(error, number, "a second @race or words after it", first);
+            out.hasRace = true;
+            continue;
+        }
+        std::vector<Event>& list = out.hasRace ? out.race : out.events;
         Event event;
         if (!ParseVblank(first, event.vblank))
             return Fail(error, number, "the vblank must be a decimal number, not", first);
-        if (!out.events.empty() && event.vblank <= out.events.back().vblank)
+        if (!list.empty() && event.vblank <= list.back().vblank)
             return Fail(error, number, "vblank is not above the previous line's", first);
         for (std::string_view token = Token(line, at); !token.empty(); token = Token(line, at))
         {
@@ -89,7 +98,7 @@ bool ParseScript(std::string_view text, Script& out, std::string& error)
             else if (found->trigger == 2)
                 event.rightTrigger = 0xFF;
         }
-        out.events.push_back(event);
+        list.push_back(event);
     }
     return true;
 }
@@ -102,10 +111,24 @@ long ActiveEvent(const Script& script, uint64_t vblank)
     return active;
 }
 
+bool Poller::RaceStarted(uint64_t vblank)
+{
+    if (!script_.hasRace || raced_)
+        return false;
+    raced_ = true, raceStart_ = vblank;
+    return true;
+}
+
 Report Poller::Poll(uint64_t vblank)
 {
     Report report;
-    report.event = ActiveEvent(script_, vblank);
+    // FM4 Recomp: after the race start, the race list's events follow the first list's in numbering (events.size() + i); before
+    // its first event, events.size() + race.size() (nothing held), a state of its own.
+    long race = -1;
+    if (raced_)
+        for (size_t i = 0; i < script_.race.size() && script_.race[i].vblank <= vblank - std::min(vblank, raceStart_); i++)
+            race = long(i);
+    report.event = !raced_ ? ActiveEvent(script_, vblank) : long(script_.events.size()) + (race >= 0 ? race : long(script_.race.size()));
     // Xenia's SDL driver (sdl_input_driver.cc:190-198): one increment per poll that sees a change, whatever the
     // number of updates in between; a freshly connected pad has a change pending so its first poll reports 1 (:477).
     if (packet_ == 0 || report.event != event_)
@@ -114,9 +137,11 @@ Report Poller::Poll(uint64_t vblank)
         event_ = report.event;
     }
     report.packet = packet_;
+    if (raced_ && race < 0)
+        return report;
     if (report.event >= 0)
     {
-        const Event& e = script_.events[size_t(report.event)];
+        const Event& e = raced_ ? script_.race[size_t(race)] : script_.events[size_t(report.event)];
         report.buttons = e.buttons, report.leftTrigger = e.leftTrigger, report.rightTrigger = e.rightTrigger;
     }
     return report;

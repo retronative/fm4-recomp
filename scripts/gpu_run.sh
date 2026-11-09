@@ -242,3 +242,6 @@ for i in $(seq 1 "$RUNS"); do
   fi
 done
 echo "gpu_run: $RUNS run(s), no lock-up evidence"
+# The runs' performance baselines beside their logs (scripts/perf_baseline.py: one per bounded
+# run). Read-only on the logs; a failure is reported, never the run's result.
+/opt/homebrew/bin/python3 -B -I "$ROOT/scripts/perf_baseline.py" "$OUT" > "$OUT/perf_baseline.txt" 2>&1 || echo "gpu_run: perf baseline failed (see $OUT/perf_baseline.txt)" >&2

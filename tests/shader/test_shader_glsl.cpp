@@ -282,6 +282,33 @@ std::vector<uint32_t> ClearVs(VFetch full = {}, VFetch mini = {})
     Put(p, Alu{});
     return p;
 }
+// FM4 Recomp: a full fetch indexed by a value the shader computes (vs_2419997a1464c2fd slot 94 at r0.w):
+// cf0 exec(3, 3): 3: MAXv r1.x = r0.x (the index copied, so no longer r0.x), 4: the full fetch from r1.x (slot 0), 5: the mini fetch;
+// then ClearVs's exports. `fromR0` fetches from r0.x instead (the untouched vertex index: not computed).
+std::vector<uint32_t> ComputedIndexVs(bool fromR0)
+{
+    std::vector<uint32_t> p;
+    PackCf(p, ExecCf(3, 3, 0x14), AllocCf(2));
+    PackCf(p, ExecCf(6, 1, 0), AllocCf(1));
+    PackCf(p, ExecCf(7, 1, 0), ExecCf(8, 1, 0, true));
+    Alu copy;
+    copy.vdest = 1, copy.vmask = 0x1, copy.s1 = T(0, "xxxx"), copy.s2 = T(0, "xxxx"), copy.s3 = T(0);
+    Put(p, copy);
+    VFetch full;
+    full.src = fromR0 ? 0 : 1, full.dest = 1, full.slot = 0, full.format = 57, full.stride = 7, full.dswz = DSwz("xyz1");
+    Put(p, full);
+    VFetch mini;
+    mini.dest = 0, mini.format = 38, mini.offset = 3, mini.mini = true, mini.dswz = DSwz("xyzw");
+    Put(p, mini);
+    Alu e0;
+    e0.exp = true, e0.vdest = 0, e0.vmask = 0xF, e0.s1 = T(0), e0.s2 = T(0), e0.s3 = T(0);
+    Put(p, e0);
+    Alu e1 = e0;
+    e1.vdest = 62, e1.s1 = T(1), e1.s2 = T(1);
+    Put(p, e1);
+    Put(p, Alu{});
+    return p;
+}
 VFetch ClearFull()
 {
     VFetch f;
@@ -365,6 +392,37 @@ std::vector<uint32_t> TexturedPs(TFetch t = {}, bool abs = true)
         Alu a;
         a.sop = 40, a.exp = true, a.vdest = 0, a.smask = 1u << i;
         a.s1 = T(0), a.s2 = T(0), a.s3 = T(abs ? 0x80 : 0, comps[i]);
+        if (i == 2)
+            a.vmask = 0x8, a.s1 = T(0, "wwww"), a.s2 = T(0, "wwww");
+        Put(p, a);
+    }
+    return p;
+}
+
+// FM4 Recomp: a predicated setTextureLod (the disc census's two refused pixel shaders): cf0 exec(2, 1) PRED_SETEs a = r0.w; cf1
+// exec(3, 2) the (p0 == condition) setTextureLod r0.z and the register-LOD fetch; cf2 alloc colours; cf3 exec_end(5, 3) exports.
+std::vector<uint32_t> PredLodPs(bool condition, bool setFirst = true)
+{
+    std::vector<uint32_t> p;
+    PackCf(p, ExecCf(2, 1, 0), ExecCf(3, 2, 0x5));
+    PackCf(p, AllocCf(2), ExecCf(5, 3, 0, true));
+    Alu set;
+    set.sop = setFirst ? 27 : 5, set.sdest = 1, set.s1 = T(0), set.s2 = T(0), set.s3 = T(0, "wwww");
+    Put(p, set);
+    TFetch lod;
+    lod.srcSwz = 0x2, lod.pred = true;
+    Put(p, lod);
+    p[p.size() - 3] = (p[p.size() - 3] & ~31u) | 24u;
+    p[p.size() - 1] = (p[p.size() - 1] & ~(1u << 31)) | uint32_t(condition) << 31;  // word 2 bit 31: the predicate condition
+    TFetch t;
+    t.regLod = true;
+    Put(p, t);
+    const char* comps[3] = {"xxxx", "yyyy", "zzzz"};
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        Alu a;
+        a.sop = 40, a.exp = true, a.vdest = 0, a.smask = 1u << i;
+        a.s1 = T(0), a.s2 = T(0), a.s3 = T(0x80, comps[i]);
         if (i == 2)
             a.vmask = 0x8, a.s1 = T(0, "wwww"), a.s2 = T(0, "wwww");
         Put(p, a);
@@ -676,6 +734,7 @@ struct PredOptions
     Cf then = {}, otherwise = {};  // replace cf3 / cf4 when w1 is non-zero
     uint32_t thenSop = 5, thenScalarMask = 0x4;  // slot 9's scalar op and mask
     int elsePred = -1;                            // slot 11 predicated on this condition (0 / 1)
+    uint32_t firstPush = 0;  // FM4 Recomp: slot 6 as PRED_SET*_PUSHv (20-23) r3 = push(r1.xxxx, c0.xxxx) with firstSetMask, RETAIN_PREV
 };
 std::vector<uint32_t> PredVs(const PredOptions& o = {})
 {
@@ -690,11 +749,13 @@ std::vector<uint32_t> PredVs(const PredOptions& o = {})
     Put(p, m);
     Alu set;
     set.sop = o.firstSet, set.sdest = 3, set.smask = o.firstSetMask, set.s1 = T(0), set.s2 = T(0), set.s3 = T(1, "xxxx");
+    if (o.firstPush != 0)
+        set = {}, set.vop = o.firstPush, set.vdest = 3, set.vmask = o.firstSetMask, set.s1 = T(1, "xxxx"), set.s2 = C(0, "xxxx"), set.s3 = T(0);
     Put(p, set);
     Alu ge;
     ge.vop = 6, ge.vdest = 1, ge.vmask = 0x2, ge.s1 = T(1, "xxxx"), ge.s2 = C(0, "zzzz"), ge.s3 = T(0);
     Put(p, ge);
-    set.sop = o.secondSet, set.smask = 0, set.s3 = T(1, "yyyy");
+    set = {}, set.sop = o.secondSet, set.sdest = 3, set.s1 = T(0), set.s2 = T(0), set.s3 = T(1, "yyyy");
     Put(p, set);
     for (uint32_t c = 1; c <= 3; c++)
     {
@@ -763,7 +824,7 @@ void TestClearVs()
     // r0.x preloaded with the index; slot 0: base word xe_vertex_base[0][0], fetch word 1 of
     // slot 0 = xe_fetch[0].y (size and endian); dword = index * 7 + offset + component.
     CHECK(Has(g, "vec4 r0 = vec4(float(xe_index), 0.0, 0.0, 0.0);"));
-    CHECK(Has(g, "int xe_vidx0 = int(floor(r0.x));"));
+    CHECK(Has(g, "    int xe_vidx0 = 0;\n") && Has(g, "    xe_vidx0 = int(floor(r0.x));\n"));  // FM4 Recomp: declared at the top of main
     CHECK(Has(g, "uintBitsToFloat(xe_vertex_word(xe_vertex_base[0][0], xe_vidx0, 7u, 0, xe_fetch[0].y))"));
     CHECK(Has(g, "uintBitsToFloat(xe_vertex_word(xe_vertex_base[0][0], xe_vidx0, 7u, 2, xe_fetch[0].y)), 0.0)"));  // 3 components
     CHECK(Has(g, "r1.z = xe_fetch0.z;") && Has(g, "r1.w = 1.0;"));
@@ -848,6 +909,8 @@ void TestQuadsVs()
             furthest = std::max(furthest, uint32_t(std::stoul(g.substr(at + 14))) + 1);
         CHECK(t.vertexFetchStrides == std::vector<uint32_t>{4} && t.vertexFetchEnds == std::vector<uint32_t>{furthest} && furthest >= 4);
         CONTROL(t.vertexFetchEnds == std::vector<uint32_t>{furthest - 1});
+        // FM4 Recomp: indexed by the untouched vertex index (r0.x): not a computed index (the draw's indices bound it).
+        CHECK(t.vertexFetchComputedIndex == std::vector<uint8_t>{0});
     }
     // DOT2ADDv: src1.x * src2.x + src1.y * src2.y + src3.x on the swizzled operands.
     CHECK(Has(g, "precise vec4 xe_v0 = vec4(xe_dp2add(r1.zwww, xe_c[3].xyyy, xe_c[3].zzzz));") && Has(g, "r0.z = xe_v0.z;"));
@@ -918,10 +981,14 @@ void TestFetchFiltersOffsets()
     CHECK(Compiles(t.glsl, true));
     CONTROL(Has(t.glsl, "vec2(-2.0, 2.0) / vec2(textureSize"));  // whole-texel units would be wrong
     // The exponent bias: after the gamma block, every component, with the host's factor.
-    CHECK(Has(t.glsl, "#endif\n#ifdef XE_TEXTURE_0_SCALE\n    xe_texel0 *= XE_TEXTURE_0_SCALE;\n#endif\n"));
+    CHECK(Has(t.glsl, "#endif\n#ifdef XE_TEXTURE_0_BIASED\n    xe_texel0 = mix(xe_texel0, xe_texel0 * 2.0 - 1.0, XE_TEXTURE_0_BIASED);\n#endif\n#ifdef XE_TEXTURE_0_SCALE\n    xe_texel0 *= XE_TEXTURE_0_SCALE;\n#endif\n"));
     std::string scaled = t.glsl;
     scaled.insert(scaled.find('\n') + 1, "#define XE_TEXTURE_0_SCALE ldexp(1.0, 1)\n#define XE_TEXTURE_0_GAMMA\n");
     CHECK(Compiles(scaled, true));
+    // Unsigned biased components (X spirv_shader_translator_fetch.cc:2167-2236): compiles with the host's bvec4.
+    std::string biased = t.glsl;
+    biased.insert(biased.find('\n') + 1, "#define XE_TEXTURE_0_BIASED bvec4(true, true, true, false)\n");
+    CHECK(Compiles(biased, true));
     // Defaults: the fetch constant's filters (3), no offset expression.
     CHECK(Translate(TexturedPs(), true, t) && t.textureFilters[0].mag == 3 && t.textureFilters[0].min == 3 && !Has(t.glsl, "textureSize"));
     // use_computed_lod clear (and no register LOD): the explicit LOD 0, also in a pixel shader.
@@ -1142,8 +1209,18 @@ void TestResolveAndPointsVs()
     CHECK(Translate(ResolveVs(), false, t));
     CHECK(t.interpolatorCount == 0 && t.vertexFetchSlots == std::vector<uint32_t>{0});
     CHECK(Has(t.glsl, "xe_vertex_word(xe_vertex_base[0][0], xe_vidx0, 2u, 0, xe_fetch[0].y)") && Has(t.glsl, "r0.z = 1.0;") && Has(t.glsl, "r0.w = 1.0;"));
-    CHECK(!Has(t.glsl, "out vec4 xe_interp_0"));
+    // FM4 Recomp: no interpolator of its own; locations 0-15 only under XE_PS_INTERPOLATORS (a pixel shader reading more),
+    // written as 0 (Xenia zeroes unwritten interpolators).
+    CHECK(Has(t.glsl, "#if XE_PS_INTERPOLATORS > 0\nlayout(location = 0) out vec4 xe_interp_0;\n#endif\n") &&
+          Has(t.glsl, "#if XE_PS_INTERPOLATORS > 0\n    xe_interp_0 = vec4(0.0);\n#endif\n") &&
+          Has(t.glsl, "#if XE_PS_INTERPOLATORS > 15\n"));
+    CONTROL(Has(t.glsl, "\nlayout(location = 0) out vec4 xe_interp_0;\nlayout"));  // not declared unconditionally
     CHECK(Compiles(t.glsl, false));
+    {
+        std::string withPs = t.glsl;
+        withPs.insert(withPs.find('\n') + 1, "#define XE_PS_INTERPOLATORS 1\n");
+        CHECK(Compiles(withPs, false));
+    }
 
     CHECK(Translate(PointsVs(), false, t));
     const std::string& g = t.glsl;
@@ -1170,13 +1247,14 @@ void TestVideoPs()
     // Fetches: each result's x into one component of r1, PWL-linearised (x, y, z) when the host
     // defines the slot's gamma macro.
     CHECK(Has(g, "vec4 xe_texel0 = texture(xe_texture_2, vec2(r0.x, r0.y));\n#endif\n#ifdef XE_TEXTURE_2_GAMMA\n"
-                 "    xe_texel0.xyz = xe_pwl_gamma_to_linear(xe_texel0.xyz);\n#endif\n#ifdef XE_TEXTURE_2_SCALE\n    xe_texel0 *= XE_TEXTURE_2_SCALE;\n#endif\n    r1.x = xe_texel0.x;"));
+                 "    xe_texel0.xyz = xe_pwl_gamma_to_linear(xe_texel0.xyz);\n#endif\n#ifdef XE_TEXTURE_2_BIASED\n    xe_texel0 = mix(xe_texel0, xe_texel0 * 2.0 - 1.0, XE_TEXTURE_2_BIASED);\n#endif\n#ifdef XE_TEXTURE_2_SCALE\n    xe_texel0 *= XE_TEXTURE_2_SCALE;\n#endif\n    r1.x = xe_texel0.x;"));
     CHECK(Has(g, "vec4 xe_texel1 = texture(xe_texture_1, vec2(r0.x, r0.y));\n#endif\n#ifdef XE_TEXTURE_1_GAMMA\n"
-                 "    xe_texel1.xyz = xe_pwl_gamma_to_linear(xe_texel1.xyz);\n#endif\n#ifdef XE_TEXTURE_1_SCALE\n    xe_texel1 *= XE_TEXTURE_1_SCALE;\n#endif\n    r1.y = xe_texel1.x;"));
+                 "    xe_texel1.xyz = xe_pwl_gamma_to_linear(xe_texel1.xyz);\n#endif\n#ifdef XE_TEXTURE_1_BIASED\n    xe_texel1 = mix(xe_texel1, xe_texel1 * 2.0 - 1.0, XE_TEXTURE_1_BIASED);\n#endif\n#ifdef XE_TEXTURE_1_SCALE\n    xe_texel1 *= XE_TEXTURE_1_SCALE;\n#endif\n    r1.y = xe_texel1.x;"));
     CHECK(Has(g, "vec4 xe_texel2 = texture(xe_texture_0, vec2(r0.x, r0.y));\n#endif\n#ifdef XE_TEXTURE_0_GAMMA\n"
-                 "    xe_texel2.xyz = xe_pwl_gamma_to_linear(xe_texel2.xyz);\n#endif\n#ifdef XE_TEXTURE_0_SCALE\n    xe_texel2 *= XE_TEXTURE_0_SCALE;\n#endif\n    r1.z = xe_texel2.x;"));
+                 "    xe_texel2.xyz = xe_pwl_gamma_to_linear(xe_texel2.xyz);\n#endif\n#ifdef XE_TEXTURE_0_BIASED\n    xe_texel2 = mix(xe_texel2, xe_texel2 * 2.0 - 1.0, XE_TEXTURE_0_BIASED);\n#endif\n#ifdef XE_TEXTURE_0_SCALE\n    xe_texel2 *= XE_TEXTURE_0_SCALE;\n#endif\n    r1.z = xe_texel2.x;"));
     // Colour 0 encoded to PWL gamma (xyz, not w) after everything else, when the host asks.
-    CHECK(Has(g, "    xe_color0.w = xe_s7;\n#ifdef XE_ALPHA_TEST\n    if (!xe_alpha_pass(xe_color0.w, XE_ALPHA_REF))\n        discard;\n#endif\n#ifdef XE_COLOR0_GAMMA\n    xe_color0.xyz = xe_linear_to_pwl_gamma(xe_color0.xyz);\n#endif\n#ifdef XE_COLOR0_7E3"));
+    CHECK(Has(g, "    xe_color0.w = xe_s7;\n#ifdef XE_ALPHA_TEST\n    if (!xe_alpha_pass(xe_color0.w, XE_ALPHA_REF))\n        discard;\n#endif\n#ifdef XE_ALPHA_TO_MASK\n") &&
+          Has(g, "#ifdef XE_COLOR0_GAMMA\n    xe_color0.xyz = xe_linear_to_pwl_gamma(xe_color0.xyz);\n#endif\n#ifdef XE_COLOR0_7E3"));
     // MAXs(a, a) is a move; DOT4v over the swizzled operands, sums ((x + y) + z) + w, products by
     // the D3D9 rule; ADDs a + b = r0.w + r0.x, both read before either op writes.
     CHECK(Has(g, "precise float xe_s0 = xe_c[255].w;\n    r1.w = xe_s0;"));
@@ -1346,9 +1424,9 @@ void TestBranchesVs()
     CHECK(Compiles(t.glsl, false));
     // Negative controls: no else, or an "else" on the same condition: r2.x is unwritten when
     // bool 5 is 0, which a VS refuses.
-    CHECK(Refuses(BranchesVs(false), false, "reads r2.x before writing it"));
-    CHECK(Refuses(BranchesVs(true, true), false, "reads r2.x before writing it"));
-    CONTROL(Translate(BranchesVs(false), false, t));
+    CHECK(Translate(BranchesVs(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r2.x unwritten on one path reads 0, as Xenia (counted)
+    CHECK(Translate(BranchesVs(true, true), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r2.x unwritten on one path reads 0, as Xenia (counted)
+    CHECK(Translate(BranchesVs(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
 }
 
 // The compare and select families: each opcode becomes its helper with src1, src2 (, src3) in
@@ -1433,12 +1511,25 @@ void TestColor7e3Clamp()
     CHECK(Compiles(scaled, true));
     CONTROL(Has(t.glsl, "greaterThanEqual(xe_color0, vec4(0.0))"));  // would let -0 through
     // Alpha test: before the output conversions, with the host's function and reference.
-    CHECK(Has(t.glsl, "#ifdef XE_ALPHA_TEST\n    if (!xe_alpha_pass(xe_color0.w, XE_ALPHA_REF))\n        discard;\n#endif\n#ifdef XE_COLOR0_GAMMA"));
+    CHECK(Has(t.glsl, "#ifdef XE_ALPHA_TEST\n    if (!xe_alpha_pass(xe_color0.w, XE_ALPHA_REF))\n        discard;\n#endif\n#ifdef XE_ALPHA_TO_MASK"));
     CHECK(Has(t.glsl, "    case 4: return a > r;\n") && Has(t.glsl, "    case 1: return a < r;\n"));
     std::string tested = t.glsl;
     tested.insert(tested.find('\n') + 1, "#define XE_ALPHA_TEST 4\n#define XE_ALPHA_REF uintBitsToFloat(0x3F000000u)\n");
     CHECK(Compiles(tested, true));
     CONTROL(Has(t.glsl, "    case 4: return a >= r;\n"));
+    // Alpha to mask (X dxbc_shader_translator_om.cc:1857-1955): after the alpha test, before the output conversions; the offset
+    // index (x & 1) << 1 | (y & 1); 4x thresholds 0.75 / 0.25 / 0.5 / 1 for host samples 0-3, 2x native guest 0 = host 1.
+    CHECK(Has(t.glsl, "#endif\n#ifdef XE_ALPHA_TO_MASK\n") && Has(t.glsl, "#ifdef XE_COLOR0_GAMMA"));
+    CHECK(Has(t.glsl, "(((xe_p.x & 1u) << 1u) | (xe_p.y & 1u)) << 1u"));
+    CHECK(Has(t.glsl, "(xe_a >= 0.75 - xe_o / 16.0 ? 1 : 0) | (xe_a >= 0.25 - xe_o / 16.0 ? 2 : 0) | (xe_a >= 0.5 - xe_o / 16.0 ? 4 : 0)"));
+    CHECK(Has(t.glsl, "(xe_a >= 0.5 - xe_o / 8.0 ? 2 : 0) | (xe_a >= 1.0 - xe_o / 8.0 ? 1 : 0)"));
+    CONTROL(Has(t.glsl, "(xe_a >= 0.5 - xe_o / 8.0 ? 1 : 0)"));  // guest sample 0 on host sample 0 would ignore native 2x
+    for (const char* samples : {"1", "2", "4"})
+    {
+        std::string masked = t.glsl;
+        masked.insert(masked.find('\n') + 1, std::string("#define XE_ALPHA_TO_MASK 170u\n#define XE_ALPHA_TO_MASK_SAMPLES ") + samples + "\n");
+        CHECK(Compiles(masked, true));
+    }
 }
 
 // Loops (ISA: loop_start skips the body when the constant's count, bits 0-7, is 0; loop_end
@@ -1469,7 +1560,7 @@ void TestLoops()
         "        vec4 xe_texel0 = texture(xe_texture_0, vec2(r0.x, r0.y));\n"
         "#endif\n"
         "#ifdef XE_TEXTURE_0_GAMMA\n        xe_texel0.xyz = xe_pwl_gamma_to_linear(xe_texel0.xyz);\n#endif\n"
-        "#ifdef XE_TEXTURE_0_SCALE\n        xe_texel0 *= XE_TEXTURE_0_SCALE;\n#endif\n"
+        "#ifdef XE_TEXTURE_0_BIASED\n        xe_texel0 = mix(xe_texel0, xe_texel0 * 2.0 - 1.0, XE_TEXTURE_0_BIASED);\n#endif\n#ifdef XE_TEXTURE_0_SCALE\n        xe_texel0 *= XE_TEXTURE_0_SCALE;\n#endif\n"
         "        r2.x = xe_texel0.x;\n        r2.y = xe_texel0.y;\n        r2.z = xe_texel0.z;\n        r2.w = xe_texel0.w;\n"
         "        precise vec4 xe_v2 = (r2.xyzw + r1.xyzw);\n"
         "        r1.x = xe_v2.x;\n        r1.y = xe_v2.y;\n        r1.z = xe_v2.z;\n        r1.w = xe_v2.w;\n"
@@ -1485,8 +1576,25 @@ void TestLoops()
         CHECK(Compiles(biased, true));
         CONTROL(Has(g, "textureLod(xe_texture_0, vec2(r0.x, r0.y), 0.0 + XE_TEXTURE_0_LOD_BIAS)"));
     }
-    CHECK(Has(g, "    vec4 r0 = xe_interp_0;\n    vec4 r1 = vec4(0.0);\n    vec4 r2 = vec4(0.0);\n"));
+    CHECK(Has(g, "#if defined(XE_PARAM_GEN) && XE_PARAM_GEN == 0\n    vec4 r0 = xe_param_gen();\n#else\n    vec4 r0 = xe_interp_0;\n#endif\n"
+                  "    vec4 r1 = vec4(0.0);\n    vec4 r2 = vec4(0.0);\n"));
     CHECK(Compiles(g, true));
+    // FM4 Recomp: PsParamGen in interpolator 0 (X spirv_shader_translator.cc:2016-2135): |floor(pixel)|, back face in x's sign bit.
+    CHECK(Has(g, "    float x = abs(floor(gl_FragCoord.x)), y = abs(floor(gl_FragCoord.y));\n") &&
+          Has(g, "x = uintBitsToFloat(floatBitsToUint(x) ^ (1u << 31));") && Has(g, "    return vec4(x, y, 0.0, 0.0);\n"));
+    for (const char* polygonal : {"0", "1"})
+    {
+        std::string generated = g;
+        generated.insert(generated.find('\n') + 1, std::string("#define XE_PARAM_GEN 0\n#define XE_PARAM_GEN_POLYGONAL ") + polygonal + "\n");
+        CHECK(Compiles(generated, true));
+    }
+    CONTROL(Has(g, "x = -x;"));  // -0.0 would not carry the back face on pixel column 0 if a compiler folded it
+    {
+        // FM4 Recomp: a line's pixel parameters: z = -0 (sign bit set, X spirv_shader_translator.cc:2107-2120).
+        std::string line = g;
+        line.insert(line.find('\n') + 1, "#define XE_PARAM_GEN 0\n#define XE_PARAM_GEN_POLYGONAL 0\n#define XE_PARAM_GEN_LINE 1\n");
+        CHECK(Has(g, "    return vec4(x, y, uintBitsToFloat(1u << 31), 0.0);\n") && Compiles(line, true));
+    }
     // Negative controls (wrong oracles): the count from bits 8-15 (aL start), the wrong dword,
     // one iteration too many.
     CONTROL(Has(g, "(xe_loop[7].w >> 8) & 0xFFu"));
@@ -1507,8 +1615,8 @@ void TestLoops()
     // conditional exec.
     CHECK(Translate(LoopVs(true), false, t) && Compiles(t.glsl, false) && t.loopConstants == std::vector<uint32_t>{0});
     CHECK(Has(t.glsl, "uvec4 xe_bool[2]; uvec4 xe_loop[8]; };") && Has(t.glsl, "uint xe_loop_count0 = xe_loop[0].x & 0xFFu;"));
-    CHECK(Refuses(LoopVs(false), false, "reads r2.x before writing it"));
-    CONTROL(Translate(LoopVs(false), false, t));
+    CHECK(Translate(LoopVs(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r2.x unwritten on one path reads 0, as Xenia (counted)
+    CHECK(Translate(LoopVs(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     // Iteration 1 sees the pre-loop registers: a body read of a register only the body writes.
     CHECK(Refuses(LoopVs(true, 3), false, "reads r3.x before writing it"));
     o = {}, o.exportReg = 2;
@@ -1604,10 +1712,10 @@ void TestLoops()
             Put(v, e);
             return v;
         };
-        CHECK(Refuses(program(false), false, "reads r2.x before writing it"));
+        CHECK(Translate(program(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r2.x unwritten on one path reads 0, as Xenia (counted)
         CHECK(Translate(program(true), false, t) && t.loopConstants == std::vector<uint32_t>{2} && t.boolConstants == std::vector<uint32_t>{0});
         CHECK(Has(t.glsl, "uint xe_loop_count0 = xe_loop[0].z & 0xFFu;") && Compiles(t.glsl, false));
-        CONTROL(Translate(program(false), false, t));
+        CHECK(Translate(program(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     }
     {
         // Twelve bool constants and a loop: more than 12 pass dimensions. Eleven bools (the twelfth
@@ -1628,7 +1736,8 @@ void TestLoops()
             Put(v, e);
             return v;
         };
-        CHECK(Refuses(program(12), true, "more than 12 conditional exec bool constants, loops and predicate sets"));
+        // FM4 Recomp: the passes enumerate paths; 12 independent bools and a loop are 2^13 = 8192 paths, past kMaxPaths 4096.
+        CHECK(Refuses(program(12), true, "more than 4096 analysis paths"));
         CHECK(Translate(program(11), true, t) && t.boolConstants.size() == 11 && t.loopConstants == std::vector<uint32_t>{0});
     }
     {
@@ -1884,8 +1993,8 @@ void TestPreviousScalarAndJump()
         };
         CHECK(Translate(program(true), false, t) && t.boolConstants == std::vector<uint32_t>{5} && Compiles(t.glsl, false));
         CHECK(Has(t.glsl, "    if (((xe_bool[0].x >> 5) & 1u) == 1u)\n    {\n        precise vec4 xe_v1 = r1.xxxx;\n"));
-        CHECK(Refuses(program(false), false, "reads r2.x before writing it"));
-        CONTROL(Translate(program(false), false, t));
+        CHECK(Translate(program(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r2.x unwritten on one path reads 0, as Xenia (counted)
+        CHECK(Translate(program(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     }
 
     // Jump refusals: unconditional, predicated, address mode, direction, backward / self; a
@@ -1904,8 +2013,8 @@ void TestPreviousScalarAndJump()
     o = {}, o.jump.target = 2;
     CHECK(Refuses(PrevPs(o), true, "backward jump to control-flow instruction 2"));
     CONTROL(Translate(PrevPs(o), true, t));
-    o = {}, o.region = JmpCf(Jmp{});
-    CHECK(Refuses(PrevPs(o), true, "jump (control-flow opcode 11) inside a jump's skipped region"));
+    o = {}, o.region = JmpCf(Jmp{});  // FM4 Recomp: a jump inside the region, to the same end, is nested (TestNestedJumps)
+    CHECK(Translate(PrevPs(o), true, t) && Compiles(t.glsl, true));
     // FM4 Recomp: an exec_end is accepted as a region's last instruction (TestUniformBranches); one
     // before the last (cf3 of the region cf3-cf4) is refused.
     o = {}, o.jump.target = 5, o.region = ExecCf(8, 2, 0, true);
@@ -2013,6 +2122,43 @@ void TestPredicate()
     CONTROL(Has(g, "    }\n    precise vec4 xe_v6"));
 
     {
+        // FM4 Recomp: PRED_SET*_PUSHv (20-23; X spirv_shader_translator_alu.cc:745-795) as the first set, FM4's
+        // PRED_SETGTE_PUSHv (23): p0 = src1.w == 0 && src2.w >= 0; with a result mask, ((src1.x == 0 && src2.x >= 0) ? -1 : src1.x) + 1.
+        PredOptions push;
+        push.firstPush = 23;
+        CHECK(Translate(PredVs(push), false, t, &error) && Has(t.glsl, "vec4 xe_push1a = r1.xxxx, xe_push1b = xe_c[0].xxxx;\n") &&
+              Has(t.glsl, "    xe_p0 = (xe_push1a.w == 0.0 && xe_push1b.w >= 0.0);\n") && Compiles(t.glsl, false));
+        if (!error.empty())
+            std::fprintf(stderr, "  %s\n", error.c_str());
+        CONTROL(Has(t.glsl, "xe_push1b.w > 0.0"));
+        push.firstPush = 21;  // PRED_SETNE_PUSHv: != (true for NaN)
+        CHECK(Translate(PredVs(push), false, t) && Has(t.glsl, "xe_p0 = (xe_push1a.w == 0.0 && xe_push1b.w != 0.0);"));
+        push.firstPush = 20, push.firstSetMask = 0x1;  // PRED_SETE_PUSHv writing r3.x
+        CHECK(Translate(PredVs(push), false, t) &&
+              Has(t.glsl, "vec4(((xe_push1a.x == 0.0 && xe_push1b.x == 0.0) ? -1.0 : xe_push1a.x) + 1.0)") && Compiles(t.glsl, false));
+        CONTROL(Has(t.glsl, "? 0.0 : xe_push1a.x"));
+    }
+    {
+        // FM4 Recomp: PRED_SET_INVs / POPs / CLRs / RESTOREs (31-34; X spirv_shader_translator_alu.cc:1254-1295) as the first set
+        // (operand r1.x), each writing r3.x (mask 1): vs_c86c2c23209b5a2d uses 31.
+        PredOptions s;
+        s.firstSetMask = 0x1;
+        s.firstSet = 31;
+        CHECK(Translate(PredVs(s), false, t, &error) && Has(t.glsl, "    xe_p0 = (r1.x == 1.0);\n") &&
+              Has(t.glsl, "(xe_p0 ? 0.0 : (r1.x == 0.0 ? 1.0 : r1.x))") && Compiles(t.glsl, false));
+        if (!error.empty())
+            std::fprintf(stderr, "  %s\n", error.c_str());
+        s.firstSet = 32;
+        CHECK(Translate(PredVs(s), false, t) && Has(t.glsl, "    xe_p0 = (r1.x - 1.0 <= 0.0);\n") && Has(t.glsl, "(xe_p0 ? 0.0 : r1.x - 1.0)") &&
+              Compiles(t.glsl, false));
+        CONTROL(Has(t.glsl, "r1.x - 1.0 < 0.0"));
+        s.firstSet = 33;
+        CHECK(Translate(PredVs(s), false, t) && Has(t.glsl, "    xe_p0 = false;\n") && Has(t.glsl, "= 3.40282347e+38;") && Compiles(t.glsl, false));
+        s.firstSet = 34;
+        CHECK(Translate(PredVs(s), false, t) && Has(t.glsl, "    xe_p0 = (r1.x == 0.0);\n") && Has(t.glsl, "(xe_p0 ? 0.0 : r1.x)") &&
+              Compiles(t.glsl, false));
+    }
+    {
         // PRED_SETGTs (29) / PRED_SETGTEs (30) as the two sets: p0 = a > 0 / a >= 0 (Xenia ucode.h).
         PredOptions gt;
         gt.firstSet = 29, gt.secondSet = 30;
@@ -2032,7 +2178,7 @@ void TestPredicate()
     CONTROL(Has(t.glsl, "        if (xe_p0)\n        {\n            precise vec4 xe_v4"));
     // Both execs on the same condition: r2.x is unwritten where the second set gives p0 == 1.
     o.otherCondition = false;
-    CHECK(Refuses(PredVs(o), false, "reads r2.x before writing it"));
+    CHECK(Translate(PredVs(o), false, t) && t.pathZeroReads.size() == 2);  // FM4 Recomp: r2.x and r1.z (both written only by the skipped instruction, both read by the export) read 0 on that path, as Xenia: 2
     // The op mapping: 28 first is !=, 27 second is ==; PRED_SETEs's result is 0 where p0 is set,
     // else 1 (here written to r3.x).
     o = {}, o.firstSet = 28, o.secondSet = 27;
@@ -2054,27 +2200,27 @@ void TestPredicate()
     // A predicated write that may not happen: with the (!p0) exec gone, r2.x and r1.z are
     // unwritten where the second set clears p0, so the VS read after is refused.
     o = {}, o.otherwise = ExecCf(10, 0, 0);  // an exec of no instructions (a nop's w1 is 0)
-    CHECK(Refuses(PredVs(o), false, "reads r2.x before writing it"));
-    CONTROL(Translate(PredVs(o), false, t));
+    CHECK(Translate(PredVs(o), false, t) && t.pathZeroReads.size() == 2);  // FM4 Recomp: r2.x and r1.z (both written only by the skipped instruction, both read by the export) read 0 on that path, as Xenia: 2
+    CHECK(Translate(PredVs(o), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     // r1.z not written by the (p0) exec: unwritten where the region ran with the second p0 set
     // (the else branch, which writes it, is jumped over).
     o = {}, o.thenScalarMask = 0;
-    CHECK(Refuses(PredVs(o), false, "reads r1.z before writing it"));
+    CHECK(Translate(PredVs(o), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r1.z unwritten on one path reads 0, as Xenia (counted)
     // With slot 8 not a predicate set, cf3 / cf4 test the first p0, which is 1 in the region:
     // only the (p0) exec runs there, so without its r1.z write r1.z is unwritten.
     o = {}, o.secondSet = 5;
     CHECK(Translate(PredVs(o), false, t) && Compiles(t.glsl, false));
     o.thenScalarMask = 0;
-    CHECK(Refuses(PredVs(o), false, "reads r1.z before writing it"));
-    CONTROL(Translate(PredVs(o), false, t));
+    CHECK(Translate(PredVs(o), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r1.z unwritten on one path reads 0, as Xenia (counted)
+    CHECK(Translate(PredVs(o), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     // The else branch runs where the jump was taken, so where p0 == 0: a (!p0) instruction there
     // runs, a (p0) one does not (r2.x then unwritten).
     o = {}, o.elsePred = 0;
     CHECK(Translate(PredVs(o), false, t) && Has(t.glsl, "    else\n    {\n        if (!xe_p0)\n        {\n            precise vec4 xe_v6") &&
           Compiles(t.glsl, false));
     o.elsePred = 1;
-    CHECK(Refuses(PredVs(o), false, "reads r2.x before writing it"));
-    CONTROL(Translate(PredVs(o), false, t));
+    CHECK(Translate(PredVs(o), false, t) && t.pathZeroReads.size() == 2);  // FM4 Recomp: r2.x and r1.z (both written only by the skipped instruction, both read by the export) read 0 on that path, as Xenia: 2
+    CHECK(Translate(PredVs(o), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     {
         // Two if / else shapes in sequence. PS: cf0 alloc colours; cf1 exec(6) PRED_SETEs
         // a = r0.x; cf2 predicated jump to cf5 (p0 == 0); cf3 exec(7) MAXv r1.x = c0.x; cf4 jmp
@@ -2131,8 +2277,8 @@ void TestPredicate()
             Put(v, e);
             return v;
         };
-        CHECK(Refuses(program(false), false, "reads r1.x before writing it"));
-        CONTROL(Translate(program(false), false, t));
+        CHECK(Translate(program(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r1.x unwritten on one path reads 0, as Xenia (counted)
+        CHECK(Translate(program(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
         CHECK(Translate(program(true), false, t) && t.boolConstants == std::vector<uint32_t>{5} &&
               Has(t.glsl, "    if (((xe_bool[0].x >> 5) & 1u) == 1u)\n    {\n        if (xe_p0)\n        {\n") && Compiles(t.glsl, false));
     }
@@ -2160,8 +2306,8 @@ void TestPredicate()
         CHECK(Translate(program(true), false, t) && Compiles(t.glsl, false));
         CHECK(Has(t.glsl, "    xe_p0 = (r0.x != 0.0);\n    if (xe_p0)\n    {\n        precise vec4 xe_v2 = xe_c[0].xxxx;\n"
                           "        r1.x = xe_v2.x;\n    }\n    precise vec4 xe_v3 = r1.xxxx;\n"));
-        CHECK(Refuses(program(false), false, "reads r1.x before writing it"));
-        CONTROL(Translate(program(false), false, t));
+        CHECK(Translate(program(false), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r1.x unwritten on one path reads 0, as Xenia (counted)
+        CHECK(Translate(program(false), false, t));  // FM4 Recomp: translates (the path-dependent read is counted)
     }
     {
         // p0 set only inside a bool jump's region, read after it: unset where the jump is taken.
@@ -2189,13 +2335,16 @@ void TestPredicate()
         CHECK(Translate(program(false), true, t) && Compiles(t.glsl, true));
     }
 
-    // Refusals: an unpredicated instruction or one predicated on the other condition in a
-    // predicated exec; a predicate set in a predicated exec, in an exec whose predicate-clean bit
-    // is set, in a bool cexec (clean by definition) or in a loop; a predicated export; the
-    // predicated exec_end; an unconditional jump with a predicate bit or not at a region's end;
-    // a predicated jump with a bool constant field or before any predicate set.
+    // FM4 Recomp: an unpredicated instruction in a predicated exec runs under the exec's guard, as Xenia (spirv_shader_translator.cc
+    // :820-839, :2229-2234): slot 9 unpredicated in the (p0) exec cf3 is emitted inside its `if`.
     o = {}, o.thenPred = false;
-    CHECK(Refuses(PredVs(o), false, "unpredicated ALU instruction inside a predicated exec"));
+    CHECK(Translate(PredVs(o), false, t) && Has(t.glsl, "        if (xe_p0)\n        {\n            precise vec4 xe_v4 = xe_c[1].xxxx;\n") &&
+          Compiles(t.glsl, false));
+    CONTROL(Has(t.glsl, "    precise vec4 xe_v4 = xe_c[1].xxxx;\n    r2.x"));  // not outside the exec's `if`
+    // Refusals: an instruction predicated on the other condition in a predicated exec; a predicate set in a predicated exec, in an
+    // exec whose predicate-clean bit is set, in a bool cexec (clean by definition) or in a loop; a predicated export; the predicated
+    // exec_end; an unconditional jump with a predicate bit or not at a region's end; a predicated jump with a bool constant field or
+    // before any predicate set.
     o = {}, o.thenPredCond = false;
     CHECK(Refuses(PredVs(o), false, "opposite condition of its predicated exec"));
     o = {}, o.thenSop = 28;
@@ -2233,8 +2382,8 @@ void TestPredicate()
             for (int i = 0; i < 6 + n; i++)
                 Put(q, set);
             Put(q, e);
-            if (n == 7)
-                CHECK(Refuses(q, true, "more than 12 bool constants, loops and predicate sets"));
+            if (n == 7)  // FM4 Recomp: 13 independent predicate sets are 2^13 = 8192 paths, past kMaxPaths 4096
+                CHECK(Refuses(q, true, "more than 4096 analysis paths"));
             else
                 CHECK(Translate(q, true, t) && Compiles(t.glsl, true));
         }
@@ -2599,7 +2748,7 @@ void TestMiniFetchScope()
     CHECK(Translate(MiniScopeVs(1), false, t, &error));
     if (!error.empty())
         std::fprintf(stderr, "  %s\n", error.c_str());
-    CHECK(Has(t.glsl, "        int xe_vidx1 = int(floor(r0.x));") &&
+    CHECK(Has(t.glsl, "        xe_vidx1 = int(floor(r0.x));") && Has(t.glsl, "    int xe_vidx1 = 0;\n") &&
           Has(t.glsl, "uintBitsToFloat(xe_vertex_word(xe_vertex_base[0][1], xe_vidx1, 4u, 3, xe_fetch[0].w))") &&
           t.vertexFetchSlots == std::vector<uint32_t>({0, 1}));
     CHECK(Compiles(t.glsl, false));
@@ -2694,9 +2843,21 @@ void TestUniformBranches()
         CHECK(Has(t.glsl, "    if (((xe_bool[1].x >> 0) & 1u) == 1u)\n    {\n        if (xe_p0)\n        {\n        }\n#ifdef XE_TEXTURE_0_LOD_BIAS\n"));
         CHECK(Has(t.glsl, "#else\n        " + sampled + "#endif\n        if (xe_p0)\n        {\n") && Has(t.glsl, "            r1.x = xe_texel0.x;\n"));
         CONTROL(Has(t.glsl, "            " + sampled));  // not sampled under p0
-        // In a predicated jump's region (p0-dependent): refused, a plain exec or a predicated one, and
-        // getTextureGradients too.
-        CHECK(Refuses(program(onP0, false), true, "texture fetch inside a predicated jump's skipped region"));
+        // In a predicated jump's region (p0-dependent). FM4 Recomp: a plain exec's fetch samples in place inside the region's `if`, as
+        // Xenia (APPROXIMATE implicit derivatives); a predicated exec's fetch there and getTextureGradients
+        // stay refused.
+        CHECK(Translate(program(onP0, false), true, t) && Has(t.glsl, "    if (xe_p0)\n    {\n#ifdef XE_TEXTURE_0_LOD_BIAS\n") &&
+              Compiles(t.glsl, true));
+        // FM4 Recomp: the fetch itself predicated (word 1 bit 31) on p0 == 1 (word 2 bit 31) in that region (slot
+        // 51): its own `if` inside the region's (Xenia's instruction-level conditional); on p0 == 0 the inverted test.
+        {
+            std::vector<uint32_t> q = program(onP0, false);
+            q[13] |= 1u << 31, q[14] |= 1u << 31;
+            CHECK(Translate(q, true, t) && Has(t.glsl, "    if (xe_p0)\n    {\n        if (xe_p0)\n        {\n#ifdef XE_TEXTURE_0_LOD_BIAS\n") &&
+                  Compiles(t.glsl, true));
+            q[14] &= ~(1u << 31);
+            CHECK(Translate(q, true, t) && Has(t.glsl, "        if (!xe_p0)\n        {\n#ifdef XE_TEXTURE_0_LOD_BIAS\n"));
+        }
         CHECK(Refuses(program(onP0, true), true, "texture fetch inside a predicated exec"));
         CHECK(Refuses(program(onP0, false, 18), true, "getTextureGradients inside a predicated jump's skipped region"));
         CONTROL(Refuses(program(onBool, false), true, "texture fetch inside"));  // the bool region is accepted
@@ -2945,7 +3106,8 @@ void TestDynamicLoop()
     o.bodySetsPred = false;
     CHECK(Refuses(DynLoopPs(o), true, "dynamic loop whose body never sets p0"));
     o = {}, o.backPredicated = false;
-    CHECK(Refuses(DynLoopPs(o), true, "texture fetch inside a predicated jump's skipped region"));  // no loop: a bool-constant back jump
+    // No loop: a bool-constant back jump (FM4 Recomp: the region's fetch now samples in place, so the walk reaches the back jump).
+    CHECK(Refuses(DynLoopPs(o), true, "jump (control-flow opcode 11) inside a jump's skipped region"));
     o = {}, o.backTarget = 3;
     CHECK(Refuses(DynLoopPs(o), true, "backward jump to itself"));
     o = {}, o.bodyPredExec = true;
@@ -2972,19 +3134,19 @@ void TestRefusals()
               Has(ct.glsl, "return vec4(-y, x < 0.0 ? z : -z, 2.0 * x, x < 0.0 ? 1.0 : 0.0);") && Compiles(ct.glsl, true));
         CONTROL(Has(ct.glsl, "float x = s.x, y = s.y, z = s.z;"));
     }
-    a.vop = 2, a.sop = 31;
-    CHECK(Refuses(ColourPs(a), true, "scalar ALU opcode 31"));
-    // Neighbours of the supported ops: MAX4v (19), DSTv (28), the predicate setters SETPEQv (20)
-    // and the other scalar predicate ops (31-34; 27-30 are translated), LOG_CLAMP (15), RECIP_FF (18; RECIP_CLAMP
+    a.vop = 2, a.sop = 18;  // RECIP_FF (31-34, the scalar predicate ops, are translated: FM4 Recomp, TestPredicate)
+    CHECK(Refuses(ColourPs(a), true, "scalar ALU opcode 18"));
+    // Neighbours of the supported ops: MAX4v (19), DSTv (28) (the vector predicate setters 20-23 are translated, FM4 Recomp:
+    // TestPredicate) and the other scalar predicate ops (31-34; 27-30 are translated), LOG_CLAMP (15), RECIP_FF (18; RECIP_CLAMP
     // (17) is translated, FM4 Recomp: TestUniformBranches), and
     // MUL_PREVs's sibling MUL_PREV2s (4) (ADD_PREVs and SUB_PREVs are translated: PrevPs above).
-    for (uint32_t op : {19u, 28u, 20u})
+    for (uint32_t op : {19u, 28u})
     {
         Alu v = a;
         v.vop = op, v.sop = 50;
         CHECK(Refuses(ColourPs(v), true, ("vector ALU opcode " + std::to_string(op)).c_str()));
     }
-    for (uint32_t op : {4u, 15u, 18u, 31u, 32u, 33u, 34u})
+    for (uint32_t op : {4u, 15u, 18u})
     {
         Alu v = a;
         v.vmask = 0x7, v.smask = 0x8, v.sop = op;
@@ -3101,7 +3263,20 @@ void TestRefusals()
     // offset on a 2D fetch, predicated; a texture fetch in a vertex shader samples LOD 0.
     TFetch t;
     t.dim = 0;
-    CHECK(Refuses(TexturedPs(t), true, "dimension 0 is not supported"));
+    {
+        // FM4 Recomp: 1D (ps_b8824322dc8a212a; X spirv_shader_translator_fetch.cc:1051, :1107-1110,
+        // :2328-2332): a sampler2D at (s, 0), the slot recorded as dimension 0 (the host binds a 1D constant as a height-1 image).
+        ShaderTranslation lt;
+        std::string error;
+        CHECK(Translate(TexturedPs(t), true, lt, &error) && Has(lt.glsl, "uniform sampler2D xe_texture_0;") &&
+              Has(lt.glsl, "texture(xe_texture_0, vec2(r0.x, 0.0))") && lt.textureDimensions == std::vector<uint32_t>{0} && Compiles(lt.glsl, true));
+        if (!error.empty())
+            std::fprintf(stderr, "  %s\n", error.c_str());
+        CONTROL(Has(lt.glsl, "vec2(r0.x, r0.y)"));
+        TFetch offset1D = t;
+        offset1D.ox = 1;
+        CHECK(Refuses(TexturedPs(offset1D), true, "offsets on a 1D fetch"));
+    }
     {
         // Cube (3): samplerCube at the direction of (sc, tc, face) = (r0.x, r0.y, r0.z) (Xenia fetch.cc kCube).
         TFetch cubeFetch = t;
@@ -3140,6 +3315,14 @@ void TestRefusals()
         CHECK(Translate(TexturedLodPs(false), true, lt) && Has(lt.glsl, "textureLod(xe_texture_0, vec2(r0.x, r0.y), xe_lod);") &&
               Compiles(lt.glsl, true));
         CONTROL(Has(lt.glsl, "textureLod(xe_texture_0, vec2(r0.x, r0.y), 0.0);"));
+        // FM4 Recomp: predicated setTextureLod ([X] spirv_shader_translator_fetch.cc:523-528 under the instruction's predicate): the
+        // store only where p0 equals the condition; the LOD otherwise stays 0, as Xenia's starts.
+        CHECK(Translate(PredLodPs(true), true, lt, &err) && Has(lt.glsl, "if (xe_p0) xe_lod = r0.z;") && Compiles(lt.glsl, true));
+        if (!err.empty())
+            std::fprintf(stderr, "  %s\n", err.c_str());
+        CHECK(Translate(PredLodPs(false), true, lt) && Has(lt.glsl, "if (!xe_p0) xe_lod = r0.z;"));
+        CONTROL(Has(lt.glsl, "if (xe_p0) xe_lod"));
+        CHECK(Refuses(PredLodPs(true, false), true, "reads the predicate before any predicate-setting op"));
     }
     t = {}, t.bias = 4;
     CHECK(Refuses(TexturedPs(t), true, "LOD bias"));
@@ -3248,7 +3431,13 @@ void TestRefusals()
 
         std::vector<uint32_t> v = ResolveVs();
         v[0] = CondExecCf(2, 1, 0, true, 0x1).w0, v[1] = (v[1] & 0xFFFF0000u) | CondExecCf(2, 1, 0, true).w1;
-        CHECK(Refuses(v, false, "vertex fetch inside a conditional exec"));
+        // FM4 Recomp: a vertex fetch inside a bool conditional exec runs where the exec runs, as Xenia: its
+        // index assigned inside the bool `if`, declared at the top of main.
+        {
+            ShaderTranslation ct;
+            CHECK(Translate(v, false, ct) && Has(ct.glsl, "    int xe_vidx0 = 0;\n") && Has(ct.glsl, "        xe_vidx0 = int(floor(") &&
+                  Compiles(ct.glsl, false));
+        }
         // A vertex fetch inside a predicated exec (FM4's car vertex shaders): p0 = r0.x == 0 (slot 2);
         // (p0) exec of a fetch r1 = slot 0 at index r0.x, stride 4 (slot 3); exec_end exporting r1 to
         // the position (slot 4). The fetch runs under the exec's test; predicated on the opposite
@@ -3271,7 +3460,7 @@ void TestRefusals()
             CHECK(Translate(r, false, vt, &why));
             if (!why.empty())
                 std::fprintf(stderr, "  %s\n", why.c_str());
-            const size_t open = vt.glsl.find("    if (xe_p0)\n    {\n"), fetch = vt.glsl.find("        int xe_vidx");
+            const size_t open = vt.glsl.find("    if (xe_p0)\n    {\n"), fetch = vt.glsl.find("        xe_vidx");
             CHECK(open != std::string::npos && fetch != std::string::npos && open < fetch && Compiles(vt.glsl, false));
             r[3 * 3 + 1] |= 1u << 31, r[3 * 3 + 2] |= 1u << 31;
             CHECK(Translate(r, false, vt));
@@ -3287,8 +3476,8 @@ void TestRefusals()
             PackCf(q, ExecCf(9, 1, 0, true), OpCf(0));
             Put(q, Alu{});
             Put(q, e);
-            if (last)
-                CHECK(Refuses(q, true, "more than 12 distinct bool constants"));
+            if (last)  // FM4 Recomp: 13 independent bools: 8192 paths, past kMaxPaths 4096
+                CHECK(Refuses(q, true, "more than 4096 analysis paths"));
             else
                 CHECK(Translate(q, true, t) && t.boolConstants.size() == 12);
         }
@@ -3305,6 +3494,75 @@ void TestRefusals()
 }
 
 }  // namespace
+
+// FM4 Recomp: nested forward jumps, the early-out chain of vs_61a87c3560f0dd70 (16 predicated jumps to cf40),
+// in small:
+//   cf0 exec(4, 2):  4: MAXv r1.x = r0.x        5: PRED_SETEs a = r1.x (p0 = r1.x == 0)
+//   cf1 cond_jmp to cf6 when p0 == 0 (predicated, condition 0): cf2-cf5 run where p0
+//   cf2 exec(6, 2):  6: MAXv r2.x = c0.x        7: PRED_SETNEs a = r1.x (p0 = r1.x != 0)
+//   cf3 cond_jmp to cf6 when p0 == 0: cf4-cf5 run where that p0, nested in cf1's region, both ending at cf6
+//   cf4 exec(8, 1):  8: MAXv r3.x = c1.x        cf5 nop
+//   cf6 alloc position; cf7 exec_end(9, 1): 9: ADDv export62 = r<exportReg>.xxxx + r<exportReg>.xxxx
+// The structure: if (xe_p0) { ...; if (xe_p0) { ... } }, closing together. Paths: p0 unset at the first jump (1), set then unset (2),
+// set twice (3): three analysis passes, not 2^2 = 4 (the second set is unread on path 1).
+std::vector<uint32_t> ChainVs(uint32_t exportReg)
+{
+    std::vector<uint32_t> p;
+    Jmp j;
+    j.target = 6, j.predicated = true, j.condition = false, j.boolIndex = 0;
+    PackCf(p, ExecCf(4, 2, 0), JmpCf(j));
+    PackCf(p, ExecCf(6, 2, 0), JmpCf(j));
+    PackCf(p, ExecCf(8, 1, 0), OpCf(0));
+    PackCf(p, AllocCf(1), ExecCf(9, 1, 0, true, true));
+    Alu m;
+    m.vdest = 1, m.vmask = 0x1, m.s1 = T(0, "xxxx"), m.s2 = T(0, "xxxx"), m.s3 = T(0);
+    Put(p, m);
+    Alu set;
+    set.sop = 27, set.sdest = 3, set.s1 = T(0), set.s2 = T(0), set.s3 = T(1, "xxxx");
+    Put(p, set);
+    Alu c0;
+    c0.vdest = 2, c0.vmask = 0x1, c0.s1 = C(0, "xxxx"), c0.s2 = C(0, "xxxx"), c0.s3 = T(0);
+    Put(p, c0);
+    set.sop = 28;
+    Put(p, set);
+    Alu c1 = c0;
+    c1.vdest = 3, c1.s1 = C(1, "xxxx"), c1.s2 = C(1, "xxxx");
+    Put(p, c1);
+    Alu e;
+    e.vop = 0, e.exp = true, e.vdest = 62, e.vmask = 0xF, e.s1 = T(exportReg, "xxxx"), e.s2 = T(exportReg, "xxxx"), e.s3 = T(0);
+    Put(p, e);
+    return p;
+}
+
+void TestNestedJumps()
+{
+    ShaderTranslation t;
+    std::string error;
+    CHECK(Translate(ChainVs(1), false, t, &error) && Compiles(t.glsl, false));
+    if (!error.empty())
+        std::fprintf(stderr, "  %s\n", error.c_str());
+    CHECK(Has(t.glsl, "    xe_p0 = (r1.x == 0.0);\n    if (xe_p0)\n    {\n"));
+    CHECK(Has(t.glsl, "        xe_p0 = (r1.x != 0.0);\n        if (xe_p0)\n        {\n"));
+    CHECK(Has(t.glsl, "            r3.x = xe_v4.x;\n        }\n    }\n"));  // both regions close at cf6, innermost first
+    CONTROL(Has(t.glsl, "        }\n        }\n"));
+    // The path analysis still checks every path: r3 is written only where both p0 hold, so exporting it is refused.
+    CHECK(Translate(ChainVs(3), false, t) && t.pathZeroReads.size() == 1);  // FM4 Recomp: r3.x unwritten on one path reads 0, as Xenia (counted)
+    // A nested jump that leaves its enclosing region is refused (not well nested): the inner jump to cf7 past the outer end cf6.
+    {
+        Jmp inner;
+        inner.target = 7, inner.predicated = true, inner.boolIndex = 0;
+        std::vector<uint32_t> q;
+        Jmp outer;
+        outer.target = 6, outer.predicated = true, outer.boolIndex = 0;
+        PackCf(q, ExecCf(4, 2, 0), JmpCf(outer));
+        PackCf(q, ExecCf(6, 2, 0), JmpCf(inner));
+        PackCf(q, ExecCf(8, 1, 0), OpCf(0));
+        PackCf(q, AllocCf(1), ExecCf(9, 1, 0, true, true));
+        const std::vector<uint32_t> chain = ChainVs(1);
+        q.insert(q.end(), chain.begin() + 12, chain.end());
+        CHECK(Refuses(q, false, "leaves its enclosing jump's region"));
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -3337,6 +3595,15 @@ int main(int argc, char** argv)
     TestLoops();
     TestPreviousScalarAndJump();
     TestPredicate();
+    TestNestedJumps();
+    {
+        ShaderTranslation ct;
+        std::string why;
+        CHECK(Translate(ComputedIndexVs(false), false, ct, &why) && ct.vertexFetchComputedIndex == std::vector<uint8_t>{1} && Compiles(ct.glsl, false));
+        if (!why.empty())
+            std::fprintf(stderr, "  %s\n", why.c_str());
+        CHECK(Translate(ComputedIndexVs(true), false, ct) && ct.vertexFetchComputedIndex == std::vector<uint8_t>{0});
+    }
     TestVertexFormats();
     TestMiniFetchScope();
     TestUniformBranches();

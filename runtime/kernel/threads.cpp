@@ -16,6 +16,7 @@
 #include <set>
 #include <memory>
 #include <pthread.h>
+#include <cstdio>
 
 namespace runtime {
 namespace {
@@ -37,6 +38,11 @@ void* Run(void* argument)
     delete static_cast<Start*>(argument);
     UseFaultStackOnThisThread();
     const uint32_t k = s.state.kthread;
+    {
+        char name[32];  // FM4 Recomp: "fm4 guest <id>" (thread_cpu.h roles; visible in sample and Instruments)
+        std::snprintf(name, sizeof name, "fm4 guest %08X", k);
+        pthread_setname_np(name);
+    }
     {
         std::unique_lock guard(suspendLock);
         resumed.wait(guard, [&] { return s.base[k + kthread_state::kSuspendCount] == 0; });
@@ -146,6 +152,7 @@ void StartServiceThread(uint8_t* base, uint8_t cpu, std::function<void(PPCContex
     pthread_t thread;
     const auto run = [](void* argument) -> void* {
         std::unique_ptr<Service> service(static_cast<Service*>(argument));
+        pthread_setname_np("fm4 guest service");  // FM4 Recomp: thread_cpu.h roles
         UseFaultStackOnThisThread();
         PPCContext ctx{};
         ctx.r1.u64 = service->state.stackBase - 0x100;

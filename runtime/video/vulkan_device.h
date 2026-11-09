@@ -52,6 +52,7 @@ struct VulkanDevice
     bool depthClamp = false;        // PA_CL_CLIP_CNTL clip_disable pipelines (pipeline_cache.cpp)
     bool independentBlend = false;
     bool imageViewFormatSwizzle = false;
+    bool samplerAnisotropy = false;  // anisotropic samplers (X vulkan_texture_cache.cc:2591-2598)
     // Window mode only: the surface (created right after the instance) and VK_KHR_swapchain enabled on the device.
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     void (*destroySurface)(VkInstance, VkSurfaceKHR) = nullptr;

@@ -7,12 +7,15 @@
 #include "objects.h"
 #include "stops.h"
 #include "stfs.h"
+#include "virtual_memory.h"
 #include <algorithm>
 #include <map>
 #include <mutex>
 #include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <dirent.h>
 #include <fstream>
 #include <sstream>
@@ -602,9 +605,20 @@ uint32_t ReadDiscFile(const DiscEntry& entry, uint64_t offset, uint8_t* buffer, 
     if (fd < 0)
         Stop(StopCode::Setup, "cannot open %s on the disc for reading", entry.host.c_str());
     uint32_t done = 0;
+    // FM4 Recomp (FM4_WRITE_WATCH): a system call cannot fault on a watched page, it returns EFAULT; the watched pages of the
+    // buffer are made writable first (virtual_memory.h BeforeHostWrite), and a page protected again meanwhile (a texture load on
+    // the command processor's thread) is read through a host buffer and copied with ordinary stores, which fault as usual.
+    BeforeHostWrite(buffer, wanted);
     while (done < wanted)
     {
-        const ssize_t n = pread(fd, buffer + done, wanted - done, off_t(offset + done));
+        ssize_t n = pread(fd, buffer + done, wanted - done, off_t(offset + done));
+        if (n < 0 && errno == EFAULT)
+        {
+            std::vector<uint8_t> bounce(wanted - done);
+            n = pread(fd, bounce.data(), bounce.size(), off_t(offset + done));
+            if (n > 0)
+                std::memcpy(buffer + done, bounce.data(), size_t(n));
+        }
         if (n <= 0)
         {
             close(fd);

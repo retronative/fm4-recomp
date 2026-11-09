@@ -20,8 +20,9 @@ constexpr uint32_t kRegisterCount = 0x5003, kRegisterBase = 0x7FC80000u, kRegist
 constexpr uint32_t RegisterAddress(uint32_t index) { return kRegisterBase + 4 * index; }
 
 // Register indices (Xenia register_table.inc).
-namespace reg { constexpr uint32_t kCpRbWptr = 0x1C5, kScratchUmsk = 0x1DC, kScratchAddr = 0x1DD, kScratchReg0 = 0x578,
+namespace reg { constexpr uint32_t kCpRbWptr = 0x1C5, kScratchUmsk = 0x1DC, kScratchAddr = 0x1DD, kScratchReg0 = 0x578, kWaitUntil = 0x5C8,
                                    kWritebackBase = 0xA04, kCoherStatusHost = 0xA31, kVgtEventInitiator = 0x21F9,
+                                   kRbSampleCountAddr = 0x2325,  // FM4 Recomp: X register_table.inc:615
                                    kVgtDmaBase = 0x21FA, kVgtDmaSize = 0x21FB, kVgtDrawInitiator = 0x21FC,
                                    kShaderConstantFetch00 = 0x4800; }
 
