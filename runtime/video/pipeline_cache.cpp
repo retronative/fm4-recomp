@@ -128,8 +128,10 @@ KeyResult PipelineCache::LayoutFor(uint64_t layoutKey, Layouts& out)
         {kBindingIndices, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
         {kBindingErrors, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT},
     };
-    for (const auto& f : fixed)
-        bindings.push_back({f.binding, f.type, 1, f.stages, nullptr});
+    for (const auto& f : fixed)  // FM4 Recomp (FM4_DESCRIPTOR_CACHE): dynamic, the ring offsets given at each bind
+        bindings.push_back({f.binding, !features_.dynamicBuffers ? f.type
+                                       : f.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
+                            1, f.stages, nullptr});
     const uint32_t vsSlots = LayoutVsSlots(layoutKey), psSlots = LayoutPsSlots(layoutKey);
     for (uint32_t slot = 0; slot < kTextureBindings; slot++)
     {

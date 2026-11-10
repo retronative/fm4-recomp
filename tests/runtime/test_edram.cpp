@@ -1630,6 +1630,42 @@ int Replay(const char* path, const uint32_t* vertexMaxY)
 
 }  // namespace
 
+// FM4_OVERWRITE_CLAIM: Bind with cutouts (edram.h Bind; Ownership::Change's clearCutout, the rule a resolve clear already uses). After the
+// old 2_10_10_10 + D24FS8 bind holds 720 + 720 tiles, the 7e3 + D24FS8@1024 bind with the vertex bound 360 (TestBind's case) transfers
+// colour 0-719 and depth 1024-1439. The 4x 640-pixel target's tiles are 40 x 8 pixels (80 x 16 samples at 4x), 16 a row, 45 rows for
+// 360 rows. A cutout of the whole 640x360 contains every tile: no transfer. A cutout of 640x352 contains rows 0-43 (44 x 16 = 704
+// tiles); row 44 (tiles 704-719, pixel rows 352-359) is partly outside and transfers. The depth claim is tiles 1024-1743, of which
+// the old depth key (720-1439) owns 1024-1439 = rows 0-25: all inside the 640x352 cutout, so no depth transfer; its row 44
+// (1728-1743) has no owner.
+void TestOverwriteCutout()
+{
+    Ownership o;
+    BindRegisters old;
+    old.surfaceInfo = kFm4Surface, old.modeControl = 4, old.colorMask = 0xFFFF, old.depthControl = 0x8777;
+    old.depthInfo = kFm4Depth, old.colorInfo[0] = kFm4Color;
+    CHECK(Bind(o, old, 360).ok && o.Count(kAc) == 720 && o.Count(kAd) == 720);
+    BindRegisters hdr = old;
+    hdr.colorInfo[0] = 0x00030000, hdr.depthInfo = 0x00010400;
+    const Key kHc = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), kHd = Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8);
+    const Ownership before = o;
+    const Rect whole{0, 0, 640, 360}, most{0, 0, 640, 352};
+    Binding b = Bind(o, hdr, 360, &whole, &whole);
+    CHECK(b.ok && b.transfers[0].empty() && b.transfers[1].empty() && o.Count(kHc) == 720 && o.Count(kHd) == 720 && o.Count(kAc) == 0);
+    o = before;
+    b = Bind(o, hdr, 360, &most, &most);
+    CHECK(b.ok && b.transfers[1] == T({{704, 720, kAc}}) && b.transfers[0].empty() && o.Count(kHc) == 720 && o.Count(kHd) == 720);
+    const Rect top{0, 0, 640, 200};  // rows 0-24 inside (25 x 16 = 400 tiles): depth 1024-1423 claimed free, 1424-1439 (row 25) transfers
+    o = before;
+    b = Bind(o, hdr, 360, &top, &top);
+    CHECK(b.ok && b.transfers[1] == T({{400, 720, kAc}}) && b.transfers[0] == T({{1424, 1440, kAd}}));
+    o = before;
+    b = Bind(o, hdr, 360, &whole, nullptr);  // depth only: the colour transfer stays
+    CHECK(b.ok && b.transfers[0].empty() && b.transfers[1] == T({{0, 720, kAc}}));
+    o = before;
+    b = Bind(o, hdr, 360);
+    CONTROL(b.transfers[1].empty() || b.transfers[0].empty());  // without cutouts both transfer, as TestBind
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1)
@@ -1652,6 +1688,7 @@ int main(int argc, char** argv)
     TestResolveDecode();
     TestResolvePlan();
     TestDepthResolve();
+    TestOverwriteCutout();
     TestK88ResolveDecode();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

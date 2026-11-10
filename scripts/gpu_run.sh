@@ -19,6 +19,9 @@
 # control (build/native/tests/fm4_validation_control: a wrong sType in a physical-device query, no device or
 # resource) must make the layer report VUID-VkPhysicalDeviceProperties2-sType-sType, else nothing runs.
 # After each run its log must show the layer inserted and no validation message; captures go to run<i>.captures/.
+# GPU_RUN_VALIDATION_OFF="<approval note>" (approved single runs only, e.g. a native frame-time measurement): no
+# layer, no Metal API validation, fm4recomp --vk-validation off; the approval text goes to validation.txt. Every other
+# safeguard (GPU_STOP, lock, preflight, deadline, lock-up checks, the pinned MoltenVK ICD) is unchanged.
 # window (unit 4b): present plus a visible window on the main thread (runtime/video/window_sdl.h). Everything above
 # applies unchanged; in addition SDL must load the same Vulkan loader fm4recomp links (SDL_VULKAN_LIBRARY below; the
 # runtime checks it and stops otherwise), each run's log must show its "[window] swapchain:" line, and exit 14 is the
@@ -165,7 +168,19 @@ BIN="$ROOT/build/native/runtime/fm4recomp"
 shasum -a 256 "$BIN" "$ROOT/game/survey/image.bin" | sed "s|$ROOT/||" | tee "$OUT/binary.sha256"
 echo "audio: $AUDIO (fm4recomp --audio $AUDIO; the run's \"[audio]\" line names the device or says none was opened)" | tee "$OUT/audio.txt"
 GPU_ARGS=(--renderer "$RENDERER")
-if [ "$RENDERER" != headless ]; then
+VALIDATION=on
+if [ -n "${GPU_RUN_VALIDATION_OFF:-}" ]; then
+  [ "$RENDERER" != headless ] || { echo "GPU_RUN_VALIDATION_OFF applies to a GPU renderer only" >&2; exit 2; }
+  VALIDATION=off
+fi
+if [ "$RENDERER" != headless ] && [ "$VALIDATION" = off ]; then
+  ICD=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
+  [ -f "$ICD" ] || { echo "gpu_run: the MoltenVK ICD $ICD is missing" >&2; exit 1; }
+  [ "$RENDERER" != window ] || { echo "gpu_run: GPU_RUN_VALIDATION_OFF is not supported with window" >&2; exit 2; }
+  export VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer
+  shasum -a 256 "$ICD" | tee -a "$OUT/binary.sha256"
+  echo "validation: OFF (no layer, no Metal API validation); approval: $GPU_RUN_VALIDATION_OFF" | tee "$OUT/validation.txt"
+elif [ "$RENDERER" != headless ]; then
   LAYERS=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d
   ICD=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
   grep -q '"api_version": "1.4.363"' "$LAYERS/VkLayer_khronos_validation.json" || { echo "gpu_run: the validation layer is not the pinned 1.4.363" >&2; exit 1; }
@@ -208,7 +223,7 @@ for i in $(seq 1 "$RUNS"); do
   RUN_GPU_ARGS=("${GPU_ARGS[@]}")
   if [ "$RENDERER" != headless ]; then
     mkdir "$OUT/run$i.captures"  # fails if it exists: evidence is never overwritten
-    RUN_GPU_ARGS+=(--gpu-capture "$OUT/run$i.captures" --vk-validation on --shader-classes "$SHADER_CLASSES")
+    RUN_GPU_ARGS+=(--gpu-capture "$OUT/run$i.captures" --vk-validation "$VALIDATION" --shader-classes "$SHADER_CLASSES")
   fi
   status=0
   perl -e '
@@ -228,7 +243,10 @@ for i in $(seq 1 "$RUNS"); do
   # The log must name the audio mode given (audible: driver and device; mute: no device opened).
   if [ "$AUDIO" = mute ]; then audio_line='[audio] mute: no audio device opened'; else audio_line='[audio] audible: '; fi
   grep -F -m1 "$audio_line" "$OUT/run$i.err" >> "$OUT/audio.txt" || { echo "run $i: no \"$audio_line\" line in its log" >&2; exit 1; }
-  if [ "$RENDERER" != headless ]; then
+  if [ "$RENDERER" != headless ] && [ "$VALIDATION" = off ]; then
+    if grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$OUT/run$i.err"; then echo "run $i: a validation layer was inserted in a validation-off run" >&2; exit 1; fi
+    grep -m1 'validation OFF' "$OUT/run$i.err" | tee -a "$OUT/validation.txt" || { echo "run $i: no \"validation OFF\" line in its log" >&2; exit 1; }
+  elif [ "$RENDERER" != headless ]; then
     grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$OUT/run$i.err" || { echo "run $i: the validation layer was not inserted" >&2; exit 1; }
     if grep -E 'Validation (Error|Warning)|Validation Performance Warning|\[vulkan validation\]|failed to load|failed assertion' "$OUT/run$i.err" | head -20; then
       echo "run $i: validation messages (above)" >&2; exit 1

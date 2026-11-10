@@ -128,4 +128,31 @@ void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes])
 bool BoundTargetHeight(const DrawState& d, const shader::ShaderTranslation& vs, const uint32_t* window, size_t windowDwords, uint32_t endian,
                        const HostIndices& indices, uint32_t& height, std::string& note);
 
+// ---- Overwriting draws (FM4 Recomp, FM4_OVERWRITE_CLAIM) ------------------------------------------------------------
+
+// The rectangle of target pixels a draw provably overwrites in every sample, so the EDRAM bind can claim the tiles inside it
+// without transferring the previous owner's content (edram::Bind cutouts; the idea is ShiftGlue's depth-overwrite claim,
+// ShiftGlue SDK include/rex/graphics/fh1_depth_overwrite.h, which runs the vertex shader on a CPU
+// interpreter; this is an independent, narrower implementation on what the host can prove without one). Fail closed: `depth` /
+// `color` are set only when every condition holds, else `why` names the first that does not.
+//   - one rectangle: a rect-list draw (primitive 8) of exactly 3 auto-indexed vertices, no culling;
+//   - screen-space positions: the vertex shader's position is a plain vertex fetch (ShaderTranslation::positionFetch; FM4's
+//     clear VS), PA_CL_VTE_CNTL vtx_xy_fmt (kFlagXyDividedByW) with no viewport scale or offset, so the fetched x, y plus the
+//     pixel-centre / window offset (GuestViewport::offsetAddXy) are the screen position; the three vertices at three corners of
+//     an axis-aligned rectangle; pixel i is covered when its centre i + 0.5 lies in [min, max): [ceil(min - 0.5), ceil(max - 0.5)),
+//     intersected with the scissor;
+//   - nothing discards a fragment: no kill op in the pixel shader (`psKills`), no alpha test, no alpha-to-mask;
+//   - depth: z test on and ALWAYS with z write, stencil on with ALWAYS, zpass REPLACE and write mask 0xFF on both faces (so both
+//     aspects of every sample are rewritten: FM4's clear, RB_DEPTHCONTROL 8777);
+//   - colour: all four channels written (colour mask 0xF for target 0), no blending, and the depth and stencil tests cannot
+//     reject (off or ALWAYS).
+struct OverwriteRect
+{
+    bool depth = false, color = false;
+    edram::Rect rect;
+    std::string why;
+};
+OverwriteRect FindOverwriteRect(const DrawState& d, const shader::ShaderTranslation& vs, bool psKills, const uint32_t* window, size_t windowDwords,
+                                uint32_t endian);
+
 }  // namespace runtime::video

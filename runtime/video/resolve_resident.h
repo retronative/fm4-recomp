@@ -22,11 +22,18 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace runtime::video {
 
 bool ResolveResident();       // FM4_RESOLVE_RESIDENT=1 and FM4_RESOLVE_DEFER=1 (logged once)
 bool ResolveResidentCheck();  // FM4_RESOLVE_RESIDENT_CHECK=1 (diagnostic: one CPU conversion per resident resolve)
+// FM4 Recomp (opt-in FM4_RESOLVE_GPU_WORDS=1, needs FM4_RESOLVE_RESIDENT=1; off while the check runs): a resolve converted on
+// the GPU is written back to guest memory from those words (copied to the staging buffer instead of its samples), tiled and
+// endian-swapped by edram_vk_plan.h ResolveWordsToGuest: no per-sample float conversion on the CPU, no sample dump pass.
+bool ResolveGpuWords();
+// FM4 Recomp (opt-in FM4_RESOLVE_RESIDENT_K88=1): k_8_8 (16 bpp) resolves are converted on the GPU too (ResidentConvertible).
+bool ResolveResidentK88();
 
 // A recorded resolve, as the texture unit sees it. `converted`: the GPU words exist (the image the EDRAM unit returns).
 struct ResidentResolve
@@ -36,20 +43,24 @@ struct ResidentResolve
     uint32_t textureBase = 0;                    // RB_COPY_DEST_BASE (physical)
     uint32_t destFormat = 0, destPitch = 0, destEndian = 0;
     uint32_t x0 = 0, y0 = 0, width = 0, height = 0;  // the texel rectangle at textureBase
+    uint32_t bytesLog2 = 2;  // FM4 Recomp: 2 for 32 bpp words, 1 for k_8_8's 16 bpp words
 };
 
 // The converting resolves the GPU path implements: storage 0 (8_8_8_8), 2 (2_10_10_10), 3 (2_10_10_10_FLOAT, 7e3) into
 // texture format 6, 7, 50 or 54 (32 bpp).
+// FM4 Recomp: also storage 0 into k_8_8 (10), 16 bpp (r | g << 8; FM4's 512x512 k_8_8 chain, about 2.75
+// resolve-consumer waits a race frame).
 inline bool ResidentConvertible(uint32_t storage, uint32_t destFormat, uint32_t destBytesLog2)
 {
-    return (storage == 0 || storage == 2 || storage == 3) && destBytesLog2 == 2 && (destFormat == 6 || destFormat == 7 || destFormat == 50 || destFormat == 54);
+    return ((storage == 0 || storage == 2 || storage == 3) && destBytesLog2 == 2 && (destFormat == 6 || destFormat == 7 || destFormat == 50 || destFormat == 54)) ||
+           (storage == 0 && destBytesLog2 == 1 && destFormat == 10);
 }
 
 // Texture formats whose host texel is the resolve format's guest word (texture_info.cpp: 6 and 50 R8G8B8A8, 7 and 54
 // A2B10G10R10; the component mapping is the view's, the same for an upload and a copy).
 inline bool ResidentFormatPair(uint32_t destFormat, uint32_t textureFormat)
 {
-    const auto group = [](uint32_t f) { return f == 6 || f == 50 ? 1 : f == 7 || f == 54 ? 2 : 0; };
+    const auto group = [](uint32_t f) { return f == 6 || f == 50 ? 1 : f == 7 || f == 54 ? 2 : f == 10 ? 3 : 0; };
     return group(destFormat) != 0 && group(destFormat) == group(textureFormat);
 }
 
@@ -75,6 +86,7 @@ inline bool ResidentTextureMatches(const ResidentTextureShape& t, const Resident
                          : !t.tiled                                ? "linear"
                          : t.pitch != r.destPitch || t.pitch == 0 || t.pitch % 32 != 0 ? "another pitch"
                          : r.textureBase < t.base || (r.textureBase - t.base) % 4096 != 0 ? "another base"
+                         : r.bytesLog2 != 2 && r.textureBase != t.base                    ? "another base"
                                                                                            : nullptr;
     if (reason == nullptr)
     {
@@ -92,6 +104,41 @@ inline bool ResidentTextureMatches(const ResidentTextureShape& t, const Resident
     if (y != nullptr)
         *y = cornerY + r.y0;
     return reason == nullptr;
+}
+
+// FM4 Recomp: a mipped texture whose levels FM4 fills one resolve each (the 256x256 k_8_8_8_8 at
+// 1C2E3000, then 128, 64 and 32 at 1C323000, 1C333000, 1C337000; ~4.75 consumer waits a race frame). Each unpacked level is
+// matched as a one-level texture at its own address, size and pitch (texture_info.h MipLevel); a packed level (its texels at an
+// offset inside a shared tail tile) is never matched. Returns the level the resolve's words go to (corner in `x`, `y`), or -1
+// with the reason level 0 gave (a single-level, unpacked texture: exactly ResidentTextureMatches).
+struct ResidentLevel
+{
+    uint32_t address = 0, width = 0, height = 0, pitch = 0;
+    bool packed = false;
+};
+inline int ResidentLevelFor(const ResidentTextureShape& t, const std::vector<ResidentLevel>& levels, const ResidentResolve& r, std::string* why = nullptr,
+                            uint32_t* x = nullptr, uint32_t* y = nullptr)
+{
+    if ((t.levels == 1 && !t.packedMips) || levels.empty())
+        return ResidentTextureMatches(t, r, why, x, y) ? 0 : -1;
+    std::string first;
+    for (size_t level = 0; level < levels.size(); level++)
+    {
+        const ResidentLevel& l = levels[level];
+        std::string reason = "a packed mip level";
+        if (!l.packed)
+        {
+            ResidentTextureShape one = t;
+            one.base = l.address, one.width = l.width, one.height = l.height, one.pitch = l.pitch, one.levels = 1, one.packedMips = false;
+            if (ResidentTextureMatches(one, r, &reason, x, y))
+                return int(level);
+        }
+        if (level == 0)
+            first = reason;
+    }
+    if (why != nullptr)
+        *why = "no level takes it (level 0: " + first + ")";
+    return -1;
 }
 
 }  // namespace runtime::video

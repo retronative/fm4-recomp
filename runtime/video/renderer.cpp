@@ -60,7 +60,10 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <tuple>
 #include <thread>
+#include <algorithm>
+#include <map>
 #include <unordered_map>
 #include <vector>
 
@@ -71,7 +74,9 @@ namespace runtime::video {
 namespace {
 
 constexpr uint32_t kDisplayWidth = 1280, kDisplayHeight = 720;  // the accepted video mode (imports_video.cpp)
-constexpr uint32_t kSlots = 1;                                     // unit 4; D-b's 12 slots come with unit 5
+// FM4 Recomp: slot 0 owns the ring, the descriptor pool and the timestamps; the others are command buffers and fences only, used
+// by FM4_SUBMIT_SPLIT (SplitSubmit) to submit part of the open work without waiting (slots 1-7). Without it only slot 0 is used.
+constexpr uint32_t kSlots = 8;
 constexpr size_t kCaptureRecords = 16;
 constexpr uint64_t kCaptureBytes = 64ull << 20;                    // 16 stored-deflate 1280x720 PNGs are ~44 MB
 constexpr size_t kKeepRecords = 96;                               // FM4_CAPTURE_KEEP_EVERY (capture_keep.h)
@@ -109,9 +114,31 @@ struct Slot
     struct ErrorDword
     {
         uint64_t offset, draw;
-        std::string what;  // FM4 Recomp: the draw's vertex shader and windows, named when its shader flags an error
+        // FM4 Recomp: the draw's vertex shader and windows, named (Text) only when its shader flags an error: kept as numbers,
+        // since formatting them for every draw cost ~3 % of the command thread.
+        uint64_t vsHash = 0;
+        uint32_t highIndex = 0;
+        struct Window { uint32_t slot, dwords, sizeWords, stride, end; bool computed; };
+        std::vector<Window> windows;
+        std::string Text() const
+        {
+            char hash[24];
+            std::snprintf(hash, sizeof hash, "vs_%016llx", (unsigned long long)vsHash);
+            std::string what = std::string(hash) + ", highest index " + std::to_string(highIndex);
+            for (const Window& w : windows)
+                what += "; slot " + std::to_string(w.slot) + ": window " + std::to_string(w.dwords) + " dwords, constant " + std::to_string(w.sizeWords) +
+                        ", stride " + std::to_string(w.stride) + ", end " + std::to_string(w.end) + (w.computed ? ", computed index" : "");
+            return what;
+        }
     };
     std::vector<ErrorDword> errorDwords;
+    // FM4 Recomp (FM4_VERTEX_REUSE): the vertex windows copied into this ring since OpenSlot, by physical address and endian:
+    // where (dwords into the ring), how many dwords, and the watch sequence they were copied under.
+    struct VertexCopy { uint32_t ringDword, dwords; uint64_t sequence; };
+    std::unordered_map<uint64_t, VertexCopy> vertexCopies;
+    // FM4 Recomp (FM4_DESCRIPTOR_CACHE): the sets allocated since the pool's reset, by DescriptorKey (layout, index range, and each
+    // texture binding's view and sampler); with dynamic buffer bindings a set does not depend on the draw's ring offsets.
+    std::unordered_map<std::string, VkDescriptorSet> descriptorCache;
 } slots[kSlots];
 VkImage display = VK_NULL_HANDLE;
 VkDeviceMemory displayMemory = VK_NULL_HANDLE;
@@ -181,6 +208,31 @@ bool ResolveResidentCheck()
     return on;
 }
 
+bool ResolveResidentK88()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_RESOLVE_RESIDENT_K88");
+        const bool enabled = ResolveResident() && v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] resident k_8_8 on (FM4_RESOLVE_RESIDENT_K88=1): 16 bpp k_8_8 resolves are converted on the GPU\n");
+        return enabled;
+    }();
+    return on;
+}
+
+bool ResolveGpuWords()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_RESOLVE_GPU_WORDS");
+        const bool asked = v != nullptr && v[0] == '1' && v[1] == '\0', enabled = asked && ResolveResident() && !ResolveResidentCheck();
+        if (asked)
+            std::fprintf(stderr, enabled ? "[gpu] resolve GPU words on (FM4_RESOLVE_GPU_WORDS=1): a GPU-converted resolve is written back from its words\n"
+                                         : "[gpu] FM4_RESOLVE_GPU_WORDS=1 ignored: it needs FM4_RESOLVE_RESIDENT=1 and FM4_RESOLVE_RESIDENT_CHECK off\n");
+        return enabled;
+    }();
+    return on;
+}
+
 namespace {
 gpu::SubmissionGate gate;
 // FM4 Recomp (FM4_GPU_TIMESTAMPS=1, diagnostic): GPU execution time of each submission from two timestamp queries, summed per
@@ -237,21 +289,204 @@ struct OpenPass
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkRenderPass pass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    int timing = -1;  // FM4_DIAG_PASS_TIMES: its entry in passTimings
+    uint32_t areaRows = 0;  // FM4_PASS_AREA: the render area's rows from the top
 } openPass;
+// FM4 Recomp (opt-in FM4_PASS_AREA=1): a draw render pass's render area is the full width and only the rows the draw can touch
+// (its scissor's bottom, rounded up to 32 and capped at the image), not the whole host target: the main scene's 1280x1024 2x
+// target is 720 rows on screen and costs ~44 ms of GPU a race frame over ~22 passes, each loading and storing both attachments
+// (FM4_DIAG_PASS_TIMES). Load and store act only inside the render area and the pixels
+// outside it are not affected (Vulkan vkCmdBeginRenderPass, VkRenderPassBeginInfo::renderArea). A merged pass continues only for
+// a draw whose rows fit its area.
+bool PassArea()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_PASS_AREA");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] pass area on (FM4_PASS_AREA=1): a draw render pass covers only the rows its draws can touch\n");
+        return enabled;
+    }();
+    return on;
+}
+// FM4 Recomp (FM4_DIAG_PASS_TIMES=1, diagnostic; needs FM4_GPU_TIMESTAMPS=1 and FM4_PASS_MERGE=1): a bottom-of-pipe timestamp
+// before each draw render pass begins and after it ends (outside the pass), read at the slot's retire: GPU time per pass kind
+// (target size, samples, formats), summed per swap and tallied every 300 swaps. The rest of GPU busy is the units' own work
+// (EDRAM transfers, resolves, clears) and copies.
+constexpr uint32_t kPassQueries = 2048;
+VkQueryPool passQueries = VK_NULL_HANDLE;
+// Also (render_hooks.h PassActivity): what ended each pass, the passes by draw count, and the GPU time between two consecutive
+// passes of one command buffer, labelled by the jobs recorded between them.
+struct PassTiming
+{
+    uint32_t query;
+    uint32_t draws;
+    std::string kind;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    std::string before;  // the jobs recorded since the previous pass of this command buffer ended
+    const char* ended = "open";
+    bool unit = false;  // a unit's own pass (render_hooks.h UnitPassBegin), tallied apart from the draw passes
+};
+int unitTiming = -1;  // the unit pass being recorded
+uint64_t unitGpuNsSinceSwap = 0;
+std::map<std::string, std::pair<uint64_t, uint64_t>> unitTally;  // kind -> (ns, passes)
+std::vector<PassTiming> passTimings;
+uint32_t passQueriesUsed = 0;
+uint64_t passGpuNsSinceSwap = 0, passTimedSinceSwap = 0, gapGpuNsSinceSwap = 0;
+std::map<std::string, std::pair<uint64_t, uint64_t>> passTally;  // kind -> (ns, passes)
+std::map<std::string, std::pair<uint64_t, uint64_t>> passDrawTally, passGapTally, passEndTally;  // FM4_DIAG_PASS_TIMES (ns, count)
+std::string passJobs;  // the jobs recorded outside a pass since the last pass ended
+void NotePassJob(const char* job)
+{
+    if (("+" + passJobs + "+").find(std::string("+") + job + "+") == std::string::npos)
+        passJobs += (passJobs.empty() ? "" : "+") + std::string(job);
+}
+const char* DrawBucket(uint32_t draws)
+{
+    return draws <= 1 ? "1 draw" : draws <= 7 ? "2-7 draws" : draws <= 31 ? "8-31 draws" : draws <= 127 ? "32-127 draws" : "128+ draws";
+}
+bool PassTimes()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_PASS_TIMES");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on && passQueries != VK_NULL_HANDLE;
+}
 uint64_t passesSinceSwap = 0;
+// FM4 Recomp (opt-in FM4_VERTEX_REUSE=1, with FM4_WRITE_WATCH=1): a draw's vertex window that the open slot's ring already holds
+// (the same physical start and endian, at least as many dwords) and that nothing wrote since it was copied (the write watch's
+// sequences: guest stores fault, resolves and system-call writes mark) is read from that copy instead of copied again. The
+// vertex binding then spans the whole ring and xe_vertex_base holds each window's dword in it.
+// Ranges the watch cannot protect (the E0000000 view) are copied every time, as before.
+bool wholeRingVertexBinding = false;  // the device's maxStorageBufferRange covers the ring (Init)
+uint64_t vertexCopiedSinceSwap = 0, vertexReusedSinceSwap = 0;
+bool VertexReuse()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_VERTEX_REUSE");
+        const bool asked = v != nullptr && v[0] == '1' && v[1] == '\0', enabled = asked && wholeRingVertexBinding;
+        if (asked)
+            std::fprintf(stderr, enabled ? "[gpu] vertex reuse on (FM4_VERTEX_REUSE=1): a window the slot's ring holds unwritten is not copied again\n"
+                                         : "[gpu] FM4_VERTEX_REUSE=1 ignored: the device's storage buffer range does not cover the ring\n");
+        return enabled;
+    }();
+    return on;
+}
+// FM4 Recomp (opt-in FM4_DESCRIPTOR_CACHE=1, with FM4_VERTEX_REUSE=1): the six buffer bindings are dynamic descriptors at base
+// offset 0, so a draw's descriptor set depends only on its layout, its textures (view and sampler per binding) and, for the
+// XE_RECT_LIST variant that reads XeIndices, the index range; a set the open slot already holds for the same key is bound again
+// with the draw's ring offsets instead of being allocated and written (vkUpdateDescriptorSets,
+// vkAllocateDescriptorSets and vkResetDescriptorPool were ~15 % of the command thread, mostly the validation layer). The vertex
+// binding needs FM4_VERTEX_REUSE's whole-ring addressing (dynamic offset 0). Xenia and ShiftGlue bind their constant buffers the
+// same way (dynamic offsets into an upload buffer). Decided in CreateResources, before any pool or layout exists.
+bool descriptorCacheOn = false;
+uint64_t descriptorHitsSinceSwap = 0, descriptorMissesSinceSwap = 0;
+// FM4 Recomp (opt-in FM4_INDEX_REUSE=1, with FM4_WRITE_WATCH=1): a guest index buffer's host indices (BuildHostIndices) are kept
+// with the write watch's sequence they were read under, keyed by every input of the conversion (range, size, endian, count,
+// restart, offset, clamp, host primitive); while nothing wrote the range since (GuestRangeUnwritten), a later draw uses them
+// instead of reading and converting the guest indices again (~5 % of the command thread). Across slots and
+// frames: the indices live on the CPU, not in the ring. Bounded: cleared above kIndexCacheBytes.
+bool IndexReuse()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_INDEX_REUSE");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] index reuse on (FM4_INDEX_REUSE=1): converted indices kept while the write watch sees no write\n");
+        return enabled;
+    }();
+    return on;
+}
+// FM4 Recomp (FM4_VERTEX_REUSE, FM4_INDEX_REUSE): a range found written since it was last watched is hot (a buffer the game
+// rewrites every frame); for kHotSwaps swaps it is copied or converted without being watched or cached, so it costs no
+// mprotect on this thread and no write fault on the guest's (~1,000 faults, 16-23 ms of fault hook a race
+// frame; WatchProtect 3 % of the command thread). Keyed by physical address << 2 | endian (vertices) or the index key.
+constexpr uint64_t kHotSwaps = 30;
+struct LastWatch { uint32_t physical, bytes; uint64_t sequence, hotUntil; };
+std::unordered_map<uint64_t, LastWatch> vertexWatches;
+std::unordered_map<std::string, uint64_t> hotIndices;  // index key -> the swap it stays hot until
+uint64_t renderSwap = 0, hotSkipsSinceSwap = 0;
+bool HotSkip()  // opt-in FM4_HOT_SKIP=1
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_HOT_SKIP");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] hot-range skip on (FM4_HOT_SKIP=1): a vertex or index range written since its last watch is not watched for %llu swaps\n",
+                         (unsigned long long)kHotSwaps);
+        return enabled;
+    }();
+    return on;
+}
+// True when the range should be watched now; marks it hot when it was written since its last watch.
+bool WatchWorthIt(LastWatch* last, uint32_t physical, uint32_t bytes)
+{
+    if (last == nullptr || !HotSkip())
+        return true;
+    if (renderSwap < last->hotUntil)
+        return false;
+    if (last->physical == physical && last->bytes >= bytes && !GuestRangeUnwritten(last->physical, last->bytes, last->sequence))
+    {
+        last->hotUntil = renderSwap + kHotSwaps;
+        return false;
+    }
+    return true;
+}
+struct CachedIndices { HostIndices host; uint64_t sequence; };
+std::unordered_map<std::string, CachedIndices> indexCache;
+uint64_t indexCacheBytes = 0, indexHitsSinceSwap = 0, indexMissesSinceSwap = 0;
+constexpr uint64_t kIndexCacheBytes = 128ull << 20;
+bool VertexReuseVerify()  // FM4_VERTEX_REUSE_VERIFY=1 (diagnostic): every reused window compared with guest memory; a mismatch stops
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_VERTEX_REUSE_VERIFY"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+}
 uint64_t cpIdleAt = 0, selfWaitsAt = 0, immediateWaitsAt = 0, memWaitsAt = 0, syncedWaitsAt = 0, memWaitNsAt = 0, immediateInterruptsAt = 0, graceSyncsAt = 0;
 uint64_t currentSwap = 0;  // the last swap Present saw (diagnostics)
 
 // FM4 Recomp (FM4_DIAG_CONSUMER=1, diagnostic): what a "resolve consumer" flush waited for; each distinct one is logged once (at
 // most 64): a vertex window or index buffer over a pending range, or a texture (its six fetch-constant words) that is not resident.
+// FM4_DIAG_CONSUMER=2: every one tallied by kind (a texture by format, size and tiling; a buffer by size), the tally printed
+// every 300 swaps (DiagConsumerReport).
+int DiagConsumerMode()
+{
+    static const int mode = [] {
+        const char* v = std::getenv("FM4_DIAG_CONSUMER");
+        return v != nullptr && (v[0] == '1' || v[0] == '2') && v[1] == '\0' ? v[0] - '0' : 0;
+    }();
+    return mode;
+}
+std::map<std::string, uint64_t> consumerTally;
+void DiagConsumerReport(uint64_t swap)
+{
+    if (DiagConsumerMode() != 2 || swap % 300 != 0 || consumerTally.empty())
+        return;
+    std::vector<std::pair<uint64_t, std::string>> sorted;
+    for (const auto& [key, count] : consumerTally)
+        sorted.push_back({count, key});
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::fprintf(stderr, "[diag consumer] swaps %llu-%llu, waits by kind:", (unsigned long long)(swap - 299), (unsigned long long)swap);
+    for (size_t i = 0; i < sorted.size() && i < 16; i++)
+        std::fprintf(stderr, "%s %llu x %s", i ? ";" : "", (unsigned long long)sorted[i].first, sorted[i].second.c_str());
+    std::fprintf(stderr, "\n");
+    consumerTally.clear();
+}
 void DiagConsumer(const char* what, uint32_t physical, uint32_t bytes, const uint32_t* words)
 {
-    static const bool on = [] {
-        const char* v = std::getenv("FM4_DIAG_CONSUMER");
-        return v != nullptr && v[0] == '1' && v[1] == '\0';
-    }();
-    if (!on)
+    if (DiagConsumerMode() == 0)
         return;
+    if (DiagConsumerMode() == 2)
+    {
+        char kind[96];
+        if (words != nullptr)  // fetch constant fields as draw_state.cpp:494-512 decodes them
+            std::snprintf(kind, sizeof kind, "%s format %u %ux%u%s dim %u", what, words[1] & 0x3F, (words[2] & 0x1FFF) + 1, ((words[2] >> 13) & 0x1FFF) + 1,
+                          (words[0] >> 31) ? " tiled" : " linear", (words[5] >> 9) & 3);
+        else
+            std::snprintf(kind, sizeof kind, "%s of %u bytes", what, bytes);
+        consumerTally[kind]++;
+        return;
+    }
     static std::set<std::string> seen;
     char key[160];
     if (words != nullptr)
@@ -272,13 +507,42 @@ bool ThreadCpuDiag()
     }();
     return on;
 }
+void BeginUnitPass(VkCommandBuffer c, const char* kind)  // FM4_DIAG_PASS_TIMES (render_hooks.h beginUnitPass)
+{
+    unitTiming = -1;
+    if (!PassTimes() || passQueriesUsed + 2 > kPassQueries)
+        return;
+    NotePassJob(passActivity);
+    vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, passQueries, passQueriesUsed);
+    unitTiming = int(passTimings.size());
+    passTimings.push_back({passQueriesUsed, 0, kind, c, passJobs, "unit", true});
+    passJobs.clear();
+    passQueriesUsed += 2;
+}
+void EndUnitPass(VkCommandBuffer c)
+{
+    if (unitTiming < 0)
+        return;
+    vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, passQueries, passTimings[size_t(unitTiming)].query + 1);
+    unitTiming = -1;
+}
 void EndOpenPass(VkCommandBuffer c)
 {
     if (openPass.commands == VK_NULL_HANDLE)
+    {
+        if (!passTimings.empty())  // FM4_DIAG_PASS_TIMES: a job between passes
+            NotePassJob(passActivity);
         return;
+    }
     if (c != openPass.commands)
         Stop(StopCode::Setup, "renderer: a render pass is open on another command buffer than the one recorded into");
     vkCmdEndRenderPass(c);
+    if (openPass.timing >= 0)  // FM4_DIAG_PASS_TIMES
+    {
+        vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, passQueries, passTimings[size_t(openPass.timing)].query + 1);
+        passTimings[size_t(openPass.timing)].ended = passActivity;
+        passJobs = passActivity;
+    }
     openPass = OpenPass{};
 }
 uint64_t gpuBusyNsSinceSwap = 0, gpuTimedSinceSwap = 0;
@@ -370,10 +634,16 @@ void RequireDraw(uint64_t draw, const Verdict& v)
 }
 
 // The slot's recorded commands to the queue, under the queue lock (window_present.h LockQueue: bounded).
+// FM4 Recomp (FM4_SUBMIT_SPLIT): the slot whose command buffer records now, and the slots submitted since slot 0 opened, in
+// submission order (RetireSlot retires them all, in that order).
+uint32_t recording = 0;
+std::vector<uint32_t> submitted;
+uint64_t drawsInBuffer = 0, splitsSinceSwap = 0;
 void SubmitSlot(uint32_t s)
 {
     std::unique_lock<std::timed_mutex> queue = LockQueue(queueLock, PresenterWaitBoundNs(guard->FenceTimeoutNs()), "submit");
     Require(guard->Submit(s));
+    submitted.push_back(s);
 }
 
 Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
@@ -409,6 +679,7 @@ void ImageBarrier(VkCommandBuffer c, VkImageLayout from, VkImageLayout to, VkPip
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = display;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const PassActivity activity("present");  // FM4_DIAG_PASS_TIMES label
     EndOpenPass(c);  // FM4_PASS_MERGE
     vkCmdPipelineBarrier(c, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
@@ -434,18 +705,23 @@ VkCommandBuffer OpenSlot(uint32_t s)
 {
     Slot& slot = slots[s];
     if (slot.open)
-        return slot.commands;
+        return slots[recording].commands;  // FM4_SUBMIT_SPLIT: the slot's work continues in this command buffer
     const VkCommandBuffer c = BeginSlot(s);
+    recording = s, drawsInBuffer = 0;
     if (slot.timestamps != VK_NULL_HANDLE)  // FM4_GPU_TIMESTAMPS (diagnostic)
     {
         vkCmdResetQueryPool(c, slot.timestamps, 0, 2);
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot.timestamps, 0);
         slot.timed = true, slot.stamped = false;
     }
+    if (PassTimes())  // FM4_DIAG_PASS_TIMES: the slot's pass queries, reset before any of its passes
+        vkCmdResetQueryPool(c, passQueries, 0, kPassQueries), passTimings.clear(), passQueriesUsed = 0, passJobs.clear();
     slot.allocator->Reset();
     Check(vkResetDescriptorPool(dev.device, slot.descriptors, 0), "vkResetDescriptorPool");
+    slot.descriptorCache.clear();
     slot.sets = 0;
     slot.errorDwords.clear();
+    slot.vertexCopies.clear();
     slot.open = true;
     return c;
 }
@@ -455,7 +731,12 @@ VkCommandBuffer OpenSlot(uint32_t s)
 // exponent 31): a set bit stops naming the draw. Read before the next OpenSlot resets the ring.
 void RetireSlot(uint32_t s)
 {
-    Require(guard->Retire(s));
+    if (submitted.empty() || submitted.front() != s)
+        Stop(StopCode::Setup, "renderer: slot %u is retired, but it is not the first submission of its work", s);
+    for (const uint32_t k : submitted)  // FM4_SUBMIT_SPLIT: every part, in submission order (each a bounded wait)
+        Require(guard->Retire(k));
+    submitted.clear();
+    recording = s;
     // The EDRAM unit's read-back resolves of this submission into guest memory (render_hooks.h EdramHooks::retired),
     // before the pending ranges are declared complete.
     if (edramHooks != nullptr)
@@ -472,13 +753,52 @@ void RetireSlot(uint32_t s)
             gpuBusyNsSinceSwap += uint64_t(double(t[1] - t[0]) * timestampPeriodNs), gpuTimedSinceSwap++;
     }
     slot.timed = slot.stamped = false;
+    if (PassTimes() && passQueriesUsed != 0)  // FM4_DIAG_PASS_TIMES: every part retired, so every query is available
+    {
+        std::vector<uint64_t> t(passQueriesUsed);
+        if (vkGetQueryPoolResults(dev.device, passQueries, 0, passQueriesUsed, t.size() * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            for (size_t i = 0; i < passTimings.size(); i++)
+            {
+                const PassTiming& p = passTimings[i];
+                if (t[p.query + 1] >= t[p.query])
+                {
+                    const uint64_t ns = uint64_t(double(t[p.query + 1] - t[p.query]) * timestampPeriodNs);
+                    if (p.unit)
+                    {
+                        unitGpuNsSinceSwap += ns;
+                        auto& u = unitTally[p.kind];
+                        u.first += ns, u.second++;
+                    }
+                    else
+                    {
+                        passGpuNsSinceSwap += ns, passTimedSinceSwap++;
+                        auto& k = passTally[p.kind];
+                        k.first += ns, k.second++;
+                        auto& b = passDrawTally[p.kind + " " + DrawBucket(p.draws)];
+                        b.first += ns, b.second++;
+                    }
+                }
+                if (!p.unit)
+                    passEndTally[p.ended].second++;
+                // The GPU time between this pass and the previous one of the same command buffer: the jobs recorded between them.
+                const PassTiming* q = i ? &passTimings[i - 1] : nullptr;
+                if (q != nullptr && q->commands == p.commands && t[p.query] >= t[q->query + 1])
+                {
+                    const uint64_t ns = uint64_t(double(t[p.query] - t[q->query + 1]) * timestampPeriodNs);
+                    gapGpuNsSinceSwap += ns;
+                    auto& g = passGapTally[p.before.empty() ? "nothing" : p.before];
+                    g.first += ns, g.second++;
+                }
+            }
+        passTimings.clear(), passQueriesUsed = 0;
+    }
     for (const Slot::ErrorDword& e : slot.errorDwords)
     {
         uint32_t error = 0;
         std::memcpy(&error, static_cast<const uint8_t*>(slot.ring.mapped) + e.offset, 4);
         if (error != 0)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: the vertex shader flagged xe_error %u (bit 0: a vertex fetch outside its slot's data; "
-                                          "bit 1: a 16-bit float with exponent 31); %s", (unsigned long long)e.draw, error, e.what.c_str());
+                                          "bit 1: a 16-bit float with exponent 31); %s", (unsigned long long)e.draw, error, e.Text().c_str());
     }
     slot.errorDwords.clear();
 }
@@ -486,9 +806,10 @@ void RetireSlot(uint32_t s)
 // FM4_GPU_TIMESTAMPS (diagnostic): the end timestamp of the open slot, recorded last (outside any render pass).
 void StampEnd(uint32_t s)
 {
-    EndOpenPass(slots[s].commands);  // FM4_PASS_MERGE: nothing is submitted inside a render pass
-    if (slots[s].timed)
-        vkCmdWriteTimestamp(slots[s].commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slots[s].timestamps, 1), slots[s].stamped = true;
+    const PassActivity activity("submit");  // FM4_DIAG_PASS_TIMES label
+    EndOpenPass(slots[recording].commands);  // FM4_PASS_MERGE: nothing is submitted inside a render pass
+    if (slots[s].timed)  // FM4_SUBMIT_SPLIT: into the last part (the start is in the first)
+        vkCmdWriteTimestamp(slots[recording].commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slots[s].timestamps, 1), slots[s].stamped = true;
 }
 
 // The open slot's recorded work, submitted and confirmed complete (a bounded wait), so that guest memory
@@ -499,10 +820,82 @@ void FlushSlot(uint32_t s, FlushCause cause)
         return;
     const auto start = std::chrono::steady_clock::now();
     StampEnd(s);
-    Check(vkEndCommandBuffer(slots[s].commands), "vkEndCommandBuffer");
-    SubmitSlot(s);
-    RetireSlot(s);  // confirmed completion, then the draws' xe_error dwords
+    Check(vkEndCommandBuffer(slots[recording].commands), "vkEndCommandBuffer");
+    SubmitSlot(recording);
+    RetireSlot(s);  // confirmed completion of every part, then the draws' xe_error dwords
     flushCountSinceSwap[size_t(cause)]++, flushNsSinceSwap[size_t(cause)] += NsSince(start);
+}
+
+// FM4 Recomp (opt-in FM4_SUBMIT_SPLIT=<draws>, 16-4096): once the command buffer recording slot 0's work holds that many draws,
+// it is ended and submitted without waiting, and the work continues in an idle slot's command buffer, so the GPU executes it
+// while the CPU records the rest; the next flush waits only for what is left (ShiftGlue 72b7dd6f vulkan/command_processor.cpp
+// :6047-6054 splits every vulkan_async_submission_split_draws draws without waiting; FM4's flushes come every ~200 draws, so the
+// split is smaller). Every part uses slot 0's ring and descriptor pool, which are reset only after every part is retired
+// (RetireSlot, in submission order); submission order on the one queue keeps the barriers' ordering across parts.
+uint32_t SplitDraws()
+{
+    static const uint32_t n = [] {
+        const char* v = std::getenv("FM4_SUBMIT_SPLIT");
+        const unsigned long draws = v != nullptr ? std::strtoul(v, nullptr, 10) : 0;
+        const uint32_t on = draws >= 16 && draws <= 4096 ? uint32_t(draws) : 0;
+        if (v != nullptr && on != 0)
+            std::fprintf(stderr, "[gpu] split submission on (FM4_SUBMIT_SPLIT=%u): every %u draws the open work is submitted without waiting\n", on, on);
+        else if (v != nullptr)
+            std::fprintf(stderr, "[gpu] FM4_SUBMIT_SPLIT=%s ignored: draws must be 16-4096\n", v);
+        return on;
+    }();
+    return n;
+}
+// FM4 Recomp (opt-in FM4_SPLIT_AT_PASS_END=1, with FM4_SUBMIT_SPLIT): a split waits until no draw render pass is open (a resolve
+// or a unit pass ended it), instead of ending the open pass itself: each pass end reloads and stores the attachments on a tile
+// GPU ("split submit" ended 8 main-scene passes a frame). A part that reaches four times the
+// split size splits anyway.
+// FM4 Recomp (opt-in FM4_OVERWRITE_CLAIM=1): a draw that provably overwrites a rectangle of its targets (draw_record.h
+// FindOverwriteRect: FM4's clears) claims the tiles inside it without an ownership transfer (edram::Bind cutouts).
+bool OverwriteClaim()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_OVERWRITE_CLAIM");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] overwrite claims on (FM4_OVERWRITE_CLAIM=1): a one-rectangle overwriting draw claims its tiles without a transfer\n");
+        return enabled;
+    }();
+    return on;
+}
+bool DiagOverwrite()
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_DIAG_OVERWRITE"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+}
+uint64_t overwriteClaimsSinceSwap = 0;
+bool SplitAtPassEnd()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_SPLIT_AT_PASS_END");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+void SplitSubmit()
+{
+    if (SplitDraws() == 0 || !slots[0].open || drawsInBuffer < SplitDraws())
+        return;
+    if (SplitAtPassEnd() && openPass.commands != VK_NULL_HANDLE && drawsInBuffer < 4 * SplitDraws())
+        return;  // FM4_SPLIT_AT_PASS_END: at the next pass boundary
+    uint32_t next = kSlots;
+    for (uint32_t k = 1; k < kSlots && next == kSlots; k++)
+        if (k != recording && guard->SlotState(k) == gpu::SubmissionLifetime<Transient>::State::Idle)
+            next = k;
+    if (next == kSlots)
+        return;  // every part slot is in flight: keep recording into this one
+    const PassActivity activity("split submit");  // FM4_DIAG_PASS_TIMES label
+    EndOpenPass(slots[recording].commands);  // FM4_PASS_MERGE: nothing is submitted inside a render pass
+    Check(vkEndCommandBuffer(slots[recording].commands), "vkEndCommandBuffer");
+    SubmitSlot(recording);
+    BeginSlot(next);
+    recording = next, drawsInBuffer = 0;
+    splitsSinceSwap++;
 }
 
 // The display image (already in TRANSFER_DST_OPTIMAL after `written`) -> the readback buffer, made
@@ -633,6 +1026,14 @@ void CreateResources()
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(dev.gpu, &properties);
     const uint64_t uniformAlign = properties.limits.minUniformBufferOffsetAlignment, storageAlign = properties.limits.minStorageBufferOffsetAlignment;
+    wholeRingVertexBinding = uint64_t(properties.limits.maxStorageBufferRange) >= RingBytes();
+    if (const char* v = std::getenv("FM4_DESCRIPTOR_CACHE"); v != nullptr && v[0] == '1' && v[1] == '\0')
+    {
+        descriptorCacheOn = VertexReuse() && properties.limits.maxDescriptorSetUniformBuffersDynamic >= 3 && properties.limits.maxDescriptorSetStorageBuffersDynamic >= 3;
+        std::fprintf(stderr, descriptorCacheOn ? "[gpu] descriptor cache on (FM4_DESCRIPTOR_CACHE=1): dynamic buffer offsets, a set reused per layout and textures\n"
+                                               : "[gpu] FM4_DESCRIPTOR_CACHE=1 ignored: it needs FM4_VERTEX_REUSE=1 and 3 dynamic uniform and storage buffers a set (%u, %u)\n",
+                     properties.limits.maxDescriptorSetUniformBuffersDynamic, properties.limits.maxDescriptorSetStorageBuffersDynamic);
+    }
     // The sampler budgets of the per-pair layouts (pipeline_key.h SamplerLimits), queried, never assumed.
     samplerLimits.perStageSamplers = properties.limits.maxPerStageDescriptorSamplers;
     samplerLimits.perStageSampledImages = properties.limits.maxPerStageDescriptorSampledImages;
@@ -646,6 +1047,7 @@ void CreateResources()
         Stop(StopCode::Setup, "renderer: buffer offset alignments %llu / %llu are not powers of two", (unsigned long long)uniformAlign,
              (unsigned long long)storageAlign);
     endOpenRenderPass = EndOpenPass;  // FM4_PASS_MERGE: the units end an open pass before recording outside one (render_hooks.h)
+    beginUnitPass = BeginUnitPass, endUnitPass = EndUnitPass;  // FM4_DIAG_PASS_TIMES
     if (GpuTimestamps())  // FM4 Recomp (diagnostic): only with timestamp support on the queue family
     {
         uint32_t families = 0;
@@ -679,6 +1081,8 @@ void CreateResources()
         VkFenceCreateInfo fence{};
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         Check(vkCreateFence(dev.device, &fence, nullptr, &s.fence), "vkCreateFence");
+        if (&s != &slots[0])
+            continue;  // FM4_SUBMIT_SPLIT: a part slot has a command buffer and a fence only
         if (timestampPeriodNs > 0)  // FM4_GPU_TIMESTAMPS (diagnostic)
         {
             VkQueryPoolCreateInfo query{};
@@ -686,6 +1090,12 @@ void CreateResources()
             query.queryType = VK_QUERY_TYPE_TIMESTAMP;
             query.queryCount = 2;
             Check(vkCreateQueryPool(dev.device, &query, nullptr, &s.timestamps), "vkCreateQueryPool");
+            if (const char* v = std::getenv("FM4_DIAG_PASS_TIMES"); v != nullptr && v[0] == '1' && v[1] == '\0')  // FM4_DIAG_PASS_TIMES
+            {
+                query.queryCount = kPassQueries;
+                Check(vkCreateQueryPool(dev.device, &query, nullptr, &passQueries), "vkCreateQueryPool");
+                std::fprintf(stderr, "[gpu] diagnostic FM4_DIAG_PASS_TIMES=1: GPU time of each draw render pass (%u queries a slot)\n", kPassQueries);
+            }
         }
         // Unit 8: the ring (uniform, storage and index data) and the descriptor pool, persistent per slot.
         // Unit 7: also the staging source of texture uploads (vkCmdCopyBufferToImage, texture_vk.cpp).
@@ -693,8 +1103,8 @@ void CreateResources()
                                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         s.allocator.emplace(RingBytes(), uniformAlign, storageAlign);
         const VkDescriptorPoolSize sizes[] = {
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kDrawsPerSlot},
+            {descriptorCacheOn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
+            {descriptorCacheOn ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * kDrawsPerSlot},
             // A set holds only its pair's samplers (per-pair layouts), at most min(32, the set budget) of them: the worst case per set.
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, std::min<uint32_t>(kTextureBindings, std::min(samplerLimits.setSamplers, samplerLimits.setSampledImages)) * kDrawsPerSlot},
         };
@@ -719,7 +1129,7 @@ void Shutdown()
     if (edramHooks != nullptr)  // its images, views and pipelines: after the framebuffers over its views, before the device
         edramHooks->shutdown();
     edramHooks = nullptr;
-    endOpenRenderPass = nullptr, openPass = OpenPass{};
+    endOpenRenderPass = nullptr, beginUnitPass = nullptr, endUnitPass = nullptr, openPass = OpenPass{};
     pipelines.reset();  // pipelines, render passes, modules, layouts
     shaders.reset();
     compiler.reset();
@@ -731,6 +1141,8 @@ void Shutdown()
         backend.Destroy(s.ring);
         vkDestroyFence(dev.device, s.fence, nullptr);
         vkDestroyQueryPool(dev.device, s.timestamps, nullptr);  // FM4_GPU_TIMESTAMPS: every submission confirmed complete (above)
+        if (&s == &slots[0])
+            vkDestroyQueryPool(dev.device, passQueries, nullptr), passQueries = VK_NULL_HANDLE;  // FM4_DIAG_PASS_TIMES
         s.timestamps = VK_NULL_HANDLE, s.timed = s.stamped = false;
         vkDestroyCommandPool(dev.device, s.pool, nullptr);  // frees its command buffer
         s.allocator.reset();
@@ -889,6 +1301,7 @@ bool Initialize(const Options& o)
     features.depthClamp = dev.depthClamp;
     features.constantAlphaColorBlendFactors = false;
     features.independentBlend = dev.independentBlend;
+    features.dynamicBuffers = descriptorCacheOn;
     KeyResult created;
     pipelines.emplace(dev.device, features, allowedClasses, created);
     if (!created)
@@ -918,6 +1331,12 @@ bool Initialize(const Options& o)
 void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap)
 {
     currentSwap = swap;
+    renderSwap = swap;
+    if (vertexWatches.size() > 65536)  // FM4_VERTEX_REUSE / FM4_INDEX_REUSE hot-range bookkeeping, bounded
+        vertexWatches.clear();
+    if (hotIndices.size() > 65536)
+        hotIndices.clear();
+    DiagConsumerReport(swap);  // FM4_DIAG_CONSUMER=2 (diagnostic)
     if (!enabled)
         return;
     Require(guard->Begin("present"));
@@ -1001,7 +1420,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
             }
         if (*separator == ',')
             timing += ")";
-        char gpuBusy[448] = "";
+        char gpuBusy[640] = "";
         if (timestampPeriodNs > 0)  // FM4_GPU_TIMESTAMPS (diagnostic)
             std::snprintf(gpuBusy, sizeof gpuBusy, "; GPU busy %.1f ms in %llu submission(s)", gpuBusyNsSinceSwap / 1e6, (unsigned long long)gpuTimedSinceSwap);
         if (ThreadCpuDiag())  // FM4_DIAG_THREAD_CPU (diagnostic): CPU time by thread role and the command processor's idle time
@@ -1026,6 +1445,77 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                           (memNs - memWaitNsAt) / 1e6, (unsigned long long)(interrupts - immediateInterruptsAt));
             selfWaitsAt = self, immediateWaitsAt = immediate, memWaitsAt = mem, syncedWaitsAt = synced, memWaitNsAt = memNs;
             immediateInterruptsAt = interrupts, graceSyncsAt = grace;
+        }
+        if (VertexReuse())  // FM4_VERTEX_REUSE: vertex window bytes copied into the ring and read from a copy it already held
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; vertices copied %.1f MB, reused %.1f MB",
+                          vertexCopiedSinceSwap / 1048576.0, vertexReusedSinceSwap / 1048576.0);
+            vertexCopiedSinceSwap = vertexReusedSinceSwap = 0;
+        }
+        if (IndexReuse())  // FM4_INDEX_REUSE: indexed draws whose host indices were kept, and conversions
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; indices reused %llu, converted %llu; hot ranges not watched %llu",
+                          (unsigned long long)indexHitsSinceSwap, (unsigned long long)indexMissesSinceSwap, (unsigned long long)hotSkipsSinceSwap);
+            indexHitsSinceSwap = indexMissesSinceSwap = hotSkipsSinceSwap = 0;
+        }
+        if (descriptorCacheOn)  // FM4_DESCRIPTOR_CACHE: draws that reused a set the slot held, and sets written
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; descriptor sets reused %llu, written %llu",
+                          (unsigned long long)descriptorHitsSinceSwap, (unsigned long long)descriptorMissesSinceSwap);
+            descriptorHitsSinceSwap = descriptorMissesSinceSwap = 0;
+        }
+        if (OverwriteClaim())  // FM4_OVERWRITE_CLAIM
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; %llu overwrite claim(s)", (unsigned long long)overwriteClaimsSinceSwap);
+            overwriteClaimsSinceSwap = 0;
+        }
+        if (SplitDraws() != 0)  // FM4_SUBMIT_SPLIT: parts submitted without waiting
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; %llu split submission(s)", (unsigned long long)splitsSinceSwap);
+            splitsSinceSwap = 0;
+        }
+        if (PassTimes())  // FM4_DIAG_PASS_TIMES (diagnostic)
+        {
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy),
+                          "; draw passes GPU %.1f ms in %llu, unit passes %.1f ms, between passes %.1f ms", passGpuNsSinceSwap / 1e6,
+                          (unsigned long long)passTimedSinceSwap, unitGpuNsSinceSwap / 1e6, gapGpuNsSinceSwap / 1e6);
+            passGpuNsSinceSwap = passTimedSinceSwap = gapGpuNsSinceSwap = unitGpuNsSinceSwap = 0;
+            // FM4_DIAG_PASS_TALLY=<swaps>: the tally interval (default 300; 60 separates the race from what precedes it).
+            static const uint64_t tallyEvery = [] {
+                const char* v = std::getenv("FM4_DIAG_PASS_TALLY");
+                const long n = v != nullptr ? std::atol(v) : 0;
+                return n >= 10 && n <= 10000 ? uint64_t(n) : 300ull;
+            }();
+            if (swap % tallyEvery == 0 && !passTally.empty())
+            {
+                std::vector<std::pair<uint64_t, std::string>> sorted;
+                for (const auto& [kind, v] : passTally)
+                    sorted.push_back({v.first, kind + " (" + std::to_string(v.second) + " passes)"});
+                std::sort(sorted.rbegin(), sorted.rend());
+                std::fprintf(stderr, "[diag passes] swaps %llu-%llu, GPU ms by draw pass kind:", (unsigned long long)(swap - tallyEvery + 1), (unsigned long long)swap);
+                for (size_t i = 0; i < sorted.size() && i < 12; i++)
+                    std::fprintf(stderr, "%s %.1f %s", i ? ";" : "", sorted[i].first / 1e6, sorted[i].second.c_str());
+                std::fprintf(stderr, "\n");
+                passTally.clear();
+                const auto print = [&](const char* what, std::map<std::string, std::pair<uint64_t, uint64_t>>& tally, size_t top) {
+                    std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::string>> rows;
+                    for (const auto& [name, v] : tally)
+                        rows.push_back({v, name});
+                    std::sort(rows.rbegin(), rows.rend());
+                    std::fprintf(stderr, "[diag passes] swaps %llu-%llu, %s:", (unsigned long long)(swap - tallyEvery + 1), (unsigned long long)swap, what);
+                    for (size_t i = 0; i < rows.size() && i < top; i++)
+                        std::fprintf(stderr, "%s %.1f ms %s (%llu)", i ? ";" : "", rows[i].first.first / 1e6, rows[i].second.c_str(),
+                                     (unsigned long long)rows[i].first.second);
+                    std::fprintf(stderr, "\n");
+                    tally.clear();
+                };
+                print("GPU ms by pass kind and draws in the pass", passDrawTally, 16);
+                print("GPU ms by EDRAM-unit pass kind (transfers, clears, dumps, resident conversions)", unitTally, 20);
+                if (edramHooks != nullptr && edramHooks->diagTally != nullptr)  // FM4_DIAG_TRANSFERS (edram_vk.cpp)
+                    edramHooks->diagTally(swap - tallyEvery + 1, swap);
+                print("GPU ms between two passes of one command buffer, by the jobs recorded there", passGapTally, 16);
+                print("passes by what ended them (count)", passEndTally, 16);
+            }
         }
         if (PassMerge())  // FM4_PASS_MERGE: render pass instances begun by draws
             std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; %llu draw render pass(es)", (unsigned long long)passesSinceSwap);
@@ -1075,6 +1565,15 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     DrawInputs in;
     in.read = ReadRegisterHook;
     in.context = base;
+    static const bool bulkConstants = [] {  // opt-in FM4_BULK_CONSTANTS=1 (draw_state.h DrawInputs::registers)
+        const char* v = std::getenv("FM4_BULK_CONSTANTS");
+        const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (on)
+            std::fprintf(stderr, "[gpu] bulk constant read on (FM4_BULK_CONSTANTS=1): the 2,080 constant registers read byte-swapped in bulk\n");
+        return on;
+    }();
+    if (bulkConstants)
+        in.registers = base + runtime::gpu::RegisterAddress(0);  // what ReadRegisterHook reads (kernel/graphics.h Load32 of RegisterAddress)
     in.opcode = opcode;
     in.vizQueryToken = vizQueryToken;
     in.physicalBytes = runtime::kPhysicalSize;
@@ -1096,7 +1595,12 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         if (ResolveDefer() && slots[0].open && GuestWritesPending() && !(ResolveResident() && edramHooks->resolveRoom()))
             FlushSlot(0, FlushCause::NextResolve);
         const VkCommandBuffer commands = OpenSlot(0);
-        if (!edramHooks->resolve(commands, base, d, draw, error))
+        bool resolved;
+        {
+            const PassActivity activity("resolve");  // FM4_DIAG_PASS_TIMES label
+            resolved = edramHooks->resolve(commands, base, d, draw, error);
+        }
+        if (!resolved)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: resolve: %s", (unsigned long long)draw, error.c_str());
         resolvesSinceSwap++;
         // FM4 Recomp (resolve_resident.h): the textures that take the resolve's words get them now; the others over its range wait.
@@ -1133,11 +1637,53 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         DiagConsumer("index buffer", d.indices.physical, d.indices.bytes, nullptr);
         FlushSlot(0, FlushCause::Consumer);
     }
-    HostIndices indices;
-    IndexSource source{base, &d.indices, draw};
-    if (uint32_t guest = 0; d.indices.indexed && runtime::PhysicalRangeToGuest(d.indices.physical, d.indices.bytes, guest))
-        source.direct = base + guest;
-    RequireDraw(draw, BuildHostIndices(d, d.indices.indexed ? ReadGuestIndex : nullptr, &source, indices));
+    HostIndices built;
+    const HostIndices* chosen = &built;
+    std::string indexKey;
+    bool indexWatched = false;
+    uint64_t indexSequence = 0;
+    if (IndexReuse() && d.indices.indexed)  // FM4_INDEX_REUSE: every input of BuildHostIndices
+    {
+        const IndexBuffer& ib = d.indices;
+        const uint32_t fields[12] = {ib.physical, ib.bytes, ib.is32Bit, ib.endian, ib.count, ib.restart, ib.resetIndex,
+                                     d.indexOffset, d.minIndex, d.maxIndex, uint32_t(d.hostPrimitive), 0};
+        indexKey.assign(reinterpret_cast<const char*>(fields), sizeof fields);
+        const auto it = indexCache.find(indexKey);
+        if (it != indexCache.end() && GuestRangeUnwritten(ib.physical, ib.bytes, it->second.sequence))
+            chosen = &it->second.host, indexHitsSinceSwap++;
+        else
+        {
+            uint64_t& hotUntil = hotIndices[indexKey];
+            if (it != indexCache.end() && HotSkip())  // written since it was watched: hot (see WatchWorthIt)
+            {
+                indexCacheBytes -= std::min<uint64_t>(indexCacheBytes, it->second.host.indices.size() * 4 + indexKey.size());
+                hotUntil = renderSwap + kHotSwaps, indexCache.erase(it);
+            }
+            if (renderSwap >= hotUntil)
+                indexWatched = WatchGuestRange(ib.physical, ib.bytes, indexSequence);  // protect, then the sequence, then the read
+            else
+                hotSkipsSinceSwap++;
+        }
+    }
+    if (chosen == &built)
+    {
+        IndexSource source{base, &d.indices, draw};
+        if (uint32_t guest = 0; d.indices.indexed && runtime::PhysicalRangeToGuest(d.indices.physical, d.indices.bytes, guest))
+            source.direct = base + guest;
+        RequireDraw(draw, BuildHostIndices(d, d.indices.indexed ? ReadGuestIndex : nullptr, &source, built));
+        if (!indexKey.empty())
+        {
+            indexMissesSinceSwap++;
+            if (indexWatched)
+            {
+                if (indexCacheBytes > kIndexCacheBytes)
+                    indexCache.clear(), indexCacheBytes = 0;
+                indexCacheBytes += built.indices.size() * 4 + indexKey.size();
+                indexCache[indexKey] = {built, indexSequence};
+            }
+        }
+    }
+    const HostIndices& indices = *chosen;
     RequireDraw(draw, GpuGuard<Transient, kSlots>::DrawLoopWork(d.vsLoopRegisters, indices.vertexCount, d.psLoopRegisters, d.pixelInvocations));
     // 4. The shader variants, the pipeline key and the descriptor plan (CPU).
     ShaderVariantDefines vsDefines, psDefines;
@@ -1228,7 +1774,10 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // the scissor bound stands and a bind refusal names why the vertices were not used.
     RenderTarget target = d.target;
     std::string extentNote;
-    if (d.extentNeedsVertices)
+    // FM4_OVERWRITE_CLAIM (draw_record.h FindOverwriteRect): a one-rectangle draw may overwrite its targets' tiles.
+    const bool overwriteCandidate = OverwriteClaim() && d.primitiveType == 8 && !d.indices.indexed && d.indices.count == 3;
+    OverwriteRect overwrite;
+    if (d.extentNeedsVertices || overwriteCandidate)
     {
         const VertexWindow* positionWindow = nullptr;
         for (const VertexWindow& w : windows)
@@ -1240,8 +1789,22 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
             loads.resize(positionWindow->dwords);
             std::memcpy(loads.data(), windowBytes(*positionWindow), loads.size() * 4);  // the GPU's 32-bit loads (little-endian host)
         }
-        BoundTargetHeight(d, vs->t, positionWindow ? loads.data() : nullptr, loads.size(), positionWindow ? positionWindow->endian : 0, indices,
-                          target.targetHeight, extentNote);
+        if (d.extentNeedsVertices)
+            BoundTargetHeight(d, vs->t, positionWindow ? loads.data() : nullptr, loads.size(), positionWindow ? positionWindow->endian : 0, indices,
+                              target.targetHeight, extentNote);
+        if (overwriteCandidate)
+        {
+            overwrite = FindOverwriteRect(d, vs->t, ps->t.kills, positionWindow ? loads.data() : nullptr, loads.size(), positionWindow ? positionWindow->endian : 0);
+            if (overwrite.depth || overwrite.color)
+                overwriteClaimsSinceSwap++;
+            else if (DiagOverwrite())
+            {
+                static std::set<uint64_t> named;
+                if (named.insert(vs->hash).second)
+                    std::fprintf(stderr, "[diag overwrite] draw %llu: a rect-list draw of 3 vertices (vs %016llx) is no overwrite: %s\n", (unsigned long long)draw,
+                                 (unsigned long long)vs->hash, overwrite.why.c_str());
+            }
+        }
     }
     // The slot's ring must hold this whole draw (every texture reloads at every bind: texture_upload.h kTextureValidity).
     // Draws are separate render passes, so a full ring is flushed between draws (submit, confirmed retire, reset) rather
@@ -1270,9 +1833,63 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
             ringFlushesSinceSwap++;
         }
     }
+    SplitSubmit();  // FM4_SUBMIT_SPLIT: between draws, outside any render pass of this draw
     const VkCommandBuffer c = OpenSlot(0);
+    drawsInBuffer++;
     HostTargets targets;
-    if (!edramHooks->acquireTargets(c, target, key.colorUsed != 0, key.depthUsed != 0, targets, error))
+    bool acquired;
+    {
+        const PassActivity activity("target acquire");  // FM4_DIAG_PASS_TIMES label
+        acquired = edramHooks->acquireTargets(c, target, key.colorUsed != 0, key.depthUsed != 0, overwrite.depth ? &overwrite.rect : nullptr,
+                                              overwrite.color ? &overwrite.rect : nullptr, targets, error);
+    }
+    if (acquired && lastBindTransferTiles != 0)  // FM4_DIAG_OVERWRITE (diagnostic): the draw that follows an ownership transfer
+    {
+        const bool diag = DiagOverwrite();
+        static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, bool>> seen;
+        const DepthStencil& ds = d.depthStencil;
+        const uint32_t depthSig = (ds.zEnable ? 1u : 0) | (ds.zWriteEnable ? 2u : 0) | ds.zFunc << 2 | (ds.stencilEnable ? 32u : 0) | ds.front.func << 6 |
+                                  ds.front.zPass << 9 | ds.front.writeMask << 12;
+        if (diag && seen.insert({vs->hash, d.primitiveType, depthSig, d.colorWriteMask, d.blend.enabled}).second)
+        {
+            char verts[256] = "";
+            if (!d.vertexSlots.empty() && d.vertexSlots[0].valid && d.vertexSlots[0].stride != 0)
+            {
+                const VertexSlot& s0 = d.vertexSlots[0];
+                size_t n = 0;
+                for (uint32_t v = 0; v < 3 && n + 48 < sizeof verts; v++)
+                {
+                    n += size_t(std::snprintf(verts + n, sizeof verts - n, " v%u(", v));
+                    for (uint32_t k = 0; k < 4 && k < s0.stride && n + 16 < sizeof verts; k++)
+                    {
+                        // The dword's guest view (PhysicalToGuest, as the vertex copy below), within the slot's window: never a raw read.
+                        const uint32_t dword = v * s0.stride + k;
+                        uint32_t guest = 0;
+                        if (dword >= s0.sizeWords || !runtime::PhysicalToGuest(s0.physical + dword * 4, guest))
+                            break;
+                        uint32_t w;
+                        std::memcpy(&w, base + guest, 4);
+                        if (s0.endian == 2) w = __builtin_bswap32(w);
+                        else if (s0.endian == 1) w = (w & 0xFF00FF00u) >> 8 | (w & 0x00FF00FFu) << 8;
+                        float f;
+                        std::memcpy(&f, &w, 4);
+                        n += size_t(std::snprintf(verts + n, sizeof verts - n, "%s%g", k ? "," : "", f));
+                    }
+                    n += size_t(std::snprintf(verts + n, sizeof verts - n, ")"));
+                }
+            }
+            std::fprintf(stderr, "[diag overwrite] draw %llu after a transfer of %u tiles: vs %016llx ps %016llx prim %u count %u indexed %d; depth z%d w%d func %u, "
+                                 "stencil %d (func %u zpass %u wmask %02X), colour mask %X blend %d; scissor %u,%u %ux%u rows %u/%u; vte xy/w %d scale %g,%g offset %g,%g; "
+                                 "slot0 %08X stride %u endian %u:%s\n",
+                         (unsigned long long)draw, lastBindTransferTiles, (unsigned long long)vs->hash, (unsigned long long)ps->hash, d.primitiveType, d.indices.count,
+                         int(d.indices.indexed), int(ds.zEnable), int(ds.zWriteEnable), ds.zFunc, int(ds.stencilEnable), ds.front.func, ds.front.zPass,
+                         ds.front.writeMask, d.colorWriteMask, int(d.blend.enabled), d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, d.target.targetHeight,
+                         d.target.edramRows, int(d.viewport.xyDividedByW), d.viewport.scale[0], d.viewport.scale[1], d.viewport.offset[0], d.viewport.offset[1],
+                         d.vertexSlots.empty() ? 0u : d.vertexSlots[0].physical, d.vertexSlots.empty() ? 0u : d.vertexSlots[0].stride,
+                         d.vertexSlots.empty() ? 0u : d.vertexSlots[0].endian, verts);
+        }
+    }
+    if (!acquired)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: render target: %s%s%s", (unsigned long long)draw, error.c_str(), extentNote.empty() ? "" : " (",
              extentNote.empty() ? "" : (extentNote + ")").c_str());
     if (targets.samples != key.samples)
@@ -1297,8 +1914,50 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     const uint64_t systemAt = Allocate(slot, draw, kSystemBytes, true, "XeSystem");
     const uint64_t vsConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XeVsConstants");
     const uint64_t psConstantsAt = Allocate(slot, draw, kConstantsBytes, true, "XePsConstants");
-    const uint64_t vertexBytes = std::max<uint64_t>(uint64_t(vertexDwords) * 4, 4);
-    const uint64_t vertexAt = Allocate(slot, draw, vertexBytes, false, "vertex data");
+    uint64_t vertexBytes = std::max<uint64_t>(uint64_t(vertexDwords) * 4, 4);
+    uint64_t vertexAt = 0;
+    if (VertexReuse())
+    {
+        // Each window gets its own place in the ring (copied, or a copy the slot holds); the binding is the whole ring.
+        for (VertexWindow& w : windows)
+        {
+            if (w.dwords == 0)
+            {
+                w.baseDword = 0;
+                continue;
+            }
+            const uint64_t key = uint64_t(w.physical) << 2 | (w.endian & 3);
+            const auto it = slot.vertexCopies.find(key);
+            if (it != slot.vertexCopies.end() && it->second.dwords >= w.dwords && GuestRangeUnwritten(w.physical, it->second.dwords * 4, it->second.sequence))
+            {
+                w.baseDword = it->second.ringDword;
+                vertexReusedSinceSwap += uint64_t(w.dwords) * 4;
+                if (VertexReuseVerify() && std::memcmp(static_cast<uint8_t*>(slot.ring.mapped) + uint64_t(w.baseDword) * 4, windowBytes(w), size_t(w.dwords) * 4) != 0)
+                    Stop(StopCode::Unimplemented, "renderer: draw %llu: vertex reuse verify: slot %u's window at %08X (%u dwords) differs from guest memory",
+                         (unsigned long long)draw, w.slot, w.physical, w.dwords);
+                continue;
+            }
+            uint64_t sequence = 0;
+            const auto lastIt = vertexWatches.find(key);
+            const bool worth = WatchWorthIt(lastIt != vertexWatches.end() ? &lastIt->second : nullptr, w.physical, w.dwords * 4);
+            const bool watched = worth && WatchGuestRange(w.physical, w.dwords * 4, sequence);
+            if (watched)
+                vertexWatches[key] = {w.physical, w.dwords * 4, sequence, 0};
+            else if (!worth)
+                hotSkipsSinceSwap++;
+            const uint64_t at = Allocate(slot, draw, uint64_t(w.dwords) * 4, false, "vertex window");
+            std::memcpy(static_cast<uint8_t*>(slot.ring.mapped) + at, windowBytes(w), size_t(w.dwords) * 4);
+            w.baseDword = uint32_t(at / 4);
+            vertexCopiedSinceSwap += uint64_t(w.dwords) * 4;
+            if (watched)
+                slot.vertexCopies[key] = {w.baseDword, w.dwords, sequence};
+            else
+                slot.vertexCopies.erase(key);
+        }
+        vertexBytes = slot.allocator->Capacity();
+    }
+    else
+        vertexAt = Allocate(slot, draw, vertexBytes, false, "vertex data");
     const uint64_t indexBytes = std::max<uint64_t>(indices.indices.size() * 4, 4);
     const uint64_t indexAt = Allocate(slot, draw, indexBytes, false, "indices");
     const uint64_t errorAt = Allocate(slot, draw, kErrorsBytes, false, "XeErrors");
@@ -1308,7 +1967,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     FillConstants(d, true, ring + psConstantsAt);
     for (const VertexWindow& w : windows)
     {
-        if (w.dwords == 0)
+        if (w.dwords == 0 || VertexReuse())
             continue;
         // A plain CPU read of guest memory, as the present path (the guarded read is unit 7).
         std::memcpy(ring + vertexAt + uint64_t(w.baseDword) * 4, windowBytes(w), size_t(w.dwords) * 4);
@@ -1317,51 +1976,20 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         std::memcpy(ring + indexAt, indices.indices.data(), indices.indices.size() * 4);
     std::memset(ring + errorAt, 0, kErrorsBytes);
     {
-        char hash[24];
-        std::snprintf(hash, sizeof hash, "vs_%016llx", (unsigned long long)vs->hash);
-        std::string what = std::string(hash) + ", highest index " + std::to_string(indices.highIndex);
+        Slot::ErrorDword e{errorAt, draw, vs->hash, indices.highIndex, {}};
+        e.windows.reserve(windows.size());
         for (size_t k = 0; k < windows.size(); k++)
-            what += "; slot " + std::to_string(windows[k].slot) + ": window " + std::to_string(windows[k].dwords) + " dwords, constant " +
-                    std::to_string(d.vertexSlots[k].sizeWords) + ", stride " + std::to_string(d.vertexSlots[k].stride) + ", end " +
-                    std::to_string(d.vertexSlots[k].end) + (d.vertexSlots[k].computedIndex ? ", computed index" : "");
-        slot.errorDwords.push_back({errorAt, draw, what});
+            e.windows.push_back({windows[k].slot, windows[k].dwords, d.vertexSlots[k].sizeWords, d.vertexSlots[k].stride, d.vertexSlots[k].end,
+                                 d.vertexSlots[k].computedIndex});
+        slot.errorDwords.push_back(std::move(e));
     }
-    // 8. The descriptor set: the six buffer bindings and the textures the pair samples.
+    // 8. The descriptor set: the six buffer bindings and the textures the pair samples. The textures are bound first (their views
+    //    and samplers decide FM4_DESCRIPTOR_CACHE's key); then a set is allocated and written, or one the slot holds is reused.
     VkDescriptorSet set = VK_NULL_HANDLE;
     const VkDescriptorSetLayout layout = pipeline.layouts.set;
-    VkDescriptorSetAllocateInfo setInfo{};
-    setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    setInfo.descriptorPool = slot.descriptors;
-    setInfo.descriptorSetCount = 1;
-    setInfo.pSetLayouts = &layout;
-    if (const VkResult r = vkAllocateDescriptorSets(dev.device, &setInfo, &set); r != VK_SUCCESS)
-        Stop(StopCode::Unimplemented, "renderer: draw %llu: vkAllocateDescriptorSets failed (VkResult %d): the slot's pool (%u sets) is exhausted "
-             "(this set: 6 buffers, %d samplers)", (unsigned long long)draw, int(r), kDrawsPerSlot, __builtin_popcount(plan.vsSlots | plan.psSlots));
-    slot.sets++;
-    const VkDescriptorBufferInfo buffers[6] = {
-        {slot.ring.buffer, vertexAt, vertexBytes},         // 0 XeVertexData
-        {slot.ring.buffer, systemAt, kSystemBytes},        // 1 XeSystem
-        {slot.ring.buffer, vsConstantsAt, kConstantsBytes}, // 2 XeVsConstants
-        {slot.ring.buffer, psConstantsAt, kConstantsBytes}, // 3 XePsConstants
-        {slot.ring.buffer, indexAt, indexBytes},           // 4 XeIndices (read by the XE_RECT_LIST variant only)
-        {slot.ring.buffer, errorAt, kErrorsBytes},         // 5 XeErrors
-    };
-    const VkDescriptorType bufferTypes[6] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-    std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorImageInfo> images;
-    images.reserve(kTextureBindings);
-    for (uint32_t b = 0; b < 6; b++)
-    {
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = set;
-        w.dstBinding = b;
-        w.descriptorCount = 1;
-        w.descriptorType = bufferTypes[b];
-        w.pBufferInfo = &buffers[b];
-        writes.push_back(w);
-    }
+    std::vector<uint32_t> imageBindings;
+    images.reserve(kTextureBindings), imageBindings.reserve(kTextureBindings);
     for (uint32_t s = 0; s < kTextureBindings; s++)
     {
         if (plan.dimension[s] == 0)
@@ -1378,22 +2006,82 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         VkSampler sampler = VK_NULL_HANDLE;
         const TextureBindContext context{c, base, slot.ring.buffer, static_cast<uint8_t*>(slot.ring.mapped), &*slot.allocator};
         const auto bindStart = std::chrono::steady_clock::now();
-        const bool bound = textures->bind(context, *t, view, sampler, error);
+        bool bound;
+        {
+            const PassActivity activity("texture");  // FM4_DIAG_PASS_TIMES label
+            bound = textures->bind(context, *t, view, sampler, error);
+        }
         textureBindNsSinceSwap += NsSince(bindStart);
         if (!bound || view == VK_NULL_HANDLE || sampler == VK_NULL_HANDLE)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: texture slot %u (%08X %08X %08X %08X %08X %08X): %s", (unsigned long long)draw, s,
                  t->words[0], t->words[1], t->words[2], t->words[3], t->words[4], t->words[5], error.empty() ? "no view or sampler" : error.c_str());
         images.push_back({sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
-        VkWriteDescriptorSet w{};
-        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet = set;
-        w.dstBinding = kBindingTexture0 + s;
-        w.descriptorCount = 1;
-        w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w.pImageInfo = &images.back();
-        writes.push_back(w);
+        imageBindings.push_back(kBindingTexture0 + s);
     }
-    vkUpdateDescriptorSets(dev.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+    // FM4_DESCRIPTOR_CACHE: XeIndices is read only by the XE_RECT_LIST variant; every other draw binds 4 bytes at its offset.
+    const uint64_t indexRange = indices.kind == HostIndices::Kind::RectList ? indexBytes : 4;
+    std::string descriptorKey;
+    if (descriptorCacheOn)
+    {
+        descriptorKey.reserve(16 + images.size() * 20);
+        const auto put = [&](uint64_t v) { descriptorKey.append(reinterpret_cast<const char*>(&v), sizeof v); };
+        put(uint64_t(reinterpret_cast<uintptr_t>(layout))), put(indexRange);
+        for (size_t k = 0; k < images.size(); k++)
+            put(imageBindings[k]), put(uint64_t(reinterpret_cast<uintptr_t>(images[k].imageView))), put(uint64_t(reinterpret_cast<uintptr_t>(images[k].sampler)));
+        if (const auto it = slot.descriptorCache.find(descriptorKey); it != slot.descriptorCache.end())
+            set = it->second, descriptorHitsSinceSwap++;
+    }
+    if (set == VK_NULL_HANDLE)
+    {
+        VkDescriptorSetAllocateInfo setInfo{};
+        setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        setInfo.descriptorPool = slot.descriptors;
+        setInfo.descriptorSetCount = 1;
+        setInfo.pSetLayouts = &layout;
+        if (const VkResult r = vkAllocateDescriptorSets(dev.device, &setInfo, &set); r != VK_SUCCESS)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: vkAllocateDescriptorSets failed (VkResult %d): the slot's pool (%u sets) is exhausted "
+                 "(this set: 6 buffers, %d samplers)", (unsigned long long)draw, int(r), kDrawsPerSlot, __builtin_popcount(plan.vsSlots | plan.psSlots));
+        slot.sets++;
+        // Dynamic (FM4_DESCRIPTOR_CACHE): base offset 0 and the fixed range; the draw's offsets go to vkCmdBindDescriptorSets.
+        const VkDescriptorBufferInfo buffers[6] = {
+            {slot.ring.buffer, descriptorCacheOn ? 0 : vertexAt, vertexBytes},                 // 0 XeVertexData
+            {slot.ring.buffer, descriptorCacheOn ? 0 : systemAt, kSystemBytes},                // 1 XeSystem
+            {slot.ring.buffer, descriptorCacheOn ? 0 : vsConstantsAt, kConstantsBytes},        // 2 XeVsConstants
+            {slot.ring.buffer, descriptorCacheOn ? 0 : psConstantsAt, kConstantsBytes},        // 3 XePsConstants
+            {slot.ring.buffer, descriptorCacheOn ? 0 : indexAt, descriptorCacheOn ? indexRange : indexBytes},  // 4 XeIndices (XE_RECT_LIST only)
+            {slot.ring.buffer, descriptorCacheOn ? 0 : errorAt, kErrorsBytes},                 // 5 XeErrors
+        };
+        const VkDescriptorType uniform = descriptorCacheOn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        const VkDescriptorType storage = descriptorCacheOn ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        const VkDescriptorType bufferTypes[6] = {storage, uniform, uniform, uniform, storage, storage};
+        std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(6 + images.size());
+        for (uint32_t b = 0; b < 6; b++)
+        {
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = set;
+            w.dstBinding = b;
+            w.descriptorCount = 1;
+            w.descriptorType = bufferTypes[b];
+            w.pBufferInfo = &buffers[b];
+            writes.push_back(w);
+        }
+        for (size_t k = 0; k < images.size(); k++)
+        {
+            VkWriteDescriptorSet w{};
+            w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet = set;
+            w.dstBinding = imageBindings[k];
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo = &images[k];
+            writes.push_back(w);
+        }
+        vkUpdateDescriptorSets(dev.device, uint32_t(writes.size()), writes.data(), 0, nullptr);
+        if (descriptorCacheOn)
+            slot.descriptorCache.emplace(std::move(descriptorKey), set), descriptorMissesSinceSwap++;
+    }
     // 9. One render pass, one draw. The render area is the whole target (every attachment loads and
     //    stores); the scissor is the guest's. Dynamic state in the pipeline's declared set.
     VkRenderPassBeginInfo pass{};
@@ -1401,16 +2089,41 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     pass.renderPass = pipeline.renderPass;
     pass.framebuffer = framebuffer;
     pass.renderArea = {{0, 0}, {targets.width, targets.height}};
-    if (openPass.commands != c || openPass.pass != pipeline.renderPass || openPass.framebuffer != framebuffer)
+    const uint32_t areaRows = PassArea() ? std::min(targets.height, (scissorBottom + 31) & ~31u) : targets.height;
+    pass.renderArea.extent.height = areaRows;
+    if (openPass.commands != c || openPass.pass != pipeline.renderPass || openPass.framebuffer != framebuffer || scissorBottom > openPass.areaRows)
     {
-        EndOpenPass(openPass.commands);
+        {
+            const PassActivity activity("draw on another target");  // FM4_DIAG_PASS_TIMES label
+            EndOpenPass(openPass.commands);
+        }
+        int timing = -1;
+        if (PassMerge() && PassTimes() && passQueriesUsed + 2 <= kPassQueries)  // FM4_DIAG_PASS_TIMES: after the work before it
+        {
+            char kind[96];
+            std::snprintf(kind, sizeof kind, "%ux%u x%u colour %d depth %d", targets.width, targets.height, targets.samples,
+                          key.colorUsed ? int(targets.format) : 0, key.depthUsed ? int(targets.depthFormat) : 0);
+            vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, passQueries, passQueriesUsed);
+            timing = int(passTimings.size());
+            passTimings.push_back({passQueriesUsed, 0, kind, c, passJobs});
+            passJobs.clear();
+            passQueriesUsed += 2;
+        }
         vkCmdBeginRenderPass(c, &pass, VK_SUBPASS_CONTENTS_INLINE);
         passesSinceSwap++;
         if (PassMerge())
-            openPass = {c, pipeline.renderPass, framebuffer};
+            openPass = {c, pipeline.renderPass, framebuffer, timing, areaRows};
     }
+    if (openPass.timing >= 0)
+        passTimings[size_t(openPass.timing)].draws++;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, 1, &set, 0, nullptr);
+    if (descriptorCacheOn)  // the dynamic offsets in binding order (FM4_DESCRIPTOR_CACHE); the vertex binding spans the ring from 0
+    {
+        const uint32_t offsets[6] = {0, uint32_t(systemAt), uint32_t(vsConstantsAt), uint32_t(psConstantsAt), uint32_t(indexAt), uint32_t(errorAt)};
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, 1, &set, 6, offsets);
+    }
+    else
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, 1, &set, 0, nullptr);
     const HostViewport hv = FoldViewport(d.viewport, targets.width, targets.height);
     const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.height), hv.zMin, hv.zMax};
     vkCmdSetViewport(c, 0, 1, &viewport);

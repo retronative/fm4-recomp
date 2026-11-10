@@ -275,7 +275,10 @@ struct Binding
 // touch (the caller passes the window scissor's bottom after the window offset, or kHeightUnknown), clamped
 // to RenderTargetHeight. Refusals (nothing changed): MSAA 3; pitch > 8192; an unknown colour format; a Key
 // outside the M4 whitelist; a cross-aspect transfer (Ownership::Change).
-Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed);
+// FM4 Recomp (FM4_OVERWRITE_CLAIM): `depthCutout` / `colorCutout`, a rectangle of the target's pixels the draw provably overwrites
+// (draw_record.h FindOverwriteRect), is passed to Ownership::Change as its clearCutout: tiles wholly inside are claimed without
+// a transfer, as a resolve clear's are.
+Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout = nullptr, const Rect* colorCutout = nullptr);
 
 // ---- Resolve: a draw in copy mode -----------------------------------------------------------------------
 
@@ -329,6 +332,8 @@ struct ResolveInfo
     CopyCommand command = CopyCommand::Raw;
     SampleSelect sampleSelect = SampleSelect::k0;  // sanitized (X draw_util.cc:495-545)
     uint32_t destFormat = 0;    // xenos ColorFormat (texture format) of the destination; a depth resolve: 22 k_24_8 / 23 k_24_8_FLOAT
+    uint32_t destNumber = 0;    // RB_COPY_DEST_INFO copy_dest_number (X registers.h:819, xenos.h:216-224 SurfaceNumberFormat): 0 unsigned
+                                // fraction, 1 signed fraction, 2 unsigned integer, 3 signed integer, 7 float (edram_vk_plan.cpp PackFixed16)
     uint32_t destEndian = 0;    // Endian128 0-3 (X xenos.h:200-207)
     int32_t destExpBias = 0;
     bool destSwap = false;      // red/blue exchange (copy_dest_swap)
@@ -423,6 +428,7 @@ uint32_t EstimateMaxY(const ExtentRegisters& r, const uint32_t* vertexMaxY);
 struct VertexPosition
 {
     float y = 0, w = 1;
+    float x = 0;  // FM4 Recomp (FindOverwriteRect): the x too; PassThroughPositions fills it
 };
 
 // X draw_extent_estimator.cc:199-264 after the shader: y / w unless vtx_xy_fmt (:212-217), the viewport's y

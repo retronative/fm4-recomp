@@ -53,6 +53,11 @@ struct VulkanDevice
     bool independentBlend = false;
     bool imageViewFormatSwizzle = false;
     bool samplerAnisotropy = false;  // anisotropic samplers (X vulkan_texture_cache.cc:2591-2598)
+    // FM4 Recomp (FM4_TRANSFER_STENCIL_EXPORT): VK_EXT_shader_stencil_export enabled when offered (MoltenVK on Apple GPUs:
+    // gl_FragStencilRefARB -> Metal [[stencil]]), and sampleRateShading (per-sample fragment shading, gl_SampleID), for the
+    // EDRAM unit's depth transfers in one draw instead of nine per sample (edram_vk.cpp ExecuteTransfers).
+    bool stencilExport = false;
+    bool sampleRateShading = false;
     // Window mode only: the surface (created right after the instance) and VK_KHR_swapchain enabled on the device.
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     void (*destroySurface)(VkInstance, VkSurfaceKHR) = nullptr;

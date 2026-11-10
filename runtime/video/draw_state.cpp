@@ -4,6 +4,7 @@
 // The draw state decode (draw_state.h). "X" is Xenia xenia-canary 67f16c4e315f src/xenia/gpu/;
 // "FR" is ForzaRecomp runtime/gpu/render.cpp (facts and simplifications, re-derived here).
 #include "draw_state.h"
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -481,8 +482,8 @@ struct Decoder
                 return Refuse("texture fetch slot " + Num(t.slot) + " is past the 32 texture fetch constants");
             for (uint32_t i = 0; i < 6; i++)
                 t.words[i] = Reg(xr::kFetchConstants + 6 * t.slot + i);
-            const std::string where = "texture slot " + Num(t.slot) + " (" + Hex(t.words[0]) + " " + Hex(t.words[1]) + " " + Hex(t.words[2]) + " " +
-                                      Hex(t.words[3]) + " " + Hex(t.words[4]) + " " + Hex(t.words[5]) + "): ";
+            const auto where = [&] { return "texture slot " + Num(t.slot) + " (" + Hex(t.words[0]) + " " + Hex(t.words[1]) + " " + Hex(t.words[2]) + " " +
+                                      Hex(t.words[3]) + " " + Hex(t.words[4]) + " " + Hex(t.words[5]) + "): "; };
             // X xenos.h:1216-1245 dword 0.
             t.type = t.words[0] & 3;
             for (uint32_t i = 0; i < 4; i++)
@@ -544,11 +545,11 @@ struct Decoder
                 continue;
             }
             if (t.physical == 0)  // X texture_cache.cc:896-899 "no texture data at all"
-                return Refuse(where + "base address 0");
+                return Refuse(where() + "base address 0");
             if (t.physical >= in.physicalBytes)
-                return Refuse(where + "base address past physical memory");
+                return Refuse(where() + "base address past physical memory");
             if (!FormatAccepted(t.format))
-                return Refuse(where + "texture format " + Num(t.format) + " is not modelled");
+                return Refuse(where() + "texture format " + Num(t.format) + " is not modelled");
             // The shader's dimension against the constant's (shader_glsl.h textureDimensions): 1 needs a 2D that is not stacked, 2 a 3D, 3 a cube.
             // FM4 Recomp: a 1D fetch (0) samples a 1D or a 2D constant at (s, 0): Xenia binds 1D and 2D fetches alike as 2D arrays
             // (spirv_shader_translator_fetch.cc:2328-2332) and builds the texture from the constant's own dimension (FM4
@@ -556,46 +557,46 @@ struct Decoder
             const uint32_t needed = u.dimension <= 3 ? u.dimension : 0xFF;
             const bool linearOf2D = u.dimension == 0 && t.dimension == 1;
             if (needed == 0xFF || (t.dimension != needed && !linearOf2D))
-                return Refuse(where + "the shader fetches dimension " + Num(u.dimension) + " (1 2D, 2 3D, 3 cube) but the constant's dimension is " +
+                return Refuse(where() + "the shader fetches dimension " + Num(u.dimension) + " (1 2D, 2 3D, 3 cube) but the constant's dimension is " +
                               Num(t.dimension) + " (0 1D, 1 2D or stacked, 2 3D, 3 cube)");
             if (t.stacked)
-                return Refuse(where + "a stacked (2D array) texture is not modelled");
+                return Refuse(where() + "a stacked (2D array) texture is not modelled");
             // A tiled 3D texture: the texture unit untiles it (texture_untile.h TiledOffset3D, Xenia texture_util.cc:461-487).
             if (t.dimension == 3 && t.width != t.height)
-                return Refuse(where + "a cube map with faces " + Num(t.width) + "x" + Num(t.height) + " is not square");
+                return Refuse(where() + "a cube map with faces " + Num(t.width) + "x" + Num(t.height) + " is not square");
             if (t.dimension != 2 && t.pitchTexels < t.width)
-                return Refuse(where + "pitch " + Num(t.pitchTexels) + " texels is smaller than the width " + Num(t.width));
+                return Refuse(where() + "pitch " + Num(t.pitchTexels) + " texels is smaller than the width " + Num(t.width));
             for (uint32_t i = 0; i < (t.dimension == 2 ? 3u : 2u); i++)
             {
                 const uint32_t m = t.clamp[i];  // X xenos.h:104-113: 0 repeat, 1 mirrored repeat, 2 clamp to edge, 6 clamp to border
                 if (!(m <= 2 || m == 6))
-                    return Refuse(where + "clamp mode " + Num(m) + " on axis " + Num(i) + " is not modelled (0, 1, 2 and 6 are)");
+                    return Refuse(where() + "clamp mode " + Num(m) + " on axis " + Num(i) + " is not modelled (0, 1, 2 and 6 are)");
                 if (m == 6 && t.borderColor > 1)  // X xenos.h:150-164: 2 and 3 are YCbCr blacks
-                    return Refuse(where + "border colour " + Num(t.borderColor) + " is not modelled (0 black, 1 white are)");
+                    return Refuse(where() + "border colour " + Num(t.borderColor) + " is not modelled (0 black, 1 white are)");
             }
             if (t.borderSize != 0)
-                return Refuse(where + "border_size 1 is not modelled");
+                return Refuse(where() + "border_size 1 is not modelled");
             if (t.anisoFilter > 5)  // X xenos.h:140-148: 0 off, 1-5 1:1 to 16:1; 6 undefined, 7 (use the fetch constant) in the constant
-                return Refuse(where + "anisotropic filter " + Num(t.anisoFilter) + " is undefined");
+                return Refuse(where() + "anisotropic filter " + Num(t.anisoFilter) + " is undefined");
             if (t.magFilter > 1 || t.minFilter > 1)  // X xenos.h:131-138: 2 (base map) and 3 (fetch constant) mean nothing here
-                return Refuse(where + "mag/min filter " + Num(t.magFilter) + "/" + Num(t.minFilter) + " is not point (0) or linear (1)");
+                return Refuse(where() + "mag/min filter " + Num(t.magFilter) + "/" + Num(t.minFilter) + " is not point (0) or linear (1)");
             if (t.dimension == 2 && (t.volMagFilter != t.magFilter || t.volMinFilter != t.minFilter))  // shader_glsl.h Filters: one host filter for all axes
-                return Refuse(where + "3D volume filters " + Num(t.volMagFilter) + "/" + Num(t.volMinFilter) + " differ from mag/min " +
+                return Refuse(where() + "3D volume filters " + Num(t.volMagFilter) + "/" + Num(t.volMinFilter) + " differ from mag/min " +
                               Num(t.magFilter) + "/" + Num(t.minFilter));
             if (t.mipMinLevel > t.mipMaxLevel)
-                return Refuse(where + "mip_min_level " + Num(t.mipMinLevel) + " above mip_max_level " + Num(t.mipMaxLevel));
+                return Refuse(where() + "mip_min_level " + Num(t.mipMinLevel) + " above mip_max_level " + Num(t.mipMaxLevel));
             // Mipmapping (mip filter 0 point / 1 linear with levels mip_min-mip_max, X xenos.h:131-138): the texture unit uploads
             // every level (texture_upload.cpp) and the sampler takes the mip mode (texture_info.cpp DescribeBinding).
             for (uint32_t i = 0; i < 4; i++)  // X xenos.h XE_GPU_TEXTURE_SWIZZLE: 0-3 components, 4 zero, 5 one
                 if (((t.swizzle >> (3 * i)) & 7) > 5)
-                    return Refuse(where + "swizzle component " + Num((t.swizzle >> (3 * i)) & 7) + " is not modelled (X Y Z W 0 1 are)");
+                    return Refuse(where() + "swizzle component " + Num((t.swizzle >> (3 * i)) & 7) + " is not modelled (X Y Z W 0 1 are)");
             const bool signedAll = t.sign[0] == 1 && t.sign[1] == 1 && t.sign[2] == 1 && t.sign[3] == 1;
             const bool floatFormat = t.format == 36 || t.format == 22 || t.format == 23 || t.format == 29 || t.format == 32;
             const bool int16 = t.format == 25;
             if (int16 && !(signedAll && t.numFormat == 1))  // FR render.cpp:611-618: FM4's signed-integer 16_16 only
-                return Refuse(where + "k_16_16 is modelled only as a signed integer texture (signs 1, number format 1)");
+                return Refuse(where() + "k_16_16 is modelled only as a signed integer texture (signs 1, number format 1)");
             if (!int16 && t.numFormat != 0 && !floatFormat)
-                return Refuse(where + "integer number format with a normalized format is not modelled");
+                return Refuse(where() + "integer number format with a normalized format is not modelled");
             // FM4 Recomp: unsigned and unsigned-biased (2) components mixed, a normalized format: the biased ones as v * 2 - 1 on the
             // result components their swizzle selects (X spirv_shader_translator_fetch.cc:2167-2236).
             // Every component unsigned stays accepted for every format (float ones too: FM4's k_24_8_FLOAT).
@@ -604,7 +605,7 @@ struct Decoder
             for (uint32_t i = 0; i < 4; i++)
                 unsignedOrBiased = unsignedOrBiased && (t.sign[i] == 0 || t.sign[i] == 2);
             if (!(unsignedAll || unsignedOrBiased || (t.gamma && !floatFormat) || (signedAll && (floatFormat || int16))))
-                return Refuse(where + "component signs " + Num(t.sign[0]) + Num(t.sign[1]) + Num(t.sign[2]) + Num(t.sign[3]) +
+                return Refuse(where() + "component signs " + Num(t.sign[0]) + Num(t.sign[1]) + Num(t.sign[2]) + Num(t.sign[3]) +
                               " are not modelled (unsigned or unsigned biased, x y z gamma, or signed float/int16)");
             for (uint32_t i = 0; i < 4; i++)
                 if (const uint32_t g = (t.swizzle >> (3 * i)) & 7; g < 4 && t.sign[g] == 2)
@@ -617,12 +618,29 @@ struct Decoder
     void Constants()
     {
         d.aluConstants.resize(2048);
-        for (uint32_t i = 0; i < 2048; i++)
-            d.aluConstants[i] = Reg(xr::kAluConstants + i);
-        for (uint32_t i = 0; i < 8; i++)
-            d.boolConstants[i] = Reg(xr::kBoolConstants + i);
-        for (uint32_t i = 0; i < 32; i++)
-            d.loopConstants[i] = Reg(xr::kLoopConstants + i);
+        if (in.registers != nullptr)  // DrawInputs::registers: the same words, byte-swapped in bulk
+        {
+            const auto bulk = [&](uint32_t first, uint32_t count, uint32_t* out) {
+                for (uint32_t i = 0; i < count; i++)
+                {
+                    uint32_t raw;
+                    std::memcpy(&raw, in.registers + 4 * size_t(first + i), 4);
+                    out[i] = __builtin_bswap32(raw);
+                }
+            };
+            bulk(xr::kAluConstants, 2048, d.aluConstants.data());
+            bulk(xr::kBoolConstants, 8, d.boolConstants);
+            bulk(xr::kLoopConstants, 32, d.loopConstants);
+        }
+        else
+        {
+            for (uint32_t i = 0; i < 2048; i++)
+                d.aluConstants[i] = Reg(xr::kAluConstants + i);
+            for (uint32_t i = 0; i < 8; i++)
+                d.boolConstants[i] = Reg(xr::kBoolConstants + i);
+            for (uint32_t i = 0; i < 32; i++)
+                d.loopConstants[i] = Reg(xr::kLoopConstants + i);
+        }
         for (uint32_t l : in.vs->loopConstants)
             d.vsLoopRegisters.push_back(d.loopConstants[l & 31]);
         for (uint32_t l : in.ps->loopConstants)

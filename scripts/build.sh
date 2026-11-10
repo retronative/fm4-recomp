@@ -19,6 +19,9 @@ mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 "$ROOT/scripts/preflight.sh"
 LLVM=/opt/homebrew/opt/llvm/bin
+# The SDK is the Command Line Tools' (pinned and logged below), whatever xcode-select points at: an Xcode install switches it
+# (Xcode is used only for xctrace, through its own DEVELOPER_DIR).
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --show-sdk-path)"
 {
   echo "date $(date '+%Y-%m-%d %H:%M:%S')"

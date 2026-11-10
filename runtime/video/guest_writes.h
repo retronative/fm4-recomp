@@ -33,5 +33,11 @@ bool GuestWritesPending();
 void GuestWritesRetired();
 // FM4 Recomp (FM4_RESOLVE_DEFER): whether [physical, physical + bytes) shares a byte with a pending range.
 bool GuestWritesOverlap(uint32_t physical, uint32_t bytes);
+// FM4 Recomp (FM4_WRITE_WATCH; FM4_VERTEX_REUSE): protect [physical, physical + bytes) against guest CPU stores, then take the
+// sequence the caller copies under (protect first: a store before it is in the copy, one after it moves a sequence above). False:
+// the watch is off or the range is not watchable (outside the shared physical views): the caller must not reuse its copy.
+bool WatchGuestRange(uint32_t physical, uint32_t bytes, uint64_t& sequence);
+// Whether nothing (guest CPU store, system-call write, heap access change, recorded resolve) wrote the range since `sequence`.
+bool GuestRangeUnwritten(uint32_t physical, uint32_t bytes, uint64_t sequence);
 
 }  // namespace runtime::video

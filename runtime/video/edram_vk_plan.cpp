@@ -563,16 +563,19 @@ void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolv
     }
     if (storage == uint32_t(ColorFormat::k16_16))  // :301-305: (XeUnpackR16G16Edram(w), 0, 0)
     {
-        // pixel_formats.xesli:367-371: red the low half, green the high one, each max(-1, int16 * (32 / 32767)): 0x7FFF is 32,
-        // and the clamp after the scale keeps -1 (0x8001 and 0x8000 both give -1, not -32). With
-        // snorm16_render_target_full_range (true by default, render_target_cache.cc:188) X adds no +5 to the bias
-        // (draw_util.cc:1258-1266 behind vulkan_render_target_cache.h:143-147): the host halves are the guest's
-        // (pipeline_key.h ColorExpBiasAccepted), read raw through the R16G16_UINT view (edram_vk.cpp kResolveDump).
+        // pixel_formats.xesli:367-371: red the low half, green the high one, int16 * (32 / 32767): 0x7FFF is 32. Both -1 snorm
+        // encodings (0x8001, 0x8000) are -1 before the scale, i.e. -32 after it: ShiftGlue 72b7dd6f fh1_native_edram.hlsli:217-220
+        // DecodeSnorm16 "max(int16 / 32767, -1) * 32" (the D3D SNORM rule). Xenia 67f16c4 writes max(-1, int16 * 32 / 32767) (the
+        // clamp after the scale, which flattens every value below -1 unit to -1; OBSERVED).
+        // With snorm16_render_target_full_range (true by default,
+        // render_target_cache.cc:188) X adds no +5 to the bias (draw_util.cc:1258-1266 behind vulkan_render_target_cache.h:143-147):
+        // the host halves are the guest's (pipeline_key.h ColorExpBiasAccepted), read raw through the R16G16_UINT view
+        // (edram_vk.cpp kResolveDump).
         const float scale = 32.0f / 32767.0f;
         for (uint32_t i = 0; i < 2; i++)
         {
             const float v = float(int16_t(uint16_t(w >> (16 * i)))) * scale;
-            rgba[i] = v > -1.0f ? v : -1.0f;
+            rgba[i] = v > -32.0f ? v : -32.0f;
         }
         rgba[2] = rgba[3] = 0.0f;
         return;
@@ -580,6 +583,21 @@ void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolv
     for (uint32_t i = 0; i < 3; i++)  // :331-335 XeUnpackR10G10B10A2UNorm, :328-349 XeUnpackR10G10B10A2Float
         rgba[i] = storage == uint32_t(ColorFormat::k2_10_10_10_Float) ? Float7e3To32(w >> (10 * i)) : float((w >> (10 * i)) & 0x3FF) * (1.0f / 1023.0f);
     rgba[3] = float(w >> 30) * (1.0f / 3.0f);
+}
+
+// A 16-bit channel in the destination's number format (xenia-canary d119505289d540f61ae3d4ba6168f1145625277a pixel_formats.xesli
+// XePackFixed, "according to the Direct3D 11.3 functional specification"; the same arithmetic in ShiftGlue 72b7dd6f
+// fh1_native_resolve_memory.cs.hlsl:218-232 PackChannel): 3 (signed integer) rounds the value half away from zero within
+// [-32768, 32767] and keeps the low 16 bits; HLSL's max(NaN, x) is x, so NaN lands on -32768. Every other number packs UNORM
+// (0, and the unexercised 1, 2 and 7: canary's "anything unexpected" branch).
+uint32_t PackFixed16(float v, uint32_t number)
+{
+    if (number == 3)
+    {
+        const float clamped = !(v == v) ? -32768.0f : v < -32768.0f ? -32768.0f : v > 32767.0f ? 32767.0f : v;
+        return uint32_t(int32_t(clamped + (v >= 0.0f ? 0.5f : -0.5f))) & 0xFFFFu;
+    }
+    return uint32_t(std::min(std::max(v, 0.0f), 1.0f) * 65535.0f + 0.5f);  // PackUnorm(v, 65535) below
 }
 
 uint32_t PackUnorm(float v, float scale)  // pixel_formats.xesli:116-125: uint(saturate(v) * scale + 0.5); NaN saturates to 0
@@ -625,10 +643,11 @@ uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStor
     // so one pixel's 16 bits are uint(saturate(r) * 255 + 0.5) | uint(saturate(g) * 255 + 0.5) << 8; the upper half is 0 here.
     if (info.destFormat == 10)
         return PackUnorm(pixel[0], 255.0f) | PackUnorm(pixel[1], 255.0f) << 8;
-    // k_16_16 (pixel_formats.xesli:236-239 XePackR16G16UNorm, :144-147): red and green only, uint(saturate(v) * 65535 + 0.5),
-    // red the low half; X packs UNORM whatever copy_dest_number says (FM4's is 3, kSignedInteger: UNRESOLVED on hardware).
+    // k_16_16: red and green only, red the low half (pixel_formats.xesli:236-239), each in the destination's number format
+    // (PackFixed16: FM4's number 3 packs the biased value as a signed 16-bit integer; Xenia 67f16c4 packed UNORM whatever the number,
+    // xenia-canary d119505 added the number formats).
     if (info.destFormat == 25)
-        return PackUnorm(pixel[0], 65535.0f) | PackUnorm(pixel[1], 65535.0f) << 16;
+        return PackFixed16(pixel[0], info.destNumber) | PackFixed16(pixel[1], info.destNumber) << 16;
     if (info.destFormat == 6 || info.destFormat == 50)  // XePackR8G8B8A8UNorm
         return PackUnorm(pixel[0], 255.0f) | PackUnorm(pixel[1], 255.0f) << 8 | PackUnorm(pixel[2], 255.0f) << 16 | PackUnorm(pixel[3], 255.0f) << 24;
     return PackUnorm(pixel[0], 1023.0f) | PackUnorm(pixel[1], 1023.0f) << 10 | PackUnorm(pixel[2], 1023.0f) << 20 | PackUnorm(pixel[3], 3.0f) << 30;  // XePackR10G10B10A2UNorm
@@ -732,6 +751,30 @@ bool ResolveDepthConvertible(const edram::ResolveInfo& info, std::string& why)
         return Refuse(why, shape + "the destination base is not the start of its extent");
     if (info.x1 <= info.x0 || info.y1 <= info.y0)
         return Refuse(why, shape + "an empty resolve rectangle");
+    return true;
+}
+
+bool ResolveWordsToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
+                         std::string& why)
+{
+    if (!ResolveFullConvertible(info, sourceStorage, why))
+        return false;
+    if (info.destBytesLog2 != 2)
+        return Refuse(why, "GPU resolve words are 32 bpp; destination format " + std::to_string(info.destFormat) + " is not");
+    const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
+    auto address = [&](uint32_t x, uint32_t y) { return TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2); };
+    if (const uint64_t past = FirstPastEnd(width, height, destBytes, [&](uint32_t x, uint32_t y) { return uint64_t(address(x, y)) + 4; });
+        past != kNonePast)
+        return Refuse(why, "resolve texel (" + std::to_string(uint32_t(past)) + ", " + std::to_string(uint32_t(past >> 32)) + ") lands past the destination's " +
+                               std::to_string(destBytes) + " bytes");
+    ParallelRows(height, width, [&](uint32_t y0, uint32_t y1) {
+    for (uint32_t y = y0; y < y1; y++)
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint32_t w = edram::GpuSwap32(words[size_t(y) * width + x], info.destEndian);  // resolve_full_32bpp.xesli:62-65
+            std::memcpy(dest + address(x, y), &w, 4);
+        }
+    });
     return true;
 }
 

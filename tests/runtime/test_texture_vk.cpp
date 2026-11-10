@@ -1163,6 +1163,55 @@ void TestResidentResolve()
     Expect(!ResidentTextureMatches(t, r, &why) && why == "more than one level", "CONTROL: a texture with mips");
     t = shape, t.tiled = false;
     Expect(!ResidentTextureMatches(t, r, &why) && why == "linear", "CONTROL: a linear texture");
+
+    // Mip levels filled one resolve each: FM4's 256x256 k_8_8_8_8 at 1C2E3000 with mips at 1C323000
+    // (fetch constant as logged). Hand layout (Xenia texture_util.cc GetGuestTextureLayout, tiled,
+    // 4 bytes a texel, rows aligned to 32): level 1 128x128 at the mip address 1C323000, 128 x 128 x 4 = 0x10000 bytes, so level 2
+    // 64x64 at 1C333000, 0x4000 bytes, so level 3 32x32 at 1C337000: the bases of FM4's resolves.
+    const uint32_t kMipped[6] = {1u << 31 | 0x02024802u,  // tiled (bit 31) | the rest of dword 0
+                                 0x1C2E3086u, 0x001FE0FFu, 0x01000C14u, 0x000000C0u, 0x1C323A00u};
+    const PreparedTexture mp = m.Prepare(kMipped, ShaderFetch{}, false, kFull);
+    if (mp.entry == nullptr)
+        return Expect(false, "resident: the mipped 256x256 prepares");
+    const TextureDescription& md = mp.entry->description;
+    const ResidentTextureShape mshape{md.base.physical, md.width, md.height, md.fetch.pitchTexels, md.fetch.format, md.fetch.endian, md.levelCount,
+                                      md.dimension, md.depth, md.fetch.tiled, md.fetch.stacked, md.fetch.packedMips};
+    std::vector<ResidentLevel> mlevels;
+    for (const MipLevel& l : md.levels)
+        mlevels.push_back({l.address, l.widthTexels, l.heightTexels, l.pitchBlocks, l.packed});
+    Expect(md.levelCount >= 4 && mlevels.size() >= 4 && mlevels[1].address == 0x1C323000u && mlevels[2].address == 0x1C333000u && mlevels[3].address == 0x1C337000u,
+           "resident: the mipped texture's levels 1-3 at 1C323000, 1C333000, 1C337000 (hand layout)");
+    const uint32_t bases[4] = {0x1C2E3000u, 0x1C323000u, 0x1C333000u, 0x1C337000u}, sizes[4] = {256, 128, 64, 32};
+    bool everyLevel = true;
+    for (int level = 0; level < 4; level++)
+    {
+        ResidentResolve lr{true, bases[level], sizes[level] * sizes[level] * 4, bases[level], 6, sizes[level], md.fetch.endian, 0, 0, sizes[level], sizes[level]};
+        uint32_t lx = 9, ly = 9;
+        everyLevel = everyLevel && ResidentLevelFor(mshape, mlevels, lr, &why, &lx, &ly) == level && lx == 0 && ly == 0;
+    }
+    Expect(everyLevel, "resident: each of FM4's four level resolves goes to its own level at texel (0, 0)");
+    Expect(!ResidentTextureMatches(mshape, ResidentResolve{true, bases[1], 65536, bases[1], 6, 128, md.fetch.endian, 0, 0, 128, 128}, &why) && why == "more than one level",
+           "CONTROL: the whole-texture match still refuses the mipped texture");
+    ResidentResolve wrongPitch{true, bases[2], 16384, bases[2], 6, 128, md.fetch.endian, 0, 0, 64, 64};
+    Expect(ResidentLevelFor(mshape, mlevels, wrongPitch, &why) == -1 && why.rfind("no level takes it", 0) == 0, "CONTROL: level 2's base with pitch 128 is refused");
+    std::vector<ResidentLevel> packedLevels = mlevels;
+    packedLevels[3].packed = true;
+    ResidentResolve level3{true, bases[3], 4096, bases[3], 6, 32, md.fetch.endian, 0, 0, 32, 32};
+    Expect(ResidentLevelFor(mshape, packedLevels, level3, &why) == -1, "CONTROL: a packed level is never matched");
+    Expect(ResidentLevelFor(shape, {}, r, &why) == 0, "CONTROL: a single-level texture is matched as before (level 0)");
+    // k_8_8 (FM4's 512x512 chain from 8_8_8_8 at 1x): storage 0 into format 10 at 16 bpp is
+    // convertible, 10 takes 10's words; a 16 bpp resolve is taken only at the texture's own base (the 32x32-tile corner rule above
+    // is for 4-byte texels). CONTROLS: 10 at 32 bpp, 10 from storage 2, 10 into 6.
+    Expect(ResidentConvertible(0, 10, 1) && !ResidentConvertible(0, 10, 2) && !ResidentConvertible(2, 10, 1) && ResidentFormatPair(10, 10) &&
+               !ResidentFormatPair(10, 6) && !ResidentFormatPair(6, 10),
+           "resident k_8_8: storage 0 -> format 10 at 16 bpp, 10 pairs only with 10");
+    ResidentTextureShape kk{0x0CE50000u, 512, 512, 512, 10, 1, 1, 1, 1, true, false, false};
+    ResidentResolve k8{true, 0x0CE50000u, 0x40000, 0x0CE50000u, 10, 512, 1, 0, 0, 512, 256};
+    k8.bytesLog2 = 1;
+    uint32_t kx = 9, ky = 9;
+    Expect(ResidentTextureMatches(kk, k8, &why, &kx, &ky) && kx == 0 && ky == 0, "resident k_8_8: FM4's 512x256 resolve at the texture's base, texel (0, 0)");
+    k8.textureBase = 0x0CE50000u + 0x1000;
+    Expect(!ResidentTextureMatches(kk, k8, &why) && why == "another base", "CONTROL: a 16 bpp resolve at a tile delta is refused (4-byte rule only)");
     Expect(ResidentFormatPair(6, 50) && ResidentFormatPair(54, 7) && !ResidentFormatPair(7, 6) && !ResidentFormatPair(36, 36) &&
                ResidentConvertible(0, 6, 2) && !ResidentConvertible(4, 25, 2) && !ResidentConvertible(3, 10, 1) && !ResidentConvertible(14, 36, 2),
            "resident: format pairs (6/50, 7/54) and the convertible storages and formats");

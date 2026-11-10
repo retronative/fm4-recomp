@@ -169,6 +169,11 @@ void SwapBlockEndian(uint8_t* block, uint32_t log2Bytes, uint32_t endian);
 // than the pitch, or a short source.
 bool DetileBlocksAt(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks,
                     uint32_t heightBlocks, uint32_t pitchBlocks, uint32_t log2Bytes, uint32_t endian);
+// FM4 Recomp (FM4_FAST_DETILE): the same refusals and the same bytes as DetileBlocksAt, with a fixed-size copy and an integer
+// swap per block size and the rows on the worker pool (parallel_rows.h) for large regions (DetileBlocksAt was
+// ~5 % of the command thread, mostly memmove calls). Tested against DetileBlocksAt for every block size and endian.
+bool DetileBlocksAtFast(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks,
+                        uint32_t heightBlocks, uint32_t pitchBlocks, uint32_t log2Bytes, uint32_t endian);
 
 // Linear storage (block (x, y) at y * rowPitchBytes + (x << log2Bytes), texture_address.xesli
 // XeTextureGuestLinearOffset) -> the same tightly packed rows. `sourceBytes` must cover

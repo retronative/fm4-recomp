@@ -30,12 +30,14 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
     // The one known false positive, matched exactly: MoltenVK 1.4.2 MVKPipeline.mm:1994-1995 (v1.4.2 tag) reports
     // "Blending is enabled" for every colour attachment whose format Metal cannot blend, whether blendEnable is set or not.
     // The renderer's integer attachments all have blendEnable VK_FALSE: R32_UINT (the EDRAM resolve's sample dump and the
-    // storage-14 transfer view) and R16G16_UINT (FM4 Recomp: the storage-4 k_16_16 transfer view, edram_vk.cpp Pipeline, blend{});
+    // storage-14 transfer view), R16G16_UINT (FM4 Recomp: the storage-4 k_16_16 transfer view, edram_vk.cpp Pipeline, blend{}) and
+    // R16_UINT (FM4 Recomp: the k_8_8 resident words, FM4_RESOLVE_RESIDENT_K88, the same Pipeline; the local capture scenario121 (not distributed) stop 9);
     // draw pipelines never use an integer format (pipeline_cache.cpp HostColorFormat). Logged once per format under another
     // prefix (scripts/gpu_run.sh's check is not fooled into passing anything else) and not counted.
     static constexpr const char* kMvkBlendFalsePositives[] = {
         "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R32_UINT, which does not support it.",
-        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16G16_UINT, which does not support it."};
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16G16_UINT, which does not support it.",
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16_UINT, which does not support it."};
     const auto knownFalsePositive = [&] {
         for (const char* text : kMvkBlendFalsePositives)
             if (!std::strcmp(data->pMessage, text))
@@ -46,7 +48,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
         !std::strcmp(data->pMessageIdName, "mvk-warn") && knownFalsePositive())
     {
         static std::atomic<unsigned> logged{0};
-        const unsigned bit = std::strstr(data->pMessage, "R16G16_UINT") ? 2u : 1u;
+        const unsigned bit = std::strstr(data->pMessage, "R16G16_UINT") ? 2u : std::strstr(data->pMessage, "R16_UINT") ? 4u : 1u;
         if (!(logged.fetch_or(bit) & bit))
             std::fprintf(stderr, "[vulkan known false positive] mvk-warn: %s (MoltenVK 1.4.2 MVKPipeline.mm:1994; blendEnable is false)\n", data->pMessage);
         return VK_FALSE;
@@ -193,6 +195,8 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
         if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset"))  // required when offered
             enabled.push_back("VK_KHR_portability_subset"), portabilityOffered = true;
         swapchainOffered |= !std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        if (!std::strcmp(e.extensionName, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME))  // FM4_TRANSFER_STENCIL_EXPORT (vulkan_device.h)
+            enabled.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME), d.stencilExport = true;
     }
     if (d.surface != VK_NULL_HANDLE)  // window mode only; offscreen modes keep their device unchanged
     {
@@ -221,7 +225,9 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
         Stop(StopCode::Setup, "vulkan: the device lacks vertexPipelineStoresAndAtomics, which the translated vertex shaders need (XeErrors)");
     d.imageViewFormatSwizzle = portabilityOffered && portability.imageViewFormatSwizzle == VK_TRUE;
     d.samplerAnisotropy = features.features.samplerAnisotropy == VK_TRUE;
+    d.sampleRateShading = features.features.sampleRateShading == VK_TRUE;  // FM4_TRANSFER_STENCIL_EXPORT (vulkan_device.h)
     VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.sampleRateShading = d.sampleRateShading ? VK_TRUE : VK_FALSE;
     enabledFeatures.samplerAnisotropy = d.samplerAnisotropy ? VK_TRUE : VK_FALSE;
     enabledFeatures.textureCompressionBC = d.textureCompressionBC ? VK_TRUE : VK_FALSE;
     enabledFeatures.depthClamp = d.depthClamp ? VK_TRUE : VK_FALSE;
@@ -248,9 +254,10 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
     vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
     // The formats the first screens need, as the device reports them:
     // S sampled, C colour attachment, D depth/stencil attachment, B blit destination, T transfer destination (optimal tiling).
-    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s, samplerAnisotropy %s (portability subset %s)\n",
+    std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s, samplerAnisotropy %s, "
+                         "sampleRateShading %s, VK_EXT_shader_stencil_export %s (portability subset %s)\n",
                  d.textureCompressionBC ? "yes" : "NO", d.depthClamp ? "yes" : "NO", d.independentBlend ? "yes" : "NO", d.imageViewFormatSwizzle ? "yes" : "NO",
-                 d.samplerAnisotropy ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
+                 d.samplerAnisotropy ? "yes" : "NO", d.sampleRateShading ? "yes" : "NO", d.stencilExport ? "yes" : "NO", portabilityOffered ? "offered" : "absent");
     static constexpr struct { VkFormat format; const char* name; } kFormats[] = {
         {VK_FORMAT_BC1_RGBA_UNORM_BLOCK, "BC1_RGBA_UNORM (Xenos DXT1)"}, {VK_FORMAT_R8G8B8A8_UNORM, "R8G8B8A8_UNORM (k_8_8_8_8)"},
         {VK_FORMAT_R8_UNORM, "R8_UNORM (k_8)"}, {VK_FORMAT_A2B10G10R10_UNORM_PACK32, "A2B10G10R10_UNORM (2_10_10_10 targets, format 54 front buffer)"},

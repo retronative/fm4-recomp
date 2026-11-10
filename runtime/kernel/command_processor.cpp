@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -133,6 +134,20 @@ bool MemWaitDiag()
 // D3D asked for idle with a WAIT_UNTIL since the last interrupt (FM4's callback emitter writes WAIT_UNTIL 0x20000 only for its idle
 // flag; reference/perf/memory_waits.md). A memory wait whose word nothing pending writes, with no store queued, polls for a
 // grace period before it syncs: the CPU writes such words (the interrupt handler's acknowledgement), not the GPU.
+// FM4 Recomp (FM4_DIAG_BINS=1, diagnostic): draw packets per bin select (predicated tiling: a frame replayed per tile),
+// run and skipped by the predicate, tallied every 60 swaps.
+bool DiagBins()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_BINS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+struct BinTally { uint64_t run = 0, skipped = 0; };
+std::map<uint64_t, BinTally> binDraws;  // key: the bin select of a predicated draw; ~0 for draws that are not predicated
+uint64_t binSelectChanges = 0;
+
 int immediateInterruptsOverride = -1;  // SetImmediateInterrupts (tests)
 bool ImmediateInterruptsOn()
 {
@@ -148,6 +163,8 @@ bool ImmediateInterruptsOn()
     return on;
 }
 bool idleAsked = false;  // a nonzero WAIT_UNTIL since the last INTERRUPT (command-processor thread)
+uint64_t packetsSeen = 0, waitUntilAt = 0;  // FM4_DIAG_MEMWAIT: packet number of the last nonzero WAIT_UNTIL
+uint32_t waitUntilValue = 0;
 constexpr uint64_t kCpuWordGraceNs = 2000000;
 uint64_t NowNs()
 {
@@ -170,7 +187,24 @@ void CpStore(uint8_t* base, uint32_t address, uint32_t value)
     StoreGpu(base, address, value);
 }
 // The packets whose only CPU-visible effect is such a store: no sync before them when stores are deferred.
-bool StoreOnly(uint32_t opcode) { return opcode == 0x3D || opcode == 0x3E || opcode == 0x58; }
+// FM4 Recomp (opt-in FM4_DEFER_EVENTS=1, with FM4_DEFER_FENCES): EVENT_WRITE_EXT's extents and EVENT_WRITE_ZPD's sample counts go
+// through the deferred store queue (CpStore, big-endian dwords) like MEM_WRITE: they land at GPU completion in packet order, after
+// the resolve write-backs, with no sync before them (measured: 2 of the 5 CPU-sync flushes a countdown frame).
+int deferEventsOverride = -1;  // SetDeferEvents (tests)
+bool DeferEvents()
+{
+    if (deferEventsOverride >= 0)
+        return deferEventsOverride == 1;
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DEFER_EVENTS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[cp] deferred event writes on (FM4_DEFER_EVENTS=1): EVENT_WRITE_EXT and EVENT_WRITE_ZPD store through the deferred queue\n");
+        return enabled;
+    }();
+    return on;
+}
+bool StoreOnly(uint32_t opcode) { return opcode == 0x3D || opcode == 0x3E || opcode == 0x58 || ((opcode == 0x5A || opcode == 0x5B) && DeferEvents()); }
 void SyncBefore(uint32_t opcode)
 {
     if (renderer && renderer->syncGuestWrites && !(StoreOnly(opcode) && renderer->deferStore))
@@ -184,7 +218,7 @@ void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     if (index == reg::kCoherStatusHost)
         value |= 1u << 31;  // the status bit (command_processor.cc:465-467)
     if (index == reg::kWaitUntil && value != 0)
-        idleAsked = true;
+        idleAsked = true, waitUntilAt = packetsSeen, waitUntilValue = value;
     WriteRegister(base, index, value);
     OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);  // DC_LUT_* only (command_processor.cc:469-574)
     if (index >= reg::kScratchReg0 && index < reg::kScratchReg0 + 8 &&
@@ -201,6 +235,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         const uint32_t type = packet >> 30;
         state.lastHeaders[state.lastCount++ % 16] = packet;
         state.packets++;
+        packetsSeen++;
         if (packet == 0 || packet == 0x0BADF00D || type == 2)  // skipped (:274-312)
             continue;
         if (type == 1)  // two registers (:357-368)
@@ -231,6 +266,11 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             remaining--;
             return r.Next();
         };
+        if (DiagBins() && (opcode == kDrawIndx || opcode == kDrawIndx2))  // FM4_DIAG_BINS
+        {
+            BinTally& t = binDraws[(packet & 1) ? state.binSelect : ~0ull];
+            ((packet & 1) && (state.binSelect & state.binMask) == 0 ? t.skipped : t.run)++;
+        }
         if ((packet & 1) && ((state.binSelect & state.binMask) == 0 || opcode == kXeSwap))  // predicated (:405-413)
         {
             while (remaining) next();
@@ -295,6 +335,18 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             // FM4 Recomp (FM4_DEFER_FENCES): raised when the work before it completes, in order behind the queued stores.
             const bool idle = idleAsked;
             idleAsked = false;
+            static std::atomic<uint32_t> irqLines{0};
+            if (MemWaitDiag() && state.swaps % 50 == 0 && irqLines.fetch_add(1) < 2000)
+            {
+                char history[16 * 9 + 1] = "";
+                for (uint32_t i = 0; i < 16 && i < state.lastCount; i++)
+                    std::snprintf(history + 9 * i, 10, " %08X", state.lastHeaders[(state.lastCount - 1 - i) % 16]);
+                std::fprintf(stderr, "[cp] interrupt swap %llu: mask %X, idle asked %d (WAIT_UNTIL %08X, %llu packet(s) before), queued %zu, "
+                                     "work open %d; headers newest first:%s\n",
+                             (unsigned long long)state.swaps, mask, idle ? 1 : 0, waitUntilValue,
+                             (unsigned long long)(packetsSeen - waitUntilAt), deferredStores.size(),
+                             renderer && renderer->workOpen && renderer->workOpen() ? 1 : 0, history);
+            }
             if (renderer && renderer->workOpen && deferredStores.empty() && !idle && ImmediateInterruptsOn())
             {
                 immediateInterrupts++;
@@ -316,6 +368,17 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             if (magic != kSwapSignature)
                 Stop(StopCode::Unimplemented, "GPU: a swap packet without its signature (%08X)", magic);
             state.swaps++;
+            if (DiagBins() && state.swaps % 60 == 0)  // FM4_DIAG_BINS
+            {
+                std::fprintf(stderr, "[diag bins] swaps %llu-%llu, draw packets by bin select (run/skipped), mask %016llX, %llu select change(s):",
+                             (unsigned long long)(state.swaps - 59), (unsigned long long)state.swaps, (unsigned long long)state.binMask,
+                             (unsigned long long)binSelectChanges);
+                for (const auto& [select, t] : binDraws)
+                    std::fprintf(stderr, " %s%016llX %llu/%llu", select == ~0ull ? "unpredicated:" : "", (unsigned long long)select,
+                                 (unsigned long long)t.run, (unsigned long long)t.skipped);
+                std::fprintf(stderr, "\n");
+                binDraws.clear(), binSelectChanges = 0;
+            }
             if (renderer)  // presented before the stop at swap n, so swap n is captured
             {
                 uint32_t fetch[6];
@@ -523,6 +586,12 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             if ((address & 3) != 1)
                 Stop(StopCode::Unimplemented, "GPU: EVENT_WRITE_EXT with endian %u is not modelled", address & 3);
             const uint16_t extents[6] = {0, 8192 >> 3, 0, 8192 >> 3, 0, 1};
+            if (DeferEvents())  // the same bytes as big-endian dwords (endian 2 swaps the host word to the guest's order)
+            {
+                for (uint32_t i = 0; i < 3; i++)
+                    CpStore(base, ((address & ~3u) + 4 * i) | 2, uint32_t(extents[2 * i]) << 16 | extents[2 * i + 1]);
+                break;
+            }
             const uint32_t at = PhysicalToGuest(address & ~3u);
             for (uint32_t i = 0; i < 6; i++)
                 base[at + 2 * i] = uint8_t(extents[i] >> 8), base[at + 2 * i + 1] = uint8_t(extents[i]);
@@ -545,6 +614,12 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 return counts[4 * word] == 0xFF && counts[4 * word + 1] == 0xFF && counts[4 * word + 2] == 0xFE && counts[4 * word + 3] == 0xED;
             };
             const bool end = (finished(4) && finished(5)) || (finished(2) && finished(3));
+            if (DeferEvents())  // the same bytes as big-endian dwords: 1000 little-endian is E8 03 00 00
+            {
+                for (uint32_t word = 0; word < 8; word++)
+                    CpStore(base, ((address & 0x1FFFFFFCu) + 4 * word) | 2, end && (word == 0 || word == 4) ? 0xE8030000u : 0u);
+                break;
+            }
             std::memset(counts, 0, 32);
             if (end)
                 for (const uint32_t word : {4u, 0u})  // ZPass_A, Total_A, little-endian
@@ -565,7 +640,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         case kSetBinSelectLo: state.binSelect = (state.binSelect & 0xFFFFFFFF00000000ull) | next(); break;
         case kSetBinSelectHi: state.binSelect = (state.binSelect & 0xFFFFFFFFull) | (uint64_t(next()) << 32); break;
         case kSetBinMask: { const uint64_t hi = next(); state.binMask = hi << 32 | next(); break; }
-        case kSetBinSelect: { const uint64_t hi = next(); state.binSelect = hi << 32 | next(); break; }
+        case kSetBinSelect: { const uint64_t hi = next(); state.binSelect = hi << 32 | next(); binSelectChanges++; break; }
         default:
             Stop(StopCode::Unimplemented, "GPU: PM4 opcode %02X (packet %08X, %u words) is not modelled", opcode, packet, count);
         }
@@ -597,6 +672,7 @@ uint64_t MemWaitNs() { return memWaitNs.load(); }
 uint64_t ImmediateInterrupts() { return immediateInterrupts.load(); }
 uint64_t GraceSyncs() { return graceSyncs.load(); }
 void SetImmediateInterrupts(bool on) { immediateInterruptsOverride = on ? 1 : 0; }
+void SetDeferEvents(bool on) { deferEventsOverride = on ? 1 : 0; }
 void SetRendererHooks(const RendererHooks* hooks) { renderer = hooks; }
 
 void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)

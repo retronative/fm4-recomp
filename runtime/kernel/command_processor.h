@@ -81,6 +81,8 @@ uint64_t ImmediateInterrupts();
 uint64_t GraceSyncs();
 // Overrides FM4_IMMEDIATE_INTERRUPTS (tests).
 void SetImmediateInterrupts(bool on);
+// Overrides FM4_DEFER_EVENTS (tests).
+void SetDeferEvents(bool on);
 void SetRendererHooks(const RendererHooks* hooks);
 
 // The run stops (11) at swap number `n` (fm4recomp --stop-at-swap n, required; M3's evidence is n = 1).

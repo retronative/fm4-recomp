@@ -4,6 +4,7 @@
 // See draw_record.h.
 #include "draw_record.h"
 
+#include <cmath>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -331,6 +332,63 @@ bool BoundTargetHeight(const DrawState& d, const shader::ShaderTranslation& vs, 
     const uint32_t vertexMaxY = edram::VertexMaxY(d.extent, positions.data(), positions.size());
     height = std::min(d.target.edramRows, edram::EstimateMaxY(d.extent, &vertexMaxY));
     return true;
+}
+
+OverwriteRect FindOverwriteRect(const DrawState& d, const shader::ShaderTranslation& vs, bool psKills, const uint32_t* window, size_t windowDwords,
+                                uint32_t endian)
+{
+    OverwriteRect o;
+    const auto no = [&](std::string why) { o.why = std::move(why); return o; };
+    if (d.kind != DrawKind::Draw || d.primitiveType != 8 || d.indices.indexed || d.indices.count != 3)
+        return no("not a rect-list draw of three auto-indexed vertices");
+    if (d.cullFront || d.cullBack)
+        return no("culling is on");
+    const GuestViewport& v = d.viewport;
+    if (!(d.systemFlags & shader::kFlagXyDividedByW) || v.scale[0] != 1.0f || v.scale[1] != 1.0f || v.offset[0] != 0.0f || v.offset[1] != 0.0f)
+        return no("the positions are not screen space (vtx_xy_fmt with no viewport scale or offset)");
+    const shader::ShaderTranslation::PositionFetch& p = vs.positionFetch;
+    if (!p.valid)
+        return no("the vertex shader's position is not a plain vertex fetch: " + p.why);
+    if (window == nullptr)
+        return no("vertex fetch slot " + std::to_string(p.slot) + " has no data window");
+    std::vector<edram::VertexPosition> positions;
+    std::string why;
+    if (!edram::PassThroughPositions(window, windowDwords, endian, p.strideDwords, p.offsetDwords, 3, positions, why))
+        return no(why);
+    float sx[3], sy[3];
+    for (uint32_t i = 0; i < 3; i++)
+        sx[i] = positions[i].x + v.offsetAddXy[0], sy[i] = positions[i].y + v.offsetAddXy[1];
+    for (float f : {sx[0], sx[1], sx[2], sy[0], sy[1], sy[2]})
+        if (!(f == f) || f < -16384.0f || f > 16384.0f)
+            return no("a position is not finite or is out of range");
+    const float minX = std::min({sx[0], sx[1], sx[2]}), maxX = std::max({sx[0], sx[1], sx[2]});
+    const float minY = std::min({sy[0], sy[1], sy[2]}), maxY = std::max({sy[0], sy[1], sy[2]});
+    // Three distinct corners of the axis-aligned rectangle [minX, maxX] x [minY, maxY].
+    for (uint32_t i = 0; i < 3; i++)
+    {
+        if ((sx[i] != minX && sx[i] != maxX) || (sy[i] != minY && sy[i] != maxY))
+            return no("the vertices are not the corners of an axis-aligned rectangle");
+        for (uint32_t j = 0; j < i; j++)
+            if (sx[i] == sx[j] && sy[i] == sy[j])
+                return no("two vertices coincide");
+    }
+    const int32_t x0 = int32_t(std::ceil(minX - 0.5f)), x1 = int32_t(std::ceil(maxX - 0.5f)), y0 = int32_t(std::ceil(minY - 0.5f)), y1 = int32_t(std::ceil(maxY - 0.5f));
+    const int32_t cx0 = std::max({x0, 0, int32_t(d.scissor.x)}), cy0 = std::max({y0, 0, int32_t(d.scissor.y)});
+    const int32_t cx1 = std::min(x1, int32_t(d.scissor.x + d.scissor.width)), cy1 = std::min(y1, int32_t(d.scissor.y + d.scissor.height));
+    if (cx1 <= cx0 || cy1 <= cy0)
+        return no("the rectangle covers no pixel inside the scissor");
+    o.rect = {uint32_t(cx0), uint32_t(cy0), uint32_t(cx1 - cx0), uint32_t(cy1 - cy0)};
+    if (psKills || d.alphaTest.enabled || d.alphaToMask != 0)
+        return no("a fragment may be discarded (kill, alpha test or alpha to mask)");
+    const DepthStencil& ds = d.depthStencil;
+    const auto replaces = [](const DepthStencil::Face& f) { return f.func == 7 && f.zPass == 2 && f.writeMask == 0xFF; };
+    const auto passes = [](const DepthStencil::Face& f) { return f.func == 7; };
+    o.depth = ds.zEnable && ds.zWriteEnable && ds.zFunc == 7 && ds.stencilEnable && replaces(ds.front) && (!ds.backfaceEnable || replaces(ds.back));
+    o.color = d.colorWriteMask == 0xF && !d.blend.enabled && (!ds.zEnable || ds.zFunc == 7) &&
+              (!ds.stencilEnable || (passes(ds.front) && (!ds.backfaceEnable || passes(ds.back))));
+    if (!o.depth && !o.color)
+        o.why = "neither depth and stencil (ALWAYS, write, REPLACE 0xFF) nor all colour channels without blending are replaced";
+    return o;
 }
 
 }  // namespace runtime::video

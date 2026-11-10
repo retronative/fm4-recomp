@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace runtime::video;
@@ -446,6 +447,37 @@ void TestCopies()
     Expect(!DetileBlocksAt(tail.data(), tail.size(), blocks, 4, 0, 4, 4, 48, 3, 0), "CONTROL: a pitch that is not a multiple of 32 blocks is refused");
     Expect(!DetileBlocksAt(tail.data(), tail.size(), blocks, 30, 0, 4, 4, 32, 3, 0), "CONTROL: a region past the pitch is refused");
     Expect(!DetileBlocksAt(tiled.data(), tiled.size(), out, 0, 0, 8, 8, 32, 0, 1), "CONTROL: k_8 with endian 8in16 is refused");
+    {
+        // FM4_FAST_DETILE: DetileBlocksAtFast gives DetileBlocksAt's bytes for every block size and supported endian, at an
+        // origin inside the tile (a packed level) and over a 256x256-block region (the worker pool), and the same refusals.
+        std::vector<uint8_t> big(size_t(16) << 20);
+        uint32_t seed = 12345;
+        for (uint8_t& b : big)
+            seed = seed * 1103515245u + 12345u, b = uint8_t(seed >> 16);
+        bool same = true, refusals = true;
+        for (uint32_t log2 = 0; log2 <= 4; log2++)
+            for (uint32_t endian = 0; endian <= 3; endian++)
+            {
+                if (!EndianSupported(log2, endian))
+                {
+                    std::vector<uint8_t> a(64 << 4), b(64 << 4);
+                    refusals = refusals && !DetileBlocksAtFast(big.data(), big.size(), b.data(), 0, 0, 8, 8, 32, log2, endian);
+                    continue;
+                }
+                for (const auto& [x0, y0, w, h, pitch] : {std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>{0, 0, 256, 256, 256},
+                                                           {4, 0, 4, 4, 32}, {3, 5, 61, 37, 64}})
+                {
+                    if (TiledAddressUpperBound2D(x0 + w, y0 + h, pitch, log2) > big.size())
+                        continue;
+                    std::vector<uint8_t> a(size_t(w) * h << log2, 0xAA), b(size_t(w) * h << log2, 0x55);
+                    same = same && DetileBlocksAt(big.data(), big.size(), a.data(), x0, y0, w, h, pitch, log2, endian) &&
+                           DetileBlocksAtFast(big.data(), big.size(), b.data(), x0, y0, w, h, pitch, log2, endian) && a == b;
+                }
+            }
+        Expect(same, "DetileBlocksAtFast: the same bytes as DetileBlocksAt (1-16 byte blocks, every supported endian, packed origin, 256x256 region)");
+        Expect(refusals && !DetileBlocksAtFast(tail.data(), 8191, blocks, 4, 0, 4, 4, 32, 3, 0) && !DetileBlocksAtFast(tail.data(), tail.size(), blocks, 4, 0, 4, 4, 48, 3, 0),
+               "CONTROL: DetileBlocksAtFast refuses an unsupported endian, a short source and a bad pitch");
+    }
     // Linear: the Y plane's rows are the source's rows; a region at (x0, y0) starts at y0 * pitch + x0.
     std::vector<uint8_t> plane(921600);
     for (size_t i = 0; i < plane.size(); i++)

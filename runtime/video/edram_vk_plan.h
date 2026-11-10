@@ -283,6 +283,12 @@ bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStora
 // written on a refusal.
 bool ResolveConvertToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
                            std::string& why);
+// FM4 Recomp (FM4_RESOLVE_GPU_WORDS): `words` are the rectangle's converted 32 bpp words, row-major and tightly packed, as
+// ResolveConvertPixel computes them (edram_vk.cpp kResolveResident on the GPU); each is endian-swapped and stored at its tiled
+// address exactly as ResolveConvertToGuest stores ResolveConvertPixel's result. 32 bpp destinations only; nothing written on a
+// refusal.
+bool ResolveWordsToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
+                         std::string& why);
 
 // ---- Depth resolves (X draw_util.cc GetResolveInfo's depth path and GetCopyShader: always the fast bit copy) ----------
 //

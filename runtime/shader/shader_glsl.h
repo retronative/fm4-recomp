@@ -103,6 +103,7 @@ struct ShaderTranslation
     // shader reads (registers r0..r(n-1) read before written, preloaded from xe_interp_i); the
     // host must check the paired VS exports at least this many.
     uint32_t interpolatorCount = 0;
+    bool kills = false;  // FM4 Recomp: a pixel shader with a kill op (xe_kill): a fragment may write neither colour nor depth (draw_record.h FindOverwriteRect)
     // FM4 Recomp: vertex shader register reads that some analysis path reaches before any write on it (the program writes the
     // register earlier on another path, e.g. under a predicate): they read the zero every temp starts at, as Xenia zeroes its
     // registers "to prevent crashes when the game references them after only initializing them conditionally"

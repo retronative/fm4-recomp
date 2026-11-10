@@ -170,7 +170,7 @@ bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Tr
 
 // ---- Bind (X render_target_cache.cc:574-1015) ---------------------------------------------------------------
 
-Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed)
+Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout, const Rect* colorCutout)
 {
     Binding b;
     const SurfaceInfo surface = DecodeSurfaceInfo(regs.surfaceInfo);
@@ -281,7 +281,7 @@ Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUse
     for (const auto& [base, index] : sorted)
     {
         (void)base;
-        if (!ownership.Change(keys[index], 0, lengths[index], b.transfers[index], b.refusal))
+        if (!ownership.Change(keys[index], 0, lengths[index], b.transfers[index], b.refusal, index == 0 ? depthCutout : colorCutout))  // FM4_OVERWRITE_CLAIM
         {
             ownership = before;
             b.ok = false;
@@ -454,6 +454,7 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     info.destEndian = r.copyDestInfo & 7;
     info.destPitch = r.copyDestPitch & 0x3FFF, info.destHeight = (r.copyDestPitch >> 16) & 0x3FFF;
     const uint32_t destFormatRaw = (r.copyDestInfo >> 7) & 0x3F, destNumber = (r.copyDestInfo >> 13) & 7;
+    info.destNumber = destNumber;
     bool is64 = false;
     uint32_t sourceBase = 0;
     if (info.isDepth)
@@ -532,10 +533,11 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
             return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " on a 16 bpp destination (only 0 and 8in16 are supported)");
         info.destBytesLog2 = info.destFormat == 10 ? 1 : 2;  // X draw_util.cc:1133 (texture_info_formats.inl:11 k_8_8: 16 bits)
         // RB_COPY_DEST_INFO copy_dest_number (X registers.h:819): Xenia 67f16c4 declares it and never reads it in its resolve path.
-        // FM4 resolves its k_32_FLOAT target into texture format 36 with number 7 (kFloat, xenos.h:216-224; the local capture draw_loop2 (not distributed),
-        // draw 31424): the natural value for float data. FM4 resolves its 16_16 target into texture format 25 with number 3
-        // (kSignedInteger, xenos.h:221; the local capture scenario17 (not distributed) draw 484805); X packs UNORM whatever the number
-        // (pixel_formats.xesli:144-147, :236-239) and so does this port: what the hardware does with number 3 is UNRESOLVED.
+        // FM4 resolves its k_32_FLOAT target into texture format 36 with number 7 (kFloat, xenos.h:216-224):
+        // the natural value for float data. FM4 resolves its 16_16 target into texture format 25 with number 3
+        // (kSignedInteger, xenos.h:221): packed as signed 16-bit integers of the biased value
+        // (edram_vk_plan.cpp PackFixed16; xenia-canary d119505 pixel_formats.xesli XePackFixed, ShiftGlue 72b7dd6f
+        // fh1_native_resolve_memory.cs.hlsl:218-232 PackChannel).
         // Accepted for those two pairings only; every other non-zero value stays refused.
         if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36) && !(destNumber == 3 && info.destFormat == 25))
             return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
@@ -804,7 +806,8 @@ bool PassThroughPositions(const uint32_t* words, size_t wordCount, uint32_t endi
         return Refuse(why, "the vertex window (" + std::to_string(wordCount) + " dwords) is shorter than " + std::to_string(vertices) + " vertices of " +
                                std::to_string(strideDwords) + " dwords");
     for (uint32_t v = 0; v < vertices; v++)
-        out.push_back({FloatBits(GpuSwap32(words[size_t(v) * strideDwords + offsetDwords + 1], endian)), 1.0f});
+        out.push_back({FloatBits(GpuSwap32(words[size_t(v) * strideDwords + offsetDwords + 1], endian)), 1.0f,
+                       FloatBits(GpuSwap32(words[size_t(v) * strideDwords + offsetDwords], endian))});
     return true;
 }
 

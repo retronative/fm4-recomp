@@ -3,11 +3,23 @@
 //
 // texture_upload.h (see its header comment).
 #include "texture_upload.h"
+#include <cstdlib>
 #include "edram_vk_plan.h"
 #include <algorithm>
 #include <cstdio>
 
 namespace runtime::video {
+
+namespace {
+// FM4 Recomp (opt-in FM4_FAST_DETILE=1): texture_untile.h DetileBlocksAtFast, the same bytes, instead of DetileBlocksAt.
+bool Detile2D(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks, uint32_t heightBlocks,
+              uint32_t pitchBlocks, uint32_t log2Bytes, uint32_t endian)
+{
+    static const bool fast = [] { const char* v = std::getenv("FM4_FAST_DETILE"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return fast ? DetileBlocksAtFast(tiled, tiledBytes, out, x0, y0, widthBlocks, heightBlocks, pitchBlocks, log2Bytes, endian)
+                : DetileBlocksAt(tiled, tiledBytes, out, x0, y0, widthBlocks, heightBlocks, pitchBlocks, log2Bytes, endian);
+}
+}  // namespace
 namespace {
 
 std::string Hex(uint32_t v)
@@ -109,7 +121,7 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
         for (uint32_t face = 1; ok && face < d.layers; face++)
         {
             const size_t skip = l.faceStrideBytes * face;
-            ok = d.fetch.tiled ? DetileBlocksAt(source + skip, l.extentBytes - skip, level + faceBytes * face, l.x, l.y, l.widthBlocks, l.heightBlocks,
+            ok = d.fetch.tiled ? Detile2D(source + skip, l.extentBytes - skip, level + faceBytes * face, l.x, l.y, l.widthBlocks, l.heightBlocks,
                                                 l.pitchBlocks, d.log2BytesPerBlock, d.fetch.endian)
                                : CopyLinearBlocksAt(source + skip, l.extentBytes - skip, level + faceBytes * face, l.x, l.y, l.widthBlocks,
                                                     l.heightBlocks, l.rowPitchBytes, d.log2BytesPerBlock, d.fetch.endian);
@@ -119,7 +131,7 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
                                                               l.zStrideBlockRows, d.log2BytesPerBlock, d.fetch.endian)
                                              : CopyLinearBlocks3D(source, l.extentBytes, level, l.widthBlocks, l.heightBlocks, l.depth, l.rowPitchBytes,
                                                                   l.zStrideBlockRows, d.log2BytesPerBlock, d.fetch.endian))
-                        : d.fetch.tiled ? DetileBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.pitchBlocks,
+                        : d.fetch.tiled ? Detile2D(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.pitchBlocks,
                                                        d.log2BytesPerBlock, d.fetch.endian)
                                       : CopyLinearBlocksAt(source, l.extentBytes, level, l.x, l.y, l.widthBlocks, l.heightBlocks, l.rowPitchBytes,
                                                            d.log2BytesPerBlock, d.fetch.endian));

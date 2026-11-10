@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <cstring>
 #include <vector>
 
 using namespace runtime::video;
@@ -355,6 +356,25 @@ void TestRectClear()
     Expect(d.aluConstants.size() == 2048 && d.aluConstants[0] == F(1.0f) && d.aluConstants[1024] == F(2.0f) && d.boolConstants[0] == 1 &&
                d.loopConstants[0] == 0x40,
            "ALU, bool and loop constants copied in register order");
+    {
+        // DrawInputs::registers (the bulk read): the same file stored big-endian gives the same constants; CONTROL: stored
+        // little-endian (not swapped) it does not.
+        std::vector<uint8_t> be(f.regs.size() * 4), le(f.regs.size() * 4);
+        for (size_t i = 0; i < f.regs.size(); i++)
+        {
+            const uint32_t v = f.regs[i], s = __builtin_bswap32(v);
+            std::memcpy(be.data() + 4 * i, &s, 4), std::memcpy(le.data() + 4 * i, &v, 4);
+        }
+        DrawInputs in;
+        in.read = ReadVector, in.context = &f.regs, in.opcode = 0x36, in.physicalBytes = kPhysical, in.vs = &vs, in.ps = &ps;
+        in.registers = be.data();
+        const DrawState bulk = DecodeDrawState(in);
+        in.registers = le.data();
+        const DrawState wrong = DecodeDrawState(in);
+        Expect(bulk.aluConstants == d.aluConstants && std::equal(bulk.boolConstants, bulk.boolConstants + 8, d.boolConstants) &&
+                   std::equal(bulk.loopConstants, bulk.loopConstants + 32, d.loopConstants) && wrong.aluConstants[0] != d.aluConstants[0],
+               "bulk register read: the big-endian file gives the reader's constants (CONTROL: an unswapped file does not)");
+    }
     Expect(d.program.vsConstBase == 0 && d.program.psConstBase == 256 && d.program.psConstSize == 255, "SQ_VS_CONST / SQ_PS_CONST decoded");
     Expect(d.textureSlots.empty() && d.vsLoopRegisters.empty(), "no textures, no loops");
 

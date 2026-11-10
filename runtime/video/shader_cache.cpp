@@ -17,6 +17,8 @@
 #include <glslang/SPIRV/Logger.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 
 namespace runtime::video {
@@ -31,6 +33,35 @@ std::string Hex(uint64_t v)
 }
 
 std::string Name(const CachedShader& s) { return std::string(s.pixel ? "ps_" : "vs_") + Hex(s.hash); }
+
+// FM4 Recomp (opt-in FM4_SHADER_NO_PRECISE=1, a GPU-cost experiment): the translated GLSL is compiled without its `precise`
+// qualifiers (shader_glsl.cpp: products and sums are precise so the host cannot fuse them, as Xenos does not). SPIRV-Cross emits
+// NoContraction arithmetic for Metal as calls to [[clang::optnone]] helpers (spvFAdd, spvFMul, spvFSub: fma(1, a, b) and the
+// like), which the Metal compiler cannot inline or schedule; without it a multiply-add may be fused (results differ by rounding
+// only). FM4_SHADER_DUMP still writes the translated text.
+bool NoPrecise()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_SHADER_NO_PRECISE");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[shader] FM4_SHADER_NO_PRECISE=1: shaders compiled without their precise qualifiers (multiply-adds may fuse)\n");
+        return enabled;
+    }();
+    return on;
+}
+
+std::string WithoutPrecise(const std::string& glsl)
+{
+    std::string out;
+    out.reserve(glsl.size());
+    for (size_t i = 0; i < glsl.size();)
+        if (glsl.compare(i, 8, "precise ") == 0 && (i == 0 || !(std::isalnum((unsigned char)glsl[i - 1]) || glsl[i - 1] == '_')))
+            i += 8;
+        else
+            out += glsl[i++];
+    return out;
+}
 
 }  // namespace
 
@@ -53,7 +84,8 @@ bool GlslangCompiler::Compile(bool pixel, const std::string& glsl, std::vector<u
     const EShLanguage stage = pixel ? EShLangFragment : EShLangVertex;
     const EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     glslang::TShader shader(stage);
-    const char* source = glsl.c_str();
+    const std::string text = NoPrecise() ? WithoutPrecise(glsl) : std::string();  // FM4_SHADER_NO_PRECISE
+    const char* source = NoPrecise() ? text.c_str() : glsl.c_str();
     shader.setStrings(&source, 1);
     shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);

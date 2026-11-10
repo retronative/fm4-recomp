@@ -4,7 +4,9 @@
 //
 // The copies of texture_untile.h (see its header comment for sources and attribution).
 #include "texture_untile.h"
+#include "parallel_rows.h"
 #include <cstring>
+#include <utility>
 
 namespace runtime::video {
 
@@ -44,6 +46,67 @@ bool DetileBlocksAt(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint3
             std::memcpy(block, tiled + TiledOffset2D(x0 + x, y0 + y, pitchBlocks, log2Bytes), bytes);
             SwapBlockEndian(block, log2Bytes, endian);
         }
+    return true;
+}
+
+namespace {
+// One dword of a block under `endian` as SwapBlockEndian permutes it ({1,0,3,2} 8in16, {3,2,1,0} 8in32, {2,3,0,1} 16in32).
+inline uint32_t SwapDword(uint32_t v, uint32_t endian)
+{
+    switch (endian)
+    {
+    case 1: return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+    case 2: return __builtin_bswap32(v);
+    case 3: return (v << 16) | (v >> 16);
+    default: return v;
+    }
+}
+template <uint32_t Bytes>
+void DetileRowsFast(const uint8_t* tiled, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks, uint32_t pitchBlocks, uint32_t log2Bytes,
+                    uint32_t endian, uint32_t firstRow, uint32_t lastRow)
+{
+    for (uint32_t y = firstRow; y < lastRow; y++)
+        for (uint32_t x = 0; x < widthBlocks; x++)
+        {
+            uint8_t* block = out + (size_t(y) * widthBlocks + x) * Bytes;
+            std::memcpy(block, tiled + TiledOffset2D(x0 + x, y0 + y, pitchBlocks, log2Bytes), Bytes);
+            if constexpr (Bytes == 2)
+            {
+                if (endian != kEndianNone)
+                    std::swap(block[0], block[1]);
+            }
+            else if constexpr (Bytes >= 4)
+            {
+                if (endian != kEndianNone)
+                    for (uint32_t i = 0; i < Bytes; i += 4)
+                    {
+                        uint32_t v;
+                        std::memcpy(&v, block + i, 4);
+                        v = SwapDword(v, endian);
+                        std::memcpy(block + i, &v, 4);
+                    }
+            }
+        }
+}
+}  // namespace
+
+bool DetileBlocksAtFast(const uint8_t* tiled, size_t tiledBytes, uint8_t* out, uint32_t x0, uint32_t y0, uint32_t widthBlocks,
+                        uint32_t heightBlocks, uint32_t pitchBlocks, uint32_t log2Bytes, uint32_t endian)
+{
+    if (!EndianSupported(log2Bytes, endian) || (pitchBlocks & (kTileWidthHeight - 1)) || x0 > pitchBlocks || widthBlocks > pitchBlocks - x0 ||
+        TiledAddressUpperBound2D(x0 + widthBlocks, y0 + heightBlocks, pitchBlocks, log2Bytes) > tiledBytes)
+        return false;
+    const auto rows = [&](uint32_t first, uint32_t last) {
+        switch (log2Bytes)
+        {
+        case 0: DetileRowsFast<1>(tiled, out, x0, y0, widthBlocks, pitchBlocks, 0, endian, first, last); break;
+        case 1: DetileRowsFast<2>(tiled, out, x0, y0, widthBlocks, pitchBlocks, 1, endian, first, last); break;
+        case 2: DetileRowsFast<4>(tiled, out, x0, y0, widthBlocks, pitchBlocks, 2, endian, first, last); break;
+        case 3: DetileRowsFast<8>(tiled, out, x0, y0, widthBlocks, pitchBlocks, 3, endian, first, last); break;
+        default: DetileRowsFast<16>(tiled, out, x0, y0, widthBlocks, pitchBlocks, 4, endian, first, last); break;
+        }
+    };
+    ParallelRows(heightBlocks, widthBlocks, rows);
     return true;
 }
 

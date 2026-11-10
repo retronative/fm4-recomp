@@ -4465,6 +4465,31 @@ int main(int, char** argv)
             Expect(mapped && synced == std::vector<uint32_t>{0x3C} && GraceSyncs() == graceBefore + 1 && MemWaits() == memBefore + 1 &&
                        graceTook >= std::chrono::milliseconds(2) && be32(page + 0x24) == 0,
                    "FM4_IMMEDIATE_INTERRUPTS: a wait on a CPU-written word polls for the 2 ms grace, then syncs once");
+            // FM4_DEFER_EVENTS: with work open (the deferring hook accepts), EVENT_WRITE_EXT (C0015A00, endian 1) and EVENT_WRITE_ZPD
+            // (C0005B00, a finished query) sync nothing and queue their stores; once applied the bytes are the immediate path's
+            // (the EVENT_WRITE_EXT / ZPD tests above): extents 0000 0400 0000 0400 0000 0001, counts E8030000 at words 0 and 4, 0
+            // elsewhere. CONTROL: before ApplyDeferredStores the memory is untouched.
+            SetDeferEvents(true);
+            accept = true;
+            synced.clear();
+            for (uint32_t i = 0; i < 3; i++)
+                Store32(base, page + 0x600 + 4 * i, 0x0BAD0BAD);
+            put(0x700, {0x11, 0x22, 0, 0, 0xFFFFFEED, 0xFFFFFEED, 7, 7});
+            WriteRegister(base, reg::kRbSampleCountAddr, phys + 0x700);
+            put(0x7C0, {0xC0015A00, 3, (phys + 0x600) | 1, 0xC0005B00, 0x15});
+            SetRendererHooks(&deferring);
+            if (mapped)
+                Execute(base, page + 0x7C0, 5, 0, 5, deferred);
+            SetRendererHooks(nullptr);
+            const bool untouched = be32(page + 0x600) == 0x0BAD0BAD && be32(page + 0x700) == 0x11 && DeferredStoresPending() && synced.empty();
+            ApplyDeferredStores();
+            SetDeferEvents(false);
+            WriteRegister(base, reg::kRbSampleCountAddr, 0);
+            Expect(mapped && untouched, "FM4_DEFER_EVENTS: EVENT_WRITE_EXT and EVENT_WRITE_ZPD with work open: no sync, stores queued, memory untouched");
+            Expect(mapped && be32(page + 0x600) == 0x00000400 && be32(page + 0x604) == 0x00000400 && be32(page + 0x608) == 0x00000001 &&
+                       be32(page + 0x700) == 0xE8030000u && be32(page + 0x704) == 0 && be32(page + 0x710) == 0xE8030000u && be32(page + 0x714) == 0 &&
+                       be32(page + 0x718) == 0 && be32(page + 0x71C) == 0,
+                   "FM4_DEFER_EVENTS: applied, the extents and the sample counts are the immediate path's bytes");
         }
         // A ring of 4 words read from word 3 with wraparound: a type-0 header at word 3, its values at words 0 and 1.
         put(0x300, {0x22, 0x33, 0, 0x00012004});

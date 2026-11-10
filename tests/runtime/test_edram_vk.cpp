@@ -469,6 +469,36 @@ void TestFastResidentWords()
     CHECK(same8 && same10);
 }
 
+// FM4_RESOLVE_GPU_WORDS: the converted words stored at the hand-computed tiled offsets of TestResolveToGuest (front buffer,
+// pitch 1280, endian 0: the word itself), and the same bytes as ResolveConvertToGuest when the words are ResolveConvertPixel's.
+void TestResolveWordsToGuest()
+{
+    std::string why;
+    const edram::ResolveInfo fb = edram::DecodeResolve(Trace12Resolve(0x00020000, 0x00100300, 0x1B441000, 0x01000380, 0));
+    const uint32_t w = 1280, h = 720;
+    std::vector<uint32_t> words(size_t(w) * h), texels(size_t(w) * h);
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+            words[size_t(y) * w + x] = 0xA0000000u | y << 12 | x, texels[size_t(y) * w + x] = 1u << 30 | (y & 0x3FF) << 20 | (x & 0x3FF);
+    std::vector<uint8_t> dest(fb.destExtentLength, 0xEE);
+    CHECK(ResolveWordsToGuest(fb, 2, words.data(), dest.data(), uint32_t(dest.size()), why));
+    CHECK(WordAt(dest, 0) == 0xA0000000u && WordAt(dest, 4) == 0xA0000001u && WordAt(dest, 16) == 0xA0001000u && WordAt(dest, 64) == 0xA0000008u);
+    CHECK(WordAt(dest, 280) == (0xA0000000u | 3u << 12 | 2u) && WordAt(dest, 4096) == 0xA0000020u && WordAt(dest, 163840) == 0xA0020000u);
+    CHECK(WordAt(dest, 3766140) == (0xA0000000u | 719u << 12 | 1279u));
+    std::vector<uint32_t> converted(texels.size());
+    for (size_t i = 0; i < texels.size(); i++)
+        converted[i] = ResolveConvertPixel(fb, 2, &texels[i]);
+    std::vector<uint8_t> a(fb.destExtentLength, 0xEE), b(fb.destExtentLength, 0xEE);
+    CHECK(ResolveWordsToGuest(fb, 2, converted.data(), a.data(), uint32_t(a.size()), why) &&
+          ResolveConvertToGuest(fb, 2, texels.data(), b.data(), uint32_t(b.size()), why) && a == b);
+    std::vector<uint8_t> untouched(fb.destExtentLength, 0xEE), small(16, 0xEE);
+    CONTROL(ResolveWordsToGuest(fb, 2, words.data(), small.data(), uint32_t(small.size()), why));  // past the end: refused
+    CHECK(small == std::vector<uint8_t>(16, 0xEE));                                                 // ... and nothing written
+    edram::ResolveInfo half = fb;
+    half.destBytesLog2 = 1;
+    CONTROL(ResolveWordsToGuest(half, 2, words.data(), untouched.data(), uint32_t(untouched.size()), why));  // not 32 bpp
+}
+
 void TestResolveToGuest()
 {
     std::string why;
@@ -1499,39 +1529,56 @@ void TestRg16Resolve()
     // The scale by hand: X's 32.0 / 32767.0 (pixel_formats.xesli:367-371) = 2^5 / (2^15 - 1) = 2^-10 / (1 - 2^-15)
     // = 2^-10 (1 + 2^-15 + 2^-30 + ...); as a float (23 fraction bits) the 2^-30 term is below half an ulp:
     // c = 2^-10 (1 + 2^-15). The bias factor (resolve.xesli:131-133) 2^10, halved twice for k0123 (:651, :670): 256.
+    // Number 3 (signed integer; canary d119505 pixel_formats.xesli XePackFixed, ShiftGlue fh1_native_resolve_memory.cs.hlsl:218-232):
+    // each half is int(clamp(v, -32768, 32767) + (v >= 0 ? 0.5 : -0.5)) & 0xFFFF, so with k0123 the output is the average of the four
+    // samples' int16 values, rounded half away from zero.
     // Pixel A, guest samples (by guest index) 0x00010001, 0x00010000, 0x00010000, 0 (red the low half, :367-371):
-    // red one unit, c * 256 = 0.25 + 2^-17; * 65535 = 16384.24999 (float 16384.25), + 0.5, truncated: 16384 = 0x4000
-    // (pixel_formats.xesli:144-147). Green three units: 0.75 (1 + 2^-15) * 65535 = 49152.74998 (float 49152.75) + 0.5 ->
-    // 49153 = 0xC001. Word 0xC001 << 16 | 0x4000.
+    // red one unit, c * 256 = 0.25 (1 + 2^-15); + 0.5 -> int(0.75...) = 0. Green three units: 0.75 (1 + 2^-15) + 0.5 -> 1. Word 0x00010000.
     const uint32_t a[4] = {0x00010001u, 0x00010000u, 0x00010000u, 0};
-    CHECK(ResolveConvertPixel(rg, 4, a) == 0xC0014000u);
-    CONTROL(ResolveConvertPixel(rg, 4, a) == 0x4000C001u);  // red in the high half
-    // A wrong scale, 1 / 32767 (the guest range as -1..1, i.e. X's +5 bias case, draw_util.cc:1258-1266, which the
-    // full-range default turns off): red 256 / 32767 * 65535 = 512.0078 -> 512, green 1536.02 -> 1536: 0x06000200.
-    CONTROL(ResolveConvertPixel(rg, 4, a) == 0x06000200u);
-    // Pixel B, the clamp max(-1, ...) after the scale: sample 0 red 0x8001 (-32767 c = -(2^30 - 1) / 2^25, about -32) -> -1;
-    // sample 1 red 0x0400 (1024 c = 1 + 2^-15 exactly); sum ((-1 + 1 + 2^-15) + 0) + 0 = 2^-15, * 256 = 2^-7; * 65535 =
-    // 511.9921875 + 0.5 = 512.4921875 -> 512 = 0x200 (green 0). Without the clamp the sum is negative: 0.
+    CHECK(ResolveConvertPixel(rg, 4, a) == 0x00010000u);
+    CONTROL(ResolveConvertPixel(rg, 4, a) == 0xC0014000u);  // the UNORM pack this port used before (saturate * 65535)
+    CONTROL(ResolveConvertPixel(rg, 4, a) == 0x00000001u);  // red and green exchanged
+    // Pixel B, both -1 snorm encodings are -32 (ShiftGlue fh1_native_edram.hlsli:217-220; Xenia 67f16c4's max(-1, int16 c) would
+    // give -1): sample 0 red 0x8001: -32767 c = -(2^30 - 1) / 2^25, as a float -32 (the 2^-25 term is below the ulp 2^-19), clamp
+    // -32; sample 1 red 0x0400: 1024 c = 1 + 2^-15 exactly. Sum (-32 + 1 + 2^-15) + 0 + 0 = -31 + 2^-15 (ulp 2^-18: exact);
+    // * 256 = -7936 + 2^-7 = -7935.9921875 (exact); negative: int(-7936.4921875) = -7936 = -0x1F00 -> 0xE100. Green 0.
     const uint32_t b[4] = {0x00008001u, 0x00000400u, 0, 0};
-    CHECK(ResolveConvertPixel(rg, 4, b) == 0x00000200u);
-    CONTROL(ResolveConvertPixel(rg, 4, b) == 0u);  // the clamp missing
-    const uint32_t b0[4] = {0x00008000u, 0x00000400u, 0, 0};  // -32768 c is also below -1: the same result
-    CHECK(ResolveConvertPixel(rg, 4, b0) == 0x00000200u);
-    // A negative green half alone: 0xFFFF = -1 unit -> -c * 256 < 0 -> saturated to 0; red one unit -> 0x4000.
+    CHECK(ResolveConvertPixel(rg, 4, b) == 0x0000E100u);
+    CONTROL(ResolveConvertPixel(rg, 4, b) == 0u);  // Xenia's -1 clamp: (-1 + 1 + 2^-15) * 256 = 2^-7 -> 0 (and the old UNORM 0x200)
+    const uint32_t b0[4] = {0x00008000u, 0x00000400u, 0, 0};  // -32768 c = -32 - 2^-10 - 2^-25: also clamped to -32: the same word
+    CHECK(ResolveConvertPixel(rg, 4, b0) == 0x0000E100u);
+    // A negative green half alone: 0xFFFF = -1 unit -> -c * 256 = -0.25 (1 + 2^-15); negative: int(-0.75...) = 0 (toward zero).
+    // Red one unit -> 0 as in pixel A. Word 0.
     const uint32_t d[4] = {0xFFFF0001u, 0, 0, 0};
-    CHECK(ResolveConvertPixel(rg, 4, d) == 0x00004000u);
-    // Saturation (r 0x0400, g 0x7FFF in every sample): red 4 (1 + 2^-15) * 256 and green 4 * 32 (1 + 2^-15) ... * 256, both
-    // above 1 -> 65535 each.
+    CHECK(ResolveConvertPixel(rg, 4, d) == 0u);
+    // The clamp at 32767 (r 0x0400, g 0x7FFF in every sample): red 4 (1 + 2^-15) * 256 = 1024 + 2^-5 -> int(1024.53125) = 1024 =
+    // 0x0400; green 4 * 32 * 256 = 32768 -> 32767 -> int(32767.5) = 0x7FFF.
     const uint32_t s[4] = {0x7FFF0400u, 0x7FFF0400u, 0x7FFF0400u, 0x7FFF0400u};
-    CHECK(ResolveConvertPixel(rg, 4, s) == 0xFFFFFFFFu);
+    CHECK(ResolveConvertPixel(rg, 4, s) == 0x7FFF0400u);
+    CONTROL(ResolveConvertPixel(rg, 4, s) == 0xFFFFFFFFu);  // the UNORM saturation of the old pack
     // The swap (DEST_INFO bit 24; resolve.xesli:699-704 .bgra before the pack): (r, g, 0, 0) -> (0, g, r, 0), and k_16_16
-    // packs red and green (pixel_formats.xesli:236-239): pixel A -> red 0, green 0xC001.
+    // packs red and green (pixel_formats.xesli:236-239): pixel s -> red 0, green 0x7FFF.
     const edram::ResolveInfo swapped = edram::DecodeResolve(Rg16Resolve(0x00020050, 0x00100060, destInfo | 1u << 24));
-    CHECK(swapped.ok && swapped.destSwap && ResolveConvertPixel(swapped, 4, a) == 0xC0010000u);
+    CHECK(swapped.ok && swapped.destSwap && ResolveConvertPixel(swapped, 4, s) == 0x7FFF0000u);
+    // A 1x k0 resolve with number 3 and bias 10 (factor 1024, no halving) passes the int16 bits through, since 1024 c = 1 + 2^-15:
+    // red 0x0400 -> 1024.03125 -> 0x0400; green 0xF800 (-2048 units: -2 (1 + 2^-15) * 1024 = -2048.0625) -> int(-2048.5625) = -2048
+    // -> 0xF800 (Xenia's -1 clamp would make it -1024, 0xFC00); 0x7FFF -> 32 * 1024 = 32768 -> clamped 0x7FFF; 0xFC00 -> -1024.03125
+    // -> 0xFC00; 0x8000 -> -32 * 1024 = -32768 -> int(-32768.5) = -32768 -> 0x8000.
+    const edram::ResolveInfo pass = edram::DecodeResolve(Rg16Resolve(0x00000050, 0x00100000, destInfo));
+    CHECK(pass.ok && pass.destNumber == 3 && pass.destExpBias == 10 && pass.sampleSelect == edram::SampleSelect::k0);
+    const uint32_t p1[4] = {0xF8000400u, 0, 0, 0}, p2[4] = {0xFC007FFFu, 0, 0, 0}, p3[4] = {0x00008000u, 0, 0, 0};
+    CHECK(ResolveConvertPixel(pass, 4, p1) == 0xF8000400u && ResolveConvertPixel(pass, 4, p2) == 0xFC007FFFu &&
+          ResolveConvertPixel(pass, 4, p3) == 0x00008000u);
+    CONTROL(ResolveConvertPixel(pass, 4, p1) == 0xFC000400u);  // the -1 clamp
+    // Number 0 keeps the UNORM pack (pixel_formats.xesli:144-147): 1x k0, bias 0, sample 0x00010001: c * 65535 = 64.00098 + 0.5 ->
+    // 64 = 0x40 in both halves.
+    CHECK(one.destNumber == 0);
+    const uint32_t u[4] = {0x00010001u, 0, 0, 0};
+    CHECK(ResolveConvertPixel(one, 4, u) == 0x00400040u);
 
     // The rectangle into guest bytes (DumpLayout of 4x 32x32): pixel A at (0, 0), pixel B at (2, 3), every other sample 0.
-    // Endian 1, k8in16 (X xenos.h:1070-1086; resolve_full_32bpp.xesli:62-65): 0xC0014000 -> 0x01C00040, stored little-endian
-    // at TiledOffset 0: bytes 40 00 C0 01; 0x00000200 -> 0x00000002 at TiledOffset(2, 3) = 280 (TestHdrResolve: only the
+    // Endian 1, k8in16 (X xenos.h:1070-1086; resolve_full_32bpp.xesli:62-65): 0x00010000 -> 0x01000000, stored little-endian
+    // at TiledOffset 0: bytes 00 00 00 01; 0x0000E100 -> 0x000000E1 at TiledOffset(2, 3) = 280 (TestHdrResolve: only the
     // macro row term depends on the pitch, 0 for y < 32); (1, 0) at 4 is 0.
     const DumpLayout l = DumpLayoutFor(Msaa::X4, 32, 32);
     std::vector<uint32_t> words(size_t(l.width) * l.columns * l.height * l.rows, 0);
@@ -1539,9 +1586,9 @@ void TestRg16Resolve()
         words[l.Word(0, 0, g)] = a[g], words[l.Word(2, 3, g)] = b[g];
     std::vector<uint8_t> dest(rg.destExtentLength, 0xEE);
     CHECK(ResolveConvertToGuest(rg, 4, words.data(), dest.data(), uint32_t(dest.size()), why));
-    CHECK(dest[0] == 0x40 && dest[1] == 0x00 && dest[2] == 0xC0 && dest[3] == 0x01);
-    CHECK(WordAt(dest, 280) == 0x00000002u && WordAt(dest, 4) == 0u);
-    CONTROL(WordAt(dest, 0) == 0xC0014000u);  // without the endian swap
+    CHECK(dest[0] == 0x00 && dest[1] == 0x00 && dest[2] == 0x00 && dest[3] == 0x01);
+    CHECK(WordAt(dest, 280) == 0x000000E1u && WordAt(dest, 4) == 0u);
+    CONTROL(WordAt(dest, 0) == 0x00010000u);  // without the endian swap
 }
 
 // The k_8_8 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 0
@@ -1641,6 +1688,7 @@ int main()
     TestGather();
     TestResolveToGuest();
     TestFastResidentWords();
+    TestResolveWordsToGuest();
     TestTrace12Frame();
     Test7e3Frame();
     TestBases();

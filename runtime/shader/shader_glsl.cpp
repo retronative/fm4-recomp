@@ -2254,6 +2254,7 @@ void Translator::Finish(const std::vector<Translator>& analyses, ShaderTranslati
         interpolators = preloadCount_;
     out.glsl = Assemble(interpolators);
     out.interpolatorCount = interpolators;
+    out.kills = kills_;
     out.pathZeroReads.assign(zeroReads.begin(), zeroReads.end());
     out.vertexFetchSlots.assign(vertexSlots_.begin(), vertexSlots_.end());
     for (uint32_t slot : out.vertexFetchSlots)

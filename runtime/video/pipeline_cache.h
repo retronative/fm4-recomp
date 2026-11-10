@@ -30,6 +30,7 @@ struct PipelineDeviceFeatures
     bool depthClamp = false;                      // VkPhysicalDeviceFeatures::depthClamp (key.depthClamp)
     bool constantAlphaColorBlendFactors = true;   // VkPhysicalDevicePortabilitySubsetFeaturesKHR; false refuses colour factors 14, 15
     bool independentBlend = false;                // unused while colour 0 is the only target
+    bool dynamicBuffers = false;                  // FM4 Recomp (FM4_DESCRIPTOR_CACHE): bindings 0-5 as *_DYNAMIC descriptors
 };
 
 // The host formats of the Xenos render target formats pipeline_key.h ColorFormatMapped accepts.

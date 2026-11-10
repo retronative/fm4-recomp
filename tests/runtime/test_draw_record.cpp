@@ -422,12 +422,83 @@ void TestUploads()
 
 }  // namespace
 
+// FindOverwriteRect (FM4_OVERWRITE_CLAIM) on TRACE draw 48, the 640x360 4X clear (Clear()), with the positions the clear VS fetches
+// (OBSERVED with [diag overwrite]: vte xy/w 1, scale 1, offset 0; three 7-dword vertices (-0.5, -0.5), (639.5, -0.5),
+// (639.5, 359.5)); the pixel-centre offset 0.5 (PA_SU_VTX_CNTL pix_center 0) makes the screen x 0, 640, 640: pixels [ceil(-0.5),
+// ceil(639.5)) = [0, 640), rows [0, 360). Expected values from the rasterization rule, never from the code.
+void TestOverwrite()
+{
+    DrawState d = Clear();
+    d.systemFlags = runtime::shader::kFlagXyDividedByW | runtime::shader::kFlagZDividedByW;
+    d.viewport.scale[0] = d.viewport.scale[1] = 1, d.viewport.offset[0] = d.viewport.offset[1] = 0;
+    d.viewport.offsetAddXy[0] = d.viewport.offsetAddXy[1] = 0.5f;
+    d.scissor = {0, 0, 640, 8192};
+    d.vertexSlots[0].stride = 7, d.vertexSlots[0].end = 3, d.vertexSlots[0].sizeWords = 21;
+    CachedShader vs = Vs();
+    vs.t.positionFetch.valid = true, vs.t.positionFetch.slot = 0, vs.t.positionFetch.strideDwords = 7, vs.t.positionFetch.offsetDwords = 0,
+    vs.t.positionFetch.format = 57;
+    const auto be = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return __builtin_bswap32(u); };  // guest big-endian floats; endian 2 swaps the host's load
+    std::vector<uint32_t> window(21, 0);
+    const float xs[3] = {-0.5f, 639.5f, 639.5f}, ys[3] = {-0.5f, -0.5f, 359.5f};
+    for (uint32_t v = 0; v < 3; v++)
+        window[v * 7] = be(xs[v]), window[v * 7 + 1] = be(ys[v]), window[v * 7 + 2] = be(0.0f);
+    OverwriteRect o = FindOverwriteRect(d, vs.t, false, window.data(), window.size(), 2);
+    Expect(o.depth && o.color && o.rect.x == 0 && o.rect.y == 0 && o.rect.width == 640 && o.rect.height == 360, "the clear overwrites depth, stencil and colour of 640x360");
+    // The scissor cuts the rectangle: rows 100-199 of columns 0-639.
+    DrawState s = d;
+    s.scissor = {0, 100, 8192, 100};
+    o = FindOverwriteRect(s, vs.t, false, window.data(), window.size(), 2);
+    Expect(o.depth && o.color && o.rect.x == 0 && o.rect.y == 100 && o.rect.width == 640 && o.rect.height == 100, "the scissor intersects the rectangle");
+    // Controls (each breaks one condition).
+    DrawState c = d;
+    c.blend.enabled = true;
+    o = FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2);
+    CONTROL(o.color, "blending keeps the colour");
+    Expect(o.depth, "blending does not affect the depth claim");
+    c = d, c.depthStencil.zFunc = 3;
+    o = FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2);
+    CONTROL(o.depth, "a LESS-EQUAL depth test may reject");
+    Expect(!o.color, "and so may reject the colour");
+    c = d, c.depthStencil.stencilEnable = false;
+    CONTROL(FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2).depth, "stencil off: the stencil bits are not replaced");
+    c = d, c.depthStencil.front.writeMask = 0x7F;
+    CONTROL(FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2).depth, "a partial stencil write mask");
+    c = d, c.cullBack = true;
+    o = FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2);
+    CONTROL(o.depth || o.color, "culling on");
+    c = d, c.indices.count = 6;
+    CONTROL(FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2).depth, "two rectangles");
+    c = d, c.colorWriteMask = 0x7;
+    o = FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2);
+    CONTROL(o.color, "three colour channels");
+    Expect(o.depth, "colour mask does not affect the depth claim");
+    c = d, c.alphaTest.enabled = true;
+    o = FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2);
+    CONTROL(o.depth || o.color, "an alpha test may discard");
+    o = FindOverwriteRect(d, vs.t, true, window.data(), window.size(), 2);
+    CONTROL(o.depth || o.color, "a pixel shader kill may discard");
+    c = d, c.systemFlags = 0;
+    CONTROL(FindOverwriteRect(c, vs.t, false, window.data(), window.size(), 2).depth, "positions not in screen space (vtx_xy_fmt off)");
+    CachedShader nv = Vs();  // (CachedShader is not copyable: its variants are unique_ptrs)
+    nv.t.positionFetch.valid = false;
+    CONTROL(FindOverwriteRect(d, nv.t, false, window.data(), window.size(), 2).depth, "the VS position is not a plain fetch");
+    CONTROL(FindOverwriteRect(d, vs.t, false, window.data(), 14, 2).depth, "a window short of the third vertex");
+    std::vector<uint32_t> tri = window;
+    tri[2 * 7] = be(300.0f), tri[2 * 7 + 1] = be(200.0f);  // (300, 200): neither x nor y is an edge of the other two vertices' rectangle
+    CONTROL(FindOverwriteRect(d, vs.t, false, tri.data(), tri.size(), 2).depth, "a triangle that is not an axis-aligned rectangle");
+    std::vector<uint32_t> tiny = window;
+    tiny[7] = be(0.4f), tiny[14] = be(0.4f);  // x 0.9: pixel 0's centre 0.5 is covered ([ceil(0), ceil(0.4)) = [0, 1)), nothing else in x
+    o = FindOverwriteRect(d, vs.t, false, tiny.data(), tiny.size(), 2);
+    Expect(o.depth && o.rect.width == 1 && o.rect.height == 360, "a 0.9-pixel-wide rectangle covers pixel column 0 only");
+}
+
 int main()
 {
     TestKeys();
     TestVariants();
     TestIndices();
     TestUploads();
+    TestOverwrite();
     std::printf("%d failure(s), %d negative control(s)\n", failures, controls);
     return failures == 0 ? 0 : 1;
 }

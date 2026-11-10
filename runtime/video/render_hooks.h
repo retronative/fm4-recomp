@@ -39,6 +39,34 @@ struct HostTargets
 // Every recording that must happen outside a render pass (barriers, copies, clears, the units' own passes) first calls
 // OutsideRenderPass, which ends it. renderer.cpp registers the function; it is null in the units' tests.
 inline void (*endOpenRenderPass)(VkCommandBuffer) = nullptr;
+// FM4 Recomp (FM4_DIAG_PASS_TIMES, diagnostic): the job recording at the moment (a scoped label), for the tallies of what ends a
+// draw render pass and of the GPU time between two passes. Only labels, read by the renderer's diagnostic; no behaviour depends on it.
+inline const char* passActivity = "other";
+// FM4 Recomp (FM4_DIAG_OVERWRITE, diagnostic): the tiles the last acquireTargets transferred into the draw's targets (0: none); the
+// renderer prints the draw that follows a transfer, once per signature, to find clear-style draws that overwrite what was moved.
+inline uint32_t lastBindTransferTiles = 0;
+struct PassActivity
+{
+    const char* saved;
+    explicit PassActivity(const char* activity) : saved(passActivity) { passActivity = activity; }
+    ~PassActivity() { passActivity = saved; }
+    PassActivity(const PassActivity&) = delete;
+    PassActivity& operator=(const PassActivity&) = delete;
+};
+// FM4 Recomp (FM4_DIAG_PASS_TIMES, diagnostic): a unit's own render pass (an EDRAM transfer, clear, resolve dump or resident
+// conversion) is timed on the GPU under `kind` when the renderer registers these; null in the units' tests.
+inline void (*beginUnitPass)(VkCommandBuffer, const char* kind) = nullptr;
+inline void (*endUnitPass)(VkCommandBuffer) = nullptr;
+inline void UnitPassBegin(VkCommandBuffer c, const char* kind)
+{
+    if (beginUnitPass != nullptr)
+        beginUnitPass(c, kind);
+}
+inline void UnitPassEnd(VkCommandBuffer c)
+{
+    if (endUnitPass != nullptr)
+        endUnitPass(c);
+}
 inline void OutsideRenderPass(VkCommandBuffer c)
 {
     if (endOpenRenderPass != nullptr)
@@ -50,7 +78,9 @@ struct EdramHooks
     // Before a Draw / DepthOnly draw is recorded: the host targets of `target` for the attachments the
     // draw uses (`needColor`: DrawKind::Draw with a colour write; `needDepth`: a depth or stencil test).
     // False with `error` refuses the draw (the renderer stops with it).
-    bool (*acquireTargets)(VkCommandBuffer commands, const RenderTarget& target, bool needColor, bool needDepth, HostTargets& out, std::string& error);
+    // FM4 Recomp (FM4_OVERWRITE_CLAIM): `depthCutout` / `colorCutout` (null: none) are the rectangles the draw overwrites (edram::Bind).
+    bool (*acquireTargets)(VkCommandBuffer commands, const RenderTarget& target, bool needColor, bool needDepth, const edram::Rect* depthCutout,
+                           const edram::Rect* colorCutout, HostTargets& out, std::string& error);
     // A DrawKind::Resolve draw (RB_MODECONTROL 6, X xenos.h:926-960): the EDRAM unit decodes RB_COPY_*
     // from `base`'s register file and records the resolve into `commands` (D-f; the M4 unit takes the
     // fallback: a copy of the rectangle into its staging buffer, written into guest memory by `retired`).
@@ -71,6 +101,8 @@ struct EdramHooks
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): whether one more resolve fits the staging before the open submission retires (the
     // EDRAM unit then keeps several read-back resolves pending; otherwise one).
     bool (*resolveRoom)();
+    // FM4 Recomp (FM4_DIAG_TRANSFERS, diagnostic): prints and clears the unit's tallies for swaps [first, last]; null when off.
+    void (*diagTally)(uint64_t firstSwap, uint64_t lastSwap);
 };
 
 class UploadRing;  // pipeline_key.h

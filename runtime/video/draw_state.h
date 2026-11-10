@@ -392,6 +392,10 @@ struct DrawInputs
 {
     RegisterReader read = nullptr;
     const void* context = nullptr;
+    // FM4 Recomp (optional): the register file as the guest holds it (big-endian words, register 0 first), read in bulk for the
+    // 2,080 constant registers instead of one `read` call each (Decoder::Constants was ~3 % of the command thread).
+    // Must hold what `read` returns, byte-swapped.
+    const uint8_t* registers = nullptr;
     uint32_t opcode = 0;          // 0x22 DRAW_INDX or 0x36 DRAW_INDX_2
     uint32_t vizQueryToken = 0;   // DRAW_INDX's first word; 0 for DRAW_INDX_2
     uint64_t physicalBytes = 0;   // the guest's physical memory size: every address range the draw reads must fit (512 MB on the console)

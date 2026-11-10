@@ -733,6 +733,19 @@ bool RangesOverlap(uint32_t a, uint64_t aBytes, uint32_t b, uint64_t bBytes)
 // resolve's range change: one that takes its words verbatim (ResidentTextureMatches) and is in step with guest memory (resident
 // already, or its reuse hash equals the guest bytes with no earlier resolve of this submission pending over it) gets them by a
 // GPU copy; every other one stops being resident, so a draw that samples it waits for the write-back as before.
+// FM4 Recomp (opt-in FM4_RESOLVE_RESIDENT_MIPS=1): a mipped image takes a resolve into one of its unpacked levels.
+bool ResidentMips()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_RESOLVE_RESIDENT_MIPS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[texture] resident mip levels on (FM4_RESOLVE_RESIDENT_MIPS=1): a resolve into an unpacked level is copied there\n");
+        return enabled;
+    }();
+    return on;
+}
+
 uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
 {
     if (!unit || r.extentLength == 0)
@@ -748,21 +761,27 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
                                          d.dimension, d.depth, d.fetch.tiled, d.fetch.stacked, d.fetch.packedMips};
         std::string why = !image.initialized ? "its host image was never loaded" : d.layers != 1 ? "a cube" : "";
         uint32_t x = 0, y = 0;
-        bool take = image.initialized && d.layers == 1 && ResidentTextureMatches(shape, r, &why, &x, &y) && words != VK_NULL_HANDLE;
+        // FM4 Recomp: a mipped image takes a resolve into one of its unpacked levels (resolve_resident.h ResidentLevelFor).
+        std::vector<ResidentLevel> levels;
+        for (const MipLevel& l : ResidentMips() ? d.levels : std::vector<MipLevel>{})
+            levels.push_back({l.address, l.widthTexels, l.heightTexels, l.pitchBlocks * (d.info.blockWidth != 0 ? d.info.blockWidth : 1), l.packed});
+        const int level = image.initialized && d.layers == 1 ? ResidentLevelFor(shape, levels, r, &why, &x, &y) : -1;
+        bool take = level >= 0 && words != VK_NULL_HANDLE;
         if (take && !image.resident)
         {
             uint64_t hash = 0;
             std::string ignored;
             take = TextureReuse() && image.hashed && unit->guestBase != nullptr &&
                    !unit->model.OverlapsEarlierPending(d.base.physical, uint32_t(d.base.size)) &&
+                   !unit->model.OverlapsEarlierPending(d.mips.physical, uint32_t(d.mips.size)) &&
                    SourceHash(d, unit->guestBase, hash, ignored) && hash == image.sourceHash;
             why = "its host image is not in step with guest memory";
         }
         static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>> named;  // once per (image, resolve base, outcome)
         if (named.insert({d.base.physical, d.fetch.format, d.width, d.height, r.textureBase, take}).second)
-            std::fprintf(stderr, "[texture] resident resolve %s the %ux%u format %u texture at %08X (resolve format %u at %08X, %ux%u at texel %u,%u)%s%s\n",
+            std::fprintf(stderr, "[texture] resident resolve %s the %ux%u format %u texture at %08X (resolve format %u at %08X, %ux%u at texel %u,%u of level %d)%s%s\n",
                          take ? "writes" : "does not write", d.width, d.height, d.fetch.format, d.base.physical, r.destFormat, r.textureBase, r.width, r.height, x, y,
-                         take ? "" : ": ", take ? "" : why.c_str());
+                         std::max(level, 0), take ? "" : ": ", take ? "" : why.c_str());
         if (!take)
         {
             if (image.resident)
@@ -772,7 +791,8 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
         Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, shaders, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         VkImageCopy copy{};
-        copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(level), 0, 1};
         copy.dstOffset = {int32_t(x), int32_t(y), 0};
         copy.extent = {r.width, r.height, 1};
         vkCmdCopyImage(c, words, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -928,6 +948,23 @@ void MarkGuestWritten(uint32_t physical, uint32_t bytes)
 bool GuestWritesPending() { return unit && unit->model.Pending(); }
 
 bool GuestWritesOverlap(uint32_t physical, uint32_t bytes) { return unit && unit->model.OverlapsPending(physical, bytes); }
+
+bool WatchGuestRange(uint32_t physical, uint32_t bytes, uint64_t& sequence)
+{
+    if (!unit || !WriteWatchOn() || unit->model.ProtectingWatch() == nullptr || bytes == 0)
+        return false;
+    WriteWatch& w = *unit->model.ProtectingWatch();
+    const uint64_t start = MonotonicNs();
+    const bool watched = w.Watch(physical, bytes);
+    unit->watchProtectNsSince += MonotonicNs() - start;
+    sequence = w.Current();
+    return watched;
+}
+
+bool GuestRangeUnwritten(uint32_t physical, uint32_t bytes, uint64_t sequence)
+{
+    return unit && WriteWatchOn() && unit->model.ProtectingWatch() != nullptr && unit->model.ProtectingWatch()->WriteSequence(physical, bytes) <= sequence;
+}
 
 void GuestWritesRetired()
 {

@@ -19,6 +19,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <cstdlib>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -80,7 +81,11 @@ uvec2 XeTileSize(uint msaa)
 // :2938-2954 (source tile = destination tile + tileOffset, & 2047). xy the source pixel, z its host sample.
 ivec3 XeSourceTexel(uvec2 d)
 {
+#ifdef XE_SAMPLE_SHADING
+    uint sm = xe_transfer.sourceMsaa, dm = xe_transfer.destMsaa, ds = uint(gl_SampleID);  // one draw for every destination sample
+#else
     uint sm = xe_transfer.sourceMsaa, dm = xe_transfer.destMsaa, ds = xe_transfer.destSample;
+#endif
     uvec2 tile = d / XeTileSize(dm), p = d % XeTileSize(dm);
     uint s = dm == 0u ? 0u : ds;
     if (sm == 2u && dm == 0u)
@@ -348,6 +353,67 @@ void main()
 }
 )";
 
+// FM4 Recomp (FM4_TRANSFER_STENCIL_EXPORT): the depth transfers in one draw: gl_FragDepth as kTransferDepth / kTransferColorToDepth
+// and all eight stencil bits through gl_FragStencilRefARB (GL_ARB_shader_stencil_export -> SPV_EXT_shader_stencil_export ->
+// Metal [[stencil]]), the pipeline replacing with write mask 0xFF, so no stencil clear and no per-bit pass. The values written
+// are those of the nine-pass path (render_targets_vk.h 4 anticipated this; X vulkan_render_target_cache.cc uses the extension
+// the same way when available). With XE_SAMPLE_SHADING (sampleRateShading) one draw covers every destination sample.
+const char* const kTransferDepthStencilExport = R"(
+#ifdef XE_SOURCE_MS
+layout(set = 0, binding = 0) uniform sampler2DMS xe_source_depth;
+layout(set = 0, binding = 1) uniform usampler2DMS xe_source_stencil;
+#else
+layout(set = 0, binding = 0) uniform sampler2D xe_source_depth;
+layout(set = 0, binding = 1) uniform usampler2D xe_source_stencil;
+#endif
+void main()
+{
+    ivec3 t = XeSourceTexel(uvec2(gl_FragCoord.xy));
+#ifdef XE_SOURCE_MS
+    float depth = texelFetch(xe_source_depth, t.xy, t.z).r;
+    uint stencil = texelFetch(xe_source_stencil, t.xy, t.z).r;
+#else
+    float depth = texelFetch(xe_source_depth, t.xy, 0).r;
+    uint stencil = texelFetch(xe_source_stencil, t.xy, 0).r;
+#endif
+    gl_FragDepth = xe_transfer.sourceFormat == xe_transfer.destFormat
+                       ? depth
+                       : XeWordDepth(XeDepthStencilWord(depth, 0u, xe_transfer.sourceFormat), xe_transfer.destFormat);
+    gl_FragStencilRefARB = int(stencil);
+}
+)";
+const char* const kTransferColorToDepthStencilExport = R"(
+#ifdef XE_SOURCE_UINT
+#ifdef XE_SOURCE_MS
+layout(set = 0, binding = 0) uniform usampler2DMS xe_source;
+#else
+layout(set = 0, binding = 0) uniform usampler2D xe_source;
+#endif
+#else
+#ifdef XE_SOURCE_MS
+layout(set = 0, binding = 0) uniform sampler2DMS xe_source;
+#else
+layout(set = 0, binding = 0) uniform sampler2D xe_source;
+#endif
+#endif
+void main()
+{
+    ivec3 t = XeSourceTexel(uvec2(gl_FragCoord.xy));
+#ifdef XE_SOURCE_MS
+    int s = t.z;
+#else
+    int s = 0;
+#endif
+#ifdef XE_SOURCE_UINT
+    uint word = XePackUint(texelFetch(xe_source, t.xy, s), xe_transfer.sourceFormat);
+#else
+    uint word = XePack(texelFetch(xe_source, t.xy, s), xe_transfer.sourceFormat);
+#endif
+    gl_FragDepth = XeWordDepth(word, xe_transfer.destFormat);
+    gl_FragStencilRefARB = int(word & 0xFFu);
+}
+)";
+
 // The guest's 32-bit EDRAM word of a depth sample (edram_vk_plan.h PackDepthStencilWord, X vulkan_render_target_cache.cc
 // :3591-3617): bits 8-31 the depth by the depth format (0 kD24S8: :3593-3604 uint(RoundEven(depth * float(0xFFFFFF))),
 // Depth32ToUnorm24; 1 kD24FS8: Depth32To20e4, X spirv_shader_translator_rb.cc:236-326, truncating, no [0, 0.5) remap),
@@ -534,7 +600,9 @@ void main()
     pixel = pixel * e;
     if (xe_transfer.pitchTiles != 0u)
         pixel = pixel.bgra;
-    if (xe_transfer.destFormat == 6u || xe_transfer.destFormat == 50u)
+    if (xe_transfer.destFormat == 10u)  // k_8_8 (edram_vk_plan.cpp ResolveConvertPixel; an R16_UINT attachment keeps the low 16 bits)
+        xe_word = XeResolveUnorm(pixel.r, 255.0) | (XeResolveUnorm(pixel.g, 255.0) << 8u);
+    else if (xe_transfer.destFormat == 6u || xe_transfer.destFormat == 50u)
         xe_word = XeResolveUnorm(pixel.r, 255.0) | (XeResolveUnorm(pixel.g, 255.0) << 8u) | (XeResolveUnorm(pixel.b, 255.0) << 16u) |
                   (XeResolveUnorm(pixel.a, 255.0) << 24u);
     else
@@ -551,7 +619,7 @@ struct TransferPush
 };
 
 enum class PipelineKind : uint32_t { Color = 0, Depth = 1, StencilBit = 2, DepthToColor = 3, Dump = 4, ColorToDepth = 5, ColorToStencilBit = 6, DumpDepth = 7,
-                                     Resident = 8 };
+                                     Resident = 8, DepthExport = 9, ColorToDepthExport = 10 };  // the last two: FM4_TRANSFER_STENCIL_EXPORT
 
 // ---- State ----------------------------------------------------------------------------------------------------
 
@@ -592,6 +660,7 @@ struct Pending  // a read-back resolve of the open submission (one, or several w
     VkDeviceSize offset = 0;  // its words in the staging buffer
     bool check = false;       // FM4_RESOLVE_RESIDENT_CHECK: its GPU words at checkOffset
     VkDeviceSize checkOffset = 0;
+    bool gpuWords = false;    // FM4_RESOLVE_GPU_WORDS: at `offset` the converted words (ResolveWordsToGuest), not the samples
 };
 
 // FM4 Recomp (FM4_RESOLVE_RESIDENT): the resident image's size bounds a converted rectangle; FM4's are 1280x720 at most.
@@ -623,6 +692,9 @@ struct Unit
     VkShaderModule depthToColorUint[2] = {}, colorToDepthUint[2] = {}, colorToStencilUint[2] = {};
     // The sample dump through a transfer view (kResolveDump XE_SOURCE_UINT), [source MS].
     VkShaderModule dumpUint[2] = {};
+    // FM4_TRANSFER_STENCIL_EXPORT: the one-draw depth transfers, [source MS][sample shading]; compiled only with the extension.
+    VkShaderModule depthExport[2][2] = {}, colorToDepthExport[2][2] = {}, colorToDepthExportUint[2][2] = {};
+    bool stencilExport = false, sampleShading = false;
     Target dump;  // kDumpWidth x kDumpHeight R32_UINT, not an EDRAM key
     VkBuffer staging = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
@@ -636,6 +708,8 @@ struct Unit
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): the converted words (kResolveResident) and the last recorded resolve (lastResolve).
     VkShaderModule resident1x = VK_NULL_HANDLE, residentMs = VK_NULL_HANDLE;
     Target resident;  // kResidentWidth x kResidentHeight R32_UINT, not an EDRAM key
+    Target resident16;  // FM4 Recomp: the same in R16_UINT, for 16 bpp destinations (k_8_8)
+    bool lastWords16 = false;  // the last converted resolve's words are in resident16
     ResidentResolve last;
     bool lastValid = false;
     uint64_t residentResolves = 0, checkedResolves = 0, checkedPixels = 0, checkMismatches = 0;
@@ -747,8 +821,9 @@ VkFramebuffer PassFramebuffer(const Target& t) { return UintStorage(t) ? t.uintF
 bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint32_t sample, VkPipeline& out, std::string& error)
 {
     const bool sourceMs = (sourceFlags & 1) != 0, sourceUint = (sourceFlags & 2) != 0, destUint = UintStorage(dest);
+    const bool sampleShading = (sourceFlags & 4) != 0;  // FM4_TRANSFER_STENCIL_EXPORT: one draw for every destination sample
     const VkFormat passFormat = PassFormat(dest);
-    const uint64_t key = uint64_t(kind) | uint64_t(sourceFlags & 3) << 4 | uint64_t(sample) << 6 | uint64_t(dest.samples) << 8 | uint64_t(passFormat) << 12;
+    const uint64_t key = uint64_t(kind) | uint64_t(sourceFlags & 7) << 4 | uint64_t(sample) << 7 | uint64_t(dest.samples) << 9 | uint64_t(passFormat) << 13;
     if (const auto it = unit->pipelines.find(key); it != unit->pipelines.end())
         return out = it->second, true;
     VkRenderPass pass = VK_NULL_HANDLE;
@@ -759,11 +834,16 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     // (a storage-4 resolve source; its R32_UINT dump image is not a transfer view).
     const bool uintVariant = kind == PipelineKind::Color ? (sourceUint || destUint)
                              : kind == PipelineKind::DepthToColor ? destUint
-                             : kind == PipelineKind::ColorToDepth || kind == PipelineKind::ColorToStencilBit || kind == PipelineKind::Dump ? sourceUint
-                                                                                                              : false;
+                             : kind == PipelineKind::ColorToDepth || kind == PipelineKind::ColorToStencilBit || kind == PipelineKind::Dump ||
+                                     kind == PipelineKind::ColorToDepthExport
+                                 ? sourceUint
+                                 : false;
     if ((sourceUint || destUint) && !uintVariant)
         return Fail(error, "a transfer-view (storage 14 or 4) side in a transfer that has no uint variant");
-    const VkShaderModule fragment = kind == PipelineKind::Color && uintVariant ? unit->colorUint[sourceMs][sourceUint][destUint]
+    const VkShaderModule fragment = kind == PipelineKind::DepthExport ? unit->depthExport[sourceMs][sampleShading]
+                                    : kind == PipelineKind::ColorToDepthExport
+                                        ? (uintVariant ? unit->colorToDepthExportUint[sourceMs][sampleShading] : unit->colorToDepthExport[sourceMs][sampleShading])
+                                    : kind == PipelineKind::Color && uintVariant ? unit->colorUint[sourceMs][sourceUint][destUint]
                                     : kind == PipelineKind::DepthToColor && uintVariant ? unit->depthToColorUint[sourceMs]
                                     : kind == PipelineKind::ColorToDepth && uintVariant ? unit->colorToDepthUint[sourceMs]
                                     : kind == PipelineKind::ColorToStencilBit && uintVariant ? unit->colorToStencilUint[sourceMs]
@@ -777,7 +857,10 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
                                     : kind == PipelineKind::ColorToDepth      ? (sourceMs ? unit->colorToDepthMs : unit->colorToDepth1x)
                                     : kind == PipelineKind::ColorToStencilBit ? (sourceMs ? unit->colorToStencilMs : unit->colorToStencil1x)
                                                                               : (sourceMs ? unit->stencilFromMs : unit->stencilFrom1x);
-    const bool writesDepth = kind == PipelineKind::Depth || kind == PipelineKind::ColorToDepth;
+    if (fragment == VK_NULL_HANDLE)
+        return Fail(error, "EDRAM transfer pipeline: its fragment shader was not compiled (stencil export without VK_EXT_shader_stencil_export?)");
+    const bool writesStencilAll = kind == PipelineKind::DepthExport || kind == PipelineKind::ColorToDepthExport;  // FM4_TRANSFER_STENCIL_EXPORT
+    const bool writesDepth = kind == PipelineKind::Depth || kind == PipelineKind::ColorToDepth || writesStencilAll;
     const bool writesStencilBit = kind == PipelineKind::StencilBit || kind == PipelineKind::ColorToStencilBit;
     VkPipelineShaderStageCreateInfo stages[2]{};
     for (auto& s : stages)
@@ -804,7 +887,9 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     VkPipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VkSampleCountFlagBits(dest.samples);
-    multisample.pSampleMask = dest.samples > 1 ? &mask : nullptr;
+    multisample.pSampleMask = dest.samples > 1 && !sampleShading ? &mask : nullptr;
+    multisample.sampleShadingEnable = sampleShading ? VK_TRUE : VK_FALSE;  // FM4_TRANSFER_STENCIL_EXPORT: the shader runs per sample (gl_SampleID)
+    multisample.minSampleShading = 1.0f;
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     if (writesDepth)
@@ -813,6 +898,12 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     {
         depthStencil.stencilTestEnable = VK_TRUE;
         depthStencil.front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xFF, 0, 0};  // mask, reference dynamic
+        depthStencil.back = depthStencil.front;
+    }
+    if (writesStencilAll)  // the exported reference replaces all eight bits (write mask 0xFF, static)
+    {
+        depthStencil.stencilTestEnable = VK_TRUE;
+        depthStencil.front = {VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xFF, 0xFF, 0};
         depthStencil.back = depthStencil.front;
     }
     VkPipelineColorBlendAttachmentState blend{};
@@ -1036,11 +1127,60 @@ bool Draw3(VkCommandBuffer c, PipelineKind kind, uint32_t sourceFlags, const Tar
     return true;
 }
 
+// FM4 Recomp (opt-in FM4_TRANSFER_STENCIL_EXPORT=1 or 2): see kTransferDepthStencilExport; needs VK_EXT_shader_stencil_export
+// (vulkan_device.h). 1: one draw for every sample (sampleRateShading when offered); 2: one draw per sample (no sample shading).
+uint32_t TransferStencilExport()
+{
+    static const uint32_t mode = [] {
+        const char* v = std::getenv("FM4_TRANSFER_STENCIL_EXPORT");
+        return v != nullptr && (v[0] == '1' || v[0] == '2') && v[1] == '\0' ? uint32_t(v[0] - '0') : 0u;
+    }();
+    return mode;
+}
+
+// FM4 Recomp (FM4_DIAG_TRANSFERS=1, diagnostic): ownership transfers by (source key -> destination key): count and tiles, printed
+// with the renderer's pass tally (EdramHooks::diagTally).
+bool DiagTransfers()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_TRANSFERS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+std::map<std::string, std::pair<uint64_t, uint64_t>> transferPairs;  // "source -> dest" -> (count, tiles)
+std::string DiagKeyName(Key k)
+{
+    char text[64];
+    std::snprintf(text, sizeof text, "%s@%u p%u %ux f%u", k.IsDepth() ? "depth" : "colour", k.Base(), k.PitchTilesAt32bpp(), 1u << uint32_t(k.MsaaMode()), k.Format());
+    return text;
+}
+void DiagTally(uint64_t firstSwap, uint64_t lastSwap)
+{
+    std::vector<std::pair<std::pair<uint64_t, uint64_t>, std::string>> rows;
+    for (const auto& [name, v] : transferPairs)
+        rows.push_back({{v.second, v.first}, name});
+    std::sort(rows.rbegin(), rows.rend());
+    std::fprintf(stderr, "[diag transfers] swaps %llu-%llu, ownership transfers by source -> destination (tiles, count):", (unsigned long long)firstSwap,
+                 (unsigned long long)lastSwap);
+    for (size_t i = 0; i < rows.size() && i < 16; i++)
+        std::fprintf(stderr, "%s %s (%llu, %llu)", i ? ";" : "", rows[i].second.c_str(), (unsigned long long)rows[i].first.first,
+                     (unsigned long long)rows[i].first.second);
+    std::fprintf(stderr, "\n");
+    transferPairs.clear();
+}
+
 bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfer>& list, std::string& error)
 {
+    const PassActivity activity("edram transfer");  // FM4_DIAG_PASS_TIMES label
     for (const Transfer& t : list)
     {
         Target& source = *unit->targets.at(t.source.packed);
+        if (DiagTransfers())
+        {
+            auto& p = transferPairs[DiagKeyName(t.source) + " -> " + DiagKeyName(dest.key)];
+            p.first++, p.second += t.endTiles - t.startTiles;
+        }
         const TransferKind kind = ClassifyTransfer(t.source, dest.key, error);
         if (kind == TransferKind::Refused)
             return false;
@@ -1076,6 +1216,9 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
         begin.framebuffer = PassFramebuffer(dest);
         begin.renderArea = {{0, 0}, {dest.width, dest.height}};
         OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+        char unitKind[64];  // FM4_DIAG_PASS_TIMES label
+        std::snprintf(unitKind, sizeof unitKind, "transfer to %s %ux%u x%u", dest.depth ? "depth" : "colour", dest.width, dest.height, dest.samples);
+        UnitPassBegin(c, unitKind);
         vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
         // A storage-14 or storage-4 source is read through its transfer view (its second set).
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, UintStorage(source) ? &source.uintSource : &source.source, 0,
@@ -1095,6 +1238,18 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
             const PipelineKind pk = kind == TransferKind::Color ? PipelineKind::Color : PipelineKind::DepthToColor;
             for (uint32_t s = 0; ok && s < dest.samples; s++)
                 push.destSample = s, ok = Draw3(c, pk, sourceMs, dest, s, push, rects, error);
+        }
+        else if (unit->stencilExport)
+        {
+            // FM4_TRANSFER_STENCIL_EXPORT: depth and all eight stencil bits in one draw for every sample (sampleRateShading) or one
+            // draw per sample, instead of the stencil clear, the depth draw and eight stencil-bit draws per sample below.
+            const bool fromColor = kind == TransferKind::ColorToDepth;
+            const PipelineKind pk = fromColor ? PipelineKind::ColorToDepthExport : PipelineKind::DepthExport;
+            if (unit->sampleShading && dest.samples > 1)
+                ok = Draw3(c, pk, sourceMs | 4u, dest, 0, push, rects, error);
+            else
+                for (uint32_t s = 0; ok && s < dest.samples; s++)
+                    push.destSample = s, ok = Draw3(c, pk, sourceMs, dest, s, push, rects, error);
         }
         else
         {
@@ -1120,6 +1275,7 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
             }
         }
         vkCmdEndRenderPass(c);  // ended even on a refusal, so the command buffer stays well formed until the stop
+        UnitPassEnd(c);
         Rest(c, source);
         if (!ok)
             return false;
@@ -1133,16 +1289,21 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
 
 // ---- Hooks --------------------------------------------------------------------------------------------------------
 
-bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, bool needDepth, HostTargets& out, std::string& error)
+bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, bool needDepth, const edram::Rect* depthCutout, const edram::Rect* colorCutout,
+                    HostTargets& out, std::string& error)
 {
     if (!needColor && !needDepth)
         return Fail(error, "a draw that needs neither a colour nor a depth target");
     // The binding exactly as the renderer's pipeline key needs it (edram_vk_plan.h BindRegistersFor); the rows the
     // draw can touch are the scissor's bottom within the surface (draw_state.h RenderTarget::targetHeight).
     const edram::Ownership before = unit->ownership;
-    const edram::Binding b = edram::Bind(unit->ownership, BindRegistersFor(rt, needColor, needDepth), rt.targetHeight);
+    const edram::Binding b = edram::Bind(unit->ownership, BindRegistersFor(rt, needColor, needDepth), rt.targetHeight, depthCutout, colorCutout);
     if (!b.ok)
         return Fail(error, b.refusal);
+    lastBindTransferTiles = 0;  // FM4_DIAG_OVERWRITE
+    for (const auto& list : {b.transfers[0], b.transfers[1]})
+        for (const Transfer& t : list)
+            lastBindTransferTiles += t.endTiles - t.startTiles;
     auto refuse = [&](std::string why) { unit->ownership = before; return Fail(error, std::move(why)); };
     if (!b.rasterizes)
         return refuse("the EDRAM model binds nothing for this draw (pitch 0 or not a drawing edram mode)");
@@ -1171,6 +1332,7 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
 // The clear of `rect` on `t` (X vulkan_render_target_cache.cc:5340-5431), inside the unit's pass on t.
 bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value, std::string& error)
 {
+    const PassActivity activity("edram clear");  // FM4_DIAG_PASS_TIMES label
     if (rect.x + rect.width > t.width || rect.y + rect.height > t.height)
         return Fail(error, "resolve clear rectangle outside its host target");
     VkClearAttachment a{};
@@ -1194,10 +1356,14 @@ bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value
     begin.framebuffer = PassFramebuffer(t);
     begin.renderArea = {{0, 0}, {t.width, t.height}};
     OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    char unitKind[64];  // FM4_DIAG_PASS_TIMES label
+    std::snprintf(unitKind, sizeof unitKind, "clear %s %ux%u x%u", t.depth ? "depth" : "colour", t.width, t.height, t.samples);
+    UnitPassBegin(c, unitKind);
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     const VkClearRect r{{{int32_t(rect.x), int32_t(rect.y)}, {rect.width, rect.height}}, 0, 1};
     vkCmdClearAttachments(c, 1, &a, 1, &r);
     vkCmdEndRenderPass(c);
+    UnitPassEnd(c);
     return true;
 }
 
@@ -1217,6 +1383,7 @@ bool GuestRange(uint32_t physical, uint32_t bytes, uint32_t& guest, std::string&
 bool RecordDump(VkCommandBuffer c, Target& source, bool depth, uint32_t storage, Msaa msaa, const edram::Rect& r, const DumpLayout& layout,
                 VkDeviceSize stagingOffset, std::string& error)
 {
+    const PassActivity activity("resolve dump");  // FM4_DIAG_PASS_TIMES label
     Target& dump = unit->dump;
     // A transfer-view source (storage 4) is read with usampler2DMS when multisampled: the device must sample that count for
     // integer formats (as ExecuteTransfers checks; Init checks only sampledImageColorSampleCounts).
@@ -1236,6 +1403,9 @@ bool RecordDump(VkCommandBuffer c, Target& source, bool depth, uint32_t storage,
     begin.framebuffer = dump.framebuffer;
     begin.renderArea = {{0, 0}, extent};
     OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    char unitKind[64];  // FM4_DIAG_PASS_TIMES label
+    std::snprintf(unitKind, sizeof unitKind, "dump %s %ux%u x%u", depth ? "depth" : "colour", r.width, r.height, 1u << uint32_t(msaa));
+    UnitPassBegin(c, unitKind);
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, uintSource ? &source.uintSource : &source.source, 0, nullptr);
     const VkViewport viewport{0.0f, 0.0f, float(dump.width), float(dump.height), 0.0f, 1.0f};
@@ -1244,6 +1414,7 @@ bool RecordDump(VkCommandBuffer c, Target& source, bool depth, uint32_t storage,
     const uint32_t sourceFlags = (source.samples > 1 ? 1u : 0u) | (uintSource ? 2u : 0u);  // Pipeline's sourceFlags
     const bool ok = Draw3(c, depth ? PipelineKind::DumpDepth : PipelineKind::Dump, sourceFlags, dump, 0, push, {VkRect2D{{0, 0}, extent}}, error);
     vkCmdEndRenderPass(c);
+    UnitPassEnd(c);
     Rest(c, source);
     if (!ok)
         return false;
@@ -1260,7 +1431,8 @@ bool RecordDump(VkCommandBuffer c, Target& source, bool depth, uint32_t storage,
 // the resident image at (0, 0), left in TRANSFER_SRC_OPTIMAL for the texture unit's copies (TextureHooks::adoptResolve).
 bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const edram::ResolveInfo& info, const edram::Rect& r, std::string& error)
 {
-    Target& dest = unit->resident;
+    const PassActivity activity("resolve resident");  // FM4_DIAG_PASS_TIMES label
+    Target& dest = info.destBytesLog2 == 1 ? unit->resident16 : unit->resident;  // FM4 Recomp: k_8_8 words are 16 bits
     uint32_t indices[4] = {}, count = 0, packed = 0;
     if (!ResolveSamples(info, indices, count))
         return Fail(error, "resident resolve: a selected sample the source does not have");
@@ -1277,6 +1449,9 @@ bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const e
     begin.framebuffer = dest.framebuffer;
     begin.renderArea = {{0, 0}, {r.width, r.height}};
     OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    char unitKind[64];  // FM4_DIAG_PASS_TIMES label
+    std::snprintf(unitKind, sizeof unitKind, "resident %ux%u x%u", r.width, r.height, 1u << uint32_t(info.msaa));
+    UnitPassBegin(c, unitKind);
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, &source.source, 0, nullptr);
     const VkViewport viewport{0.0f, 0.0f, float(dest.width), float(dest.height), 0.0f, 1.0f};
@@ -1284,6 +1459,7 @@ bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const e
     const TransferPush push{count, packed, storage, info.destFormat, biasBits, info.destSwap ? 1u : 0u, 0, uint32_t(info.msaa), 0, r.x, r.y, r.width, r.height, 0};
     const bool ok = Draw3(c, PipelineKind::Resident, source.samples > 1 ? 1u : 0u, dest, 0, push, {VkRect2D{{0, 0}, {r.width, r.height}}}, error);
     vkCmdEndRenderPass(c);
+    UnitPassEnd(c);
     Rest(c, source);
     if (!ok)
         return false;
@@ -1351,7 +1527,7 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
     // The copy (X vulkan_render_target_cache.cc:1033-1200 order: the copy, then the clears).
     const VkDeviceSize offset = (unit->stagingUsed + 255) & ~VkDeviceSize(255);
     const VkDeviceSize wordBytes = VkDeviceSize(layout.width) * layout.height * layout.samples * 4;
-    bool converted = false, check = false;
+    bool converted = false, check = false, gpuWords = false;
     VkDeviceSize checkOffset = 0;
     if (plan.copy)
     {
@@ -1361,7 +1537,23 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         const edram::Rect& r = plan.copyRect;
         if (r.x + r.width > source->width || r.y + r.height > source->height)
             return Fail(error, "resolve rectangle outside the source's host target");
-        if (!dumpPath)
+        // FM4 Recomp (FM4_RESOLVE_GPU_WORDS): a resolve the GPU converts below is read back from those words instead.
+        std::string unconvertible;
+        const bool residentWords = ResolveResident() && !depthCopy && (!fast || ResolveFullConvertible(info, storage, unconvertible)) &&
+                                   ResidentConvertible(storage, info.destFormat, info.destBytesLog2) && (info.destBytesLog2 == 2 || ResolveResidentK88()) &&
+                                   r.width == info.x1 - info.x0 &&
+                                   r.height == info.y1 - info.y0 && r.width <= kResidentWidth && r.height <= kResidentHeight;
+        gpuWords = residentWords && ResolveGpuWords() && info.destBytesLog2 == 2;  // ResolveWordsToGuest is 32 bpp
+        if (!residentWords && ResolveResident())  // FM4_DIAG_CONSUMER (diagnostic): each resolve shape without GPU words, once
+            if (const char* v = std::getenv("FM4_DIAG_CONSUMER"); v != nullptr && v[0] != '0')
+            {
+                static std::set<std::tuple<uint32_t, uint32_t, uint32_t, bool, bool, uint32_t, uint32_t>> named;
+                if (named.insert({storage, info.destFormat, uint32_t(info.msaa), fast, depthCopy, r.width, r.height}).second)
+                    std::fprintf(stderr, "[edram] resolve without GPU words: storage %u (%s) to texture format %u (bytes log2 %u), msaa %u, %s, %ux%u, bias %d, swap %d\n",
+                                 storage, depthCopy ? "depth" : "colour", info.destFormat, info.destBytesLog2, uint32_t(info.msaa), fast ? "fast copy" : "converting",
+                                 r.width, r.height, info.destExpBias, int(info.destSwap));
+            }
+        if (!gpuWords && !dumpPath)  // (FM4_RESOLVE_GPU_WORDS: the words are copied after RecordResident instead)
         {
             Transition(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             VkBufferImageCopy copy{};
@@ -1371,21 +1563,28 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
             copy.bufferOffset = offset;
             vkCmdCopyImageToBuffer(c, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &copy);
         }
-        else if (!RecordDump(c, *source, depthCopy, storage, info.msaa, r, layout, offset, error))
+        else if (!gpuWords && !RecordDump(c, *source, depthCopy, storage, info.msaa, r, layout, offset, error))
             return false;
         // FM4 Recomp (FM4_RESOLVE_RESIDENT): the converted words for the texture unit; the read-back above stays for guest memory.
         // A fast (bit-copy) resolve converts too when the converting path takes it: for 8_8_8_8 -> 6/50 and 2_10_10_10 -> 7/54 at
         // 1x its unpack and pack are the identity, so the words are the fast path's before the endian swap (test_edram_vk
         // TestFastResidentWords; 21 of 34 race resolves were fast and stayed non-resident).
-        std::string unconvertible;
-        if (ResolveResident() && !depthCopy && (!fast || ResolveFullConvertible(info, storage, unconvertible)) &&
-            ResidentConvertible(storage, info.destFormat, info.destBytesLog2) && r.width == info.x1 - info.x0 && r.height == info.y1 - info.y0 &&
-            r.width <= kResidentWidth && r.height <= kResidentHeight)
+        if (residentWords)
         {
             if (!RecordResident(c, *source, storage, info, r, error))
                 return false;
             converted = true;
-            if (ResolveResidentCheck())
+            unit->lastWords16 = info.destBytesLog2 == 1;
+            if (gpuWords)  // FM4_RESOLVE_GPU_WORDS: the converted words are the read-back (row-major, tightly packed)
+            {
+                VkBufferImageCopy words{};
+                words.bufferOffset = offset;
+                words.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                words.imageExtent = {r.width, r.height, 1};
+                OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE): RecordResident ended any open pass; explicit for the site check
+                vkCmdCopyImageToBuffer(c, unit->resident.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &words);
+            }
+            if (ResolveResidentCheck())  // CheckResident compares the 32-bit words, or the 16-bit ones of k_8_8
             {
                 check = true;
                 checkOffset = (offset + wordBytes + 255) & ~VkDeviceSize(255);
@@ -1394,7 +1593,8 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
                 words.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 words.imageExtent = {r.width, r.height, 1};
                 OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE): RecordResident ended any open pass; explicit for the site check
-                vkCmdCopyImageToBuffer(c, unit->resident.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, unit->staging, 1, &words);
+                vkCmdCopyImageToBuffer(c, info.destBytesLog2 == 1 ? unit->resident16.image : unit->resident.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       unit->staging, 1, &words);
             }
         }
         VkBufferMemoryBarrier host{};
@@ -1418,8 +1618,10 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
     }
     if (plan.copy)
     {
-        unit->pending.push_back({info, storage, fast, depthCopy, offset, check, checkOffset});
-        unit->stagingUsed = (check ? checkOffset + VkDeviceSize(info.x1 - info.x0) * (info.y1 - info.y0) * 4 : offset + wordBytes);
+        unit->pending.push_back({info, storage, fast, depthCopy, offset, check, checkOffset, gpuWords});
+        unit->stagingUsed = check      ? checkOffset + VkDeviceSize(info.x1 - info.x0) * (info.y1 - info.y0) * 4
+                            : gpuWords ? offset + VkDeviceSize(info.x1 - info.x0) * (info.y1 - info.y0) * 4
+                                       : offset + wordBytes;
         // Recorded: the range is stale and pending for the texture unit until the slot retires (guest_writes.h).
         unit->observer(info.destExtentStart, info.destExtentLength);
         ResidentResolve& l = unit->last;
@@ -1428,6 +1630,7 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         l.extentStart = info.destExtentStart, l.extentLength = info.destExtentLength;
         l.textureBase = regs.copyDestBase, l.destFormat = info.destFormat, l.destPitch = info.destPitch, l.destEndian = info.destEndian;
         l.x0 = info.x0, l.y0 = info.y0, l.width = info.x1 - info.x0, l.height = info.y1 - info.y0;
+        l.bytesLog2 = info.destBytesLog2;
         unit->lastValid = true;
     }
     unit->resolves++;
@@ -1440,6 +1643,7 @@ void CheckResident(const Pending& p)
     const uint8_t* staging = static_cast<const uint8_t*>(unit->stagingMapped);
     const uint32_t* words = reinterpret_cast<const uint32_t*>(staging + p.offset);
     const uint32_t* gpu = reinterpret_cast<const uint32_t*>(staging + p.checkOffset);
+    const uint16_t* gpu16 = reinterpret_cast<const uint16_t*>(staging + p.checkOffset);  // FM4 Recomp: k_8_8's R16_UINT words
     const uint32_t width = p.info.x1 - p.info.x0, height = p.info.y1 - p.info.y0;
     const DumpLayout l = DumpLayoutFor(p.info.msaa, width, height);
     uint64_t mismatches = 0;
@@ -1450,7 +1654,8 @@ void CheckResident(const Pending& p)
             uint32_t samples[4] = {};
             for (uint32_t g = 0; g < l.samples; g++)
                 samples[g] = words[l.Word(x, y, g)];
-            const uint32_t want = ResolveConvertPixel(p.info, p.storage, samples), got = gpu[size_t(y) * width + x];
+            const uint32_t want = ResolveConvertPixel(p.info, p.storage, samples),
+                           got = p.info.destBytesLog2 == 1 ? gpu16[size_t(y) * width + x] : gpu[size_t(y) * width + x];
             if (want != got && mismatches++ < 4)
             {
                 char text[96];
@@ -1481,7 +1686,8 @@ bool Retired(std::string& error)
         // fault hook is installed, guest_memory.h SetGuestWriteFaultHook; once one is, a watched page faults
         // here on the CP thread: an open question.)
         const uint32_t* words = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(unit->stagingMapped) + p.offset);
-        const bool ok = p.depth  ? ResolveDepthToGuest(p.info, words, unit->guestBase + guest, p.info.destExtentLength, error)
+        const bool ok = p.gpuWords ? ResolveWordsToGuest(p.info, p.storage, words, unit->guestBase + guest, p.info.destExtentLength, error)
+                        : p.depth  ? ResolveDepthToGuest(p.info, words, unit->guestBase + guest, p.info.destExtentLength, error)
                         : p.fast ? ResolveToGuest(p.info, p.storage, words, unit->guestBase + guest, p.info.destExtentLength, error)
                                  : ResolveConvertToGuest(p.info, p.storage, words, unit->guestBase + guest, p.info.destExtentLength, error);
         if (!ok)
@@ -1497,7 +1703,7 @@ bool LastResolve(ResidentResolve& out, VkImage& words)
     if (!unit->lastValid)
         return false;
     out = unit->last;
-    words = out.converted ? unit->resident.image : VK_NULL_HANDLE;
+    words = !out.converted ? VK_NULL_HANDLE : unit->lastWords16 ? unit->resident16.image : unit->resident.image;
     return true;
 }
 
@@ -1533,7 +1739,7 @@ void Shutdown()
     vkDestroyPipelineLayout(device, unit->layout, nullptr);
     vkDestroyDescriptorSetLayout(device, unit->setLayout, nullptr);
     vkDestroySampler(device, unit->sampler, nullptr);
-    for (Target* t : {&unit->dump, &unit->resident})
+    for (Target* t : {&unit->dump, &unit->resident, &unit->resident16})
     {
         vkDestroyFramebuffer(device, t->framebuffer, nullptr);
         vkDestroyImageView(device, t->view, nullptr);
@@ -1545,14 +1751,17 @@ void Shutdown()
                              unit->colorToStencil1x, unit->colorToStencilMs, unit->colorUint[0][0][1], unit->colorUint[0][1][0],
                              unit->colorUint[0][1][1], unit->colorUint[1][0][1], unit->colorUint[1][1][0], unit->colorUint[1][1][1],
                              unit->depthToColorUint[0], unit->depthToColorUint[1], unit->colorToDepthUint[0], unit->colorToDepthUint[1],
-                             unit->colorToStencilUint[0], unit->colorToStencilUint[1], unit->dumpUint[0], unit->dumpUint[1], unit->resident1x, unit->residentMs})
-        vkDestroyShaderModule(device, m, nullptr);
+                             unit->colorToStencilUint[0], unit->colorToStencilUint[1], unit->dumpUint[0], unit->dumpUint[1], unit->resident1x, unit->residentMs,
+                             unit->depthExport[0][0], unit->depthExport[0][1], unit->depthExport[1][0], unit->depthExport[1][1], unit->colorToDepthExport[0][0],
+                             unit->colorToDepthExport[0][1], unit->colorToDepthExport[1][0], unit->colorToDepthExport[1][1], unit->colorToDepthExportUint[0][0],
+                             unit->colorToDepthExportUint[0][1], unit->colorToDepthExportUint[1][0], unit->colorToDepthExportUint[1][1]})
+        vkDestroyShaderModule(device, m, nullptr);  // a VK_NULL_HANDLE (an export module without the extension) is allowed
     vkDestroyBuffer(device, unit->staging, nullptr);
     vkFreeMemory(device, unit->stagingMemory, nullptr);  // implicitly unmapped
     unit.reset();
 }
 
-const EdramHooks kHooks{AcquireTargets, Resolve, Retired, Shutdown, LastResolve, ResolveRoom};
+const EdramHooks kHooks{AcquireTargets, Resolve, Retired, Shutdown, LastResolve, ResolveRoom, DiagTransfers() ? &DiagTally : nullptr};  // FM4_DIAG_TRANSFERS
 
 bool Module(SpirvCompiler& compiler, bool pixel, const std::string& glsl, VkShaderModule& out, std::string& error)
 {
@@ -1662,6 +1871,22 @@ bool Create(SpirvCompiler& compiler, std::string& error)
         !Module(compiler, true, header + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToStencil1x, error) ||
         !Module(compiler, true, header + ms + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToStencilMs, error))
         return false;
+    if (unit->dev.stencilExport)  // FM4_TRANSFER_STENCIL_EXPORT: [source MS][sample shading]
+    {
+        const std::string ext = "#extension GL_ARB_shader_stencil_export : require\n", shading = "#define XE_SAMPLE_SHADING 1\n",
+                          uintSource = "#define XE_SOURCE_UINT 1\n";
+        for (uint32_t m = 0; m < 2; m++)
+            for (uint32_t sh = 0; sh < 2; sh++)
+            {
+                const std::string defines = header + ext + (m ? ms : "") + (sh ? shading : "");
+                if (!Module(compiler, true, defines + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepthStencilExport, unit->depthExport[m][sh], error) ||
+                    !Module(compiler, true, defines + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
+                            unit->colorToDepthExport[m][sh], error) ||
+                    !Module(compiler, true, defines + swap + uintSource + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
+                            unit->colorToDepthExportUint[m][sh], error))
+                    return false;
+            }
+    }
     // The colour transfers with a 32_FLOAT or 16_16 side (kTransferColor's XE_SOURCE_UINT / XE_DEST_UINT; [0/1][0][0] are colorFrom1x/4x).
     unit->colorUint[0][0][0] = unit->colorFrom1x, unit->colorUint[1][0][0] = unit->colorFrom4x;
     for (uint32_t m = 0; m < 2; m++)
@@ -1690,12 +1915,12 @@ bool Create(SpirvCompiler& compiler, std::string& error)
         return false;
     // The sample dump image (kResolveDump): R32_UINT, rendered then copied to the staging buffer; held for the run. FM4 Recomp: the
     // resident image (kResolveResident; FM4_RESOLVE_RESIDENT only) the same way, at kResidentWidth x kResidentHeight.
-    for (Target* t : {&unit->dump, ResolveResident() ? &unit->resident : nullptr})
+    for (Target* t : {&unit->dump, ResolveResident() ? &unit->resident : nullptr, ResolveResident() ? &unit->resident16 : nullptr})
     {
         if (t == nullptr)
             continue;
         Target& d = *t;
-        d.format = VK_FORMAT_R32_UINT, d.samples = 1;
+        d.format = t == &unit->resident16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT, d.samples = 1;
         d.width = t == &unit->dump ? kDumpWidth : kResidentWidth, d.height = t == &unit->dump ? kDumpHeight : kResidentHeight;
         VkImageCreateInfo image{};
         image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1866,6 +2091,12 @@ const EdramHooks* InitializeEdramVk(const VulkanDevice& device, SpirvCompiler& c
         return Fail(error, "the EDRAM unit needs the writable guest base and the guest-write observer"), nullptr;
     unit = std::make_unique<Unit>();
     unit->dev = device;
+    unit->stencilExport = device.stencilExport && TransferStencilExport() != 0;  // FM4_TRANSFER_STENCIL_EXPORT
+    unit->sampleShading = device.sampleRateShading && TransferStencilExport() == 1;
+    if (TransferStencilExport() != 0)
+        std::fprintf(stderr, "[edram] FM4_TRANSFER_STENCIL_EXPORT=%u: depth transfers in one draw%s through VK_EXT_shader_stencil_export%s\n",
+                     TransferStencilExport(), unit->sampleShading ? " for every sample" : " per sample",
+                     device.stencilExport ? "" : " - NOT offered by the device: the nine-pass path stays");
     unit->guestBase = guestBase;
     unit->observer = observer;
     if (!Create(compiler, error))
