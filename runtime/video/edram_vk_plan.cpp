@@ -33,6 +33,8 @@ VkFormat HostColorFormat(ColorFormat storage)
     case ColorFormat::k2_10_10_10_Float: return VK_FORMAT_R16G16B16A16_SFLOAT;  // X vulkan_render_target_cache.cc:1601-1603
     case ColorFormat::k32_Float: return VK_FORMAT_R32_SFLOAT;  // X :1618-1619 (transfers and clears via R32_UINT, :1643-1644)
     case ColorFormat::k16_16: return VK_FORMAT_R16G16_SNORM;   // X :1604-1608 (the guest's -32..32 as -1..1: pipeline_key.cpp)
+    // FM4 Recomp (alpha, RT format 5): X :1609-1613; the guest's -32..32 as -1..1 by the shader's XE_COLOR0_SCALE (draw_record.cpp).
+    case ColorFormat::k16_16_16_16: return VK_FORMAT_R16G16B16A16_SNORM;
     default: return VK_FORMAT_UNDEFINED;  // edram::SupportedKey refuses the rest in M4
     }
 }
@@ -89,6 +91,12 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
         return k.Format() == uint32_t(ColorFormat::k8_8_8_8) || k.Format() == uint32_t(ColorFormat::k2_10_10_10) ||
                k.Format() == uint32_t(ColorFormat::k2_10_10_10_Float) || k.Format() == uint32_t(ColorFormat::k16_16);
     };
+    // FM4 Recomp (alpha, RT format 5): a 64 bpp colour key (storage 5) moves to and from colour keys only (kTransferColor64). Its
+    // depth <-> colour transfers (X packs two depth samples into one 64 bpp sample, :3303-3333, and picks a 32 bpp half for a
+    // depth destination, :3080-3102) are not modelled yet: refused by name, so the run that needs one says so.
+    if (source.IsDepth() != dest.IsDepth() && (source.Is64bpp() || dest.Is64bpp()))
+        return refuse(source.IsDepth() ? "depth -> colour into a 64 bpp key (storage 5) is not modelled yet (X :3303-3333)"
+                                       : "colour -> depth from a 64 bpp key (storage 5) is not modelled yet (X :3080-3102)");
     if (source.IsDepth() && !dest.IsDepth())  // X kDepthToColor (:4910-4913); edram_vk_plan.h for the accepted shape
     {
         // Any pitches: X splits the destination tile index by the destination's pitch (:2516-2577) and the source tile index
@@ -145,12 +153,15 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     {
         return k.Format() == uint32_t(ColorFormat::k8_8_8_8) || k.Format() == uint32_t(ColorFormat::k2_10_10_10) ||
                k.Format() == uint32_t(ColorFormat::k2_10_10_10_Float) || k.Format() == uint32_t(ColorFormat::k16_16) ||
-               k.Format() == uint32_t(ColorFormat::k32_Float);
+               k.Format() == uint32_t(ColorFormat::k32_Float) || k.Format() == uint32_t(ColorFormat::k16_16_16_16);
     };
     if (!storage(source) || !storage(dest))
-        return refuse("a colour storage format other than 0 (8_8_8_8), 2 (2_10_10_10), 3 (2_10_10_10_FLOAT, 7e3), 4 (16_16) and 14 (32_FLOAT)");
+        return refuse("a colour storage format other than 0 (8_8_8_8), 2 (2_10_10_10), 3 (2_10_10_10_FLOAT, 7e3), 4 (16_16), 5 (16_16_16_16) and "
+                      "14 (32_FLOAT)");
     // An unchanged sample count with equal bases, pitches and formats is the same key (refused above): here the formats
     // differ, and the pixel goes through the 32-bit packing (X :3387-3700) at the same pixel and sample (MapTransferTexel).
+    // FM4 Recomp (alpha, RT format 5): a 64 bpp side (storage 5) goes through its two 32-bit guest words (MapTransferSource,
+    // TransferWordOf64 / TransferTexelOf64; X :2607-2777, :3005-3023, :3080-3102, :3114-3370), every MSAA pair as for 32 bpp.
     return TransferKind::Color;
 }
 
@@ -179,21 +190,115 @@ SourceTexel MapCrossAspectTexel(uint32_t destX, uint32_t destY, uint32_t destSam
 
 SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest)
 {
-    const uint32_t pitch = dest.PitchTilesAt32bpp();
-    const uint32_t dtw = edram::kTileWidthSamples >> edram::SamplesXLog2(dest.MsaaMode()), dth = edram::kTileHeightSamples >> edram::SamplesYLog2(dest.MsaaMode());
-    const uint32_t stw = edram::kTileWidthSamples >> edram::SamplesXLog2(source.MsaaMode()), sth = edram::kTileHeightSamples >> edram::SamplesYLog2(source.MsaaMode());
-    // X :2516-2577: the destination's 32bpp tile and the pixel within it.
-    const uint32_t destTile = (destY / dth) * pitch + destX / dtw;
-    SourceTexel p = MapTransferTexel(destX % dtw, destY % dth, destSample, source.MsaaMode(), dest.MsaaMode());  // tile-relative
-    if (source.IsDepth() != dest.IsDepth())  // X :2916: only between colour and depth
+    return MapTransferSource(destX, destY, destSample, source, dest).first;
+}
+
+// FM4 Recomp (alpha, RT format 5): MapEdramTexel generalized to 64 bpp keys (edram_vk_plan.h MapTransferSource). For two 32 bpp keys
+// every step is the former MapEdramTexel's (PitchTiles() is PitchTilesAt32bpp() there, the tile sizes have no 64 bpp shift, and the
+// same-bpp branch is MapTransferTexel).
+TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest)
+{
+    const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
+    const bool s64 = source.Is64bpp(), d64 = dest.Is64bpp();
+    // X :2540-2545: a tile is 80 samples wide at 32 bpp, 40 at 64 bpp (>> dest_is_64bpp), halved again at 4x; :2550-2554 its height.
+    const uint32_t dtw = edram::kTileWidthSamples >> (edram::SamplesXLog2(dm) + (d64 ? 1 : 0)), dth = edram::kTileHeightSamples >> edram::SamplesYLog2(dm);
+    const uint32_t stw = edram::kTileWidthSamples >> (edram::SamplesXLog2(sm) + (s64 ? 1 : 0)), sth = edram::kTileHeightSamples >> edram::SamplesYLog2(sm);
+    // X :2516-2577: the destination's tile (split by its pitch, X :4823 and :5223 GetPitchTiles, doubled at 64 bpp) and the pixel in it.
+    const uint32_t destTile = (destY / dth) * dest.PitchTiles() + destX / dtw;
+    const uint32_t px = destX % dtw, py = destY % dth;
+    TransferSource r;
+    if (s64 == d64)
+        r.first = MapTransferTexel(px, py, destSample, sm, dm);  // X :2778-2831 "Same bit count", with the common Y below folded in
+    else
     {
-        const uint32_t half = edram::kTileWidthSamples >> (1 + edram::SamplesXLog2(source.MsaaMode()));  // X :2919-2920
-        p.x = p.x < half ? p.x + half : p.x - half;                                                          // X :2921-2935
+        uint32_t x = px, y = py, s = dm == Msaa::X1 ? 0 : destSample;
+        if (d64)  // X :2607-2685: 32 bpp -> 64 bpp, the low word's texel (the high word's: `second` below)
+        {
+            if (sm == Msaa::X4)
+            {
+                if (dm == Msaa::X4)  // :2611-2627: s = ds & 2, x = BitFieldInsert(ds, x, 1, 31)
+                    s = destSample & 2, x = px << 1 | (destSample & 1);
+                else if (dm == Msaa::X2)  // :2628-2647 (native 2x host samples): s = (ds ^ 1) << 1
+                    s = ((destSample ^ 1) & 1) << 1;
+                else  // :2648-2662: s = BitFieldInsert(0, y, 1, 1), y >>= 1
+                    s = (py & 1) << 1, y = py >> 1;
+            }
+            else  // :2663-2685: 4x x = BitFieldInsert(x << 2, ds, 1, 1); 1x/2x x <<= 1 (Y below)
+                x = dm == Msaa::X4 ? px << 2 | (destSample & 1) << 1 : px << 1;
+        }
+        else  // X :2686-2777: 64 bpp -> 32 bpp, with the half of the source sample that holds the destination's word
+        {
+            if (dm == Msaa::X4)
+            {
+                if (sm == Msaa::X4)  // :2692-2707: s = BitFieldInsert(ds, x, 0, 1), x >>= 1
+                    s = (destSample & ~1u) | (px & 1), x = px >> 1;
+                r.half = destSample & 1;  // :2714-2717: the destination's horizontal sample
+            }
+            else
+            {
+                if (sm == Msaa::X4)  // :2722-2762: s = (x >> 1) & 1 and the vertical sample bit, x >>= 2
+                {
+                    s = (px >> 1) & 1;
+                    if (dm == Msaa::X2)  // :2729-2746 (native 2x): bit 1 = ds ^ 1
+                        s |= ((destSample ^ 1) & 1) << 1;
+                    else  // :2747-2758: bit 1 = y & 1, y >>= 1
+                        s |= (py & 1) << 1, y = py >> 1;
+                    x = px >> 2;
+                }
+                else  // :2763-2770
+                    x = px >> 1;
+                r.half = px & 1;  // :2771-2774: the destination's horizontal pixel
+            }
+        }
+        // X :2833-2903: the common Y (and sample) of a 1x/2x source of another sample count, independent of bits per sample.
+        if (sm != Msaa::X4 && sm != dm)
+        {
+            if (dm == Msaa::X4)
+            {
+                if (sm == Msaa::X2)  // :2839-2853 (native 2x): (ds >> 1) ^ 1
+                    s = ((destSample >> 1) & 1) ^ 1;
+                else  // :2856-2864: y = BitFieldInsert(ds >> 1, y, 1, 31)
+                    y = py << 1 | ((destSample >> 1) & 1);
+            }
+            else if (sm == Msaa::X2)  // :2867-2886: 2x -> 1x, s = (y & 1) ^ 1, y >>= 1
+                s = (py & 1) ^ 1, y = py >> 1;
+            else  // :2887-2898: 1x -> 2x, y = BitFieldInsert(ds ^ 1, y, 1, 31)
+                y = py << 1 | ((destSample ^ 1) & 1);
+        }
+        if (sm == Msaa::X1)
+            s = 0;
+        r.first.x = x, r.first.y = y, r.first.sample = s;
     }
-    const uint32_t sourceTile = (destTile + dest.Base() - source.Base()) & (edram::kTileCount - 1);       // X :2938-2954
-    const uint32_t sourcePitch = source.PitchTilesAt32bpp();  // X :2956-2965: the source's own pitch splits its tile index
-    p.x += (sourceTile % sourcePitch) * stw, p.y += (sourceTile / sourcePitch) * sth;
-    return p;
+    if (source.IsDepth() != dest.IsDepth())  // X :2916-2936: only between colour and depth (never with a 64 bpp side: ClassifyTransfer)
+    {
+        const uint32_t half = edram::kTileWidthSamples >> (1 + edram::SamplesXLog2(sm) + (s64 ? 1 : 0));  // X :2912-2920
+        r.first.x = r.first.x < half ? r.first.x + half : r.first.x - half;                              // X :2921-2935
+    }
+    const uint32_t sourceTile = (destTile + dest.Base() - source.Base()) & (edram::kTileCount - 1);  // X :2938-2954
+    const uint32_t sourcePitch = source.PitchTiles();  // X :2956-2965, :5224: the source's own pitch splits its tile index
+    r.first.x += (sourceTile % sourcePitch) * stw, r.first.y += (sourceTile / sourcePitch) * sth;  // X :2966-2987
+    r.second = r.first;
+    if (d64 && !s64)  // X :3005-3023: the high word is the next sample (a 4x source) or the next pixel (1x/2x)
+    {
+        if (sm == Msaa::X4)
+            r.second.sample = r.first.sample | 1;
+        else
+            r.second.x = r.first.x | 1;
+    }
+    return r;
+}
+
+uint32_t TransferWordOf64(const uint32_t texel[4], uint32_t half)
+{
+    // X :3080-3102: the second half takes components 2-3 (half the component count, 4 >> 1); :3545-3576: red (or blue) the low half.
+    const uint32_t lo = half ? texel[2] : texel[0], hi = half ? texel[3] : texel[1];
+    return (lo & 0xFFFF) | (hi & 0xFFFF) << 16;
+}
+
+void TransferTexelOf64(uint32_t low, uint32_t high, uint32_t texel[4])
+{
+    // X :3352-3370: component i = BitFieldUExtract(packed[i >> 1], (i & 1) ? 16 : 0, 16).
+    texel[0] = low & 0xFFFF, texel[1] = low >> 16, texel[2] = high & 0xFFFF, texel[3] = high >> 16;
 }
 
 VkRect2D UnitPassArea(const VkRect2D* rects, size_t count, uint32_t width, uint32_t height)
@@ -348,6 +453,7 @@ VkFormat TransferViewFormat(ColorFormat storage)
     {
     case ColorFormat::k32_Float: return VK_FORMAT_R32_UINT;   // X vulkan_render_target_cache.cc:1643-1644
     case ColorFormat::k16_16: return VK_FORMAT_R16G16_UINT;   // X :1637-1639
+    case ColorFormat::k16_16_16_16: return VK_FORMAT_R16G16B16A16_UINT;  // FM4 Recomp (alpha, RT format 5): X :1640-1642
     default: return VK_FORMAT_UNDEFINED;
     }
 }
@@ -654,6 +760,14 @@ bool ResolveSamples(const edram::ResolveInfo& info, uint32_t indices[4], uint32_
 
 namespace {
 
+// FM4 Recomp (alpha, 64 bpp resolve): one 16-bit EDRAM component of a 16_16 or 16_16_16_16 sample (pixel_formats.xesli:367-377
+// XeUnpackR16G16Edram / XeUnpackR16G16B16A16Edram, with this port's clamp at -32: see the 16_16 branch below), factored out of it.
+float UnpackR16Edram(uint32_t half)
+{
+    const float v = float(int16_t(uint16_t(half))) * (32.0f / 32767.0f);
+    return v > -32.0f ? v : -32.0f;
+}
+
 void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolve.xesli:273-321
 {
     if (storage == uint32_t(ColorFormat::k32_Float))  // :313-318 "Treat as 32_FLOAT": (f, 0, 0, 0)
@@ -678,12 +792,8 @@ void UnpackResolveSample(uint32_t w, uint32_t storage, float rgba[4])  // resolv
         // render_target_cache.cc:188) X adds no +5 to the bias (draw_util.cc:1258-1266 behind vulkan_render_target_cache.h:143-147):
         // the host halves are the guest's (pipeline_key.h ColorExpBiasAccepted), read raw through the R16G16_UINT view
         // (edram_vk.cpp kResolveDump).
-        const float scale = 32.0f / 32767.0f;
         for (uint32_t i = 0; i < 2; i++)
-        {
-            const float v = float(int16_t(uint16_t(w >> (16 * i)))) * scale;
-            rgba[i] = v > -32.0f ? v : -32.0f;
-        }
+            rgba[i] = UnpackR16Edram(w >> (16 * i));  // FM4 Recomp (alpha, 64 bpp resolve): the same expression, shared
         rgba[2] = rgba[3] = 0.0f;
         return;
     }
@@ -711,6 +821,34 @@ uint32_t PackUnorm(float v, float scale)  // pixel_formats.xesli:116-125: uint(s
 {
     const float s = v > 0.0f ? (v < 1.0f ? v : 1.0f) : 0.0f;
     return uint32_t(s * scale + 0.5f);
+}
+
+// FM4 Recomp (alpha, 64 bpp resolve): one component of xesl_packHalf2x16 (pixel_formats.xesli:269-277; GLSL packHalf2x16, HLSL
+// f32tof16): the IEEE 754 binary32 -> binary16 conversion, rounding to nearest even, subnormals kept, overflow to infinity, NaN
+// kept as a quiet NaN. APPROXIMATE: GLSL leaves the rounding of packHalf2x16 to the implementation and Xenos's own conversion is
+// not documented; the values FM4's 16_16_16_16 source can hold (int16 * 32 / 32767, times 2^bias) lie far from a rounding tie.
+uint32_t PackHalf(float f)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &f, 4);
+    const uint32_t sign = (bits >> 16) & 0x8000u, exponent = (bits >> 23) & 0xFFu, mantissa = bits & 0x7FFFFFu;
+    if (exponent == 0xFFu)  // infinity, or NaN with the quiet bit set
+        return sign | 0x7C00u | (mantissa ? 0x200u | (mantissa >> 13) : 0u);
+    const int32_t e = int32_t(exponent) - 127 + 15;  // the binary16 biased exponent
+    if (e >= 31)
+        return sign | 0x7C00u;
+    if (e <= 0)
+    {
+        if (e < -10)  // below half the smallest subnormal (2^-25): zero
+            return sign;
+        // A subnormal: the significand with its implicit bit, shifted to units of 2^-24, rounded to nearest even (a carry into
+        // bit 10 gives the smallest normal, which is the right encoding).
+        const uint32_t significand = mantissa | 0x800000u, shift = uint32_t(14 - e);
+        const uint32_t kept = significand >> shift, rest = significand & ((1u << shift) - 1), halfway = 1u << (shift - 1);
+        return sign | (kept + (rest > halfway || (rest == halfway && (kept & 1)) ? 1u : 0u));
+    }
+    const uint32_t kept = uint32_t(e) << 10 | mantissa >> 13, rest = mantissa & 0x1FFFu;
+    return sign | (kept + (rest > 0x1000u || (rest == 0x1000u && (kept & 1)) ? 1u : 0u));  // a carry may round up to infinity
 }
 
 }  // namespace
@@ -760,6 +898,24 @@ uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStor
     return PackUnorm(pixel[0], 1023.0f) | PackUnorm(pixel[1], 1023.0f) << 10 | PackUnorm(pixel[2], 1023.0f) << 20 | PackUnorm(pixel[3], 3.0f) << 30;  // XePackR10G10B10A2UNorm
 }
 
+void ResolveConvertPixel64(const edram::ResolveInfo& info, uint32_t low, uint32_t high, uint32_t out[2])
+{
+    // FM4 Recomp (alpha, 64 bpp resolve): resolve.xesli:368-389 XeResolveUnpack64bpp2Samples (k_16_16_16_16: XeUnpackR16G16B16A16Edram,
+    // pixel_formats.xesli:373-377: red the low half of the low word, green its high half, blue and alpha the high word's), the exponent
+    // bias factor (resolve.xesli:131-133, :695-698; one sample, so no halving), the swap (.bgra, :699-704), then XePack64bpp4Pixels'
+    // k_16_16_16_16_FLOAT branch (pixel_formats.xesli:269-277): packHalf2x16(r, g), packHalf2x16(b, a), the first component the low half.
+    float pixel[4] = {UnpackR16Edram(low), UnpackR16Edram(low >> 16), UnpackR16Edram(high), UnpackR16Edram(high >> 16)};
+    const uint32_t biasBits = (uint32_t(info.destExpBias) << 23) + 0x3F800000u;  // as ResolveConvertPixel
+    float exp;
+    std::memcpy(&exp, &biasBits, 4);
+    for (float& c : pixel)
+        c *= exp;
+    if (info.destSwap)
+        std::swap(pixel[0], pixel[2]);
+    out[0] = PackHalf(pixel[0]) | PackHalf(pixel[1]) << 16;
+    out[1] = PackHalf(pixel[2]) | PackHalf(pixel[3]) << 16;
+}
+
 bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, std::string& why)
 {
     if (!info.ok || !info.copy)
@@ -770,9 +926,27 @@ bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStora
                               " to texture format " + std::to_string(info.destFormat) + " (exp bias " + std::to_string(info.destExpBias) + ", swap " +
                               std::to_string(int(info.destSwap)) + ", endian " + std::to_string(info.destEndian) + "): ";
     const bool rg16 = sourceStorage == uint32_t(ColorFormat::k16_16);
+    // FM4 Recomp (alpha, 64 bpp resolve): storage 5 (16_16_16_16) only into 32 (k_16_16_16_16_FLOAT), number 7, 1x sample 0, the 64 bpp
+    // layout DecodeResolve sets (destBytesLog2 3), endian 0 or 8in16; and 32 only from storage 5.
+    const bool rgba16 = sourceStorage == uint32_t(ColorFormat::k16_16_16_16);
+    if (rgba16 != (info.destFormat == 32))
+        return Refuse(why, shape + "texture format 32 pairs only with a 16_16_16_16 source (storage 5), and storage 5 only with 32");
+    if (rgba16)
+    {
+        if (info.msaa != Msaa::X1 || info.sampleSelect != edram::SampleSelect::k0 || info.destNumber != 7 || info.destBytesLog2 != 3 ||
+            info.destEndian > 1)
+            return Refuse(why, shape + "not the 1x, sample 0, number 7, 64 bpp, endian 0 or 8in16 resolve DecodeResolve accepts from storage 5");
+        if (info.destBase != info.destExtentStart)
+            return Refuse(why, shape + "the destination base is not the start of its extent");
+        if (info.x1 <= info.x0 || info.y1 <= info.y0)
+            return Refuse(why, shape + "an empty resolve rectangle");
+        return true;
+    }
+    if (info.destBytesLog2 == 3)
+        return Refuse(why, shape + "a 64 bpp destination layout from a 32 bpp source");
     if (sourceStorage != uint32_t(ColorFormat::k8_8_8_8) && sourceStorage != uint32_t(ColorFormat::k2_10_10_10) &&
         sourceStorage != uint32_t(ColorFormat::k2_10_10_10_Float) && sourceStorage != uint32_t(ColorFormat::k32_Float) && !rg16)
-        return Refuse(why, shape + "a source storage format other than 0, 2, 3, 4 and 14");
+        return Refuse(why, shape + "a source storage format other than 0, 2, 3, 4, 5 and 14");
     // 16_16 resolves only into k_16_16 (25), the observed pairing (edram::DecodeResolve), and 25 only from 16_16.
     if (rg16 != (info.destFormat == 25))
         return Refuse(why, shape + "texture format 25 pairs only with a 16_16 source (storage 4), and storage 4 only with 25");
@@ -805,6 +979,36 @@ bool ResolveConvertToGuest(const edram::ResolveInfo& info, uint32_t sourceStorag
     if (!ResolveFullConvertible(info, sourceStorage, why))
         return false;
     const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
+    if (info.destBytesLog2 == 3)
+    {
+        // FM4 Recomp (alpha, 64 bpp resolve): `words` is the 1x 16_16_16_16 source's rectangle as vkCmdCopyImageToBuffer gives it
+        // (edram_vk.cpp Resolve): 8 bytes a pixel, row-major, the R16G16B16A16 texel's components in order, little-endian, i.e. the
+        // EDRAM sample's two words low (r | g << 16) then high (b | a << 16) (TransferWordOf64; X resolve.xesli:368-389 reads a 64 bpp
+        // sample as packed.xy). Each pixel's two destination words are XeEndianSwap 8in16 per 16-bit component (xenos.h:200-207
+        // Endian128; texture_untile.h EndianSwap16Pair on each word, as ShiftGlue 72b7dd6f fh1_native_resolve_memory.cs.hlsl:343-353
+        // does for its 16_16_16_16_FLOAT pack) stored low word first at TiledOffset2D(destOffsetX + x, destOffsetY + y, destPitch, 3)
+        // (resolve.xesli:161-184 XeResolveDestPixelAddress with bpp_log2 3, texture_util.cc:443-458). Xenia's 64 bpp shader stores pixel
+        // pairs as one R32G32B32A32 (resolve.xesli:186-197 XeResolveDestRightConsecutiveBlocksOffset; resolve_full_64bpp.xesli itself
+        // is not in the local sparse checkout); at bpp_log2 3 pixel x | 1 is 8 bytes after x & ~1 (x bit 0 is bit 3 of the micro
+        // offset, texture_util.cc:451-454), so per-pixel 8-byte stores at the per-pixel address write the same bytes.
+        auto address = [&](uint32_t x, uint32_t y) { return TiledOffset2D(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 3); };
+        if (const uint64_t past = FirstPastEnd(width, height, destBytes, [&](uint32_t x, uint32_t y) { return uint64_t(address(x, y)) + 8; });
+            past != kNonePast)
+            return Refuse(why, "resolve texel (" + std::to_string(uint32_t(past)) + ", " + std::to_string(uint32_t(past >> 32)) + ") lands past the destination's " +
+                                   std::to_string(destBytes) + " bytes");
+        ParallelRows(height, uint64_t(width) * 2, [&](uint32_t y0, uint32_t y1) {
+            for (uint32_t y = y0; y < y1; y++)
+                for (uint32_t x = 0; x < width; x++)
+                {
+                    const size_t i = (size_t(y) * width + x) * 2;
+                    uint32_t packed[2];
+                    ResolveConvertPixel64(info, words[i], words[i + 1], packed);
+                    const uint32_t w[2] = {EndianSwap16Pair(packed[0], info.destEndian), EndianSwap16Pair(packed[1], info.destEndian)};
+                    std::memcpy(dest + address(x, y), w, 8);  // little-endian stores (arm64), the low word first
+                }
+        });
+        return true;
+    }
     // FM4 Recomp: a 16 bpp destination (k_8_8) stores 2 bytes per texel at X's bpp_log2 1 tiled address (resolve_full_16bpp.xesli
     // :61-63 XeResolveDestPixelAddress(..., 1u), resolve.xesli:161-184 -> texture_util.cc:443-458, texture_untile.h TiledOffset2D).
     // X stores four pixels as one uint2 (pixel 0 in the low half); their tiled addresses are consecutive (x & 7 is the

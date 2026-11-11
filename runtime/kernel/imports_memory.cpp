@@ -291,3 +291,29 @@ GUEST_IMPORT(MmDeleteKernelStack, "REFERENCE_DERIVED: Xenia xboxkrnl_memory.cc:7
     runtime::DiscardFiber(top);
     ctx.r3.u64 = runtime::ReleaseStack(base, top, limit) ? 0 : 0xC0000001;  // STATUS_UNSUCCESSFUL
 }
+
+// FM4 Recomp: the kernel pool, imported by SpeechFacade_default.xex (default.xex never used it). Xenia 67f16c4
+// xboxkrnl_memory.cc:645-675: ExAllocatePool(size) = ExAllocatePoolTypeWithTag(size, 'None', 0): a size under 4 KB is rounded up to
+// 4 KB (alignment 8), a larger one 4 KB-aligned, from Xenia's system heap; ExFreePool frees it. Here the system heap is the 4 KB
+// virtual heap (INFERRED: which heap Xenia's SystemHeapAlloc uses is not in the local tree), read-write, committed, zero-filled pages.
+GUEST_IMPORT(ExAllocatePool, "REFERENCE_DERIVED: Xenia 67f16c4 xboxkrnl_memory.cc:645-670 (rounded to 4 KB); the heap INFERRED (the 4 KB virtual heap)")
+{
+    // (size): the address of a fresh read-write block of size rounded up to 4 KB, or 0 when the heap has no room (NT: NULL).
+    using namespace runtime;
+    const uint64_t rounded = (uint64_t(ctx.r3.u32) + 4095) / 4096 * 4096;
+    if (rounded == 0 || rounded > 0xFFFFF000u)
+        return (void)(ctx.r3.u64 = 0);
+    ctx.r3.u64 = VirtualHeap(4096)->Alloc(uint32_t(rounded), 4096, mem::kReserve | mem::kCommit, page::kReadWrite, false);
+}
+
+GUEST_IMPORT(ExFreePool, "REFERENCE_DERIVED: Xenia 67f16c4 xboxkrnl_memory.cc:672-675 (SystemHeapFree)")
+{
+    // (address): releases a block ExAllocatePool returned. Anything else (an address that is not an allocation's base in that heap)
+    // is a guest bug NT would bug-check on: it stops.
+    using namespace runtime;
+    const uint32_t address = ctx.r3.u32;
+    Heap* heap = VirtualHeap(4096);
+    if (!heap->Contains(address) || !heap->Release(address, nullptr))
+        Stop(StopCode::GuestFault, "ExFreePool(%08X): not a pool block (lr=%08X)", address, uint32_t(ctx.lr));
+}
+

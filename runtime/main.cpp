@@ -31,6 +31,7 @@
 #include "video/renderer.h"
 #include "video/window_sdl.h"
 #include "kernel/imports.h"
+#include "kernel/input_live.h"
 #include "kernel/loader.h"
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
@@ -52,14 +53,15 @@
 static_assert(fm4::kImageBase == PPC_IMAGE_BASE && fm4::kImageSize == PPC_IMAGE_SIZE,
               "the generated tables and ppc/ describe different images");
 
+// Title-specific hooks (M2-T03): generated from config/title_hooks.toml (FM4's own image, SHA-256-checked; each opt-in by a flag)
+// into fm4_hooks.cpp; no other title's hook or address is ever ported.
+namespace fm4 { int TitleHookCount(); void ReportTitleHooks(); }
+
 namespace {
 
 uint8_t* base = nullptr;
 std::vector<const char*> dataImports;  // by guard index
 
-// Title-specific hooks (M2-T03): none. FM4's are added here, from FM4's own image, when a later
-// task proves one is needed; no other title's hook or address is ever ported.
-constexpr int kTitleHooks = 0;
 
 const char* DescribeGuest(uint32_t guest)
 {
@@ -164,6 +166,12 @@ int main(int argc, char** argv)
     // presses the file's buttons at its vblanks; a malformed file stops (9) here, before the title runs.
     if (const char* script = std::getenv("FM4_INPUT_SCRIPT"); script != nullptr && *script != '\0')
         runtime::input::LoadScript(script);
+    // FM4 Recomp: FM4_INPUT_LIVE=1 with --renderer window connects the live pad (input_live.h) instead.
+    const bool liveInput = std::getenv("FM4_INPUT_LIVE") != nullptr && !std::strcmp(std::getenv("FM4_INPUT_LIVE"), "1");
+    if (liveInput && (std::strcmp(rendererMode, "window") || runtime::input::ScriptLoaded()))
+        Stop(StopCode::Setup, "FM4_INPUT_LIVE=1 needs --renderer window and no FM4_INPUT_SCRIPT");
+    if (liveInput)
+        runtime::input::EnableLive();
     runtime::xma::SetDecoderFactory(runtime::xma::FfmpegDecoderFactory());  // XMA decoding (kernel/xma.h)
     runtime::ldi::SetFactory(runtime::ldi::MspackDecoderFactory());  // LZX decompression (kernel/ldi.h)
     runtime::gpu::SetStopAtSwap(uint32_t(stopAtSwap));
@@ -260,7 +268,8 @@ int main(int argc, char** argv)
     runtime::SetTitleProcess(process, fm4::kTls, fm4::kDefaultStackSize);  // threads the title creates (kernel/threads.h)
     std::fprintf(stderr, "[runtime] %zu functions, %zu imports (%zu implemented), %zu data imports documented, %zu guarded, "
                  "%d title hooks\n", functions, fm4::kImportCount, runtime::ImplementedImportCount(), documented,
-                 dataImports.size(), kTitleHooks);
+                 dataImports.size(), fm4::TitleHookCount());
+    fm4::ReportTitleHooks();
     std::fprintf(stderr, "[runtime] main thread: PCR %08X, KTHREAD %08X, TLS %08X, stack %08X-%08X\n",
                  mainThread.pcr, mainThread.kthread, mainThread.tls, mainThread.stackLimit, mainThread.stackBase);
 

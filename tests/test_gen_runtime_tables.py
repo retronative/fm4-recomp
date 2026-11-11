@@ -183,5 +183,79 @@ class Generate(unittest.TestCase):
         self.assertIn('usage:', log)
 
 
+class TitleHooks(unittest.TestCase):
+    """FM4 Recomp: config/title_hooks.toml -> fm4_hooks.cpp, every hook checked by the SHA-256 of its function's bytes."""
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('gen', Path(__file__).resolve().parent.parent / 'scripts' / 'gen_runtime_tables.py')
+        cls.gen = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.gen)
+
+    def config(self, function=0x10008, size=8, sha=None, flag='FM4_TEST_HOOK', value=1):
+        import hashlib
+        image = bytes(range(64))
+        sha = sha or hashlib.sha256(image[8:8 + size]).hexdigest()  # the 8 bytes at base + 8 (hand: 08 09 .. 0F)
+        return image, f'[[hook]]\nname = "test"\nfunction = 0x{function:X}\nflag = "{flag}"\nreturns = {value}\nbytes = {size}\nsha256 = "{sha}"\n'
+
+    def test_override_generated(self):
+        image, text = self.config()
+        out = self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('PPC_FUNC(sub_00010008)', out)
+        self.assertIn('ctx.r3.u64 = 0x1u;', out)
+        self.assertIn('__imp__sub_00010008(ctx, base);', out)
+        self.assertIn('HookFlag("FM4_TEST_HOOK")', out)
+        self.assertIn('int TitleHookCount() { return 1; }', out)
+
+    def test_no_hooks(self):
+        self.assertIn('int TitleHookCount() { return 0; }', self.gen.title_hooks('', bytes(16), 0x10000))
+
+    def test_wrong_hash_refused(self):
+        image, text = self.config(sha='0' * 64)
+        with self.assertRaises(SystemExit) as e:
+            self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('hash to', str(e.exception))
+
+    def test_outside_image_refused(self):
+        image, text = self.config(function=0x10040)
+        with self.assertRaises(SystemExit) as e:
+            self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('outside the image', str(e.exception))
+
+    def test_bad_flag_or_size_refused(self):
+        for kwargs in ({'flag': 'NOT_FM4'}, {'size': 6}):
+            image, text = self.config(**kwargs)
+            with self.assertRaises(SystemExit):
+                self.gen.title_hooks(text, image, 0x10000)
+
+    def press_config(self, stop_sha=None):
+        import hashlib
+        image = bytes(range(64))
+        sha = hashlib.sha256(image[8:16]).hexdigest()
+        stop_sha = stop_sha or hashlib.sha256(image[32:40]).hexdigest()  # the 8 bytes at base + 32 (hand: 20 21 .. 27)
+        return image, (f'[[hook]]\nname = "press"\nkind = "stop_on_press"\nfunction = 0x10008\nflag = "FM4_TEST_HOOK"\nbytes = 8\n'
+                       f'sha256 = "{sha}"\ncaller = 0x10104\nstop = 0x10020\nstop_bytes = 8\nstop_sha256 = "{stop_sha}"\n')
+
+    def test_stop_on_press_generated(self):
+        image, text = self.press_config()
+        out = self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('uint32_t(ctx.lr) == 0x00010104u', out)
+        self.assertIn('runtime::input::APresses()', out)
+        self.assertIn('sub_00010020(ctx, base);', out)
+        self.assertIn('ctx.r3.u64 = 0;', out)
+        self.assertIn('__imp__sub_00010008(ctx, base);', out)
+
+    def test_stop_on_press_checks_the_stop_function(self):
+        image, text = self.press_config(stop_sha='0' * 64)
+        with self.assertRaises(SystemExit) as e:
+            self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('(stop)', str(e.exception))
+
+    def test_unknown_kind_refused(self):
+        image, text = self.config()
+        with self.assertRaises(SystemExit):
+            self.gen.title_hooks(text.replace('returns = 1', 'kind = "other"\nreturns = 1'), image, 0x10000)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

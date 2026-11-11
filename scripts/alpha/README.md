@@ -1,0 +1,85 @@
+<p align="center"><img src="logo.svg" width="320" alt="FM4 Recomp"></p>
+
+# FM4 Recomp: macOS alpha
+
+A static recompilation of *Forza Motorsport 4* (Xbox 360, USA Disc 1) to native Apple-silicon macOS. This alpha plays the game
+in a window with sound, a gamepad or the keyboard. It is an early, unoptimised build: expect a low frame rate and the known
+issues below.
+
+**You must supply your own game.** Nothing from the game is included. Setup reads your own Forza Motorsport 4 (USA) Disc 1 ISO
+and checks every file it derives against the SHA-256 this build was made for. Other disc versions are refused.
+
+## Requirements
+
+- An Apple-silicon Mac with macOS 26 or later.
+- Your own *Forza Motorsport 4* (USA) Disc 1 (Play Disc) as an ISO, and about 9 GB free disk space.
+
+Nothing else: the app includes everything it runs (SDL 3, the Vulkan loader, MoltenVK, the Vulkan validation layer, glslang,
+SPIRV-Tools and the setup tools). No Homebrew, Xcode or developer tools are needed.
+
+## Install and first run
+
+1. Open `FM4-Recomp-<version>.dmg` and drag **FM4 Recomp** onto **Applications**.
+2. Open **FM4 Recomp** from Applications. This alpha is not notarised: the first time, macOS may refuse to open it. Then open
+   System Settings > Privacy & Security, choose **Open Anyway** for FM4 Recomp, and open it again.
+3. The setup guides you: it checks your Mac (Apple silicon, macOS 26 or later), asks for your Disc 1 ISO (choose it or drop it on the window), then copies and
+   checks the game files (a few minutes; the ISO is only read).
+4. Press **Play**. Each session runs with the GPU safeguards below and ends at its time limit or when you close the game window.
+
+Your data, saves and session logs are kept in `~/Library/Application Support/FM4 Recomp` (`data/`, `data/user-data`,
+`logs/<date>/`). To remove FM4 Recomp, move the app to the Bin and delete that folder.
+
+**Without the app** (the `.tar.gz` package): `./setup.sh "<Disc 1 .iso>"` once, then `./play.sh [minutes]`; the data stays next to
+the scripts (or in `$FM4_RECOMP_HOME`).
+
+## Controls
+
+| Pad (SDL gamepad, Xbox layout) | Keyboard |
+|---|---|
+| Left stick: steer | A / D |
+| Right trigger: throttle | W |
+| Left trigger: brake | S |
+| A / B / X | Enter / Backspace or Escape / X |
+| D-pad | Arrow keys |
+
+A skips the long welcome video before the first race. Retail FM4 cannot skip it; this build adds that.
+
+## Performance (measured on the developers' M5, 1280x720 game resolution)
+
+| Scene | Frame rate |
+|---|---|
+| Menus | about 20 fps |
+| Race, in a window | about 15 fps (median frame 65 ms) |
+
+The window always runs with the Vulkan validation layer (a GPU safeguard, below), which costs about two thirds of the
+renderer's CPU time. Without the window and the layer the same race runs at about 29 fps. Making the window fast is the
+next work item.
+
+## GPU safeguards (always on)
+
+- One session at a time, under a hard deadline, in its own process group.
+- The Vulkan validation layer is on and is proven live before each session by a deliberate, query-only misuse it must report.
+- After each session the system log and crash reports are searched for a GPU hang or restart. On any evidence `play.sh`
+  writes `GPU_STOP` (in the data folder above) and refuses to start again until you read it and delete it yourself. Please send that file and the
+  session's `logs/` folder to the developers.
+
+## Known issues
+
+- **Low frame rate in the window** (see Performance).
+- **A rectangular dark shadow** sometimes surrounds the player car, in chase and bumper views. Under investigation; it is not
+  caused by how render results are copied back.
+- **After a finished race**, the first scene that draws a 64-bit colour target (the stop seen after confirming a car in Car
+  Select) is new in this build and has only passed automated tests. If the game stops there, please send the log.
+- **Unsupported features stop the game with a named message** instead of guessing: some later menus, online features, Kinect,
+  and anything not reached in testing. The log names the missing piece; please send it.
+- **Achievements and online** are not available.
+- **Audio** can drop briefly (about 40 ms) during heavy loading.
+
+## Before publishing
+
+This package contains code translated from the game's executable. It is for local testing only;
+it must not be published.
+
+## Licence
+
+GPL-3.0-or-later (see COPYING and NOTICE). Third-party notices: THIRD_PARTY_NOTICES.md and LICENSES/

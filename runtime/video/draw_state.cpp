@@ -360,27 +360,35 @@ struct Decoder
             // 0 8_8_8_8, 1 8_8_8_8_GAMMA, 2 2_10_10_10, 3 2_10_10_10_FLOAT, 14 32_FLOAT (X xenos.h:299-318; 14 is 32 bpp, xenos.h:323-327,
             // so the tile arithmetic below holds; FM4's HDR luminance reduction), 4 16_16 (32 bpp; FM4
             // Recomp: FM4's intro); the rest are not modelled
-            if (t.colorFormat > 4 && t.colorFormat != 14)
-                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 4, 10, 12, 14 are)");
-            // The exponent bias: only where the host's scale is 1 (pipeline_key.h ColorExpBiasAccepted: 16_16 with 5, else 0).
-            if (t.colorFormat == 4 ? t.colorExpBias != 5 : t.colorExpBias != 0)
+            // FM4 Recomp (alpha, RT format 5): 5 16_16_16_16 (X xenos.h:309-310 "Fixed point -32...32", 64 bpp: xenos.h:323-327; FM4 after a
+            // race, RB_COLOR_INFO 00050000). 6, 7 and 15 stay refused.
+            if (t.colorFormat > 5 && t.colorFormat != 14)
+                return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour format " + Num(t.colorFormatRaw) + " is not modelled (0, 1, 2, 3, 4, 5, 10, 12, 14 are)");
+            // The exponent bias (pipeline_key.h ColorExpBiasAccepted): 16_16 with 5 (the host scale 1), 16_16_16_16 with any (the pixel
+            // shader scales by 2^(bias - 5): draw_record.cpp XE_COLOR0_SCALE), the others 0.
+            if (t.colorFormat == 4 ? t.colorExpBias != 5 : t.colorFormat != 5 && t.colorExpBias != 0)
                 return Refuse("RB_COLOR_INFO " + Hex(ci) + ": colour exponent bias " + Num(uint64_t(int64_t(t.colorExpBias))) + " is not modelled" +
                               (t.colorFormat == 4 ? " (16_16 takes 5)" : ""));
             if (t.depthWritten && t.colorBase == t.depthBase)
                 return Refuse("RB_COLOR_INFO " + Hex(ci) + " / RB_DEPTH_INFO " + Hex(di) + ": colour and depth at the same EDRAM base, both written");
         }
-        // Tiles (X xenos.h:467-480 GetSurfacePitchTiles; every accepted colour format is 32 bpp): 80 samples a tile row, the
-        // 4X pitch doubled; rows a tile holds: 16 samples over 1 (1X) or 2 (2X, 4X) vertical samples.
+        // Tiles (X xenos.h:467-480 GetSurfacePitchTiles): 80 samples a tile row at 32 bpp, the 4X pitch doubled; rows a tile holds:
+        // 16 samples over 1 (1X) or 2 (2X, 4X) vertical samples. `pitchTiles` is the 32 bpp pitch (the depth target's, Bind's).
+        // FM4 Recomp (alpha, RT format 5): a written 64 bpp colour target (format 5) has twice the tiles a row (xenos.h:474-476
+        // is_64bpp, render_target_cache.h:321-323 GetPitchTiles), so its rows to the next surface are counted at that pitch. Each
+        // target's rows are taken separately; for 32 bpp targets that is the former min(tiles) / pitchTiles (floor division is
+        // monotonic, so the minimum commutes with it).
         const uint32_t pitchSamples = t.pitch << (t.msaa == 2 ? 1 : 0);
         t.pitchTiles = (pitchSamples + 79) / 80;
         const uint32_t rowsPerTile = 16 / (t.msaa == 0 ? 1 : 2);
         const auto limit = [](uint32_t base, uint32_t other) { return other > base ? other : 2048u; };
-        uint32_t tiles = 2048;
+        const auto rows = [&](uint32_t tiles, uint32_t pitchTiles) { return tiles / pitchTiles * rowsPerTile; };
+        uint32_t edramRows = rows(2048, t.pitchTiles);
         if (t.colorWritten)
-            tiles = std::min(tiles, limit(t.colorBase, t.depthBase) - t.colorBase);
+            edramRows = std::min(edramRows, rows(limit(t.colorBase, t.depthBase) - t.colorBase, t.pitchTiles << (t.colorFormat == 5 ? 1 : 0)));
         if (t.depthWritten)
-            tiles = std::min(tiles, limit(t.depthBase, t.colorBase) - t.depthBase);
-        t.edramRows = tiles / t.pitchTiles * rowsPerTile;
+            edramRows = std::min(edramRows, rows(limit(t.depthBase, t.colorBase) - t.depthBase, t.pitchTiles));
+        t.edramRows = edramRows;
         if (t.edramRows == 0)
             return Refuse("RB_SURFACE_INFO " + Hex(si) + " RB_COLOR_INFO " + Hex(ci) + " RB_DEPTH_INFO " + Hex(di) + ": the render target has no rows");
         // An empty scissor gives a target height of 0: a defined draw that covers nothing (X draw_util.h:282-283), not a refusal.

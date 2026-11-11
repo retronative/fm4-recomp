@@ -4,6 +4,7 @@
 // XAudio render-driver clients (audio.h).
 #include "audio.h"
 #include "arena.h"
+#include "av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
 #include "graphics.h"
 #include "imports.h"
 #include "indirect.h"
@@ -61,8 +62,8 @@ void Worker(uint8_t* base, PPCContext& initial)
             made = ++counters.callbacks;
         }
         callbackDone.notify_all();
-        if (made == 1 || made == kQueuedFrames)
-            Report(made == 1 ? "first callback returned" : "the 64 initial callbacks returned");
+        if (made == 1 || made == QueuedFrames())
+            Report(made == 1 ? "first callback returned" : "the initial callbacks returned");
     }
 }
 
@@ -85,6 +86,22 @@ void Clock()
     }
 }
 }  // namespace
+
+uint32_t QueuedFrames()
+{
+    static const uint32_t frames = [] {
+        const char* v = std::getenv("FM4_AUDIO_QUEUED_FRAMES");
+        if (v == nullptr)
+            return kDefaultQueuedFrames;
+        char* end = nullptr;
+        const unsigned long n = std::strtoul(v, &end, 10);
+        if (end == v || *end != '\0' || n < 16 || n > kQueuedFrames)
+            Stop(StopCode::Setup, "FM4_AUDIO_QUEUED_FRAMES=%s: must be 16 to %u (Xenia apu_max_queued_frames' range)", v, kQueuedFrames);
+        std::fprintf(stderr, "[audio] FM4_AUDIO_QUEUED_FRAMES=%lu: a client queues at most %lu frames (%.1f ms) ahead of the output\n", n, n, n * 256.0 / 48.0);
+        return uint32_t(n);
+    }();
+    return frames;
+}
 
 void SetOutput(std::function<void(const float*)> out, std::function<double()> queuedMs)
 {
@@ -122,12 +139,12 @@ uint32_t RegisterClient(uint8_t* base, uint32_t routine, uint32_t argument)
     Store32(base, wrappedArgument, argument);
     callback = routine;
     registered = true;
-    permits = kQueuedFrames;
+    permits = QueuedFrames();
     const bool startClock = sink == Sink::Clock && !clockStarted;
     clockStarted = clockStarted || startClock;
     guard.unlock();
     std::fprintf(stderr, "[audio] render client registered: callback %08X, argument %08X (wrapped at %08X), %u permits\n", routine,
-                 argument, wrappedArgument, kQueuedFrames);
+                 argument, wrappedArgument, QueuedFrames());
     StartServiceThread(base, 0, [base](PPCContext& ctx) { Worker(base, ctx); });
     if (startClock)
         std::thread(Clock).detach();
@@ -143,6 +160,20 @@ void SubmitFrame(const uint8_t* base, uint32_t driver, uint32_t samples)
         Stop(StopCode::Unimplemented, "XAudioSubmitRenderDriverFrame: driver %08X is not the registered client", driver);
     if (frames.size() >= kMaxQueued)
         Stop(StopCode::Unimplemented, "XAudioSubmitRenderDriverFrame: %u frames wait for the output (more than permits allow)", kMaxQueued);
+    // FM4 Recomp (FM4_DIAG_AV_LATENCY, diagnostic): the frame's level and the frames already queued ahead of it.
+    if (av::Enabled())
+    {
+        double sum = 0;
+        for (uint32_t i = 0; i < kFrameFloats; i++)
+        {
+            const uint8_t* b = frame.data() + i * 4;
+            const uint32_t bits = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
+            float f;
+            std::memcpy(&f, &bits, 4);
+            sum += double(f) * f;
+        }
+        av::AudioSubmitted(counters.submitted + 1, std::sqrt(sum / kFrameFloats), uint32_t(frames.size()));
+    }
     frames.push_back(std::move(frame));
     if (++counters.submitted == 1)
         std::fprintf(stderr, "[audio] first frame submitted\n");
@@ -168,7 +199,7 @@ bool ConsumeFrame(float* out)
             frame = std::move(frames.front());
             frames.pop_front();
             counters.consumed++;
-            if (permits < kQueuedFrames)  // the semaphore's maximum (audio_system.cc:52)
+            if (permits < QueuedFrames())  // the semaphore's maximum (audio_system.cc:52)
                 permits++;
         }
         if (counters.consumed == 1 && !frame.empty())
@@ -192,6 +223,15 @@ bool ConsumeFrame(float* out)
     }
     if (report)
         Report(report);
+    if (!frame.empty() && av::Enabled())  // FM4_DIAG_AV_LATENCY: frames are pulled in submission order
+    {
+        uint64_t sequence;
+        {
+            std::lock_guard guard(lock);
+            sequence = counters.consumed;
+        }
+        av::AudioPulled(sequence, outputQueuedMs ? outputQueuedMs() : -1.0);
+    }
     return !frame.empty();
 }
 

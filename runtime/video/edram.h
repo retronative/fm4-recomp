@@ -187,6 +187,8 @@ struct Key
 // GetStorageColorFormat, "the same packing and meaning of values ... without blending precision modifiers"); both
 // 32_FLOAT (storage 14, 32 bpp); both depth formats; 1x, 2x and 4x MSAA. False with the reason otherwise (64 bpp formats,
 // 32_32_FLOAT among them, by name).
+// FM4 Recomp (alpha, RT format 5): also 16_16 (storage 4) and 16_16_16_16 (storage 5, the one 64 bpp format accepted: its key's
+// pitch and tile width are 64 bpp ones, Key::PitchTiles, RangeRectangles); 16_16_16_16_FLOAT and 32_32_FLOAT stay refused.
 bool SupportedKey(Key k, std::string& why);
 
 // ---- Ownership ----------------------------------------------------------------------------------------
@@ -435,6 +437,8 @@ struct ResolveInfo
     uint32_t destPitch = 0, destHeight = 0;  // texels (RB_COPY_DEST_PITCH)
     // Bytes per destination texel, log2 (X draw_util.cc:1133 bpp_log2 from texture_info_formats.inl): 2 (32 bpp), or 1 for
     // texture format 10 (k_8_8, 16 bpp, texture_info_formats.inl:11). A depth resolve: 2.
+    // FM4 Recomp (alpha, 64 bpp resolve): 3 for texture format 32 (k_16_16_16_16_FLOAT, texture_info_formats.inl:33) from a 64 bpp
+    // source; its base granularity is 32x32 texels, as at 32 bpp.
     uint32_t destBytesLog2 = 2;
     // Physical address of the base-granularity tile holding (x0, y0): X draw_util.cc:1134-1173 (32x32 texels at 32 bpp, 64x64
     // at 16 bpp, xenos.h:1188-1195).

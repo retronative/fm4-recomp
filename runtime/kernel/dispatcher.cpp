@@ -5,6 +5,7 @@
 // Taken from ForzaRecomp runtime/kernel/dispatcher.cpp (GPL-3.0-or-later, same owner), reviewed and
 // re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: none.
 #include "dispatcher.h"
+#include "diag_waits.h"  // FM4 Recomp: FM4_DIAG_WAITS (diagnostic)
 #include "imports.h"
 #include "thread_state.h"
 #include <chrono>
@@ -161,7 +162,10 @@ uint32_t WaitForObjects(uint8_t* base, const uint32_t* headers, uint32_t count, 
         }
         return all;
     };
-    if (!Block(guard, timeout, ready))
+    diag::WaitBegin(base, headers, count, thread);  // FM4_DIAG_WAITS (diagnostic)
+    const bool woke = Block(guard, timeout, ready);
+    diag::WaitEnd();
+    if (!woke)
         return wait::kTimeout;
     if (!all)
     {

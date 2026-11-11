@@ -159,7 +159,8 @@ inline bool ColorFormatMapped(uint32_t format)
     switch (format)
     {
     case 0: case 1: case 2: case 3: case 4: case 7: case 14: case 15: return true;  // 8_8_8_8, _GAMMA, 2_10_10_10, _FLOAT, 16_16 (R16G16_SNORM), 16_16_16_16_FLOAT, 32_FLOAT, 32_32_FLOAT
-    default: return false;  // 5 16_16_16_16, 6, 10, 12
+    case 5: return true;  // FM4 Recomp (alpha, RT format 5): 16_16_16_16 (R16G16B16A16_SNORM, X vulkan_render_target_cache.cc:1609-1613)
+    default: return false;  // 6, 10, 12
     }
 }
 
@@ -168,9 +169,13 @@ inline bool ColorFormatMapped(uint32_t format)
 // holds as -1..1 (vulkan_command_processor.cc:3755-3774; render_target_cache.cc:188 snorm16_render_target_full_range true).
 // Only the case where that scale is 1 is accepted: 16_16 with bias 5 (FM4's intro, RB_COLOR_INFO
 // 00540340), so no shader scale is emitted; any other bias is refused.
+// FM4 Recomp (alpha, RT format 5): 16_16_16_16 takes any bias (6-bit signed, -32..31): the pixel shader multiplies colour 0 by
+// 2^(bias - 5), exact in float32 (XE_COLOR0_SCALE, shader_glsl.h; X vulkan_command_processor.cc:3757-3774, the scale applied after
+// the alpha test, spirv_shader_translator_rb.cc:831). FM4's post-race draw has bias 0 (RB_COLOR_INFO
+// 00050000), a scale of 1/32: the guest's -32..32 held as SNORM's -1..1.
 inline bool ColorExpBiasAccepted(uint32_t format, int32_t bias)
 {
-    return format == 4 ? bias == 5 : bias == 0;
+    return format == 4 ? bias == 5 : format == 5 ? true : bias == 0;
 }
 
 // The pipeline state of a draw. `vs`/`ps`: the stage's current shaders; the variants (DeriveVariants)
@@ -193,7 +198,8 @@ KeyResult DerivePipelineKey(const DrawStateView& s, const CachedShader& vs, cons
 // neutral), XE_TEXTURE_<s>_SCALE ldexp(1.0, n) for a non-zero exp_adjust (dword 3 bits 13-18, signed),
 // XE_TEXTURE_<s>_LOD_BIAS for a non-zero lod_bias (dword 4 bits 12-21, signed, / 32); the pixel
 // shader's XE_ALPHA_TEST <func> + XE_ALPHA_REF <ref> when RB_COLORCONTROL alpha_test_enable (bit 3)
-// is set (func bits 0-2), XE_COLOR0_GAMMA for colour format 1, XE_COLOR0_7E3 for format 3.
+// is set (func bits 0-2), XE_COLOR0_GAMMA for colour format 1, XE_COLOR0_7E3 for format 3, XE_COLOR0_SCALE 2^(bias - 5) for
+// format 5 with an exponent bias other than 5 (FM4 Recomp, alpha, RT format 5: ColorExpBiasAccepted).
 // Refuses a texture slot whose fetch constant is not a texture (type != 2) or whose dimension
 // (dword 5 bits 9-10) disagrees with the shader's: 2D needs 1 with stacked (dword 1 bit 10) clear,
 // 3D needs 2, cube needs 3 (shader_glsl.h textureDimensions; a stacked 2D fetched as 3D is refused).

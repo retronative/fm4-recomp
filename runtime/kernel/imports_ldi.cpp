@@ -40,12 +40,17 @@ GUEST_IMPORT(LDICreateDecompression, "INFERRED: cabinet SDK LDI interface; VERIF
     // tried at 2^15-2^21); its zips (method 21) are 128 KB-window streams (2^17; tests/ldi). The second word is 0 in
     // every call seen (its meaning, the cabinet SDK's CPU type, is INFERRED); another value, allocation callbacks, or no
     // handle pointer stops (7). The size output is left untouched (FM4 never reads it).
+    // FM4 Recomp: SpeechFacade_default.xex creates {0x8000, 1} with its own allocation callbacks.
+    // The second word 1 is accepted beside 0: as the cabinet SDK's CPU type (286/386) it picks the decoder's code path, not its
+    // output; an LZX stream's own header carries what decoding depends on (window, E8 translation), and every block is still
+    // decoded by the same validating decoder (INFERRED). The callbacks are accepted and not called (APPROXIMATE): the decoder's
+    // state lives in host memory, so the guest allocator is not used, which a caller sees only if it counts its own allocations.
     const uint32_t config = ctx.r4.u32, alloc = ctx.r5.u32, free = ctx.r6.u32, handleOut = ctx.r9.u32;
     const uint32_t window = runtime::Load32(base, config), second = runtime::Load32(base, config + 4);
     uint32_t bits = 15;
     while (bits <= 21 && (1u << bits) != window)
         bits++;
-    if (bits > 21 || second != 0 || alloc || free || handleOut == 0)
+    if (bits > 21 || second > 1 || (alloc == 0) != (free == 0) || handleOut == 0)
         Stop(StopCode::Unimplemented, "LDICreateDecompression(configuration {%08X, %08X}, alloc %08X, free %08X, handle* %08X) is not modelled",
              window, second, alloc, free, handleOut);
     std::lock_guard guard(ldiLock);

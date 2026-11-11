@@ -53,6 +53,7 @@
 #include "kernel/thread_cpu.h"
 #include "kernel/cp_trace.h"
 #include "kernel/graphics.h"
+#include "kernel/av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
 #include "kernel/virtual_memory.h"
 #include <chrono>
 #include <cstdio>
@@ -1676,6 +1677,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                  kNoWriteDraws == NoWriteDraws::Skip ? "recorded as nothing (draw_record.h kNoWriteDraws)" : "(none allowed)",
                  (unsigned long long)resolvesSinceSwap, (unsigned long long)shadersSinceSwap, (unsigned long long)slots[0].allocator->Used(),
                  (unsigned long long)ringFlushesSinceSwap, TextureUnitSummary().c_str());
+    runtime::av::Swap(swap, drawsSinceSwap);  // FM4_DIAG_AV_LATENCY (diagnostic): the UI transition after an A press
     {
         std::string timing;
         uint64_t waits = 0;

@@ -438,8 +438,25 @@ void TestRectClear()
     File g = RectClear();
     g[xr::kRbSurfaceInfo] = 0x0A030280;  // msaa 3
     CONTROL(Decode(g, vs, ps), "msaa_samples 3");
-    g = RectClear(), g[xr::kRbColorInfo] = 0x00050000;  // format 5 (16_16_16_16)
-    CONTROL(Decode(g, vs, ps), "colour format 5");
+    // FM4 Recomp (alpha, RT format 5): RB_COLOR_INFO 00050000 (FM4 after a race):
+    // base 0, format (0x00050000 >> 16) & 0xF = 5 (k_16_16_16_16, 64 bpp: X xenos.h:323-327), bias 0. On the clear's 640-pitch 4X
+    // surface the 32 bpp pitch stays 1280 / 80 = 16 tiles; the colour target's 64 bpp rows are 32 tiles (X xenos.h:474-476, render_
+    // target_cache.h:321-323), so its rows to the depth base are 720 / 32 = 22 tile rows = 176 pixel rows (8 a tile row at 4X); the
+    // depth target's (2048 - 720) / 16 = 83 tile rows = 664; edramRows = min(176, 664) = 176; target height min(176, 0 + 8192) = 176.
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00050000;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 5 && d.target.colorFormatRaw == 5 && d.target.colorExpBias == 0 && d.target.colorBase == 0,
+           "colour format 5 (16_16_16_16) with exponent bias 0 decodes: storage 5, base 0");
+    Expect(d.target.pitchTiles == 16 && d.target.edramRows == 176 && d.target.targetHeight == 176,
+           "a 64 bpp colour target counts its rows at twice the 32 bpp pitch: 176 rows to the depth base");
+    // Any 6-bit bias with 16_16_16_16 (the shader's 2^(bias - 5)): 0x03F50000 = bias field 0x3F = -1.
+    g = RectClear(), g[xr::kRbColorInfo] = 0x03F50000;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 5 && d.target.colorExpBias == -1, "colour format 5 with exponent bias -1 decodes");
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00060000;  // format 6 (16_16_FLOAT): still not modelled
+    CONTROL(Decode(g, vs, ps), "colour format 6");
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00070000;  // format 7 (16_16_16_16_FLOAT, 64 bpp): still not modelled
+    CONTROL(Decode(g, vs, ps), "colour format 7");
     g = RectClear(), g[xr::kRbColorInfo] = 0x000A0000;  // format 10 is storage format 2
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::Draw && d.target.colorFormat == 2 && d.target.colorFormatRaw == 10, "colour format 10 decodes as storage format 2");

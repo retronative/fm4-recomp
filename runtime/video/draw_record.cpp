@@ -162,6 +162,12 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
             psDefines.Add("XE_COLOR0_GAMMA");
         else if (d.target.colorFormat == 3)
             psDefines.Add("XE_COLOR0_7E3");
+        // FM4 Recomp (alpha, RT format 5): a 16_16_16_16 target (R16G16B16A16_SNORM) holds the guest's -32..32 as -1..1: colour 0
+        // times 2^(bias - 5) after the alpha test (X vulkan_command_processor.cc:3757-3774 color_exp_bias -= 5 on the host-render-
+        // target path with snorm16_render_target_full_range, render_target_cache.cc:188; spirv_shader_translator_rb.cc:831). Bias 0
+        // (FM4's) is 1/32; bias 5 is 1 and needs no define (as 16_16's, which accepts only 5).
+        else if (d.target.colorFormat == 5 && d.target.colorExpBias != 5)
+            psDefines.Add("XE_COLOR0_SCALE " + FloatLiteral(std::ldexp(1.0f, d.target.colorExpBias - 5)));
     }
     else
         psDefines.Add("XE_NO_COLOR_OUTPUT");  // no colour attachment (the key's colorUsed is 0): the output is not declared

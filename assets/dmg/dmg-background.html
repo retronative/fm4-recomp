@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later
+     FM4 Recomp DMG window background, 660 x 400 points (assets/dmg/dmg-design.md). Rendered by assets/dmg/render.mjs.
+     Layout after reFrozen assets/dmg (GPL-3.0-or-later): icons at (185, 250) and (475, 250), 128 pt, label plates
+     136 x 32 at y 316 (centred on the label Finder draws, measured) in #697789 (white and black Finder labels both above 4.5:1). Query: ?mock=1&appearance=dark|light
+     draws the icons and labels Finder would draw (review only). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; width: 660px; height: 400px; overflow: hidden; background: #0b0d10; }
+  body { position: relative; font-family: -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif; }
+  .bg {
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse 70% 55% at 50% 64%, rgba(255, 68, 41, 0.13), rgba(255, 68, 41, 0) 70%),
+      radial-gradient(ellipse 90% 80% at 50% 0%, #1d2128 0%, #111317 55%, #0b0d10 100%);
+  }
+  /* carbon weave, very faint */
+  .weave {
+    position: absolute; inset: 0; opacity: 0.35;
+    background-image:
+      repeating-linear-gradient(45deg, rgba(255,255,255,0.025) 0 2px, transparent 2px 6px),
+      repeating-linear-gradient(-45deg, rgba(0,0,0,0.25) 0 2px, transparent 2px 6px);
+  }
+  .logo { position: absolute; left: 50%; top: 14px; width: 252px; transform: translateX(-50%);
+          filter: drop-shadow(0 6px 14px rgba(0,0,0,0.55)); }
+  .rule { position: absolute; left: 230px; width: 200px; top: 172px; height: 1px;
+          background: linear-gradient(90deg, transparent, rgba(255,68,41,0.85), transparent); }
+  /* the drag cue: shaft x 268-394 at y 250 */
+  .cue { position: absolute; left: 262px; top: 232px; width: 140px; height: 36px; }
+  .plate { position: absolute; top: 316px; width: 136px; height: 32px; border-radius: 7px; background: #697789;
+           box-shadow: inset 0 0 0 1px rgba(255,255,255,0.10), 0 1px 3px rgba(0,0,0,0.5); }
+  .note { position: absolute; left: 0; right: 0; top: 356px; text-align: center; color: #c9ced6;
+          font-size: 11.5px; letter-spacing: 0.4px; }
+  .note b { color: #ffffff; font-weight: 600; }
+  /* review mock-up only */
+  .icon { position: absolute; width: 128px; height: 128px; top: 186px; border-radius: 28px; }
+  .label { position: absolute; top: 318px; width: 136px; text-align: center; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="bg"></div>
+  <div class="weave"></div>
+  <img class="logo" src="../fm4-recomp-logo.svg" alt="">
+  <div class="rule"></div>
+  <svg class="cue" viewBox="0 0 140 36" aria-hidden="true">
+    <defs>
+      <linearGradient id="shaft" gradientUnits="userSpaceOnUse" x1="6" y1="18" x2="118" y2="18">
+        <stop offset="0" stop-color="#ff4429" stop-opacity="0.15"/>
+        <stop offset="0.55" stop-color="#ff4429" stop-opacity="0.85"/>
+        <stop offset="1" stop-color="#ff6a4f"/>
+      </linearGradient>
+      <filter id="glow" x="-20%" y="-80%" width="140%" height="260%"><feGaussianBlur stdDeviation="2.4"/></filter>
+    </defs>
+    <g filter="url(#glow)" opacity="0.6"><path d="M6 18H118" stroke="#ff4429" stroke-width="6" stroke-linecap="round"/></g>
+    <path d="M6 18H116" stroke="url(#shaft)" stroke-width="4" stroke-linecap="round"/>
+    <path d="M104 6L132 18L104 30" fill="none" stroke="#ff6a4f" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M58 11L66 18L58 25" fill="none" stroke="#ffffff" stroke-opacity="0.85" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M70 11L78 18L70 25" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <div class="plate" style="left: 117px"></div>
+  <div class="plate" style="left: 407px"></div>
+  <div class="note">Drag <b>FM4 Recomp</b> to Applications, then open it to set up from your own Disc 1.</div>
+  <script>
+    const q = new URLSearchParams(location.search)
+    if (q.get('mock')) {
+      const dark = q.get('appearance') !== 'light'
+      const add = (html) => document.body.insertAdjacentHTML('beforeend', html)
+      add(`<img class="icon" style="left: 121px" src="${q.get('icon') || ''}">`)
+      add(`<div class="icon" style="left: 411px; background: linear-gradient(#64b5f6, #1e88e5); border-radius: 18px;"></div>`)
+      for (const [x, t] of [[117, 'FM4 Recomp'], [407, 'Applications']])
+        add(`<div class="label" style="left: ${x}px; color: ${dark ? '#fff' : '#000'}">${t}</div>`)
+    }
+  </script>
+</body>
+</html>

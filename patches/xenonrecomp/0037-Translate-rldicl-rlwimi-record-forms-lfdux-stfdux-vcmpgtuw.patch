@@ -1,0 +1,106 @@
+From 436f303533af23167aba67e7ae2fccf40fa92a1b Mon Sep 17 00:00:00 2001
+From: Soe Thura <6492082+thixpin@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 16:44:59 +0700
+Subject: [PATCH] Translate rldicl. (and its clrldi./rotldi. aliases), rlwimi.
+ record forms, lfdux, stfdux and vcmpgtuw
+
+---
+ XenonRecomp/recompiler.cpp | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 428377b..5816aa7 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -1312,6 +1312,9 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_CLRLDI:
+         println("\t{}.u64 = {}.u64 & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), (1ull << (64 - insn.operands[2])) - 1);
++        // FM4 Recomp (patch 0037): clrldi. is rldicl. (sh 0): CR0 from the 64-bit result
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_CLRLWI:
+@@ -1830,13 +1833,16 @@ bool Recompiler::Recompile(
+     case PPC_INST_LFSU:
+     case PPC_INST_LFSUX:
+     case PPC_INST_LFDU:
++    case PPC_INST_LFDUX:  // FM4 Recomp (patch 0037): SpeechFacade_default.xex
+     case PPC_INST_STFSU:
+     case PPC_INST_STFSUX:
+     case PPC_INST_STFDU:
++    case PPC_INST_STFDUX:  // FM4 Recomp (patch 0037)
+     {
+         const uint32_t id = insn.opcode->id;
+         const bool indexed = id == PPC_INST_LBZUX || id == PPC_INST_LHZUX || id == PPC_INST_LWZUX || id == PPC_INST_LDUX ||
+-            id == PPC_INST_STBUX || id == PPC_INST_STHUX || id == PPC_INST_STDUX || id == PPC_INST_LFSUX || id == PPC_INST_STFSUX;
++            id == PPC_INST_STBUX || id == PPC_INST_STHUX || id == PPC_INST_STDUX || id == PPC_INST_LFSUX || id == PPC_INST_STFSUX ||
++            id == PPC_INST_LFDUX || id == PPC_INST_STFDUX;
+         const bool gprLoad = id == PPC_INST_LBZUX || id == PPC_INST_LHZU || id == PPC_INST_LHZUX || id == PPC_INST_LHAU ||
+             id == PPC_INST_LWZUX || id == PPC_INST_LDUX;
+         const uint32_t rt = insn.operands[0], ra = insn.operands[indexed ? 1 : 2];
+@@ -1870,6 +1876,7 @@ bool Recompiler::Recompile(
+             println("\t{}.f64 = double({}.f32);", f(rt), temp());
+             break;
+         case PPC_INST_LFDU:
++        case PPC_INST_LFDUX:
+             printSetFlushMode(false);
+             println("\t{}.u64 = PPC_LOAD_U64({});", f(rt), ea());
+             break;
+@@ -1880,6 +1887,7 @@ bool Recompiler::Recompile(
+             println("\t{}_U32({}, {}.u32);", store, ea(), temp());
+             break;
+         case PPC_INST_STFDU:
++        case PPC_INST_STFDUX:
+             printSetFlushMode(false);
+             println("\t{}_U64({}, {}.u64);", store, ea(), f(rt));
+             break;
+@@ -2050,6 +2058,9 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_RLDICL:
+         println("\t{}.u64 = __builtin_rotateleft64({}.u64, {}) & 0x{:X};", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], ComputeMask(insn.operands[3], 63));
++        // FM4 Recomp (patch 0037): the record form sets CR0 from the 64-bit result (PowerPC ISA Book I, 64-bit mode)
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_RLDICR:
+@@ -2067,6 +2078,9 @@ bool Recompiler::Recompile(
+     {
+         const uint64_t mask = ComputeMask(insn.operands[3] + 32, insn.operands[4] + 32);
+         println("\t{}.u64 = (__builtin_rotateleft32({}.u32, {}) & 0x{:X}) | ({}.u64 & 0x{:X});", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2], mask, r(insn.operands[0]), ~mask);
++        // FM4 Recomp (patch 0037): the record form sets CR0 from the 64-bit result (PowerPC ISA Book I, 64-bit mode)
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+     }
+ 
+@@ -2078,6 +2092,9 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_ROTLDI:
+         println("\t{}.u64 = __builtin_rotateleft64({}.u64, {});", r(insn.operands[0]), r(insn.operands[1]), insn.operands[2]);
++        // FM4 Recomp (patch 0037): rotldi. is rldicl. (mb 0): CR0 from the 64-bit result
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());
+         break;
+ 
+     case PPC_INST_ROTLW:
+@@ -2571,6 +2588,14 @@ bool Recompiler::Recompile(
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu8(simde_mm_load_si128((simde__m128i*){}.u8), simde_mm_load_si128((simde__m128i*){}.u8)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         break;
+ 
++    case PPC_INST_VCMPGTUW:
++        // FM4 Recomp (patch 0037): unsigned word compare as a signed compare of both operands with the sign bit flipped
++        // (a > b unsigned <=> (a ^ 0x80000000) > (b ^ 0x80000000) signed); the record form sets CR6 (all / none true).
++        println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epi32(simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(int(0x80000000))), simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(int(0x80000000)))));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
++        if (strchr(insn.opcode->name, '.'))
++            println("\t{}.setFromMask(simde_mm_load_si128((simde__m128i*){}.u8), 0xFFFF);", cr(6), v(insn.operands[0]));
++        break;
++
+     case PPC_INST_VCMPGTUH:
+         println("\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_cmpgt_epu16(simde_mm_load_si128((simde__m128i*){}.u16), simde_mm_load_si128((simde__m128i*){}.u16)));", v(insn.operands[0]), v(insn.operands[1]), v(insn.operands[2]));
+         // the record form sets CR6 (patch 0032)
+-- 
+2.54.0 (Apple Git-157)
+

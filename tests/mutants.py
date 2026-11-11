@@ -55,6 +55,8 @@ TESTS = {
     # the shader cache's load memo). Their binaries compile from runtime/video sources; no GPU work.
     "edram_vk": dict(cmd=["bash", "tests/run_edram_vk_tests.sh"], timeout=300, build=True, ran=r"^(PASS|FAIL): \d+ failure",
                      deps=["tests/run_edram_vk_tests.sh", "tests/runtime/test_edram_vk.cpp", "runtime/video", "runtime/kernel", "scripts/preflight.sh"]),
+    "edram": dict(cmd=["bash", "tests/run_edram_tests.sh"], timeout=300, build=True, ran=r"^(PASS|FAIL): \d+ failure",
+                  deps=["tests/run_edram_tests.sh", "tests/runtime/test_edram.cpp", "runtime/video", "runtime/kernel", "scripts/preflight.sh"]),
     "shader_pipeline": dict(cmd=["bash", "tests/run_shader_pipeline_tests.sh"], timeout=300, build=True, ran=r"^\d+ failure\(s\), \d+ negative control",
                             deps=["tests/run_shader_pipeline_tests.sh", "tests/runtime/test_shader_cache.cpp", "tests/runtime/test_pipeline_cache.cpp",
                                   "runtime/video", "runtime/shader", "runtime/kernel", "scripts/preflight.sh"]),
@@ -1408,6 +1410,20 @@ MUTANTS = [
 
     # ---- M1: patches/xenonrecomp/0034, negative-input check ----
 
+    # ---- M7 (alpha): patches/xenonrecomp/0037 (ours: SpeechFacade's rldicl./rlwimi. record forms, lfdux, stfdux, vcmpgtuw) ----
+    dict(id='P37a', milestone="M7", file=RECOMP, test='translator', fault='rldicl. compares the low 32 bits only',
+         old='        // FM4 Recomp (patch 0037): the record form sets CR0 from the 64-bit result (PowerPC ISA Book I, 64-bit mode)\n        if (strchr(insn.opcode->name, \'.\'))\n            println("\\t{}.compare<int64_t>({}.s64, 0, {});", cr(0), r(insn.operands[0]), xer());\n        break;\n\n    case PPC_INST_RLDICR:',
+         new='        // FM4 Recomp (patch 0037): the record form sets CR0 from the 64-bit result (PowerPC ISA Book I, 64-bit mode)\n        if (strchr(insn.opcode->name, \'.\'))\n            println("\\t{}.compare<int32_t>({}.s32, 0, {});", cr(0), r(insn.operands[0]), xer());\n        break;\n\n    case PPC_INST_RLDICR:',
+         expect='speechfacade_forms'),
+    dict(id='P37b', milestone="M7", file=RECOMP, test='translator', fault='vcmpgtuw as a signed compare',
+         old='simde_mm_cmpgt_epi32(simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(int(0x80000000))), simde_mm_xor_si128(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_set1_epi32(int(0x80000000)))));',
+         new='simde_mm_cmpgt_epi32(simde_mm_load_si128((simde__m128i*){}.u32), simde_mm_load_si128((simde__m128i*){}.u32)));',
+         expect='speechfacade_forms'),
+    dict(id='P37c', milestone="M7", file=RECOMP, test='translator', fault='lfdux does not update rA',
+         old="            id == PPC_INST_LFDUX || id == PPC_INST_STFDUX;",
+         new="            id == PPC_INST_STFDUX;",
+         expect='speechfacade_forms'),
+
     # ---- M1: patches/xenonrecomp/0034 (ours: frsqrte as a double-precision reciprocal square root, accepted policy) ----
     dict(id='P34a', milestone="M1", file=RECOMP, test='translator', fault='rounded through float',
          old='println("\\t{}.f64 = {}.f64 < 0.0 ? __builtin_nan(\\"\\") : 1.0 / sqrt({}.f64);",',
@@ -1985,6 +2001,23 @@ MUTANTS = [
          old='                if (std::memcmp(candidate->microcode.data(), words, size_t(count) * 4) == 0)',
          new='                if (std::memcmp(candidate->microcode.data(), words, size_t(count) * 2) == 0)',
          expect='memo: one word changed in the middle is another program'),
+    # FM4 Recomp (alpha, 64 bpp resolve): the binary16 pack, the 64 bpp store's endian and address, the 64 bpp extent.
+    dict(id='R64a', milestone="M7", file='runtime/video/edram_vk_plan.cpp', test='edram_vk', fault='the binary16 subnormal is shifted one bit too little',
+         old='        const uint32_t significand = mantissa | 0x800000u, shift = uint32_t(14 - e);',
+         new='        const uint32_t significand = mantissa | 0x800000u, shift = uint32_t(13 - e);',
+         expect='out[0] == 0x28000010u && out[1] == 0u'),
+    dict(id='R64b', milestone="M7", file='runtime/video/edram_vk_plan.cpp', test='edram_vk', fault='the 64 bpp store drops the destination endian',
+         old='                    const uint32_t w[2] = {EndianSwap16Pair(packed[0], info.destEndian), EndianSwap16Pair(packed[1], info.destEndian)};',
+         new='                    const uint32_t w[2] = {packed[0], packed[1]};',
+         expect='bytesAt(0, {0x3C, 0x00, 0x50, 0x00, 0xD0, 0x00, 0x00, 0x00})'),
+    dict(id='R64c', milestone="M7", file='runtime/video/edram_vk_plan.cpp', test='edram_vk', fault='the 64 bpp store uses the 32 bpp tiled address',
+         old='        auto address = [&](uint32_t x, uint32_t y) { return TiledOffset2D(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 3); };',
+         new='        auto address = [&](uint32_t x, uint32_t y) { return TiledOffset2D(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2); };',
+         expect='bytesAt(560, {0x4C, 0x00, 0xBC, 0x00, 0x14, 0x00, 0xD0, 0x00})'),
+    dict(id='R64d', milestone="M7", file='runtime/video/edram.cpp', test='edram', fault='the 64 bpp destination extent at 32 bpp',
+         old='        info.destExtentLength = r.copyDestBase + TiledAddressUpperBound2D(info.x1, info.y1, info.destPitch, 3) - info.destExtentStart;',
+         new='        info.destExtentLength = r.copyDestBase + TiledAddressUpperBound2D(info.x1, info.y1, info.destPitch, 2) - info.destExtentStart;',
+         expect='i.destExtentLength == 163840'),
 ]
 
 # Retired from the active registry (mutation-suite audit): proven EQUIVALENT, so no test can kill them and each cost a run in every gate.

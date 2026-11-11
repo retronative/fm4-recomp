@@ -8,7 +8,7 @@
 file(GLOB FM4_KERNEL_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kernel/*.cpp)
 file(GLOB FM4_VIDEO_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/video/*.cpp)
 # shader/shader_glsl.cpp: the Xenos microcode -> GLSL translator (reviewed unit), used by video/shader_cache.cpp.
-add_executable(fm4recomp main.cpp stops.cpp guest_memory.cpp audio_sdl.cpp xma_ffmpeg.cpp ldi_mspack.cpp ${FM4_KERNEL_SOURCES} ${FM4_VIDEO_SOURCES} shader/shader_glsl.cpp ${FM4_GENERATED}/fm4_imports.cpp ${FM4_GENERATED}/fm4_image.h)
+add_executable(fm4recomp main.cpp stops.cpp guest_memory.cpp audio_sdl.cpp xma_ffmpeg.cpp ldi_mspack.cpp ${FM4_KERNEL_SOURCES} ${FM4_VIDEO_SOURCES} shader/shader_glsl.cpp ${FM4_GENERATED}/fm4_imports.cpp ${FM4_GENERATED}/fm4_hooks.cpp ${FM4_GENERATED}/fm4_image.h)
 target_include_directories(fm4recomp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/kernel ${PROJECT_SOURCE_DIR}/recomp ${FM4_GENERATED})
 # SDL3 for the audible audio sink only (audio_sdl.cpp); the runtime tests build kernel/ without it.
 find_package(SDL3 REQUIRED CONFIG)

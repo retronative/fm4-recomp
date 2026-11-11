@@ -164,3 +164,84 @@ GUEST_IMPORT(NtCancelTimer, "REFERENCE_DERIVED: Xenia xboxkrnl_threading.cc NtCa
         Store32(base, stateOut, Load32(base, object->header + dispatch::kSignalState) ? 1 : 0);
     ctx.r3.u64 = status::kSuccess;
 }
+
+// FM4 Recomp: the KTIMER calls SpeechFacade_default.xex makes after a race.
+// Xenia 67f16c4 lists KeInitializeTimerEx, KeSetTimer and KeCancelTimer without implementing them (xboxkrnl_table.inc); the
+// semantics are NT's (INFERRED) over the same timer model as the Nt calls above: the guest's own KTIMER (its dispatcher header
+// first) is the body the timer thread signals.
+namespace runtime {
+namespace {
+uint32_t GuestTimer(uint8_t* base, PPCContext& ctx, const char* import)
+{
+    const uint32_t timer = ctx.r3.u32;
+    if (timer == 0 || timer % 4)
+        Stop(StopCode::GuestFault, "%s(%08X): null or misaligned (lr=%08X)", import, timer, uint32_t(ctx.lr));
+    if (base[timer] != dispatch::kNotificationTimer && base[timer] != dispatch::kSynchronizationTimer)
+        Stop(StopCode::GuestFault, "%s(%08X): not an initialized timer (type %u) (lr=%08X)", import, timer, base[timer], uint32_t(ctx.lr));
+    std::lock_guard guard(timersLock);
+    if (timers.find(timer) == timers.end())
+        Stop(StopCode::GuestFault, "%s(%08X): a timer KeInitializeTimerEx never saw (lr=%08X)", import, timer, uint32_t(ctx.lr));
+    return timer;
+}
+}  // namespace
+}  // namespace runtime
+
+GUEST_IMPORT(KeInitializeTimerEx, "INFERRED: NT KeInitializeTimerEx (KTIMER: dispatcher header type 8 notification / 9 synchronization, unsignalled, not queued); Xenia has none")
+{
+    // (timer*, type 0 notification / 1 synchronization): the 0x28-byte KTIMER cleared, its header typed and unsignalled, the
+    // wait list head pointing at itself; registered unarmed with the timer thread. Another type stops.
+    using namespace runtime;
+    const uint32_t timer = ctx.r3.u32, type = ctx.r4.u32;
+    if (timer == 0 || timer % 4)
+        Stop(StopCode::GuestFault, "KeInitializeTimerEx(%08X): null or misaligned (lr=%08X)", timer, uint32_t(ctx.lr));
+    if (type > 1)
+        Stop(StopCode::Unimplemented, "KeInitializeTimerEx(%08X, type %u): not a notification (0) or synchronization (1) timer", timer, type);
+    std::memset(base + timer, 0, 0x28);
+    base[timer] = type ? dispatch::kSynchronizationTimer : dispatch::kNotificationTimer;
+    Store32(base, timer + 8, timer + 8);
+    Store32(base, timer + 0xC, timer + 8);
+    {
+        std::lock_guard guard(timersLock);
+        timers[timer] = {Clock::time_point::max(), 0, false};
+        if (!timerThreadStarted)
+        {
+            timerBase = base;
+            timerThreadStarted = true;
+            std::thread(TimerThread).detach();
+        }
+    }
+}
+
+GUEST_IMPORT(KeSetTimer, "INFERRED: NT KeSetTimer = KeSetTimerEx(timer, due time, period 0, DPC) (returns whether it was already queued; setting resets the signal); Xenia has none")
+{
+    // (timer*, due time (64 bits, one register: negative relative, positive absolute, 100 ns), DPC*): arms the timer once; it
+    // is signalled at the due time (the timer thread, as NtSetTimerEx). Returns TRUE when the timer was already armed (NT: in
+    // the timer queue). A DPC (deferred procedure call) is not modelled and stops.
+    using namespace runtime;
+    const uint32_t timer = GuestTimer(base, ctx, "KeSetTimer"), dpc = ctx.r5.u32;
+    if (dpc)
+        Stop(StopCode::Unimplemented, "KeSetTimer(%08X) with a DPC (%08X) is not implemented (lr=%08X)", timer, dpc, uint32_t(ctx.lr));
+    bool wasArmed;
+    {
+        std::lock_guard guard(timersLock);
+        wasArmed = timers[timer].armed;
+        ResetEvent(base, timer);
+        timers[timer] = {DueTime(int64_t(ctx.r4.u64)), 0, true};
+    }
+    timersChanged.notify_all();
+    ctx.r3.u64 = wasArmed ? 1 : 0;
+}
+
+GUEST_IMPORT(KeCancelTimer, "INFERRED: NT KeCancelTimer (dequeues; returns whether it was queued; the signal state is kept); Xenia has none")
+{
+    // (timer*): disarms the timer and returns TRUE if it was armed; its signal state is kept (as NtCancelTimer here).
+    using namespace runtime;
+    const uint32_t timer = GuestTimer(base, ctx, "KeCancelTimer");
+    bool wasArmed;
+    {
+        std::lock_guard guard(timersLock);
+        wasArmed = timers[timer].armed;
+        timers[timer].armed = false;
+    }
+    ctx.r3.u64 = wasArmed ? 1 : 0;
+}

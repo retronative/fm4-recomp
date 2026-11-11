@@ -4,6 +4,7 @@
 // File-system imports. Semantics: Xenia xenia-canary 67f16c4e315f,
 // src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc.
 #include "imports.h"
+#include "diag_waits.h"  // FM4 Recomp: FM4_DIAG_WAITS (diagnostic)
 #include "file_system.h"
 #include <algorithm>
 #include "content.h"
@@ -194,6 +195,7 @@ void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t han
     }
     if (entry.directory && (options & kNonDirectoryFile))
         return finish(0xC00000BA, 0, 0xFFFFFFFF);  // STATUS_FILE_IS_A_DIRECTORY (no action written by Xenia: 0 here)
+    runtime::diag::Opened(path.c_str());  // FM4_DIAG_WAITS (diagnostic)
     finish(0, kOpened, runtime::OpenDiscFile(base, entry, (options & kSynchronousIo) != 0));
 }
 
@@ -492,6 +494,7 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
             status = 0xC0000011;  // STATUS_END_OF_FILE
         else
             bytes = runtime::ReadDiscFile(file->entry, offset, base + buffer, length);
+        runtime::diag::ReadBytes(bytes);  // FM4_DIAG_WAITS (diagnostic)
     }
     if (status == 0 && file->synchronous)
         file->position = offset + bytes;

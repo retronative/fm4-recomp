@@ -23,9 +23,11 @@ LLVM=/opt/homebrew/opt/llvm/bin
 # (Xcode is used only for xctrace, through its own DEVELOPER_DIR).
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --show-sdk-path)"
+# The oldest macOS the build runs on (the alpha targets macOS 26 on Apple silicon).
+export MACOSX_DEPLOYMENT_TARGET=26.0
 {
   echo "date $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "SDKROOT $SDKROOT $(xcrun --show-sdk-version)"
+  echo "SDKROOT $SDKROOT $(xcrun --show-sdk-version), deployment target $MACOSX_DEPLOYMENT_TARGET"
   "$LLVM/clang++" --version | head -1
   echo "cmake $(cmake --version | head -1)"
   echo "ninja $(ninja --version)"
@@ -34,7 +36,7 @@ export SDKROOT="$(xcrun --show-sdk-path)"
 cat "$OUT/env.txt"
 : > "$OUT/tu.tsv"
 cmake -S "$ROOT" -B "$ROOT/build/native" -G Ninja -Wno-dev \
-  -DCMAKE_CXX_COMPILER="$LLVM/clang++" -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+  -DCMAKE_CXX_COMPILER="$LLVM/clang++" -DCMAKE_OSX_SYSROOT="$SDKROOT" -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
   -DCMAKE_CXX_COMPILER_LAUNCHER="$ROOT/scripts/measure_tu.sh;$OUT/tu.tsv" > "$OUT/configure.log"
 
 # Combined compiler RSS, sampled until the build ends.

@@ -10,6 +10,8 @@
 //   tests/run_gamma_ramp_tests.sh
 #include "gamma_ramp.h"
 #include <cstdio>
+#include <string>
+#include <vector>
 
 using namespace runtime::gpu::gamma;
 
@@ -212,6 +214,35 @@ void TestApply()
     Expect(pixels[1] == 3u << 30, "frame: black stays black, alpha 3");
 
     Expect(PwlDigest(def.pwl) == PwlDigest(DefaultRamp().pwl) && PwlDigest(def.pwl) != PwlDigest(d.ramp.pwl), "digest: stable, tells ramps apart");
+
+    // FM4 Recomp (the table form of ApplyPwlToFrame): every 10-bit value of every channel against ApplyPwl10 itself, per pixel,
+    // on two ramps (Xenia's default, and one whose three components differ in every entry), with the input alpha bits set to 1
+    // (the output alpha is always 3). Red v, green 1023 - v, blue 7v mod 1024: each channel meets all 1024 values.
+    PwlEntry mixed[128][3];
+    for (uint32_t e = 0; e < 128; e++)
+        for (uint32_t c = 0; c < 3; c++)
+            mixed[e][c] = {uint16_t((e * 0x1C0u + c * 0x2C0u) & 0xFFC0u), uint16_t((0x40u * (1 + (e * 3 + c * 5) % 40)) & 0xFFC0u)};
+    using Pwl = const PwlEntry (*)[128][3];
+    for (Pwl ramp : {Pwl(&def.pwl), Pwl(&mixed)})
+    {
+        std::vector<uint32_t> frame(1024);
+        for (uint32_t v = 0; v < 1024; v++)
+            frame[v] = 1u << 30 | (v * 7 % 1024) << 20 | (1023 - v) << 10 | v;
+        const std::vector<uint32_t> in = frame;
+        ApplyPwlToFrame(frame.data(), frame.size(), *ramp);
+        int wrong = 0;
+        for (uint32_t i = 0; i < 1024; i++)
+        {
+            uint32_t want = 3u << 30;
+            for (uint32_t c = 0; c < 3; c++)
+            {
+                const uint32_t v = (in[i] >> (10 * c)) & 0x3FF;
+                want |= ApplyPwl10(v, (*ramp)[v >> 3][c]) << (10 * c);
+            }
+            wrong += frame[i] != want;
+        }
+        Expect(wrong == 0, "frame: every value of every channel equals ApplyPwl10");
+    }
 }
 }  // namespace
 

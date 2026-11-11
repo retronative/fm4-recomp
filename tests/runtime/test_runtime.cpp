@@ -31,6 +31,8 @@
 #include "kernel/dispatcher.h"
 #include "kernel/imports.h"
 #include "kernel/input_script.h"
+#include "kernel/input_live.h"
+namespace runtime { uint32_t ArmedTimerCountForTests(); }  // kernel/imports_timer.cpp (test hook)
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
 #include "kernel/virtual_memory.h"
@@ -732,6 +734,27 @@ int main(int, char** argv)
         imp("XamInputGetState")(pad, base);
         Expect(pad.r3.u64 == 0x48F && be32(padState) == 0 && be32(padState + 12) == 0 && be32(padState + 16) == 0xAAAAAAAA,
                "XamInputGetState: no controller: the 16-byte state zeroed (nothing past it), ERROR_DEVICE_NOT_CONNECTED");
+        // FM4 Recomp (FM4_INPUT_LIVE, kernel/input_live.h): the keyboard mapping and the SDL conversions, hand-derived from the XInput
+        // layout (Xenia hid/input.h:30-72): W = RT 255, S = LT 255, A = left stick -32768, D = +32767, both = 0; Enter A (0x1000), Space
+        // START (0x10), the up arrow DPAD_UP (1); an SDL Y axis is +down, XInput +up; an SDL trigger of 32767 is 255, 16384 is 127.
+        {
+            input::Keys k;
+            k.w = true, k.a = true, k.enter = true, k.space = true, k.up = true;
+            const input::LiveState s = input::FromKeys(k);
+            Expect(s.rightTrigger == 255 && s.leftTrigger == 0 && s.leftX == -32768 && s.buttons == (0x1000 | 0x10 | 0x1), "live pad: W, A, Enter, Space and up");
+            k.d = true;
+            Expect(input::FromKeys(k).leftX == 0, "live pad: A and D together steer straight");
+            Expect(!(input::FromKeys(k).leftX == -32768), "control: live pad: A and D together are not a left turn");
+            Expect(input::ThumbFromSdl(-32768, true) == 32767 && input::ThumbFromSdl(100, true) == -100 && input::ThumbFromSdl(100, false) == 100 &&
+                       input::TriggerFromSdl(32767) == 255 && input::TriggerFromSdl(16384) == 127 && input::TriggerFromSdl(-5) == 0,
+                   "live pad: SDL axes to XInput thumbs (+Y up) and triggers");
+            input::LiveState pad;
+            pad.buttons = 0x2000, pad.leftTrigger = 40, pad.leftX = 1200;
+            input::Keys only;
+            only.w = true;
+            const input::LiveState m = input::Merge(pad, input::FromKeys(only));
+            Expect(m.buttons == 0x2000 && m.leftTrigger == 40 && m.rightTrigger == 255 && m.leftX == 1200, "live pad: the pad and the keyboard merged");
+        }
         // The scripted gamepad (kernel/input_script.h; FM4_INPUT_SCRIPT). Without a script (this process never loads one)
         // the other input imports are the generated strict stubs (3).
         Expect(!input::ScriptLoaded() && ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0, c.r4.u32 = 1, c.r5.u32 = padState; imp("XamInputGetCapabilities")(c, base); }) == int(StopCode::Import) &&
@@ -946,6 +969,8 @@ int main(int, char** argv)
         };
         Expect(openContent(updatePath) == 2 && ExitCodeOf([&] { (void)openContent(gamePath); }) == int(StopCode::Unimplemented),
                "XamContentOpenFile: an update:\\ file is not found (no title update installed); another path stops (7)");
+        // FM4 Recomp (alpha): the device name in any case (SpeechFacade opens "UPDATE:\\nuisp1033").
+        Expect(openContent(cString("UPDATE:\\nuisp1033")) == 2, "XamContentOpenFile: UPDATE:\\ (upper case) is the title update device too");
         // Notification listeners (kernel/imports_notify.cpp; Xenia xam_notify.cc): FM4's call (mask EF, version 9) gives
         // a listener handle, not signalled, with nothing queued (no startup notifications: policy); XNotifyGetNext
         // then gives 0 with id and data 0; version 11 stops; a handle that is no listener stops.
@@ -1572,7 +1597,22 @@ int main(int, char** argv)
             imp("LDIDestroyDecompression")(destroy, base);
             Expect(created && decoded && destroy.r3.u64 == 0,
                    "LDI: FM4's configuration {80000, 0} -> a 2^19 window; blocks decoded to the size asked, written back; destroy 0");
-            Expect(ExitCodeOf([&] { StoreBigEndian32(base, cfg + 4, 1); (void)create(); }) == int(StopCode::Unimplemented) &&
+            // FM4 Recomp (alpha): SpeechFacade's configuration {8000, 1} with allocation callbacks -> a 2^15 window, a handle, 0; the
+            // callbacks are not called (any guest address works: nothing runs there).
+            {
+                StoreBigEndian32(base, cfg, 0x8000), StoreBigEndian32(base, cfg + 4, 1);
+                PPCContext c{};
+                c.r3.u32 = blockMax, c.r4.u32 = cfg, c.r5.u32 = 0x10, c.r6.u32 = 0x20, c.r9.u32 = handleAt;
+                StoreBigEndian32(base, handleAt, 0);
+                imp("LDICreateDecompression")(c, base);
+                Expect(c.r3.u64 == 0 && seenBits == 15 && be32(handleAt) != 0, "LDI: SpeechFacade's {8000, 1} with callbacks -> a 2^15 window, a handle, 0");
+                PPCContext half{};
+                half.r3.u32 = blockMax, half.r4.u32 = cfg, half.r5.u32 = 0x10, half.r9.u32 = handleAt;
+                Expect(ExitCodeOf([&] { imp("LDICreateDecompression")(half, base); }) == int(StopCode::Unimplemented),
+                       "LDI: an allocation callback without its free callback stops (7)");
+                StoreBigEndian32(base, cfg, 0x80000), StoreBigEndian32(base, cfg + 4, 0);
+            }
+            Expect(ExitCodeOf([&] { StoreBigEndian32(base, cfg + 4, 2); (void)create(); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { StoreBigEndian32(base, cfg, 0x30000); (void)create(); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { (void)decompress(handle, 0x8000); }) == int(StopCode::Unimplemented) &&
                        ExitCodeOf([&] { (void)create(); (void)decompress(be32(handleAt), 0x8001); }) == int(StopCode::Unimplemented) &&
@@ -3700,7 +3740,8 @@ int main(int, char** argv)
         Expect(nuiCallback.r3.u32 == ((1u << 31) | 0x4005), "XAM message 0002C009 (NUI callback registration): E_FAIL (no Kinect events)");
     }
     {
-        // The audio client (kernel/audio.h): 64 callbacks at registration (audio_system.cc:38, :52, :182), then one
+        // The audio client (kernel/audio.h): 16 callbacks at registration (FM4 Recomp default kDefaultQueuedFrames; Xenia's mechanism
+        // audio_system.cc:38, :52, :182 with apu_max_queued_frames 16, its minimum), then one
         // per consumed frame; an empty queue is silence and returns no permit (sdl_audio_driver.cc:130-160).
         const uint32_t code = uint32_t(PPC_CODE_BASE) + 0x30;
         PPC_LOOKUP_FUNC(base, code) = AudioCallback;
@@ -3714,9 +3755,9 @@ int main(int, char** argv)
         audio::SetSink(audio::Sink::External);
         PPCContext reg = none;
         imp("XAudioRegisterRenderDriverClient")(reg, base);
-        Expect(reg.r3.u64 == 0 && be32(driverOut) == 0x41550000 && audio::WaitForCallbacks(64, 5000) && audioArgument == 0x1234ABCD &&
-                   !audio::WaitForCallbacks(65, 200),
-               "audio: register -> driver 0x41550000, exactly 64 callbacks with the wrapped argument (a pointer to 1234ABCD)");
+        Expect(reg.r3.u64 == 0 && be32(driverOut) == 0x41550000 && audio::WaitForCallbacks(16, 5000) && audioArgument == 0x1234ABCD &&
+                   !audio::WaitForCallbacks(17, 200),
+               "audio: register -> driver 0x41550000, exactly 16 callbacks with the wrapped argument (a pointer to 1234ABCD)");
         StoreBigEndian32(base, frame + (1 * 256 + 3) * 4, 0x3F800000);
         PPCContext submit{};
         submit.r3.u32 = 0x41550000, submit.r4.u32 = frame;
@@ -3726,13 +3767,13 @@ int main(int, char** argv)
         imp("XAudioSubmitRenderDriverFrame")(s2, base);
         std::vector<float> out(audio::kFrameFloats);
         const bool first = audio::ConsumeFrame(out.data());
-        const bool played = first && out[3 * 6 + 1] == 1.0f && audio::WaitForCallbacks(65, 5000);
-        const bool second = audio::ConsumeFrame(out.data()) && out[3 * 6 + 1] == 0.0f && audio::WaitForCallbacks(66, 5000);
+        const bool played = first && out[3 * 6 + 1] == 1.0f && audio::WaitForCallbacks(17, 5000);
+        const bool second = audio::ConsumeFrame(out.data()) && out[3 * 6 + 1] == 0.0f && audio::WaitForCallbacks(18, 5000);
         out[0] = 7.0f;
-        const bool silent = !audio::ConsumeFrame(out.data()) && out[0] == 0.0f && !audio::WaitForCallbacks(67, 200);
+        const bool silent = !audio::ConsumeFrame(out.data()) && out[0] == 0.0f && !audio::WaitForCallbacks(19, 200);
         const audio::Counters c = audio::GetCounters();
         Expect(s1.r3.u64 == 0 && s2.r3.u64 == 0 && played && second && silent && c.submitted == 2 && c.consumed == 2 && c.silent == 1 &&
-                   c.callbacks == 66 && c.queued == 0,
+                   c.callbacks == 18 && c.queued == 0,
                "audio: each consumed frame (copied at submission) plays and returns one callback; an empty queue plays silence, no callback");
         PPCContext wrong = submit;
         wrong.r3.u32 = 0x41550001;
@@ -4521,6 +4562,256 @@ int main(int, char** argv)
                "VdSwap: the slot holds type 0 (6 fetch words to 4800, physical base), XE_SWAP {SWAP, physical, 1280, 720}, type-2 fill");
         Store32(base, args + 4, 7);
         Expect(ExitCodeOf([&] { PPCContext c = swap; imp("VdSwap")(c, base); }) == int(StopCode::Unimplemented), "VdSwap: format 7 stops (7)");
+    }
+
+    {
+        // _snprintf / _snwprintf (kernel/imports_strings.cpp): Xenia 67f16c4 xboxkrnl_strings.cc _snprintf_entry :857-894,
+        // _snwprintf_entry :928-966, format_core :120-683; MSDN printf format syntax. Every expected text is hand-derived.
+        // (buffer r3, count r4, format r5, varargs r6.. = argument 3..): arguments 3-7 in r6-r10, argument 8 + k in the
+        // 8-byte big-endian stack slot at r1 + 0x50 + 8k (32-bit value: its low word at r1 + 0x54 + 8k, Xenia
+        // shim_utils.h:51-76 get_arg_stack_ptr/get_arg_32).
+        auto ansi = [&](const char* text) {
+            const uint32_t at = ArenaAlloc(base, uint32_t(std::strlen(text)) + 1);
+            std::memcpy(base + at, text, std::strlen(text) + 1);
+            return at;
+        };
+        auto wide = [&](const std::u16string& text) {
+            const uint32_t at = ArenaAlloc(base, uint32_t(2 * text.size() + 2));
+            for (size_t i = 0; i <= text.size(); i++)
+                Store16(base, at + uint32_t(2 * i), uint16_t(i < text.size() ? text[i] : 0));
+            return at;
+        };
+        const uint32_t out = ArenaAlloc(base, 0x100), frame = ArenaAlloc(base, 0x100);
+        // One call: out filled with AA first (so an untouched byte is visible); the varargs as 64-bit values, the stack ones
+        // written as whole slots. Returns r3 and keeps the context (for the sign-extension check).
+        PPCContext last{};
+        auto call = [&](const char* name, uint32_t buffer, uint32_t count, uint32_t format, std::initializer_list<uint64_t> varargs) {
+            std::memset(base + out, 0xAA, 0x100);
+            PPCContext c{};
+            c.r1.u32 = frame, c.r3.u32 = buffer, c.r4.u32 = count, c.r5.u32 = format;
+            PPCRegister* registers[] = {&c.r6, &c.r7, &c.r8, &c.r9, &c.r10};
+            unsigned i = 0;
+            for (uint64_t v : varargs)
+            {
+                if (i < 5)
+                    registers[i]->u64 = v;
+                else
+                    Store32(base, frame + 0x50 + 8 * (i - 5), uint32_t(v >> 32)), Store32(base, frame + 0x54 + 8 * (i - 5), uint32_t(v));
+                i++;
+            }
+            imp(name)(c, base);
+            last = c;
+            return c.r3.s32;
+        };
+        auto text = [&](uint32_t length) { return std::string(reinterpret_cast<const char*>(base + out), length); };
+        auto sn = [&](uint32_t count, const char* format, std::initializer_list<uint64_t> varargs) { return call("_snprintf", out, count, ansi(format), varargs); };
+
+        Expect(sn(16, "Hello", {}) == 5 && text(6) == std::string("Hello\0", 6) && base[out + 6] == 0xAA,
+               "_snprintf: plain text: 5, terminated, nothing past the terminator");
+        Expect(sn(64, "%d|%i|%d", {uint64_t(-42), 7, 1u << 31}) == 17 && text(18) == std::string("-42|7|-2147483648\0", 18),
+               "_snprintf: %d/%i: -42, 7 and INT32_MIN (-2147483648)");
+        Expect(sn(64, "%u %x %X %08x %-4X|", {0xFFFFFFFFu, 255, 255, 0xBEEF, 0xA}) == 31 && text(32) == std::string("4294967295 ff FF 0000beef A   |\0", 32),
+               "_snprintf: %u of FFFFFFFF, %x/%X of 255, %08x zero-padded, %-4X left-justified");
+        Expect(sn(64, "%5d|%-5d|%05d|%+d|% d", {42, 42, uint64_t(-42), 7, 7}) == 23 && text(24) == std::string("   42|42   |-0042|+7| 7\0", 24),
+               "_snprintf: width, '-', '0' (the sign before the zeros), '+' and ' '");
+        const uint32_t speech = ansi("speech"), abc = ansi("abcdef"), wideWord = wide(u"Wide");
+        Expect(sn(64, "[%s] %c%% %.3s %S|%s", {speech, 'A', abc, wideWord, 0}) == 27 && text(28) == std::string("[speech] A% abc Wide|(null)\0", 28),
+               "_snprintf: %s, %c, %%, %.3s (3 characters), %S (a big-endian wide string), %s of null = (null)");
+        // Stack varargs: arguments 8 and 9 (the 6th and 7th varargs) in the slots at frame + 0x50 and + 0x58, their high words
+        // 5A5A5A5A (a 32-bit argument's undefined upper half). CONTROL: Xenia's StackArgList (get_arg_64 at r1 + 0x54) would
+        // read the high word of the next slot (5A5A5A5A = 1515870810) for the 6th vararg.
+        Expect(sn(64, "%d %d %d %d %d %d %d", {1, 2, 3, 4, 5, 0x5A5A5A5A00000006ull, 0x5A5A5A5A00000007ull}) == 13 &&
+                   text(14) == std::string("1 2 3 4 5 6 7\0", 14) && Load32(base, frame + 0x58) == 0x5A5A5A5Au,
+               "_snprintf: the 6th and 7th varargs from the low words at r1 + 0x54 and r1 + 0x5C (not Xenia's straddling read)");
+        // FM4 Recomp: a 64-bit vararg on the stack is not modelled (its slot is unverified): it stops (7) by name.
+        Expect(ExitCodeOf([&] { (void)sn(64, "%d %d %d %d %d %lld", {1, 2, 3, 4, 5, 0xFFFFFFFFFFFFFFFEull}); }) == int(StopCode::Unimplemented),
+               "_snprintf: a 64-bit %lld passed on the stack stops (7)");
+        // %f: the double's bits are the next 64-bit argument (Xenia :475-476). 1.5 = 3FF8.., -2.25 = C002.., 0.75 = 3FE8..,
+        // 3.125 = 4009.. (no rounding ties).
+        Expect(sn(64, "%f|%.2f|%.0f|%#.0f|%8.3f", {0x3FF8000000000000ull, 0xC002000000000000ull, 0x3FE8000000000000ull, 0x3FE8000000000000ull,
+                                                    0x4009000000000000ull}) == 28 &&
+                   text(29) == std::string("1.500000|-2.25|1|1.|   3.125\0", 29),
+               "_snprintf: %f (6 digits), %.2f of a negative, %.0f, %#.0f keeps the point, %8.3f padded");
+        Expect(sn(64, "%p %#x %#o %#x", {0x1234ABCD, 0x1F, 8, 0}) == 19 && text(20) == std::string("1234ABCD 0x1f 010 0\0", 20),
+               "_snprintf: %p (8 upper-case digits), %#x, %#o (leading 0), %#x of 0 has no 0x");
+        Expect(sn(64, "%hu %hd %lld %I64x %llu", {0x1FFFF, 0xFFFF, 0xFFFFFFFFFFFFFFFEull, 0x123456789Aull, 0xFFFFFFFFFFFFFFFFull}) == 43 &&
+                   text(44) == std::string("65535 -1 -2 123456789a 18446744073709551615\0", 44),
+               "_snprintf: %hu (low 16 bits, zero-extended), %hd, %lld, %I64x, %llu of 2^64 - 1");
+        // Output that does not fit (Xenia :880-892): count = length - 1 copies count characters unterminated and returns -1
+        // (r3 sign-extended); count = length copies them unterminated and returns the length; length + 1 terminates.
+        const uint32_t six = ansi("abcdef");
+        Expect(call("_snprintf", out, 5, six, {}) == -1 && last.r3.u64 == 0xFFFFFFFFFFFFFFFFull && text(5) == "abcde" && base[out + 5] == 0xAA,
+               "_snprintf: 6 characters into 5: the first 5, unterminated, -1 (sign-extended)");
+        Expect(call("_snprintf", out, 6, six, {}) == 6 && text(6) == "abcdef" && base[out + 6] == 0xAA,
+               "_snprintf: 6 characters into exactly 6: copied, unterminated, 6");
+        Expect(call("_snprintf", out, 7, six, {}) == 6 && base[out + 6] == 0 && base[out + 7] == 0xAA, "_snprintf: 6 characters into 7: terminated, 6");
+        Expect(call("_snprintf", out, 0, six, {}) == -1 && base[out] == 0xAA && call("_snprintf", 0, 7, six, {}) == -1 &&
+                   call("_snprintf", out, 7, 0, {}) == -1 && base[out] == 0xAA,
+               "_snprintf: count 0, a null buffer or a null format: -1, nothing written");
+        Expect(sn(16, "ab%", {}) == -1 && base[out] == 0 && base[out + 1] == 0xAA && sn(16, "x%S", {wide(u"Ā")}) == -1 && base[out] == 0,
+               "_snprintf: a format ending inside a conversion, and a wide character above FF in narrow output: -1, the first byte 0");
+        Expect(ExitCodeOf([&] { (void)sn(16, "%n", {frame}); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)sn(16, "%e", {0x3FF8000000000000ull}); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)sn(16, "%Lf", {0x3FF8000000000000ull}); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)sn(16, "%Z", {frame}); }) == int(StopCode::Unimplemented) &&
+                   ExitCodeOf([&] { (void)sn(16, "%f", {0x7FF0000000000000ull}); }) == int(StopCode::Unimplemented) &&
+                   StderrOf([&] { (void)sn(16, "%n", {frame}); }).find("_snprintf: the conversion '%n'") != std::string::npos,
+               "_snprintf: %n, %e, the L size, %Z and a non-finite %f stop (7) by name");
+
+        // _snwprintf: a big-endian UTF-16 format; there %s and %c are wide and %S/%hs narrow (Xenia :347, :560).
+        const uint32_t wfmt = wide(u"%s=%d %S %c|%ls %hs"), ab = ansi("ab");
+        const std::u16string expected = u"Wide=-5 ab ☺|Wide ab";
+        bool same = call("_snwprintf", out, 64, wfmt, {wideWord, uint64_t(-5), ab, 0x263A, wideWord, ab}) == int32_t(expected.size());
+        for (size_t i = 0; i < expected.size(); i++)
+            same = same && Load16(base, out + uint32_t(2 * i)) == uint16_t(expected[i]);
+        Expect(same && expected.size() == 20 && base[out + 22] == 0x26 && base[out + 23] == 0x3A && Load16(base, out + 40) == 0 &&
+                   Load16(base, out + 42) == 0xAAAA,
+               "_snwprintf: wide %s, %d, narrow %S, wide %c (U+263A stored 26 3A), %ls, %hs (the 6th vararg from the stack); 20 units, terminated");
+        Expect(call("_snwprintf", out, 3, wfmt, {wideWord, uint64_t(-5), ab, 0x263A, wideWord, ab}) == -1 && Load16(base, out) == 'W' &&
+                   Load16(base, out + 4) == 'd' && Load16(base, out + 6) == 0xAAAA,
+               "_snwprintf: 20 units into 3: the first 3 (big-endian), unterminated, -1");
+        Expect(call("_snwprintf", 0, 3, wfmt, {}) == -1 && ExitCodeOf([&] { (void)call("_snwprintf", out, 8, wide(u"%n"), {frame}); }) == int(StopCode::Unimplemented),
+               "_snwprintf: a null buffer is -1; %n stops (7)");
+    }
+
+    {
+        // FM4 Recomp (alpha): the imports SpeechFacade_default.xex reaches after a race. Expected values from the
+        // citations in the imports (NT, Xenia 67f16c4), by hand.
+        const uint32_t sem = ArenaAlloc(base, 32);
+        std::memset(base + sem, 0xAA, 32);
+        PPCContext init{};
+        init.r3.u32 = sem, init.r4.u32 = 0, init.r5.u32 = 0x7FFFFFFF;
+        imp("KeInitializeSemaphore")(init, base);
+        Expect(base[sem] == 5 && be32(sem + 4) == 0 && be32(sem + 8) == sem + 8 && be32(sem + 12) == sem + 8 && be32(sem + 16) == 0x7FFFFFFF &&
+                   base[sem + 20] == 0xAA,
+               "KeInitializeSemaphore(count 0, limit 7FFFFFFF): type 5, signal 0, empty wait list, limit at +0x10, nothing past 20 bytes");
+        auto release = [&](uint32_t object, uint32_t adjustment) {
+            PPCContext c{};
+            c.r3.u32 = object, c.r4.u32 = 1, c.r5.u32 = adjustment, c.r6.u32 = 0;
+            imp("KeReleaseSemaphore")(c, base);
+            return c.r3.u32;
+        };
+        Expect(release(sem, 1) == 0 && be32(sem + 4) == 1 && release(sem, 2) == 1 && be32(sem + 4) == 3,
+               "KeReleaseSemaphore: returns the previous count (0, then 1), the count goes 1 then 3");
+        const uint32_t small = ArenaAlloc(base, 32);
+        init.r3.u32 = small, init.r4.u32 = 1, init.r5.u32 = 2;
+        imp("KeInitializeSemaphore")(init, base);
+        Expect(ExitCodeOf([&] { (void)release(small, 2); }) == int(StopCode::Unimplemented) && ExitCodeOf([&] { (void)release(ArenaAlloc(base, 32), 1); }) != 0,
+               "KeReleaseSemaphore: past the limit (1 + 2 > 2) stops (7, NT raises); a zeroed non-semaphore stops");
+
+        const uint32_t timer = ArenaAlloc(base, 0x30);
+        std::memset(base + timer, 0xAA, 0x30);
+        PPCContext t{};
+        t.r3.u32 = timer, t.r4.u32 = 1;
+        imp("KeInitializeTimerEx")(t, base);
+        const uint32_t armedBefore = runtime::ArmedTimerCountForTests();
+        Expect(base[timer] == 9 && be32(timer + 4) == 0 && be32(timer + 8) == timer + 8 && base[timer + 0x28] == 0xAA,
+               "KeInitializeTimerEx(synchronization): type 9, unsignalled, empty wait list, 0x28 bytes");
+        auto setTimer = [&](uint64_t due) { PPCContext c{}; c.r3.u32 = timer, c.r4.u64 = due, c.r5.u32 = 0; imp("KeSetTimer")(c, base); return c.r3.u32; };
+        auto cancel = [&] { PPCContext c{}; c.r3.u32 = timer; imp("KeCancelTimer")(c, base); return c.r3.u32; };
+        // -15 s relative (the call SpeechFacade makes): 0xFFFFFFFFF70F2E80 = -150,000,000 x 100 ns.
+        Expect(setTimer(0xFFFFFFFFF70F2E80ull) == 0 && runtime::ArmedTimerCountForTests() == armedBefore + 1 && setTimer(0xFFFFFFFFF70F2E80ull) == 1 &&
+                   cancel() == 1 && runtime::ArmedTimerCountForTests() == armedBefore && cancel() == 0,
+               "KeSetTimer: FALSE when not armed, TRUE when already armed; KeCancelTimer: TRUE then FALSE, disarmed");
+        Expect(ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = timer, c.r4.u64 = 0xFFFFFFFFF70F2E80ull, c.r5.u32 = 0x1000; imp("KeSetTimer")(c, base); }) ==
+                   int(StopCode::Unimplemented),
+               "KeSetTimer with a DPC stops (7)");
+
+        const uint32_t random = ArenaAlloc(base, 32);
+        std::memset(base + random, 0xAA, 32);
+        PPCContext r{};
+        r.r3.u32 = random, r.r4.u32 = 16;
+        imp("XeCryptRandom")(r, base);
+        bool allSentinel = true;
+        for (uint32_t i = 0; i < 16; i++)
+            allSentinel = allSentinel && base[random + i] == 0xAA;
+        Expect(!allSentinel && base[random + 16] == 0xAA && base[random + 31] == 0xAA, "XeCryptRandom: 16 bytes written (not all the sentinel), none past them");
+
+        const uint32_t words = ArenaAlloc(base, 16);
+        StoreBigEndian32(base, words, 0x11223344), StoreBigEndian32(base, words + 4, 0x11223344), StoreBigEndian32(base, words + 8, 0x55667788);
+        auto cmp = [&](uint32_t length, uint32_t pattern) { PPCContext c{}; c.r3.u32 = words, c.r4.u32 = length, c.r5.u32 = pattern; imp("RtlCompareMemoryUlong")(c, base); return c.r3.u32; };
+        Expect(cmp(12, 0x11223344) == 8 && cmp(7, 0x11223344) == 4 && cmp(12, 0x55667788) == 0,
+               "RtlCompareMemoryUlong: 8 matching bytes then a differing word; length 7 compares 4 bytes; a first mismatch is 0");
+        PPCContext ui{};
+        ui.r3.u32 = 0x1234;
+        imp("XamIsUIActive")(ui, base);
+        Expect(ui.r3.u64 == 0, "XamIsUIActive: no XAM dialog is shown: FALSE");
+
+        // The Rtl string and time family (imports_rtl.cpp). Wide strings big-endian UTF-16.
+        auto wideAt = [&](const char16_t* text) {
+            uint32_t n = 0;
+            while (text[n]) n++;
+            const uint32_t at = ArenaAlloc(base, 2 * n + 2);
+            for (uint32_t i = 0; i <= n; i++) Store16(base, at + 2 * i, uint16_t(text[i]));
+            return at;
+        };
+        auto call = [&](const char* name, std::initializer_list<uint64_t> args) {
+            PPCContext c{};
+            uint64_t* regs[] = {&c.r3.u64, &c.r4.u64, &c.r5.u64, &c.r6.u64, &c.r7.u64};
+            size_t i = 0;
+            for (uint64_t a : args) *regs[i++] = a;
+            imp(name)(c, base);
+            return c.r3.u64;
+        };
+        const uint32_t hi = wideAt(u"Hi!"), narrow = ArenaAlloc(base, 8), count = ArenaAlloc(base, 4);
+        std::memset(base + narrow, 0xAA, 8);
+        Expect(call("RtlUnicodeToMultiByteN", {narrow, 2, count, hi, 6}) == 0 && base[narrow] == 'H' && base[narrow + 1] == 'i' && base[narrow + 2] == 0xAA &&
+                   be32(count) == 2,
+               "RtlUnicodeToMultiByteN: min(6 / 2, 2) = 2 units narrowed (\"Hi\"), written 2, nothing past");
+        Expect(ExitCodeOf([&] { (void)call("RtlUnicodeToMultiByteN", {narrow, 4, 0, wideAt(u"\u00e9"), 2}); }) == int(StopCode::Unimplemented),
+               "RtlUnicodeToMultiByteN: a non-ASCII unit (U+00E9) stops (7: code page)");
+        const uint32_t ustr = ArenaAlloc(base, 8), abc = wideAt(u"abc");
+        Expect(call("RtlInitUnicodeString", {ustr, abc}) == ustr && Load16(base, ustr) == 6 && Load16(base, ustr + 2) == 8 && be32(ustr + 4) == abc &&
+                   call("RtlInitUnicodeString", {ustr, 0}) == ustr && Load16(base, ustr) == 0 && be32(ustr + 4) == 0,
+               "RtlInitUnicodeString: \"abc\" -> length 6, maximum 8, the source buffer; null clears");
+        const uint32_t src = ArenaAlloc(base, 8), dst = ArenaAlloc(base, 8), text = ArenaAlloc(base, 8), buf = ArenaAlloc(base, 8);
+        std::memcpy(base + text, "hello", 6), std::memset(base + buf, 0xAA, 8);
+        Store16(base, src, 5), Store16(base, src + 2, 6), Store32(base, src + 4, text);
+        Store16(base, dst, 0), Store16(base, dst + 2, 4), Store32(base, dst + 4, buf);
+        call("RtlCopyString", {dst, src});
+        Expect(Load16(base, dst) == 4 && std::memcmp(base + buf, "hell", 4) == 0 && base[buf + 4] == 0xAA, "RtlCopyString: min(maximum 4, length 5) = 4 bytes, no terminator");
+        Store16(base, ustr, 6), Store16(base, ustr + 2, 8), Store32(base, ustr + 4, abc);
+        Store16(base, dst, 0), Store16(base, dst + 2, 8);
+        std::memset(base + buf, 0xAA, 8);
+        Expect(call("RtlUnicodeStringToAnsiString", {dst, ustr, 0}) == 0 && std::memcmp(base + buf, "abc", 4) == 0, "RtlUnicodeStringToAnsiString: \"abc\" terminated, 0");
+        Store16(base, dst + 2, 3);
+        std::memset(base + buf, 0xAA, 8);
+        Expect(call("RtlUnicodeStringToAnsiString", {dst, ustr, 0}) == ((2u << 30) | 5) && std::memcmp(base + buf, "ab", 3) == 0 && base[buf + 3] == 0xAA,
+               "RtlUnicodeStringToAnsiString: capacity 3: \"ab\" + terminator, STATUS_BUFFER_OVERFLOW");
+        Expect(ExitCodeOf([&] { (void)call("RtlUnicodeStringToAnsiString", {dst, ustr, 1}); }) == int(StopCode::Unimplemented),
+               "RtlUnicodeStringToAnsiString: allocating the destination stops (7)");
+        Expect(call("RtlUpcaseUnicodeChar", {'a'}) == 'A' && call("RtlUpcaseUnicodeChar", {'1'}) == '1' && call("RtlDowncaseUnicodeChar", {'Z'}) == 'z' &&
+                   ExitCodeOf([&] { (void)call("RtlUpcaseUnicodeChar", {0xE9}); }) == int(StopCode::Unimplemented),
+               "RtlUpcaseUnicodeChar a -> A, 1 -> 1; RtlDowncaseUnicodeChar Z -> z; U+00E9 stops (7)");
+        // 2000-01-01 01:02:03.456 (a Saturday, 6): 145,731 days after 1601-01-01 = 125,911,584,000,000,000 x 100 ns, plus 3,723.456 s
+        // = 37,234,560,000: 125,911,621,234,560,000 (0x01BF53F3D0C78C00).
+        const uint64_t when = 125911621234560000ULL;
+        const uint32_t ft = ArenaAlloc(base, 8), tf = ArenaAlloc(base, 16);
+        Store32(base, ft, uint32_t(when >> 32)), Store32(base, ft + 4, uint32_t(when));
+        call("RtlTimeToTimeFields", {ft, tf});
+        Expect(Load16(base, tf) == 2000 && Load16(base, tf + 2) == 1 && Load16(base, tf + 4) == 1 && Load16(base, tf + 6) == 1 && Load16(base, tf + 8) == 2 &&
+                   Load16(base, tf + 10) == 3 && Load16(base, tf + 12) == 456 && Load16(base, tf + 14) == 6,
+               "RtlTimeToTimeFields: 2000-01-01 01:02:03.456, Saturday (6)");
+        Store32(base, ft, 0), Store32(base, ft + 4, 0);
+        call("RtlTimeToTimeFields", {ft, tf});
+        Expect(Load16(base, tf) == 1601 && Load16(base, tf + 2) == 1 && Load16(base, tf + 4) == 1 && Load16(base, tf + 14) == 1,
+               "RtlTimeToTimeFields: time 0 is 1601-01-01, a Monday (1)");
+        const uint16_t fields[8] = {2000, 1, 1, 1, 2, 3, 456, 0};
+        for (uint32_t i = 0; i < 8; i++) Store16(base, tf + 2 * i, fields[i]);
+        Expect(call("RtlTimeFieldsToTime", {tf, ft}) == 1 && (uint64_t(be32(ft)) << 32 | be32(ft + 4)) == when, "RtlTimeFieldsToTime: the fields back to 125911621234560000");
+        Store16(base, tf + 2, 2), Store16(base, tf + 4, 30);
+        Store32(base, ft, 0x11111111);
+        Expect(call("RtlTimeFieldsToTime", {tf, ft}) == 0 && be32(ft) == 0x11111111, "RtlTimeFieldsToTime: February 30 is FALSE, nothing written");
+
+        // The pool (imports_memory.cpp): 100 bytes -> a 4 KB-aligned block of 4 KB, writable, zero-filled; freed; a second free stops.
+        const uint32_t pool = uint32_t(call("ExAllocatePool", {100}));
+        bool zero = pool != 0 && pool % 4096 == 0;
+        for (uint32_t i = 0; zero && i < 4096; i++) zero = base[pool + i] == 0;
+        if (pool) base[pool + 4095] = 0x5A;
+        Expect(zero && base[pool + 4095] == 0x5A, "ExAllocatePool(100): a zero-filled, writable 4 KB block at a 4 KB boundary");
+        call("ExFreePool", {pool});
+        Expect(ExitCodeOf([&] { (void)call("ExFreePool", {pool}); }) == int(StopCode::GuestFault) && call("ExAllocatePool", {0x1001}) % 4096 == 0,
+               "ExFreePool: a block freed twice stops (2); 0x1001 bytes -> 4 KB-aligned");
     }
 
     std::printf("runtime tests: %d failures\n", failures);

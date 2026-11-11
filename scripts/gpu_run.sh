@@ -209,7 +209,7 @@ elif [ "$RENDERER" != headless ]; then
   fi
   # Negative control first: a deliberate, query-only misuse the layer must report (no device, no GPU work).
   CONTROL="$ROOT/build/native/tests/fm4_validation_control"
-  perl -e 'alarm 30; exec @ARGV' "$CONTROL" > "$OUT/validation_control.log" 2>&1 || true
+  perl -e 'alarm 30; exec { $ARGV[0] } @ARGV' "$CONTROL" > "$OUT/validation_control.log" 2>&1 || true
   grep -q 'VUID-VkPhysicalDeviceProperties2-sType-sType' "$OUT/validation_control.log" ||
     { echo "gpu_run: negative control: the layer did not report the deliberate misuse; nothing runs" >&2; exit 1; }
   echo "validation: negative control reported (VUID-VkPhysicalDeviceProperties2-sType-sType)" | tee "$OUT/validation.txt"
@@ -229,7 +229,7 @@ for i in $(seq 1 "$RUNS"); do
   perl -e '
     my ($deadline, @cmd) = @ARGV;
     my $pid = fork; die "fork: $!" unless defined $pid;
-    if (!$pid) { setpgrp(0, 0); exec @cmd; die "exec: $!\n"; }
+    if (!$pid) { setpgrp(0, 0); exec { $cmd[0] } @cmd; die "exec: $!\n"; }
     $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[launcher] deadline: process group killed\n"; exit 124 };
     alarm $deadline + 30; waitpid $pid, 0; alarm 0;
     my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \

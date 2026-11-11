@@ -56,6 +56,9 @@ MODULES = {
     'default': Module(ROOT / 'config/fm4.toml', ROOT / 'config/switch_tables.toml', ROOT / 'game/survey', ROOT / 'ppc'),
     'xmediafacade': Module(ROOT / 'config/xmediafacade.toml', ROOT / 'config/switch_tables_xmediafacade.toml',
                            ROOT / 'game/modules/xmediafacade/survey', ROOT / 'game/modules/xmediafacade/ppc'),
+    # FM4 Recomp (playable alpha): the module FM4 loads after a race.
+    'speechfacade': Module(ROOT / 'config/speechfacade.toml', ROOT / 'config/switch_tables_speechfacade.toml',
+                           ROOT / 'game/modules/speechfacade/survey', ROOT / 'game/modules/speechfacade/ppc'),
 }
 TOOLS = {
     'xexsurvey': ROOT / 'tools/survey/xexsurvey',

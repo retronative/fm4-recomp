@@ -167,9 +167,12 @@ void TestKeys()
         t = clear, t.target.samples = 8;
         r = KeyFromDrawState(t, vs, ps, 0, 0, out);
         Expect(!r && Has(r.reason, "8 samples"), "8 samples are refused");
-        t = clear, t.target.colorFormat = 5;
+        // FM4 Recomp (alpha, RT format 5): 16_16_16_16 is mapped (R16G16B16A16_SNORM); 6 (16_16_FLOAT) is not.
+        t = clear, t.target.colorFormat = 5, t.target.colorFormatRaw = 5;
+        Expect(KeyFromDrawState(t, vs, ps, 0, 0, out).ok && out.colorUsed == 1 && out.color[0].format == 5, "colour format 5 (16_16_16_16) keys as format 5");
+        t = clear, t.target.colorFormat = 6;
         r = KeyFromDrawState(t, vs, ps, 0, 0, out);
-        Expect(!r && Has(r.reason, "colour format 5"), "an unmapped colour format is refused");
+        Expect(!r && Has(r.reason, "colour format 6"), "an unmapped colour format is refused");
         t = clear, t.colorWriteMask = 0, t.depthStencil = {};
         r = KeyFromDrawState(t, vs, ps, 0, 0, out);
         Expect(!r && Has(r.reason, "no attachment"), "no colour write and no depth/stencil test: refused");
@@ -234,6 +237,25 @@ void TestVariants()
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_GAMMA", "storage format 1: XE_COLOR0_GAMMA");
     d = Ui(), d.target.colorFormat = 3;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_7E3", "storage format 3: XE_COLOR0_7E3");
+    // FM4 Recomp (alpha, RT format 5): 16_16_16_16 scales colour 0 by 2^(bias - 5) (X vulkan_command_processor.cc:3757-3774:
+    // color_exp_bias -= 5 for k_16_16_16_16 on the host-render-target path, then the float with exponent field 127 + bias). By hand:
+    // bias 0 (FM4's RB_COLOR_INFO 00050000) 2^-5 = 1/32 = 0.03125; bias -1 2^-6 = 0.015625; bias 31 2^26 = 67108864 (FloatLiteral
+    // adds ".0" to an integral %.9g); bias 5 2^0 = 1: no define. The define sorts before XE_TEXTURE_0_GAMMA ('C' < 'T').
+    d = Ui(), d.target.colorFormat = 5, d.target.colorFormatRaw = 5, d.target.colorExpBias = 0;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_COLOR0_SCALE 0.03125", "XE_TEXTURE_0_GAMMA"},
+           "storage format 5, bias 0: XE_COLOR0_SCALE 0.03125 (2^-5)");
+    d.target.colorExpBias = -1;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_SCALE 0.015625", "storage format 5, bias -1: 2^-6");
+    d.target.colorExpBias = 31;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines[0] == "XE_COLOR0_SCALE 67108864.0", "storage format 5, bias 31: 2^26");
+    d.target.colorExpBias = 5;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"}, "storage format 5, bias 5: scale 1, no define");
+    d = Ui(), d.target.colorFormat = 4, d.target.colorFormatRaw = 4, d.target.colorExpBias = 5;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA"},
+           "CONTROL-PAIR: storage format 4 (16_16, bias 5) has no XE_COLOR0_SCALE");
+    d = Ui(), d.target.colorFormat = 5, d.target.colorExpBias = 0, d.kind = DrawKind::DepthOnly, d.colorWriteMask = 0;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"},
+           "CONTROL-PAIR: storage format 5 without a colour write: no XE_COLOR0_SCALE");
     d = Ui(), d.target.colorFormat = 1, d.kind = DrawKind::DepthOnly, d.colorWriteMask = 0;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"},
            "DepthOnly: no colour conversion define, and XE_NO_COLOR_OUTPUT (no colour attachment)");

@@ -94,6 +94,8 @@ enum class TransferKind
 // Storage 4 (16_16) as source or destination of Color, DepthToColor and ColorToDepth, with the same rules, through its
 // R16G16_UINT transfer view (X :1628-1653, :3545-3576, :3692-3711; observed: the 1x kD24FS8 key
 // 6082D0 into the 4x 16_16 key 1106B40). Storage 14 (32_FLOAT) stays colour <-> colour only.
+// FM4 Recomp (alpha, RT format 5): storage 5 (16_16_16_16, 64 bpp) is Color to and from every colour storage above and itself at
+// another sample count (MapTransferSource); depth <-> storage 5 is refused by name (not modelled yet).
 TransferKind ClassifyTransfer(edram::Key source, edram::Key dest, std::string& why);
 
 // The guest's 32-bit depth/stencil word from the host's float depth and 8-bit stencil (X :3605-3617): kD24FS8 depth
@@ -149,6 +151,32 @@ SourceTexel MapCrossAspectTexel(uint32_t destX, uint32_t destY, uint32_t destSam
 // (:2956-2987). The GLSL XeSourceTexel (edram_vk.cpp) is the same arithmetic.
 SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
 
+// FM4 Recomp (alpha, RT format 5): MapEdramTexel with 64 bpp keys (storage 5). A 64 bpp tile is 40x16 samples of 8 bytes (X
+// vulkan_render_target_cache.cc:2540-2545 tile width >> dest_is_64bpp; :2912-2913 and :2966-2987 the source's, >> source_is_64bpp;
+// :5554-5556 "treating 64bpp tiles as storing 40x16 samples"), a key's tiles a row PitchTiles() (doubled, X :4823, :5223-5224). Each
+// 64 bpp sample is two 32-bit EDRAM words, low then high, in the dwords a 32 bpp key sees as two horizontally adjacent samples (a 4x
+// source, host sample bit 0) or pixels (1x/2x); X's rules per pair, :2607-2685 (32 -> 64), :2686-2777 (64 -> 32), :2833-2903 (the
+// common Y of a 1x/2x source):
+//   - `first`: the source texel (32 -> 64: of the destination's low word); `second`: 32 -> 64, the texel of its high word (X :3005-3023:
+//     sample | 1 from a 4x source, x | 1 otherwise), else equal to `first`;
+//   - `half`: 64 -> 32, the half of the source sample that is the destination's word (X :2714-2717 the destination's horizontal
+//     sample at 4x, :2771-2774 its horizontal pixel otherwise; :3080-3102 the pick), else 0.
+// For two 32 bpp keys (or two 64 bpp keys) `first` is MapEdramTexel's former result, `second` == `first`, `half` 0. Cross-aspect
+// pairs with a 64 bpp side are refused (ClassifyTransfer). The GLSL XeSourceTexel with XE_SOURCE_64 / XE_DEST_64 (edram_vk.cpp
+// kTransferCommon) and kTransferColor64 are the same arithmetic.
+struct TransferSource
+{
+    SourceTexel first, second;
+    uint32_t half = 0;
+};
+TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
+// FM4 Recomp (alpha, RT format 5): the 32-bit guest word of half `half` of a 64 bpp 16_16_16_16 sample read through its
+// R16G16B16A16_UINT view (X :3080-3102 the half's two components, :3545-3576 the first the low 16 bits): half 0 r | g << 16, half 1
+// b | a << 16. And the sample from its two words (X :3352-3370 "unpack two packed 32-bit parts"): r, g the low word's halves, b, a
+// the high word's. A 64 -> 64 transfer copies the R16G16B16A16_UINT texel itself (X :3254-3273), the same as both composed.
+uint32_t TransferWordOf64(const uint32_t texel[4], uint32_t half);
+void TransferTexelOf64(uint32_t low, uint32_t high, uint32_t texel[4]);
+
 // The 32-bit guest word of a colour as a format-changing transfer packs it (X :3402-3449 for 8_8_8_8:
 // uint(v * 255 + 0.5) per component, R in bits 0-7; :3467-3490 for 2_10_10_10: rgb * 1023, a * 3, R in bits 0-9;
 // :3497-3542 for 7e3: R, G, B through Float32To7e3 at bits 0, 10, 20, alpha uint(NClamp(a, 0, 1) * 3 + 0.5) at bit 30),
@@ -161,6 +189,9 @@ void UnpackTransferColor(uint32_t word, uint32_t storage, float rgba[4]);
 // vulkan_render_target_cache.cc:1628-1653 GetColorOwnershipTransferVulkanFormat: "Floating-point numbers have NaNs ... and
 // SNORM has two representations of -1"): storage 14 (32_FLOAT) -> R32_UINT, storage 4 (16_16) -> R16G16_UINT; the target is
 // created MUTABLE_FORMAT with that view (edram_vk.cpp). VK_FORMAT_UNDEFINED for the rest (they transfer as floats).
+// FM4 Recomp (alpha, RT format 5): storage 5 (16_16_16_16, host R16G16B16A16_SNORM) -> R16G16B16A16_UINT (X :1640-1642), a 64-bit
+// view of a 64-bit format (one Vulkan compatibility class). PackTransferUint / UnpackTransferUint stay 32 bpp (0 for storage 5):
+// a 64 bpp texel is two words (TransferWordOf64, TransferTexelOf64).
 VkFormat TransferViewFormat(edram::ColorFormat storage);
 // The 32-bit guest word of a texel read through a transfer view, and back (the GLSL XePackUint / XeUnpackUint in
 // edram_vk.cpp kTransferPacking are the same): storage 14 the R32_UINT texel itself (X :3579-3585, :3713-3726); storage 4
@@ -314,6 +345,12 @@ bool ResolveSamples(const edram::ResolveInfo& info, uint32_t indices[4], uint32_
 
 // One destination word (before the endian swap) from the guest words of one pixel's samples, indexed by guest sample.
 uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* samplesByGuestIndex);
+// FM4 Recomp (alpha, 64 bpp resolve): the two destination words (before the endian swap), low then high, of a 1x 16_16_16_16 pixel
+// resolved into k_16_16_16_16_FLOAT (32): the sample's EDRAM words `low` (r | g << 16) and `high` (b | a << 16), each component
+// int16 * 32 / 32767 clamped at -32 (as the 16_16 unpack), times 2^destExpBias, red and blue exchanged when destSwap, each packed to
+// IEEE binary16 rounding to nearest even (APPROXIMATE, edram_vk_plan.cpp PackHalf): out[0] = half(r) | half(g) << 16, out[1] =
+// half(b) | half(a) << 16 (X resolve.xesli:368-389, :131-133, :699-704; pixel_formats.xesli:269-277, :373-377).
+void ResolveConvertPixel64(const edram::ResolveInfo& info, uint32_t low, uint32_t high, uint32_t out[2]);
 
 // The checks of the full path that do not need the words: storage 0, 2, 3 or 14 into destination format 6, 7, 36, 50, 54,
 // storage 4 (16_16) into 25 (k_16_16) only (the 32bpp formats DecodeResolve accepts; XePack32bpp4Pixels :205-252); storage
@@ -322,6 +359,10 @@ uint32_t ResolveConvertPixel(const edram::ResolveInfo& info, uint32_t sourceStor
 // FM4 Recomp: a 16 bpp destination (info.destBytesLog2 1) is stored 2 bytes a texel: ResolveConvertPixel's low 16 bits,
 // XeEndianSwap16 (resolve_full_16bpp.xesli:61-63, texture_untile.h EndianSwap16Pair), at TiledOffset2D(destOffsetX + x,
 // destOffsetY + y, destPitch, 1).
+// FM4 Recomp (alpha, 64 bpp resolve): storage 5 (16_16_16_16) into 32 (k_16_16_16_16_FLOAT) only, 1x sample 0, number 7, endian 0
+// or 8in16 (info.destBytesLog2 3): `words` then holds two words a pixel, row-major (the 1x source's R16G16B16A16 texels copied to the
+// buffer), and each pixel's ResolveConvertPixel64 words, EndianSwap16Pair each, are stored low word first at TiledOffset2D(destOffsetX
+// + x, destOffsetY + y, destPitch, 3), 8 bytes.
 bool ResolveFullConvertible(const edram::ResolveInfo& info, uint32_t sourceStorage, std::string& why);
 // Every pixel of the rectangle from `words` (DumpLayoutFor(info.msaa, ...)) into `dest` as ResolveToGuest does; nothing
 // written on a refusal.

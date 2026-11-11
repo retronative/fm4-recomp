@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 390" role="img" aria-labelledby="title">
+  <title id="title">FM4 RECOMP racing circuit logo</title>
+  <defs>
+    <path id="circuit" d="M166 325H504Q529 325 543 305L591 232Q607 207 588 185L530 111Q516 94 495 94H430Q414 94 402 82L373 52Q360 38 339 38H251Q229 38 219 57L199 94Q190 111 171 111H107Q84 111 74 132L47 190Q37 212 51 230L105 298Q127 325 166 325Z"/>
+  </defs>
+  <use href="#circuit" fill="none" stroke="#20242a" stroke-width="18" stroke-linejoin="round"/>
+  <use href="#circuit" fill="none" stroke="#ffffff" stroke-width="7" stroke-linejoin="round"/>
+  <g fill="none" stroke="#000000" stroke-width="7" stroke-dasharray="11 8">
+    <path d="M543 305 591 232Q607 207 588 185"/>
+    <path d="M402 82 373 52Q360 38 339 38H310"/>
+    <path d="M107 111Q84 111 74 132L47 190Q37 212 51 230"/>
+  </g>
+  <g transform="translate(190 151) skewX(-22)" stroke="#20242a" stroke-width="10" stroke-linejoin="round" paint-order="stroke fill">
+    <path fill="#ffffff" d="M0 0H89V16H23V25H75V41H23V69H0Z M96 0H120L145 27 170 0H194V69H172V28L145 57 118 28V69H96Z"/>
+    <path fill="#ff4429" fill-rule="evenodd" d="M251 0H277V43H292V58H277V69H254V58H204V42ZM254 21 227 43H254Z"/>
+  </g>
+  <g transform="translate(205 244) skewX(-22)" fill="#ffffff" fill-rule="evenodd" stroke="#20242a" stroke-width="5" stroke-linejoin="round" paint-order="stroke fill">
+    <path d="M0 0h30q6 0 6 6v5q0 6-6 6h-2l9 8H25l-8-8H9v8H0Zm9 6v5h18V6Z"/>
+    <path d="M46 0h34v6H55v4h21v5H55v4h25v6H46Z"/>
+    <path d="M95 0h29v6H99v13h25v6H95q-5 0-5-5V5q0-5 5-5Z"/>
+    <path d="M139 0h26q6 0 6 6v13q0 6-6 6h-26q-6 0-6-6V6q0-6 6-6Zm3 6v13h20V6Z"/>
+    <path d="M181 0h9l11 11 11-11h9v25h-8V10l-12 12-12-12v15h-8Z"/>
+    <path d="M231 0h30q6 0 6 6v5q0 6-6 6h-21v8h-9Zm9 6v5h18V6Z"/>
+  </g>
+  <path d="M306 318v7h7v7h7v-7h-7v-7Zm14 0v7h7v7h7v-7h-7v-7Z" fill="#000000"/>
+</svg>

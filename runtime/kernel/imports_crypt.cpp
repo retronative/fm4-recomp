@@ -7,6 +7,7 @@
 // count % 64 bytes are meaningful). The state is read and written at every call, so the guest may copy it.
 #include "imports.h"
 #include <algorithm>
+#include <cstdlib>  // arc4random_buf (macOS)
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -420,4 +421,17 @@ GUEST_IMPORT(XeKeysAesCbcUsingKey, "REFERENCE_DERIVED: Xenia xboxkrnl_crypt.cc:6
         }
     }
     ctx.r3.u64 = 0;
+}
+
+// FM4 Recomp: reached by SpeechFacade_default.xex (8 bytes).
+GUEST_IMPORT(XeCryptRandom, "INFERRED: random bytes from the host (arc4random_buf); Xenia 67f16c4 xboxkrnl_crypt.cc:354-357 is a stub filling 0xFD")
+{
+    // (buffer*, size): fills the buffer with random bytes. Xenia's 0xFD fill is a declared stub (kStub), not the console's
+    // behaviour; the console returns random data, which the host's generator provides. A null buffer with a size stops.
+    const uint32_t buffer = ctx.r3.u32, size = ctx.r4.u32;
+    if (size == 0)
+        return;
+    if (buffer == 0)
+        Stop(StopCode::GuestFault, "XeCryptRandom(null, %u) (lr=%08X)", size, uint32_t(ctx.lr));
+    arc4random_buf(base + buffer, size);
 }

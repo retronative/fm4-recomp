@@ -8,6 +8,7 @@
 #include "shader/ucode.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace runtime::video {
@@ -208,6 +209,10 @@ KeyResult DeriveVariants(const DrawStateView& s, const CachedShader& vs, const C
             psDefines.Add("XE_COLOR0_GAMMA");
         else if (format == 3)
             psDefines.Add("XE_COLOR0_7E3");
+        // FM4 Recomp (alpha, RT format 5): 16_16_16_16's -32..32 held as SNORM -1..1: colour 0 times 2^(bias - 5) (pipeline_key.h
+        // ColorExpBiasAccepted; X vulkan_command_processor.cc:3757-3774), exact in float32 for every 6-bit bias.
+        else if (const int32_t bias = runtime::shader::ucode::SignedBits(s.rbColorInfo[0], 20, 6); format == 5 && bias != 5)
+            psDefines.Add("XE_COLOR0_SCALE " + FloatLiteral(std::ldexp(1.0f, bias - 5)));
     }
     return Accept();
 }

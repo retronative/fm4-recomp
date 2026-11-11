@@ -293,7 +293,7 @@ void TestRefusals()
         {"MSAA 4x", [](DrawStateView& s) { s.rbSurfaceInfo |= 2u << 16; }, "msaa_samples 2"},
         {"colour format 4 (16_16) without its bias 5", [](DrawStateView& s) { s.rbColorInfo[0] = 4u << 16; }, "colour exponent bias 0"},
         {"colour format 0 with bias 5", [](DrawStateView& s) { s.rbColorInfo[0] = 5u << 20; }, "colour exponent bias 5"},
-        {"colour format 5 (16_16_16_16)", [](DrawStateView& s) { s.rbColorInfo[0] = 5u << 16; }, "colour format 5"},
+        {"colour format 6 (16_16_FLOAT)", [](DrawStateView& s) { s.rbColorInfo[0] = 6u << 16; }, "colour format 6"},  // FM4 Recomp (alpha, RT format 5): 5 is mapped
         {"colour format 10", [](DrawStateView& s) { s.rbColorInfo[0] = 10u << 16; }, "colour format 10"},
         {"blend factor 2", [](DrawStateView& s) { s.rbBlendControl[0] = 0x00010002; }, "blend factor 2"},
         {"blend factor 3 (dst)", [](DrawStateView& s) { s.rbBlendControl[0] = 0x00010301; }, "blend factor 3"},
@@ -336,6 +336,13 @@ void TestRefusals()
         DrawStateView w = base;
         w.rbColorInfo[0] = 0x00540340;
         Expect(DerivePipelineKey(w, vs, ps, 0, 0, k).ok && k.color[0].format == 4, "colour format 4 (16_16) with exponent bias 5 is accepted");
+        // FM4 Recomp (alpha, RT format 5): 16_16_16_16 with bias 0 (RB_COLOR_INFO 00050000) and with bias -1
+        // (0x03F50000: bits 20-25 = 0x3F) are accepted: the shader scales by 2^(bias - 5) (TestVariants).
+        DrawStateView x = base;
+        x.rbColorInfo[0] = 0x00050000;
+        Expect(DerivePipelineKey(x, vs, ps, 0, 0, k).ok && k.color[0].format == 5, "colour format 5 (16_16_16_16) with exponent bias 0 is accepted");
+        x.rbColorInfo[0] = 0x03F50000;
+        Expect(DerivePipelineKey(x, vs, ps, 0, 0, k).ok && k.color[0].format == 5, "colour format 5 with exponent bias -1 is accepted");
     }
 }
 
@@ -376,6 +383,12 @@ void TestVariants()
         Expect(DeriveVariants(s, vs, ps, v, p).ok && p.lines == std::vector<std::string>{"XE_COLOR0_GAMMA"}, "colour format 1: XE_COLOR0_GAMMA");
         s.rbColorInfo[0] = 3u << 16;
         Expect(DeriveVariants(s, vs, ps, v, p).ok && p.lines == std::vector<std::string>{"XE_COLOR0_7E3"}, "colour format 3: XE_COLOR0_7E3");
+        // FM4 Recomp (alpha, RT format 5): format 5 bias 0 -> 2^(0 - 5) = 0.03125, bias 5 -> 1 (no define); X
+        // vulkan_command_processor.cc:3757-3774.
+        s.rbColorInfo[0] = 5u << 16;
+        Expect(DeriveVariants(s, vs, ps, v, p).ok && p.lines == std::vector<std::string>{"XE_COLOR0_SCALE 0.03125"}, "colour format 5, bias 0: XE_COLOR0_SCALE 0.03125");
+        s.rbColorInfo[0] = 5u << 16 | 5u << 20;
+        Expect(DeriveVariants(s, vs, ps, v, p).ok && p.lines.empty(), "colour format 5, bias 5: no define");
         s.rbColorMask = 0;
         Expect(DeriveVariants(s, vs, ps, v, p).ok && p.lines.empty(), "no colour write: no colour define");
     }

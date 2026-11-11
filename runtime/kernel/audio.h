@@ -24,7 +24,15 @@ namespace runtime::audio {
 
 constexpr uint32_t kSampleRate = 48000, kChannels = 6, kChannelSamples = 256;
 constexpr uint32_t kFrameFloats = kChannels * kChannelSamples, kFrameBytes = kFrameFloats * 4;
-constexpr uint32_t kQueuedFrames = 64;   // permits a client starts with (Xenia apu_max_queued_frames default)
+constexpr uint32_t kQueuedFrames = 64;   // the most permits a client may start with (Xenia apu_max_queued_frames default)
+// FM4 Recomp: the default is 16 frames (85 ms, Xenia's minimum), not
+// Xenia's 64, so a new sound is not 336 ms late; a game hitch longer than ~85 ms plays silence (seen once, 8 frames).
+constexpr uint32_t kDefaultQueuedFrames = 16;
+// FM4 Recomp (opt-in FM4_AUDIO_QUEUED_FRAMES=<16..64>): the permits a client
+// starts with and their maximum, as Xenia's apu_max_queued_frames cvar (audio_system.cc:38, :52: "Allows changing max buffered audio
+// frames to reduce audio delay. Minimum is 16."). The guest keeps the queue full, so every sound waits this many frames (5.33 ms each)
+// before it is played (FM4_DIAG_AV_LATENCY: 63 frames = 336 ms). Default kDefaultQueuedFrames.
+uint32_t QueuedFrames();
 constexpr uint32_t kMaxQueued = 256;     // frames waiting for the output before the run stops (not in Xenia)
 constexpr uint32_t kDriverTag = 0x41550000;  // driver handle = tag | client index (xboxkrnl_audio.cc:77)
 

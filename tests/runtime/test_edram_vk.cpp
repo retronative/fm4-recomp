@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>  // FM4 Recomp (alpha, 64 bpp resolve): TestResolve64
 #include <string>
 #include <vector>
 
@@ -1491,6 +1492,112 @@ void TestK16_16()
     CONTROL(DecodeColorClearUint(0x7FFF8001u, 2, k));
 }
 
+// FM4 Recomp (alpha, RT format 5): 16_16_16_16 (storage 5, 64 bpp), FM4's post-race target
+// (RB_COLOR_INFO 00050000). Every texel expectation is derived from the EDRAM layout, not from MapTransferSource: a tile row is 80
+// dwords; a 32 bpp 1x key has one dword a pixel, a 32 bpp 4x key's pixel (x, y) host sample h has dword column 2x + (h & 1) and
+// row 2y + (h >> 1) (X vulkan_render_target_cache.cc:2597-2598: host sample bit 0 horizontal); a 64 bpp sample is two dwords, low
+// then high (X :5554-5556: 40x16 samples of 8 bytes a tile; :3352-3370 the low word first), so a 64 bpp 1x pixel x has columns 2x,
+// 2x + 1 and a 64 bpp 4x pixel (x, y) sample h has 2(2x + (h & 1)) and + 1, row 2y + (h >> 1). Xenia's own tables (X :2611-2627,
+// :2648-2662, :2692-2707 "D p.. = S .."), where they exist, give the same answers; they are cited next to the checks.
+void TestK16_16_16_16()
+{
+    std::string why;
+    // Host formats (X :1609-1613, :1640-1642).
+    CHECK(HostColorFormat(ColorFormat::k16_16_16_16) == VK_FORMAT_R16G16B16A16_SNORM);
+    CHECK(TransferViewFormat(ColorFormat::k16_16_16_16) == VK_FORMAT_R16G16B16A16_UINT);
+    CONTROL(HostColorFormat(ColorFormat::k16_16_16_16_Float) != VK_FORMAT_UNDEFINED);  // 7: still refused (edram::SupportedKey)
+
+    // Keys: base 0, 16 tiles a row at 32 bpp (32 at 64 bpp); 1x, 2x, 4x.
+    const Key c5b = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16), c5a = Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_16_16);
+    const Key c5h = Key::Color(0, 16, Msaa::X2, ColorFormat::k16_16_16_16), c4b = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16);
+    const Key f32 = Key::Color(0, 16, Msaa::X1, ColorFormat::k32_Float), c0a = Key::Color(0, 16, Msaa::X4, ColorFormat::k8_8_8_8);
+    CHECK(c5b.Is64bpp() && c5b.PitchTiles() == 32 && c5b.Width() == 1280 && c5a.Width() == 640);
+    // Classification: colour <-> colour with any 32 bpp storage and between 64 bpp keys of another sample count.
+    CHECK(ClassifyTransfer(kBc0, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, kBc0, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(kAc, c5a, why) == TransferKind::Color && ClassifyTransfer(c5a, kBc2, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(kA7, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, kB7, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(c4b, c5a, why) == TransferKind::Color && ClassifyTransfer(c5a, c4b, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(f32, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, f32, why) == TransferKind::Color);
+    CHECK(ClassifyTransfer(c5a, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, c5h, why) == TransferKind::Color);
+    CONTROL(ClassifyTransfer(c5b, c5b, why) != TransferKind::Refused);  // a key as its own source
+    // Named stops: depth <-> 64 bpp, and the other 64 bpp formats.
+    CHECK(ClassifyTransfer(kBd, c5b, why) == TransferKind::Refused && why.find("64 bpp") != std::string::npos);
+    CHECK(ClassifyTransfer(c5a, kAd, why) == TransferKind::Refused && why.find("64 bpp") != std::string::npos);
+    CHECK(ClassifyTransfer(c5b, Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16_Float), why) == TransferKind::Refused);
+
+    auto is = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
+    // 32 -> 64, 4x -> 4x: 64 bpp 4x pixel (0, 0) host sample 1 = dwords 2(0 + 1) = 2, 3 of row 0 = 32 bpp 4x pixel 1, samples 0 and 1
+    // (X :2611-2627 "D p0,0 s1,0 = S p1,0 s0,0 | S p1,0 s1,0"); sample 3 = row 1: pixel 1, samples 2 and 3 ("D p0,0 s1,1").
+    TransferSource m = MapTransferSource(0, 0, 1, c0a, c5a);
+    CHECK(is(m.first, 1, 0, 0) && is(m.second, 1, 0, 1) && m.half == 0);
+    m = MapTransferSource(0, 0, 3, c0a, c5a);
+    CHECK(is(m.first, 1, 0, 2) && is(m.second, 1, 0, 3));
+    // 32 -> 64, 4x -> 1x: 64 bpp 1x pixel (0, 1) = dwords 0, 1 of row 1 = 4x pixel (0, 0), samples 2 and 3 (X :2648-2662 "D p0,1 =
+    // S p0,0 s0,1 | S p0,0 s1,1").
+    m = MapTransferSource(0, 1, 0, c0a, c5b);
+    CHECK(is(m.first, 0, 0, 2) && is(m.second, 0, 0, 3));
+    // 32 -> 64, 1x -> 4x: 64 bpp 4x pixel (1, 0) host sample 3 = dwords 2(2 + 1) = 6, 7 of row 1 = 1x pixels (6, 1), (7, 1).
+    m = MapTransferSource(1, 0, 3, kBc0, c5a);
+    CHECK(is(m.first, 6, 1, 0) && is(m.second, 7, 1, 0));
+    // 32 -> 64, 1x -> 1x across tiles and rows, pitch 7 at 32 bpp (14 at 64 bpp): 64 bpp pixel 45 is pixel 5 of 40-pixel tile 1 =
+    // dwords 10, 11 of EDRAM tile 1 = 32 bpp pixels 80 + 10, 80 + 11; 64 bpp row 16 starts tile 14 = the 32 bpp key's row 2 (tiles
+    // 14-20), pixel row 32.
+    const Key p32 = Key::Color(0, 7, Msaa::X1, ColorFormat::k8_8_8_8), p64 = Key::Color(0, 7, Msaa::X1, ColorFormat::k16_16_16_16);
+    m = MapTransferSource(45, 0, 0, p32, p64);
+    CHECK(is(m.first, 90, 0, 0) && is(m.second, 91, 0, 0));
+    m = MapTransferSource(0, 16, 0, p32, p64);
+    CHECK(is(m.first, 0, 32, 0) && is(m.second, 1, 32, 0));
+    CONTROL(is(MapTransferSource(0, 16, 0, p32, p64).first, 0, 16, 0));  // the 32 bpp pitch would put it on the same row
+    // 64 -> 32, the inverse: 32 bpp pixel 91 = dword 11 of tile 1 = 64 bpp pixel 40 + 5, high half; pixel row 32 = tile 14 = the 64 bpp
+    // key's row 1 (tiles 14-27), pixel row 16, low half.
+    m = MapTransferSource(91, 0, 0, p64, p32);
+    CHECK(is(m.first, 45, 0, 0) && m.half == 1 && is(m.second, 45, 0, 0));
+    m = MapTransferSource(0, 32, 0, p64, p32);
+    CHECK(is(m.first, 0, 16, 0) && m.half == 0);
+    // 64 -> 32, 4x -> 4x: 32 bpp 4x pixel (1, 0) host sample 1 = dword 3 of row 0 = 64 bpp pixel 0, sample 1, high half (X :2692-2707
+    // "D p1,0 s1,0 = S s1,0 high"); pixel (0, 0) sample 1 = dword 1: pixel 0, sample 0, high ("D p0,0 s1,0 = S s0,0 high").
+    m = MapTransferSource(1, 0, 1, c5a, c0a);
+    CHECK(is(m.first, 0, 0, 1) && m.half == 1);
+    m = MapTransferSource(0, 0, 1, c5a, c0a);
+    CHECK(is(m.first, 0, 0, 0) && m.half == 1);
+    // 64 -> 32, 4x -> 1x: 32 bpp 1x pixel (6, 1) = dword 6 of row 1 = 2(2x + (h & 1)) + half with 2x + (h & 1) = 3, half 0, and
+    // row 2y + (h >> 1) = 1: 64 bpp 4x pixel (1, 0), sample 1 | 2 = 3, low half.
+    m = MapTransferSource(6, 1, 0, c5a, kBc0);
+    CHECK(is(m.first, 1, 0, 3) && m.half == 0);
+    // 64 -> 32, 1x -> 4x: 32 bpp 4x pixel (3, 0) host sample 2 = dword 6 of row 1 = 64 bpp 1x pixel (3, 1), low half.
+    m = MapTransferSource(3, 0, 2, c5b, c0a);
+    CHECK(is(m.first, 3, 1, 0) && m.half == 0);
+    // 64 -> 64, 4x -> 1x: 64 bpp 1x pixel (41, 1) = 8-byte column 1 of tile 1, row 1 = 64 bpp 4x pixel (0, 0) of tile 1 (20 pixels a
+    // tile), sample 1 | 2 = 3: (20, 0, 3); the same-bpp rule (X :2804-2818) on 64 bpp tiles.
+    m = MapTransferSource(41, 1, 0, c5a, c5b);
+    CHECK(is(m.first, 20, 0, 3) && is(m.second, 20, 0, 3) && m.half == 0);
+    // Two 32 bpp keys keep the 32 bpp layout: 4x pixel (1, 0) host sample 3 = dword column 2 + 1 = 3, row 0 + 1 = 1 = 1x pixel (3, 1);
+    // the second texel is the first and no half is picked.
+    m = MapTransferSource(1, 0, 3, kBc0, c0a);
+    CHECK(is(m.first, 3, 1, 0) && is(m.second, 3, 1, 0) && m.half == 0 && is(MapEdramTexel(1, 0, 3, kBc0, c0a), 3, 1, 0));
+
+    // The words (X :3080-3102 the half's two components, :3545-3576 r | g << 16; :3352-3370 the four halves back).
+    const uint32_t t4[4] = {0x1111u, 0x2222u, 0x3333u, 0x4444u};
+    CHECK(TransferWordOf64(t4, 0) == 0x22221111u && TransferWordOf64(t4, 1) == 0x44443333u);
+    CONTROL(TransferWordOf64(t4, 1) == 0x22221111u);
+    uint32_t u[4] = {9, 9, 9, 9};
+    TransferTexelOf64(0x22221111u, 0x44443333u, u);
+    CHECK(u[0] == 0x1111u && u[1] == 0x2222u && u[2] == 0x3333u && u[3] == 0x4444u);
+    // Both SNORM -1 encodings and +1 pass as integers (X :1633-1635 "SNORM has two representations of -1").
+    const uint32_t neg[4] = {0x8000u, 0x8001u, 0x7FFFu, 0u};
+    CHECK(TransferWordOf64(neg, 0) == ((0x8001u << 16) | 0x8000u) && TransferWordOf64(neg, 1) == 0x00007FFFu);
+    // 0 -> 5: the 8_8_8_8 word 0x44332211 (TestPack) as the low word -> r 0x2211, g 0x4433.
+    const float v8[4] = {0x11 / 255.0f, 0x22 / 255.0f, 0x33 / 255.0f, 0x44 / 255.0f};
+    TransferTexelOf64(PackTransferColor(v8, 0), 0, u);
+    CHECK(u[0] == 0x2211u && u[1] == 0x4433u && u[2] == 0 && u[3] == 0);
+    // No 32-bit word and no resolve or value clear for storage 5 (fail closed: Clear stops by name, ValueClear copies instead).
+    CHECK(PackTransferUint(t4, 5) == 0);
+    uint32_t k[4] = {9, 9, 9, 9};
+    CONTROL(DecodeColorClearUint(0x12345678u, 5, k));
+    PendingClear pc;
+    CONTROL(ValueClear(c5b, 0, edram::Rect{0, 0, 40, 16}, pc));
+}
+
 // The 16_16 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 4
 // (storage 4), 4x, sample select 6 (k0123), into texture format 25 (k_16_16) with number 3, exp bias 10, no swap, endian 1
 // (k8in16). The registers are a stand-in of that shape (the run logs no raw values): a 32x32 rectangle of a pitch-80
@@ -2115,6 +2222,114 @@ void TestClearValueOwnership()
     CONTROL(ValueClear(c2, 0xC0020180u, edram::Rect{0, 0, 0, 512}, pc));
 }
 
+// FM4 Recomp (alpha, 64 bpp resolve): a 1x 16_16_16_16 source (storage 5) into texture format 32 (k_16_16_16_16_FLOAT), number 7,
+// endian 8in16 (FM4's shape) on Float32Resolve's 32x32 rectangle. Every
+// expected value by hand: the unpack int16 * c with c = fl(32 / 32767) = 2^-10 (1 + 2^-15) (TestRg16Resolve's derivation; pixel_formats
+// .xesli:373-377, the -32 clamp as the 16_16 unpack), the bias factor 2^bias (resolve.xesli:131-133), IEEE binary16 (1 sign, 5 exponent
+// bits biased by 15, 10 fraction bits; subnormals in units of 2^-24) rounded to nearest (every value below sits far from a tie), the
+// pack r | g << 16, b | a << 16 (pixel_formats.xesli:269-277), 8in16 per 16-bit half (xenos.h:200-207), the 8-byte tiled address
+// (texture_util.cc:443-458 with bpp_log2 3).
+void TestResolve64()
+{
+    std::string why;
+    const edram::ResolveRegisters regs = [] {
+        edram::ResolveRegisters r = Float32Resolve(1 | 32u << 7 | 7u << 13);
+        r.colorInfo[0] = 0x00050000;  // RB_COLOR_INFO format 5, base 0
+        return r;
+    }();
+    const edram::ResolveInfo info = edram::DecodeResolve(regs);
+    CHECK(info.ok && info.source == Key::Color(0, 1, Msaa::X1, ColorFormat::k16_16_16_16) && info.destFormat == 32 && info.destNumber == 7 &&
+          info.destEndian == 1 && info.destBytesLog2 == 3 && info.x1 == 32 && info.y1 == 32);
+    // The extent: TiledOffset2D(0, 0) + (0x400 << 3) = 8192 = 32 * 32 * 8 (texture_util.cc:490-517).
+    CHECK(info.destBase == 0x10000000u && info.destExtentStart == info.destBase && info.destExtentLength == 8192);
+    CHECK(!ResolveUsesFastPath(info, 5) && ResolveFullConvertible(info, 5, why));
+    CONTROL(ResolveConvertible(info, 5, why));  // never bitwise equivalent (X xenos.h:612-641)
+    CONTROL(ResolveFullConvertible(info, 4, why));  // the read-back storage must be the key's
+    {
+        edram::ResolveInfo w = info;
+        w.destFormat = 25;  // storage 5 only into 32
+        CONTROL(ResolveFullConvertible(w, 5, why));
+        w = info, w.destBytesLog2 = 2;  // not DecodeResolve's 64 bpp layout
+        CONTROL(ResolveFullConvertible(w, 5, why));
+        w = info, w.destEndian = 2;
+        CONTROL(ResolveFullConvertible(w, 5, why));
+        w = info, w.msaa = Msaa::X2;
+        CONTROL(ResolveFullConvertible(w, 5, why));
+    }
+    // The fast paths stay off: no resident pair, no GPU words for a 64 bpp layout (resolve_resident.h, ResolveWordsToGuest).
+    CONTROL(ResidentConvertible(5, 32, 3) || ResidentFormatPair(32, 32));
+
+    // One pixel, ResolveConvertPixel64 (words before the endian swap).
+    uint32_t out[2] = {};
+    // r 0x0400: 1024 c = 1 + 2^-15 -> 1.0 = 0x3C00 (exponent 15); g 0x7FFF: 32767 c = 32 - 2^-25 -> the float 32.0 (ulp 2^-19 below 32)
+    // -> 2^5 = 0x5000; b 0x8001: -32 likewise, clamped -32 -> 0xD000; a 0 -> 0.
+    ResolveConvertPixel64(info, 0x7FFF0400u, 0x00008001u, out);
+    CHECK(out[0] == 0x50003C00u && out[1] == 0x0000D000u);
+    CONTROL(out[1] == 0x0000BC00u);  // Xenia 67f16c4's max(-1, ...) clamp (pixel_formats.xesli:373-377) would give -1.0
+    CONTROL(out[0] == 0xFFFFFFFFu);  // the UNORM pack of k_16_16_16_16 (XePackR16G16B16A16UNorm, :149-152): not this format
+    // r 0x4000: 16384 c = 16 + 2^-11 -> 16.0 = 0x4C00 (half ulp at 16 is 2^-7); g 0xFC00: -(1 + 2^-15) -> -1.0 = 0xBC00; b 1: c =
+    // 2^-10 (1 + 2^-15) -> exponent 5, fraction 0 = 0x1400; a 0x8000: -32 (1 + 2^-15), clamped -32 -> 0xD000.
+    ResolveConvertPixel64(info, 0xFC004000u, 0x8000u << 16 | 1u, out);
+    CHECK(out[0] == 0xBC004C00u && out[1] == 0xD0001400u);
+    {
+        edram::ResolveInfo b = info;
+        b.destExpBias = 1;  // factor 2: r 2 + 2^-14 -> 2.0 = 0x4000; g 64 = 0x5400; b 0xFC00: -2 = 0xC000
+        ResolveConvertPixel64(b, 0x7FFF0400u, 0x0000FC00u, out);
+        CHECK(out[0] == 0x54004000u && out[1] == 0x0000C000u);
+        b.destExpBias = -10;  // factor 2^-10: r 1 unit: 2^-20 (1 + 2^-15) = 16 units of 2^-24, a subnormal 0x0010; g 32 * 2^-10 = 2^-5 = 0x2800
+        ResolveConvertPixel64(b, 0x7FFF0001u, 0, out);
+        CHECK(out[0] == 0x28000010u && out[1] == 0u);
+        CONTROL(out[0] == 0x28000000u);  // the subnormal flushed to zero
+        b.destExpBias = 31;  // r 1024 units: 2^31 (1 + 2^-15) is above 65504: infinity 0x7C00
+        ResolveConvertPixel64(b, 0x00000400u, 0, out);
+        CHECK(out[0] == 0x00007C00u);
+        b = info, b.destSwap = true;  // .bgra before the pack (resolve.xesli:699-704): r 1.0 and b 16.0 exchanged
+        ResolveConvertPixel64(b, 0x00000400u, 0x00004000u, out);
+        CHECK(out[0] == 0x00004C00u && out[1] == 0x00003C00u);
+    }
+
+    // The rectangle (two words a pixel, row-major): every pixel (1.0, 1.0, 1.0, 1.0), 0x3C00 each, after 8in16 the bytes 3C 00 four
+    // times, except (0, 0), (1, 0) and (2, 3). Their 8-byte tiled offsets (texture_util.cc:443-458, pitch 32, bpp_log2 3): (0, 0) 0;
+    // (1, 0): micro 1 << 3 = 8 -> 8; (2, 3): micro (2 + ((3 & 0xE) << 2)) << 3 = 80, offset ((80 & ~0xF) << 1) + 0 + (1 << 4) = 176,
+    // mix (176 & 0x1C0) << 2 = 512 + (176 & 0x3F) = 48 -> 560 (the 32 bpp offset of (2, 3) is 280, TestRg16Resolve).
+    std::vector<uint32_t> words(32 * 32 * 2, 0x04000400u);
+    words[0] = 0x7FFF0400u, words[1] = 0x00008001u;           // (0, 0): (1, 32, -32, 0)
+    words[2] = 0x00000400u, words[3] = 0;                     // (1, 0): (1, 0, 0, 0)
+    words[(3 * 32 + 2) * 2] = 0xFC004000u, words[(3 * 32 + 2) * 2 + 1] = 0x8000u << 16 | 1u;  // (2, 3)
+    std::vector<uint8_t> dest(info.destExtentLength, 0xEE);
+    CHECK(ResolveConvertToGuest(info, 5, words.data(), dest.data(), uint32_t(dest.size()), why));
+    auto bytesAt = [&](uint32_t offset, std::initializer_list<uint8_t> want) {
+        uint32_t k = 0;
+        for (uint8_t b : want)
+            if (dest[offset + k++] != b)
+                return false;
+        return true;
+    };
+    // 0x50003C00 -> 8in16 0x0050003C, little-endian 3C 00 50 00; 0x0000D000 -> 0x000000D0: D0 00 00 00 (each half big-endian).
+    CHECK(bytesAt(0, {0x3C, 0x00, 0x50, 0x00, 0xD0, 0x00, 0x00, 0x00}));
+    CHECK(bytesAt(8, {0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}));
+    CHECK(bytesAt(560, {0x4C, 0x00, 0xBC, 0x00, 0x14, 0x00, 0xD0, 0x00}));
+    CONTROL(WordAt(dest, 0) == 0x50003C00u);   // without the 8in16 swap
+    CONTROL(bytesAt(280, {0x4C, 0x00, 0xBC, 0x00}));  // (2, 3) at its 32 bpp address
+    // Every other 8-byte slot holds the filler: the 1,024 tiled addresses of the 32x32 tile are exactly the multiples of 8 below 8192.
+    uint32_t filler = 0;
+    for (uint32_t o = 0; o < 8192; o += 8)
+        filler += o != 0 && o != 8 && o != 560 && bytesAt(o, {0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00});
+    CHECK(filler == 1021);
+    // Endian 0: no swap, the words as packed (00 3C 00 50 ...).
+    {
+        edram::ResolveInfo e0 = info;
+        e0.destEndian = 0;
+        std::vector<uint8_t> d0(8192, 0xEE);
+        CHECK(ResolveConvertToGuest(e0, 5, words.data(), d0.data(), 8192, why) && d0[0] == 0x00 && d0[1] == 0x3C && d0[2] == 0x00 && d0[3] == 0x50);
+    }
+    // A destination one byte short: refused before any store.
+    std::vector<uint8_t> shortDest(8191, 0xEE);
+    CONTROL(ResolveConvertToGuest(info, 5, words.data(), shortDest.data(), uint32_t(shortDest.size()), why));
+    CHECK(shortDest[0] == 0xEE && shortDest[8] == 0xEE);
+    CONTROL(ResolveWordsToGuest(info, 5, words.data(), shortDest.data(), uint32_t(shortDest.size()), why));  // GPU words: 32 or 16 bpp only
+}
+
 int main()
 {
     TestFormats();
@@ -2141,7 +2356,9 @@ int main()
     TestDepthResolveVk();
     TestDepth4xTo2x();
     TestK16_16();
+    TestK16_16_16_16();  // FM4 Recomp (alpha, RT format 5)
     TestRg16Resolve();
+    TestResolve64();  // FM4 Recomp (alpha, 64 bpp resolve)
     TestResident1616();
     TestK88Resolve();
     TestResolveWords16ToGuest();

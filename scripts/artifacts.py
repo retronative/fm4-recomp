@@ -6,6 +6,7 @@
   /opt/homebrew/bin/python3 -I scripts/artifacts.py inventory            # sizes by class (read-only)
   /opt/homebrew/bin/python3 -I scripts/artifacts.py plan                 # dry run: writes a manifest
   /opt/homebrew/bin/python3 -I scripts/artifacts.py plan --captures frame-ring[,keep-frames] [--keep s1,s2]
+  /opt/homebrew/bin/python3 -I scripts/artifacts.py plan --evidence metal-trace,profile-xml,shader-dumps,saves [--milestone mN] [--before N] [--keep s1,s2]
   /opt/homebrew/bin/python3 -I scripts/artifacts.py apply --manifest F --approve ID
 
 Method: dry run first, a
@@ -24,6 +25,11 @@ keep-frames). A run qualifies when its scenario directory carries a .retention.j
 evidence), its log <run>.err lies beside the captures (the recorded result stays) and the scenario
 is not named in --keep. Only files of the chosen classes go; the directory, the logs, the shader
 dumps, traces, user-data and every other file stay.
+Old run evidence (traces, profile XML, shader dumps and saves of old runs; only with `plan --evidence`): in a research/m<N>/scenario<K>/ directory that is marked (.retention.json) and
+keeps a run log (run/*.err), the classes metal-trace (<scenario>/*.trace bundles), profile-xml (<scenario>/*.xml exported from
+them), shader-dumps (<scenario>/shaders, <scenario>/run/shaders) and saves (<scenario>/user-data, the archived save after a run).
+--before K limits it to scenarios numbered below K; --keep names scenarios left out. Run logs, result notes and every other file
+stay, and only scenario<K> directories qualify (named saves such as save_c14 never do).
 Never candidates: anything else under research/ (evidence), ppc/, game/, tools/, sources, the
 gate's scratch sources and XenonRecomp build (they keep the next run incremental), the harness
 caches (capped by size-based eviction instead), unmarked data. Nothing is touched while a gate, a
@@ -181,6 +187,59 @@ def capture_candidates(root, classes, keep):
     return items
 
 
+EVIDENCE_CLASSES = ("metal-trace", "profile-xml", "shader-dumps", "saves")
+SCENARIO_RE = re.compile(r"^research/m\d+/scenario(\d+)$")
+
+
+def evidence_paths(scenario_dir, cls):
+    """The paths of class `cls` in a scenario directory (absolute)."""
+    out = []
+    names = sorted(os.listdir(scenario_dir))
+    if cls == "metal-trace":
+        out = [os.path.join(scenario_dir, n) for n in names if n.endswith(".trace") and os.path.isdir(os.path.join(scenario_dir, n))]
+    elif cls == "profile-xml":
+        out = [os.path.join(scenario_dir, n) for n in names if n.endswith(".xml") and os.path.isfile(os.path.join(scenario_dir, n))]
+    elif cls == "shader-dumps":
+        out = [p for p in (os.path.join(scenario_dir, "shaders"), os.path.join(scenario_dir, "run", "shaders")) if os.path.isdir(p)]
+    elif cls == "saves":
+        out = [p for p in (os.path.join(scenario_dir, "user-data"),) if os.path.isdir(p)]
+    return [p for p in out if not os.path.islink(p)]
+
+
+def evidence_scenario_ok(root, rel_scenario):
+    """Why this scenario's old evidence may not be planned or deleted, or None."""
+    if not SCENARIO_RE.match(rel_scenario):
+        return "not research/m<N>/scenario<K>"
+    p = os.path.join(root, rel_scenario)
+    if os.path.islink(p) or not os.path.isdir(p):
+        return "symlink or gone"
+    if marker(p) is None:
+        return "scenario has no .retention.json"
+    run = os.path.join(p, "run")
+    if not (os.path.isdir(run) and any(n.endswith(".err") for n in os.listdir(run))):
+        return "no run log in the scenario"
+    return None
+
+
+def evidence_candidates(root, classes, keep, before=None, milestone=None):
+    items = []
+    research = os.path.join(root, "research")
+    for ms in sorted(os.listdir(research)) if os.path.isdir(research) else []:
+        if not re.match(r"^m\d+$", ms) or (milestone is not None and ms != milestone):
+            continue
+        for scenario in sorted(os.listdir(os.path.join(research, ms))):
+            rel_s = "research/%s/%s" % (ms, scenario)
+            m = SCENARIO_RE.match(rel_s)
+            if not m or scenario in keep or (before is not None and int(m.group(1)) >= before) or evidence_scenario_ok(root, rel_s):
+                continue
+            for cls in classes:
+                for p in evidence_paths(os.path.join(root, rel_s), cls):
+                    items.append(dict(path=os.path.relpath(p, root), kind="evidence", classes=[cls], inode=os.stat(p).st_ino,
+                                      bytes=size(p) if os.path.isdir(p) else os.path.getsize(p),
+                                      reason="old run evidence (%s) of a marked scenario with its run log" % cls))
+    return items
+
+
 def manifest_id(items):
     canon = json.dumps([[i["path"], i["inode"], i["bytes"], i.get("kind"), i.get("classes")] for i in items], sort_keys=True)
     return hashlib.sha256(canon.encode()).hexdigest()[:12]
@@ -205,6 +264,25 @@ def validate(root, it):
     """Why this manifest item may not be deleted now, or None."""
     rel = it["path"]
     p = os.path.join(root, rel)
+    if it.get("kind") == "evidence":
+        if os.path.isabs(rel) or ".." in rel.split("/"):
+            return "absolute path or escape"
+        cls = (it.get("classes") or [None])[0]
+        if cls not in EVIDENCE_CLASSES:
+            return "unknown evidence class"
+        scenario = "/".join(rel.split("/")[:3])
+        why = evidence_scenario_ok(root, scenario)
+        if why:
+            return why
+        if not os.path.lexists(p):
+            return "gone"
+        if os.path.islink(p):
+            return "symlink"
+        if p not in evidence_paths(os.path.join(root, scenario), cls):
+            return "not a %s path of its scenario" % cls
+        if os.stat(p).st_ino != it["inode"]:
+            return "replaced since the plan (inode changed)"
+        return None
     if it.get("kind") == "captures":
         if os.path.isabs(rel):
             return "absolute path"
@@ -249,8 +327,9 @@ def cmd_inventory(root):
     return 0
 
 
-def cmd_plan(root, out, captures=(), keep=()):
-    items = candidates(root) + (capture_candidates(root, captures, set(keep)) if captures else [])
+def cmd_plan(root, out, captures=(), keep=(), evidence=(), before=None, milestone=None):
+    items = candidates(root) + (capture_candidates(root, captures, set(keep)) if captures else []) \
+        + (evidence_candidates(root, evidence, set(keep), before, milestone) if evidence else [])
     mid = manifest_id(items)
     for it in items:
         print("candidate %-40s %12s  %s" % (it["path"], mib(it["bytes"]), it["reason"]))
@@ -294,6 +373,15 @@ def cmd_apply(root, manifest, approve, audit, patterns=None):
                     os.remove(f)
                 freed += n
                 result = "deleted %d files (%s), directory kept" % (len(files), mib(n))
+            elif why is None and it.get("kind") == "evidence":
+                p = os.path.join(root, it["path"])
+                n = size(p) if os.path.isdir(p) else os.path.getsize(p)
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+                freed += n
+                result = "deleted"
             elif why is None:
                 n = size(os.path.join(root, it["path"]))
                 shutil.rmtree(os.path.join(root, it["path"]))
@@ -318,19 +406,26 @@ def main(argv=None):
     ap.add_argument("--approve")
     ap.add_argument("--captures", help="plan: capture classes to list under research/, comma-separated: %s"
                     % ", ".join(CAPTURE_CLASSES))
-    ap.add_argument("--keep", default="", help="plan --captures: scenario directory names left out, comma-separated")
+    ap.add_argument("--keep", default="", help="plan --captures/--evidence: scenario directory names left out, comma-separated")
+    ap.add_argument("--evidence", help="plan: old run evidence classes, comma-separated: %s" % ", ".join(EVIDENCE_CLASSES))
+    ap.add_argument("--before", type=int, help="plan --evidence: only scenarios numbered below this")
+    ap.add_argument("--milestone", help="plan --evidence: only research/<milestone> (e.g. m5)")
     a = ap.parse_args(argv)
     root = os.path.abspath(a.root)
     captures = [c for c in (a.captures or "").split(",") if c]
     if any(c not in CAPTURE_CLASSES for c in captures):
         print("unknown capture class; known: %s" % ", ".join(CAPTURE_CLASSES), file=sys.stderr)
         return 2
+    evidence = [c for c in (a.evidence or "").split(",") if c]
+    if any(c not in EVIDENCE_CLASSES for c in evidence):
+        print("unknown evidence class; known: %s" % ", ".join(EVIDENCE_CLASSES), file=sys.stderr)
+        return 2
     if a.command == "inventory":
         return cmd_inventory(root)
     if a.command == "plan":
         out = a.out or os.path.join(root, "research", "storage",
                                     "plan-%s.json" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-        return cmd_plan(root, out, captures, [k for k in a.keep.split(",") if k])
+        return cmd_plan(root, out, captures, [k for k in a.keep.split(",") if k], evidence, a.before, a.milestone)
     if not (a.manifest and a.approve):
         print("apply needs --manifest and --approve", file=sys.stderr)
         return 2

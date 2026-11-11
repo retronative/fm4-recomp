@@ -13,8 +13,13 @@
 #include "imports.h"
 #include "graphics.h"
 #include "input_script.h"
+#include "input_live.h"  // FM4 Recomp: FM4_INPUT_LIVE
+#include "av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -29,6 +34,23 @@ std::unique_ptr<runtime::input::Poller> poller;  // null: no script, no pad
 std::string scriptPath;
 long logged = -1;       // the last event reported in the log
 uint64_t rumbles = 0;
+// FM4 Recomp (FM4_INPUT_LIVE, input_live.h): the live pad, updated by the window loop; its packet number counts its changes.
+bool live = false;
+runtime::input::LiveState liveState;
+uint32_t livePacket = 0;
+// A pad on user 0: the script's or the live one (lock held).
+bool Connected() { return poller != nullptr || live; }
+uint16_t lastButtons = 0;  // the previous state returned to user 0 (FM4_DIAG_AV_LATENCY, APresses)
+std::atomic<uint64_t> aPresses{0};
+void NoteButtons(uint16_t buttons)
+{
+    if ((buttons & runtime::input::button::kA) && !(lastButtons & runtime::input::button::kA))
+    {
+        aPresses.fetch_add(1, std::memory_order_relaxed);
+        runtime::av::APressed(runtime::gpu::VblankCount());
+    }
+    lastButtons = buttons;
+}
 
 // Xenia xam_input.cc:107-110 (GetState), :67-70 (GetCapabilitiesEx), :156-159 (GetKeystroke): a query that names
 // device types (low byte) without the gamepad bit is for another device: not connected.
@@ -66,6 +88,29 @@ void NotifyRaceStart(uint64_t vblank)
                      (unsigned long long)vblank, poller->script().race.size());
 }
 
+void EnableLive()
+{
+    std::lock_guard guard(lock);
+    live = true;
+    std::fprintf(stderr, "[input] live pad on user 0 (FM4_INPUT_LIVE=1): an SDL gamepad and the keyboard (A/D steer, W throttle, S brake, arrows d-pad, "
+                         "Enter A, Backspace/Escape B, X, Y, Space START, Tab BACK, Q/E shoulders, C right thumb)\n");
+}
+
+bool LiveEnabled()
+{
+    std::lock_guard guard(lock);
+    return live;
+}
+
+uint64_t APresses() { return aPresses.load(std::memory_order_relaxed); }
+
+void SetLiveState(const LiveState& state)
+{
+    std::lock_guard guard(lock);
+    if (!(state == liveState))
+        liveState = state, livePacket++;
+}
+
 bool ScriptLoaded()
 {
     std::lock_guard guard(lock);
@@ -87,10 +132,41 @@ GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-121; a 
     if (state)
         std::memset(base + state, 0, 16);
     std::lock_guard guard(lock);
-    if (poller == nullptr || index != 0 || OtherDevice(flags))
+    // FM4 Recomp (diagnostic, FM4_DIAG_INPUT=1): every distinct caller (lr) with its user index and flags, once, then a count of
+    // calls by caller every 600 vblanks, to see which code reads the pad in a phase (e.g. the pre-race video).
+    if (static const bool diag = std::getenv("FM4_DIAG_INPUT") && std::getenv("FM4_DIAG_INPUT")[0] == '1'; diag)
+    {
+        static std::map<uint64_t, uint64_t> calls;
+        static uint64_t window = 0;
+        const uint64_t key = uint64_t(uint32_t(ctx.lr)) << 32 | (index & 0xFF) << 24 | (flags & 0xFFFFFF);
+        if (calls[key]++ == 0)
+            std::fprintf(stderr, "[diag input] XamInputGetState(user %u, flags %08X, state %08X) first called from lr %08X at vblank %llu\n", index, flags, state,
+                         uint32_t(ctx.lr), (unsigned long long)runtime::gpu::VblankCount());
+        if (const uint64_t w = runtime::gpu::VblankCount() / 600; w != window)
+        {
+            for (const auto& [k, n] : calls)
+                std::fprintf(stderr, "[diag input] vblanks %llu-%llu: lr %08X user %u flags %06X: %llu call(s)\n", (unsigned long long)window * 600,
+                             (unsigned long long)window * 600 + 599, uint32_t(k >> 32), uint32_t(k >> 24) & 0xFF, uint32_t(k) & 0xFFFFFF, (unsigned long long)n);
+            calls.clear(), window = w;
+        }
+    }
+    if (!Connected() || index != 0 || OtherDevice(flags))
         return (void)(ctx.r3.u64 = kErrorDeviceNotConnected);
     if (state == 0)
         Stop(StopCode::Unimplemented, "XamInputGetState(user 0, flags %u) without a state pointer while a pad is connected is not modelled", flags);
+    if (poller == nullptr)  // FM4 Recomp (FM4_INPUT_LIVE): the live pad, thumbs included (hid/input.h:57-72)
+    {
+        runtime::Store32(base, state, livePacket);
+        runtime::Store16(base, state + 4, liveState.buttons);
+        base[state + 6] = liveState.leftTrigger;
+        base[state + 7] = liveState.rightTrigger;
+        runtime::Store16(base, state + 8, uint16_t(liveState.leftX));
+        runtime::Store16(base, state + 10, uint16_t(liveState.leftY));
+        runtime::Store16(base, state + 12, uint16_t(liveState.rightX));
+        runtime::Store16(base, state + 14, uint16_t(liveState.rightY));
+        NoteButtons(liveState.buttons);
+        return (void)(ctx.r3.u64 = 0);
+    }
     {
         const runtime::input::Report report = poller->Poll(runtime::gpu::VblankCount());
         // FM4 Recomp: indices past the first list are the @race list's (input_script.h Poller::Poll); its "nothing held yet" state
@@ -110,6 +186,7 @@ GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-121; a 
         }
         runtime::Store32(base, state, report.packet);
         runtime::Store16(base, state + 4, report.buttons);
+        NoteButtons(report.buttons);
         base[state + 6] = report.leftTrigger;
         base[state + 7] = report.rightTrigger;
     }
@@ -153,7 +230,7 @@ GUEST_IMPORT(XamInputGetCapabilities, "REFERENCE_DERIVED: Xenia xam_input.cc:85-
 {
     // (user index, flags, X_INPUT_CAPABILITIES*): see Capabilities. Without a script this is the generated strict stub.
     std::lock_guard guard(lock);
-    if (poller == nullptr)
+    if (!Connected())
         PpcImportStop("XamInputGetCapabilities", ctx);
     Capabilities(ctx, base, 1, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32);
 }
@@ -162,7 +239,7 @@ GUEST_IMPORT(XamInputGetCapabilitiesEx, "REFERENCE_DERIVED: Xenia xam_input.cc:4
 {
     // (unknown, user index, flags, X_INPUT_CAPABILITIES*): see Capabilities. Without a script this is the generated strict stub.
     std::lock_guard guard(lock);
-    if (poller == nullptr)
+    if (!Connected())
         PpcImportStop("XamInputGetCapabilitiesEx", ctx);
     Capabilities(ctx, base, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32);
 }
@@ -176,7 +253,7 @@ GUEST_IMPORT(XamInputSetState, "REFERENCE_DERIVED: Xenia xam_input.cc:126-146 (a
     // which the log says once (never silently). Without a script this is the generated strict stub.
     const uint32_t index = ctx.r3.u32, vibration = ctx.r5.u32;
     std::lock_guard guard(lock);
-    if (poller == nullptr)
+    if (!Connected())
         PpcImportStop("XamInputSetState", ctx);
     if (index >= 4)
         return (void)(ctx.r3.u64 = (1u << 31) | (7u << 16) | kErrorDeviceNotConnected);
@@ -185,7 +262,7 @@ GUEST_IMPORT(XamInputSetState, "REFERENCE_DERIVED: Xenia xam_input.cc:126-146 (a
     if (index != 0)
         return (void)(ctx.r3.u64 = kErrorDeviceNotConnected);
     if (rumbles++ == 0)
-        std::fprintf(stderr, "[input] XamInputSetState: rumble (left %04X, right %04X) accepted and discarded: the scripted pad has no motors (reported once)\n",
+        std::fprintf(stderr, "[input] XamInputSetState: rumble (left %04X, right %04X) accepted and discarded: the pad has no motors (reported once)\n",
                      runtime::Load32(base, vibration) >> 16, runtime::Load32(base, vibration) & 0xFFFF);
     ctx.r3.u64 = 0;
 }

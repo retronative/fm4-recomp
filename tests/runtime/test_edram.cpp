@@ -139,7 +139,11 @@ void TestTileMath()
     CHECK(SupportedKey(kAc, why) && SupportedKey(kAd, why) && SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k8_8_8_8), why));
     CHECK(SupportedKey(Key::Depth(0, 16, Msaa::X1, DepthFormat::D24S8), why));
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), why));  // 2x (the local capture draw_bases2 (not distributed)'s HDR resolve)
-    CONTROL(SupportedKey(k64, why));
+    // FM4 Recomp (alpha, RT format 5): k_16_16_16_16 (storage 5) is accepted at 1x, 2x and 4x; the other 64 bpp formats are not.
+    CHECK(SupportedKey(k64, why) && SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_16_16), why) &&
+          SupportedKey(Key::Color(0, 8, Msaa::X2, ColorFormat::k16_16_16_16), why));
+    CONTROL(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16_Float), why));
+    CHECK(why.find("64 bpp") != std::string::npos);
     CHECK(SupportedKey(Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), why) &&
           SupportedKey(Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), why));  // storage 3 (7e3)
     CHECK(SupportedKey(Key::Color(832, 16, Msaa::X1, ColorFormat::k16_16), why));  // FM4 Recomp: observed in FM4
@@ -607,10 +611,28 @@ void TestBindCases()
     b = Bind(o, r, 360);
     CONTROL(b.ok);
     CHECK(b.refusal.find("unknown") != std::string::npos);
+    {
+        // FM4 Recomp (alpha, RT format 5): k_16_16_16_16 (64 bpp) at colour base 0 with the scene's depth at 720, 360 rows, on a fresh map
+        // (X render_target_cache.cc:844-857): length at 32 bpp ceil((360 << 1) / 16) * 16 = 720; the smallest distance "as if 64 bpp"
+        // (:819-827) is min(4096, (720 - 0) << 0 (the 64 bpp colour below), (2048 + 0 - 720) << 1 = 2656) = 720; colour (64 bpp, shift
+        // 1): min(720 << 1, 720 >> 0, 720 - 0) = 720; depth (32 bpp): min(720, 720 >> 1, 2048 + 0 - 720) = 360. The key: 0 | 16 << 11 |
+        // 2 << 19 | 5 << 22 = 0x1508000.
+        r = Fm4Bind();
+        r.colorInfo[0] = 0x00050000;
+        Ownership scratch;
+        b = Bind(scratch, r, 360);
+        const Key k64 = Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_16_16);
+        CHECK(k64.packed == 0x1508000u && k64.PitchTiles() == 32 && k64.Width() == 640);
+        CHECK(b.ok && b.color[0] == k64 && b.depth == kAd && b.lengthTiles[1] == 720 && b.lengthTiles[0] == 360);
+        CHECK(scratch.Count(k64) == 720 && scratch.Count(kAd) == 360 && scratch.At(719) == k64 && scratch.At(720) == kAd && scratch.At(1079) == kAd &&
+              scratch.At(1080).Empty());
+        CHECK(b.transfers[0].empty() && b.transfers[1].empty());
+    }
     r = Fm4Bind();
-    r.colorInfo[0] = 0x00050000;  // k_16_16_16_16: 64 bpp, outside the whitelist
+    r.colorInfo[0] = 0x00070000;  // k_16_16_16_16_FLOAT: 64 bpp, outside the whitelist
     b = Bind(o, r, 360);
     CONTROL(b.ok);
+    CHECK(b.refusal.find("64 bpp") != std::string::npos);
     {
         // 2x MSAA binds (on a copy): pitch 640 at 2x is 640 / 80 = 8 tiles a row, 2x tiles are 80x8 pixels.
         Ownership copy = o;
@@ -770,8 +792,10 @@ void TestTrace10()
     r.depthControl = 0x1;
     b = Bind(o, r, 360);
     CHECK(b.ok && b.depth == kAd);
-    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 5-9,
+    // Exactly these keys are accepted: every other colour format on either surface is refused (formats 6-9,
     // 11, 13, 15 at the 4x pitch; 2x MSAA; the 1x pitch with 64 bpp); 3 and 12 (7e3, storage 3), 4 (16_16, FM4 Recomp) and 14 are accepted.
+    // FM4 Recomp (alpha, RT format 5): 5 (16_16_16_16) too: on the 1280-pitch 1x surface with depth at 720 and 720 rows, colour claims
+    // min(720 << 1, 720 >> 0, 720) = 720 tiles and depth min(720, 720 >> 1, 1328) = 360 (X render_target_cache.cc:819-857).
     for (uint32_t f = 3; f <= 15; f++)
     {
         if (f == 10)
@@ -780,7 +804,7 @@ void TestTrace10()
         r.surfaceInfo = 0x14000500, r.modeControl = 4, r.colorMask = 0xF, r.depthControl = 0x8777;
         r.depthInfo = kFm4Depth, r.colorInfo[0] = f << 16;
         Ownership scratch;
-        if (f == 3 || f == 4 || f == 12 || f == 14)
+        if (f == 3 || f == 4 || f == 5 || f == 12 || f == 14)
             CHECK(Bind(scratch, r, 720).ok);
         else
             CONTROL(Bind(scratch, r, 720).ok);
@@ -1946,6 +1970,126 @@ void TestClearValueOwnership()
     }
 }
 
+// FM4 Recomp (alpha, RT format 5): ownership between 32 bpp and 64 bpp keys of the same tiles (X render_target_cache.cc:1539-1699
+// ChangeOwnership is format-blind: a tile changes owner and the previous owner is a transfer source whatever its bits per pixel; the
+// lengths double at 64 bpp, :847-857 `<< is_64bpp`). The 1280-pitch 1x surface (16 tiles a row at 32 bpp, 32 at 64 bpp), colour only.
+void TestOwnership64()
+{
+    BindRegisters c32 = Bind1x(0, 0xF), c64 = Bind1x(0, 0xF);
+    c32.colorInfo[0] = 0x00000000;  // base 0, k_8_8_8_8
+    c64.colorInfo[0] = 0x00050000;  // base 0, k_16_16_16_16
+    const Key k32 = Key::Color(0, 16, Msaa::X1, ColorFormat::k8_8_8_8), k64 = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16);
+    Ownership o;
+    // 32 rows of 32 bpp: ceil(32 / 16) = 2 tile rows * 16 = 32 tiles (one target: min(32, 4096 >> 1, 2048)).
+    Binding b = Bind(o, c32, 32);
+    CHECK(b.ok && b.color[0] == k32 && b.lengthTiles[1] == 32 && o.Count(k32) == 32 && b.transfers[1].empty());
+    // 16 rows of 64 bpp: ceil(16 / 16) = 1 tile row * 16 = 16 tiles at 32 bpp, << 1 = 32 tiles (min(32, 4096 >> 0, 2048)): the same 32
+    // tiles, all from the 32 bpp key (one transfer, X :1624-1632 coalescing).
+    b = Bind(o, c64, 16);
+    CHECK(b.ok && b.color[0] == k64 && b.lengthTiles[1] == 32 && b.transfers[1] == T({{0, 32, k32}}));
+    CHECK(o.Count(k64) == 32 && o.Count(k32) == 0 && o.At(31) == k64 && o.At(32).Empty());
+    // Tiles [0, 32) in the 64 bpp key's pixels: one 32-tile row of 40-pixel tiles (X :355-357): (0, 0, 1280, 16); in the 32 bpp
+    // key's: two 16-tile rows of 80-pixel tiles: (0, 0, 1280, 32).
+    Rect r[3];
+    CHECK(RangeRectangles(0, 32, k64, r) == 1 && r[0] == Rect{0, 0, 1280, 16});
+    CHECK(RangeRectangles(0, 32, k32, r) == 1 && r[0] == Rect{0, 0, 1280, 32});
+    // Back to 32 bpp, 48 rows: 3 tile rows = 48 tiles; [0, 32) from the 64 bpp key, [32, 48) had no owner (no transfer).
+    b = Bind(o, c32, 48);
+    CHECK(b.ok && b.lengthTiles[1] == 48 && b.transfers[1] == T({{0, 32, k64}}) && o.Count(k32) == 48 && o.Count(k64) == 0);
+    // CONTROL: the 64 bpp claim is not the 32 bpp length (16 tiles would leave tiles 16-31 with the 32 bpp key).
+    Ownership q;
+    CHECK(Bind(q, c32, 32).ok);
+    b = Bind(q, c64, 16);
+    CONTROL(b.lengthTiles[1] == 16 || q.At(16) == k32);
+}
+
+// FM4 Recomp (alpha, 64 bpp resolve): FM4's resolve after a race in Car Select (its log:
+// colour 0, RB_COLOR_INFO format 5, 1x, sample select 0, to texture format 32, number 7, exp bias 0, swap 0, endian 1,
+// convert). The source key is the one the log names (key 1402000: base 0, 4 tiles a row at 32 bpp, 1x, storage 5; 320x8192): pitch
+// 320 (X render_target_cache.cc:606-608: (320 + 79) / 80 = 4). The rectangle here is 320x64 (the log does not give FM4's).
+ResolveRegisters Resolve64()
+{
+    ResolveRegisters r = Fm4Resolve();
+    r.surfaceInfo = 320, r.colorInfo[0] = 5u << 16, r.copyControl = 1u << 20;  // RB_COLOR_INFO format bits 16-19 (X registers.h:689-694)
+    r.copyDestPitch = 320 | 64u << 16;
+    r.copyDestInfo = 1 | 32u << 7 | 7u << 13;  // X registers.h:812-826: endian 1, format 32, number 7, bias 0, no swap
+    const float v[6] = {-0.5f, -0.5f, 319.5f, -0.5f, 319.5f, 63.5f};
+    for (int i = 0; i < 6; i++)
+        r.vertexWords[i] = GuestFloat(v[i]);
+    return r;
+}
+
+void TestResolve64Decode()
+{
+    auto refused = [](ResolveRegisters rr, const char* text) {
+        const ResolveInfo x = DecodeResolve(rr);
+        return !x.ok && x.refusal.find(text) != std::string::npos;
+    };
+    ResolveRegisters r = Resolve64();
+    const ResolveInfo i = DecodeResolve(r);
+    CHECK(i.ok && i.copy && !i.isDepth && i.source == Key::Color(0, 4, Msaa::X1, ColorFormat::k16_16_16_16) && i.source.packed == 0x1402000u);
+    CHECK(i.x0 == 0 && i.y0 == 0 && i.x1 == 320 && i.y1 == 64 && i.sampleSelect == SampleSelect::k0);
+    CHECK(i.destFormat == 32 && i.destNumber == 7 && i.destEndian == 1 && i.destExpBias == 0 && !i.destSwap && i.destBytesLog2 == 3);
+    // The destination with bpp_log2 3 (X draw_util.cc:1133-1173): granularity 32x32 (xenos.h:1188-1195: 7 - min(2, 3) = 5), so offset
+    // (0, 0) and base = lower bound = copyDestBase + TiledOffset2D(0, 0) = copyDestBase. The upper bound (texture_util.cc:490-517):
+    // the tile of (319, 63) -> (288, 32); TiledOffset2D(288, 32, 320, 3) (:443-458): pitch 320 (already 32-aligned), macro = (288 >> 5
+    // = 9) + (32 >> 5 = 1) * (320 >> 5 = 10) = 19, << (3 + 7) = 19456 = 0x4C00; micro = ((288 & 7) + ((32 & 0xE) << 2)) << 3 = 0;
+    // offset 19456; mix: (0x4C00 & ~0x1FF) << 3 = 0x26000 = 155648, (32 & 16) << 7 = 0, (0x4C00 & 0x1C0) << 2 = 0,
+    // (((32 & 8) >> 2) + (288 >> 3 = 36)) & 3 = 0, 0x4C00 & 0x3F = 0 -> 155648; + 0x400 << 3 = 8192 (:512-514) -> 163840
+    // = 320 * 64 * 8 bytes.
+    CHECK(i.destOffsetX == 0 && i.destOffsetY == 0 && i.destBase == 0x00800000u && i.destExtentStart == i.destBase && i.destExtentLength == 163840);
+    CONTROL(i.destExtentLength == 81920);  // the 32 bpp extent of the same rectangle
+    // The span (X draw_util.cc:1202-1256, GetResolveEdramTileSpan :875-904): 64 bpp tiles are 40x16 pixels at 1x, 8 a row
+    // (pitch 4 << 1); 320 pixels = tiles 0-7 (((0 + 40) << (3 + 1)) + 79) / 80 = 8), 64 rows = 4 tile rows.
+    CHECK(i.spanBase == 0 && i.spanPitch == 8 && i.spanRowLength == 8 && i.spanRows == 4);
+    CONTROL(i.spanRowLength == 4);  // the 32 bpp span
+
+    // An origin at x0 = 32, y0 = 8 (vertex 31.5, 7.5 + the half pixel, X draw_util.cc:801-807): at bpp_log2 3 the granularity is
+    // still 32 (unlike 16 bpp's 64), so offset (0, 8) and base = extent start = TiledOffset2D(32, 0, 320, 3): macro 1 << 10 = 0x400;
+    // (0x400 & ~0x1FF) << 3 = 8192; (0 + (32 >> 3 = 4)) & 3 = 0 -> 8192. The upper bound is the same: length 163840 - 8192 = 155648.
+    const float v1[6] = {31.5f, 7.5f, 319.5f, 7.5f, 319.5f, 63.5f};
+    ResolveRegisters o = r;
+    for (int k = 0; k < 6; k++)
+        o.vertexWords[k] = GuestFloat(v1[k]);
+    const ResolveInfo oi = DecodeResolve(o);
+    CHECK(oi.ok && oi.x0 == 32 && oi.y0 == 8 && oi.destOffsetX == 0 && oi.destOffsetY == 8 && oi.destBase == 0x00800000u + 8192 &&
+          oi.destExtentStart == oi.destBase && oi.destExtentLength == 155648);
+    CONTROL(oi.destOffsetX == 32);  // the 16 bpp (64-texel) granularity
+
+    // Exponent bias and swap go through the full resolve's generic factor and .bgra (decoded as given).
+    o = r, o.copyDestInfo |= 3u << 16 | 1u << 24;
+    CHECK(DecodeResolve(o).ok && DecodeResolve(o).destExpBias == 3 && DecodeResolve(o).destSwap);
+    o = r, o.copyDestInfo = 32u << 7 | 7u << 13;  // endian 0
+    CHECK(DecodeResolve(o).ok && DecodeResolve(o).destEndian == 0);
+
+    // Neighbours, each refused by name.
+    o = r, o.copyDestInfo = 1 | 32u << 7;  // number 0
+    CHECK(refused(o, "number format 0 into texture format 32"));
+    o = r, o.copyDestInfo = 2 | 32u << 7 | 7u << 13;  // 8in32
+    CHECK(refused(o, "endian 2 on a 64 bpp destination"));
+    o = r, o.copyDestInfo = 4 | 32u << 7 | 7u << 13;  // 8in64 (X xenos.h:200-207)
+    CHECK(refused(o, "64/128-bit swap"));
+    o = r, o.copyDestInfo = 1 | 33u << 7 | 7u << 13;
+    CHECK(refused(o, "into texture format 33"));
+    o = r, o.copyDestInfo = 1 | 26u << 7 | 7u << 13;  // k_16_16_16_16 (xenos.h:600): not the observed destination
+    CHECK(refused(o, "into texture format 26"));
+    o = r, o.surfaceInfo = 320 | 1u << 16;  // 2x (RB_SURFACE_INFO msaa_samples bits 16-17)
+    CHECK(refused(o, "64 bpp source (storage 5) at 2x"));
+    o = r, o.surfaceInfo = 320 | 2u << 16;  // 4x (pitch tiles (640 + 79) / 80 = 8)
+    CHECK(refused(o, "64 bpp source (storage 5) at 4x"));
+    o = r, o.copyControl |= 1u << 8;  // copy_color_clear_enable
+    CHECK(refused(o, "that also clears (colour 1, depth 0)"));
+    o = r, o.copyControl |= 1u << 9;  // copy_depth_clear_enable
+    CHECK(refused(o, "that also clears (colour 0, depth 1)"));
+    // CONTROL: a 32 bpp source into 32 stays refused by the 32 bpp destination list, and storage 5 into 6 by the 64 bpp one.
+    o = r, o.colorInfo[0] = 0;
+    CHECK(refused(o, "texture format 32 is not supported in M4"));
+    CONTROL(DecodeResolve(o).ok);
+    o = r, o.copyDestInfo = 1 | 6u << 7;
+    CHECK(refused(o, "into texture format 6"));
+    CONTROL(DecodeResolve(o).ok);
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1)
@@ -1972,6 +2116,8 @@ int main(int argc, char** argv)
     TestK88ResolveDecode();
     TestTransferSkip();
     TestClearValueOwnership();
+    TestOwnership64();  // FM4 Recomp (alpha, RT format 5)
+    TestResolve64Decode();  // FM4 Recomp (alpha, 64 bpp resolve)
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

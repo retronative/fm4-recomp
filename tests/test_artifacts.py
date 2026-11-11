@@ -320,5 +320,101 @@ class Captures(unittest.TestCase):
         self.assertFalse(self.exists("research/storage/plan.json"))
 
 
+class Evidence(unittest.TestCase):
+    """plan --evidence / apply on old run evidence: traces, profile XML, shader dumps and saves of
+    marked scenario<K> directories that keep their run log; never logs, notes, unmarked or kept scenarios, named saves."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+        r = self.root
+        marker = json.dumps({"kind": "evidence", "created": "2026-11-09", "keep": "until M7 close"})
+        put(r, "research/m5/scenario150/.retention.json", marker)
+        put(r, "research/m5/scenario150/run/run1.err", "[stop 11]")
+        put(r, "research/m5/scenario150/metal.trace/Trace1.run/data", "t" * 4000)
+        put(r, "research/m5/scenario150/time_profile.xml", "x" * 2000)
+        put(r, "research/m5/scenario150/shaders/vs.bin", "s" * 500)
+        put(r, "research/m5/scenario150/user-data/content/1/save", "u" * 300)
+        put(r, "research/m5/scenario150/cp_buckets.txt", "notes")
+        put(r, "research/m5/scenario150/launcher.txt", "launcher")
+        put(r, "research/m5/scenario250/.retention.json", marker)  # numbered 250: outside --before 200
+        put(r, "research/m5/scenario250/run/run1.err")
+        put(r, "research/m5/scenario250/metal.trace/d", "t" * 4000)
+        put(r, "research/m5/scenario142/.retention.json", marker)  # named in --keep
+        put(r, "research/m5/scenario142/run/run1.err")
+        put(r, "research/m5/scenario142/metal.trace/d", "t" * 4000)
+        put(r, "research/m5/scenario151/metal.trace/d", "t" * 4000)  # unmarked
+        put(r, "research/m5/scenario151/run/run1.err")
+        put(r, "research/m5/scenario152/.retention.json", marker)  # no run log
+        put(r, "research/m5/scenario152/metal.trace/d", "t" * 4000)
+        put(r, "research/m4/save_c14/.retention.json", marker)  # a named save: never
+        put(r, "research/m4/save_c14/user-data/content/1/save", "u" * 300)
+        put(r, "research/m4/save_c14/run/run1.err")
+        self.manifest = os.path.join(r, "research", "storage", "plan.json")
+        self.audit = os.path.join(r, "research", "storage", "audit.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def quiet(self, fn, *args, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = fn(*args, **kw)
+        return code, buf.getvalue()
+
+    def plan(self, evidence=artifacts.EVIDENCE_CLASSES, before=200):
+        code, out = self.quiet(artifacts.cmd_plan, self.root, self.manifest, (), ("scenario142",), evidence, before)
+        self.assertEqual(code, 0, out)
+        with open(self.manifest) as f:
+            return json.load(f)
+
+    def test_plan_lists_only_old_marked_logged_unkept_scenarios(self):
+        man = self.plan()
+        ev = sorted((i["path"], i["classes"][0], i["bytes"]) for i in man["items"] if i.get("kind") == "evidence")
+        self.assertEqual(ev, [("research/m5/scenario150/metal.trace", "metal-trace", 4000),
+                              ("research/m5/scenario150/shaders", "shader-dumps", 500),
+                              ("research/m5/scenario150/time_profile.xml", "profile-xml", 2000),
+                              ("research/m5/scenario150/user-data", "saves", 300)])
+
+    def test_before_is_optional(self):
+        man = self.plan(evidence=("metal-trace",), before=None)
+        self.assertEqual(sorted(i["path"] for i in man["items"] if i.get("kind") == "evidence"),
+                         ["research/m5/scenario150/metal.trace", "research/m5/scenario250/metal.trace"])
+
+    def test_apply_deletes_the_planned_evidence_and_keeps_logs_and_notes(self):
+        man = self.plan()
+        code, out = self.quiet(artifacts.cmd_apply, self.root, self.manifest, man["id"], self.audit, patterns=IDLE)
+        self.assertEqual(code, 0, out)
+        for rel in ("research/m5/scenario150/metal.trace", "research/m5/scenario150/time_profile.xml",
+                    "research/m5/scenario150/shaders", "research/m5/scenario150/user-data"):
+            self.assertFalse(os.path.lexists(os.path.join(self.root, rel)), rel)
+        for rel in ("research/m5/scenario150/run/run1.err", "research/m5/scenario150/cp_buckets.txt",
+                    "research/m5/scenario150/launcher.txt", "research/m5/scenario150/.retention.json",
+                    "research/m5/scenario250/metal.trace", "research/m5/scenario142/metal.trace", "research/m5/scenario151/metal.trace",
+                    "research/m5/scenario152/metal.trace", "research/m4/save_c14/user-data"):
+            self.assertTrue(os.path.lexists(os.path.join(self.root, rel)), rel)
+
+    def test_log_removed_after_plan_is_skipped(self):
+        man = self.plan()
+        os.remove(os.path.join(self.root, "research/m5/scenario150/run/run1.err"))
+        code, out = self.quiet(artifacts.cmd_apply, self.root, self.manifest, man["id"], self.audit, patterns=IDLE)
+        self.assertIn("skipped: no run log in the scenario", out)
+        self.assertTrue(os.path.lexists(os.path.join(self.root, "research/m5/scenario150/metal.trace")))
+
+    def test_milestone_filter(self):
+        code, out = self.quiet(artifacts.cmd_plan, self.root, self.manifest, (), (), ("saves",), None, "m4")
+        with open(self.manifest) as f:
+            man = json.load(f)
+        self.assertEqual([i["path"] for i in man["items"] if i.get("kind") == "evidence"], [])  # m4 has only a named save
+        code, out = self.quiet(artifacts.cmd_plan, self.root, self.manifest, (), (), ("saves",), None, "m5")
+        with open(self.manifest) as f:
+            man = json.load(f)
+        self.assertEqual([i["path"] for i in man["items"] if i.get("kind") == "evidence"], ["research/m5/scenario150/user-data"])
+
+    def test_cli_rejects_unknown_evidence_class(self):
+        code, out = self.quiet(artifacts.main, ["plan", "--root", self.root, "--evidence", "logs"])
+        self.assertEqual(code, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

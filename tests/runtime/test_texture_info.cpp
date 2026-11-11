@@ -141,6 +141,19 @@ void TestFormatsAndDescriptions()
                BytesPerBlock(GetFormatInfo(49)) == 16,
            "host format: k_DXN -> BC5_UNORM (141), RGGG, no signed form, 16-byte 4x4 blocks (:330-333)");
     Expect(HostFormatFor(19, h) && h.vkFormat == 135 && h.blockCompressed, "host format: k_DXT2_3 -> BC2_UNORM (135) (:191-195)");
+    // FM4 Recomp (alpha, 64 bpp resolve): k_16_16_16_16_FLOAT (xenos.h:603, 32) -> R16G16B16A16_SFLOAT (VK enum 97), RGBA, float data
+    // (sign and number ignored), 8-byte 1x1 blocks (texture_info_formats.inl: 64 bits); its 8in16 swap exchanges the bytes of every
+    // halfword (texture_untile.h SwapBlockEndian {1,0,3,2} per dword): 3C 00 | 00 3C ... (half 1.0 = 0x3C00 stored big-endian).
+    Expect(HostFormatFor(32, h) && h.vkFormat == 97 && h.formatSwizzle == kSwizzleRGBA && !h.blockCompressed && h.signIgnored && h.floatData &&
+               BytesPerBlock(GetFormatInfo(32)) == 8 && EndianSupported(3, 1),
+           "host format: k_16_16_16_16_FLOAT -> R16G16B16A16_SFLOAT (97), RGBA, float, 8-byte blocks, 8in16 supported (:258-262)");
+    {
+        uint8_t block[8] = {0x3C, 0x00, 0x40, 0x00, 0xC0, 0x00, 0x00, 0x00};  // big-endian halves 1.0, 2.0, -2.0, 0.0
+        SwapBlockEndian(block, 3, 1);
+        Expect(block[0] == 0x00 && block[1] == 0x3C && block[2] == 0x00 && block[3] == 0x40 && block[4] == 0x00 && block[5] == 0xC0,
+               "k_16_16_16_16_FLOAT 8in16: each halfword's bytes exchanged (host half 1.0, 2.0, -2.0)");
+    }
+    Expect(!HostFormatFor(26, h) && !HostFormatFor(33, h), "CONTROL: k_16_16_16_16 (26) and k_32_32_FLOAT (33) still have no host mapping");
     Expect(!HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
            "CONTROL: 5_6_5 and 2_10_10_10 have no host mapping yet");
 

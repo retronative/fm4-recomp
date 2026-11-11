@@ -4,7 +4,7 @@
 #
 # Survey and recompile one of FM4's modules: the M1 pipeline (survey/survey.py does the work).
 #
-#   scripts/survey.sh [--module default|xmediafacade] [--diagnostic] [--compare-with <run1>.json]
+#   scripts/survey.sh [--module default|xmediafacade|speechfacade] [--diagnostic] [--compare-with <run1>.json]
 #
 # Without --module: the executable (config/fm4.toml, game/files/default.xex); xmediafacade:
 # config/xmediafacade.toml, game/files/XMediaFacade_default.xex, outputs under game/modules/xmediafacade/.
@@ -14,8 +14,8 @@
 # survey/survey.py has a deadline. Fail-closed: exit 1 on any recompiler problem, error marker,
 # inconsistent input or (with --compare-with) any byte difference from the earlier run.
 # Two-run reproducibility check (M1 acceptance):
-#   scripts/survey.sh && cp game/survey/reproducibility.json the local capture repro_run1 (not distributed).json
-#   scripts/survey.sh --compare-with the local capture repro_run1 (not distributed).json
+#   scripts/survey.sh && cp game/survey/reproducibility.json research/m1/repro_run1.json
+#   scripts/survey.sh --compare-with research/m1/repro_run1.json
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY=/opt/homebrew/bin/python3
@@ -30,7 +30,8 @@ for ((i = 1; i <= $#; i++)); do
     case "${!j:-}" in
       default) ;;
       xmediafacade) CONFIG=config/xmediafacade.toml XEX=game/files/XMediaFacade_default.xex ;;
-      *) echo "survey: --module needs default or xmediafacade" >&2; exit 1 ;;
+      speechfacade) CONFIG=config/speechfacade.toml XEX=game/files/SpeechFacade_default.xex ;;
+      *) echo "survey: --module needs default, xmediafacade or speechfacade" >&2; exit 1 ;;
     esac
   fi
 done

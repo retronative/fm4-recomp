@@ -31,13 +31,16 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
     // "Blending is enabled" for every colour attachment whose format Metal cannot blend, whether blendEnable is set or not.
     // The renderer's integer attachments all have blendEnable VK_FALSE: R32_UINT (the EDRAM resolve's sample dump and the
     // storage-14 transfer view), R16G16_UINT (FM4 Recomp: the storage-4 k_16_16 transfer view, edram_vk.cpp Pipeline, blend{}) and
-    // R16_UINT (FM4 Recomp: the k_8_8 resident words, FM4_RESOLVE_RESIDENT_K88, the same Pipeline; the local capture scenario121 (not distributed) stop 9);
+    // R16_UINT (FM4 Recomp: the k_8_8 resident words, FM4_RESOLVE_RESIDENT_K88, the same Pipeline)
+    // and R16G16B16A16_UINT (FM4 Recomp, alpha: the storage-5 k_16_16_16_16 transfer view, the same Pipeline and blend{}; used
+    // after a race);
     // draw pipelines never use an integer format (pipeline_cache.cpp HostColorFormat). Logged once per format under another
     // prefix (scripts/gpu_run.sh's check is not fooled into passing anything else) and not counted.
     static constexpr const char* kMvkBlendFalsePositives[] = {
         "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R32_UINT, which does not support it.",
         "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16G16_UINT, which does not support it.",
-        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16_UINT, which does not support it."};
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16_UINT, which does not support it.",
+        "VK_ERROR_FEATURE_NOT_PRESENT: Blending is enabled for attachment with format VK_FORMAT_R16G16B16A16_UINT, which does not support it."};
     const auto knownFalsePositive = [&] {
         for (const char* text : kMvkBlendFalsePositives)
             if (!std::strcmp(data->pMessage, text))
@@ -48,7 +51,8 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
         !std::strcmp(data->pMessageIdName, "mvk-warn") && knownFalsePositive())
     {
         static std::atomic<unsigned> logged{0};
-        const unsigned bit = std::strstr(data->pMessage, "R16G16_UINT") ? 2u : std::strstr(data->pMessage, "R16_UINT") ? 4u : 1u;
+        const unsigned bit = std::strstr(data->pMessage, "R16G16B16A16_UINT") ? 8u : std::strstr(data->pMessage, "R16G16_UINT") ? 2u
+                             : std::strstr(data->pMessage, "R16_UINT") ? 4u : 1u;
         if (!(logged.fetch_or(bit) & bit))
             std::fprintf(stderr, "[vulkan known false positive] mvk-warn: %s (MoltenVK 1.4.2 MVKPipeline.mm:1994; blendEnable is false)\n", data->pMessage);
         return VK_FALSE;

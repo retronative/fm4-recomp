@@ -280,3 +280,37 @@ GUEST_IMPORT(InterlockedFlushSList, "REFERENCE_DERIVED: Xenia xboxkrnl_threading
     const uint64_t raw = __atomic_exchange_n(word, 0, __ATOMIC_SEQ_CST);
     ctx.r3.u64 = uint32_t(__builtin_bswap64(raw) >> 32);
 }
+
+// FM4 Recomp: reached by SpeechFacade_default.xex after a race.
+GUEST_IMPORT(KeInitializeSemaphore, "REFERENCE_DERIVED: Xenia 67f16c4 xboxkrnl_threading.cc:639-653 (type 5, signal state = count, limit +0x10); wait list head from NT (INFERRED)")
+{
+    // (semaphore*, count, limit): the 20-byte KSEMAPHORE NtCreateSemaphore also builds (dispatcher header type 5, signal state
+    // = count, limit at +0x10), the wait list head pointing at itself (+8, +0xC: an empty NT list, as KeInitializeMutant).
+    // Xenia does not check the arguments; a null or misaligned pointer stops here.
+    using namespace runtime;
+    const uint32_t semaphore = ctx.r3.u32, count = ctx.r4.u32, limit = ctx.r5.u32;
+    if (semaphore == 0 || semaphore % 4)
+        Stop(StopCode::GuestFault, "KeInitializeSemaphore(%08X): null or misaligned (lr=%08X)", semaphore, uint32_t(ctx.lr));
+    std::memset(base + semaphore, 0, 20);
+    base[semaphore] = dispatch::kSemaphore;
+    Store32(base, semaphore + dispatch::kSignalState, count);
+    Store32(base, semaphore + 8, semaphore + 8);
+    Store32(base, semaphore + 0xC, semaphore + 8);
+    Store32(base, semaphore + dispatch::kSemaphoreLimit, limit);
+}
+
+GUEST_IMPORT(KeReleaseSemaphore, "REFERENCE_DERIVED: Xenia 67f16c4 xboxkrnl_threading.cc:655-674 (releases `adjustment`, returns the previous count); limit from NT (INFERRED)")
+{
+    // (semaphore*, increment, adjustment, wait): adds `adjustment` to the count and returns the count before. The priority
+    // increment has no effect and `wait` needs nothing (Xenia's TODOs, as KeSetEvent here). Passing the limit makes NT raise
+    // STATUS_SEMAPHORE_LIMIT_EXCEEDED, an exception, which is not modelled: it stops; so does an object that is not a semaphore.
+    using namespace runtime;
+    const uint32_t semaphore = ctx.r3.u32, adjustment = ctx.r5.u32;
+    if (semaphore == 0 || semaphore % 4 || base[semaphore] != dispatch::kSemaphore)
+        Stop(StopCode::GuestFault, "KeReleaseSemaphore(%08X): not a semaphore (lr=%08X)", semaphore, uint32_t(ctx.lr));
+    int32_t previous = 0;
+    if (!ReleaseSemaphore(base, semaphore, int32_t(adjustment), previous))
+        Stop(StopCode::Unimplemented, "KeReleaseSemaphore(%08X, %u): past the limit %u (NT raises STATUS_SEMAPHORE_LIMIT_EXCEEDED) (lr=%08X)", semaphore,
+             adjustment, Load32(base, semaphore + dispatch::kSemaphoreLimit), uint32_t(ctx.lr));
+    ctx.r3.u64 = uint32_t(previous);
+}

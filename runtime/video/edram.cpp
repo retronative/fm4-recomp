@@ -63,6 +63,13 @@ bool SupportedKey(Key k, std::string& why)
     case ColorFormat::k16_16_Float:
         return Refuse(why, "colour format " + std::to_string(k.Format()) + " (16_16_FLOAT) is not supported yet");
     case ColorFormat::k16_16_16_16:
+        // FM4 Recomp (alpha, RT format 5): 64 bpp (X xenos.h:323-327), four signed 16-bit components, the guest range -32..32 (xenos.h:
+        // 309-310); FM4 after a race (RB_COLOR_INFO 00050000). Host R16G16B16A16_SNORM, transfers
+        // through R16G16B16A16_UINT (edram_vk_plan.h HostColorFormat, TransferViewFormat); the tile arithmetic below is 64 bpp-aware
+        // (Key::PitchTiles, RangeRectangles, Bind). Its resolves stay refused (DecodeResolve), so it is never cleared by one.
+        // FM4 Recomp (alpha, 64 bpp resolve): its 1x resolve into k_16_16_16_16_FLOAT (32) is accepted (DecodeResolve); a resolve that
+        // also clears is still refused there, so it is still never cleared by one.
+        return true;
     case ColorFormat::k16_16_16_16_Float:
     case ColorFormat::k32_32_Float:
         return Refuse(why, "64 bpp colour format " + std::to_string(k.Format()) + " is not supported in M4");
@@ -730,10 +737,41 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         // bitwise equivalent (xenos.h:616-641 has no 16_16 case), so always X's full resolve (draw_util.cc:1312-1347).
         // 10 = k_8_8 (xenos.h:593; FM4: from an 8_8_8_8 source): never bitwise
         // equivalent either, so X's full 16 bpp resolve (draw_util.cc:1333-1334 kFull16bpp, shaders/resolve_full_16bpp.xesli).
+        // FM4 Recomp (alpha, RT format 5): a 64 bpp source (storage 5) is never bitwise equivalent (X xenos.h:612-641 lists no
+        // k_16_16_16_16 case), so X always takes its full shader, kFull64bpp / kFull32bpp by the destination's size (draw_util.cc:
+        // 1305-1347; resolve.xesli XeResolveUnpack64bpp*).
+        // FM4 Recomp (alpha, 64 bpp resolve): one shape is modelled, FM4's after a race in Car Select:
+        // a 1x storage-5 source into texture format 32, k_16_16_16_16_FLOAT (X xenos.h:603;
+        // 64 bits a texel, texture_info_formats.inl:33, so X's kFull64bpp shader, draw_util.cc:1339-1341), number 7 (kFloat, xenos.h:222),
+        // endian 0 or 1 (8in16). The CPU converts it (edram_vk_plan.cpp ResolveConvertPixel64: XeUnpackR16G16B16A16Edram, the exponent
+        // bias, the swap, packHalf2x16 per pixel_formats.xesli:269-277; not a pass-through of the guest's 16-bit values). Refused by name:
+        // a multisampled source (the 1x source is read by vkCmdCopyImageToBuffer, edram_vk.cpp Resolve; Vulkan copies no multisampled
+        // image to a buffer and the sample dump writes one 32-bit word a sample), every other destination format and number, the
+        // 64/128-bit endian swaps and 8in32 / 16in32 (not observed), and a clear in the same resolve (X render_target_cache.cc:1181-1186,
+        // :1283-1293 halve the 64 bpp pitch and base offset and double the colour clear's tile range; PrepareResolve does not, and
+        // edram_vk_plan.cpp DecodeColorClearUint has no storage 5).
+        if (is64)
+        {
+            const std::string from = "a resolve from a 64 bpp source (storage " + std::to_string(info.source.Format()) + ")";
+            if (info.msaa != Msaa::X1)
+                return refuse(shape + from + " at " + std::to_string(1u << uint32_t(info.msaa)) + "x is not supported yet (1x only)");
+            if (info.destFormat != 32)
+                return refuse(shape + from + " into texture format " + std::to_string(info.destFormat) +
+                              " is not supported yet (32, k_16_16_16_16_FLOAT, only; X draw_util.cc:1305-1347)");
+            if (destNumber != 7)
+                return refuse(shape + from + ": resolve destination number format " + std::to_string(destNumber) +
+                              " into texture format 32 is not supported (7, float, only)");
+            if (info.destEndian > 1)
+                return refuse(shape + from + ": resolve destination endian " + std::to_string(info.destEndian) +
+                              " on a 64 bpp destination is not supported (0 and 8in16 only)");
+            if (info.clearColor || info.clearDepth)
+                return refuse(shape + from + " that also clears (colour " + std::to_string(int(info.clearColor)) + ", depth " +
+                              std::to_string(int(info.clearDepth)) + ") is not supported yet (X render_target_cache.cc:1181-1186 64 bpp clear)");
+        }
         const bool rg16 = info.source.Format() == uint32_t(ColorFormat::k16_16);
-        if (info.destFormat == 25 ? !rg16
-                                  : info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 10 && info.destFormat != 50 &&
-                                        info.destFormat != 54 && info.destFormat != 36)
+        if (!is64 && (info.destFormat == 25 ? !rg16
+                                            : info.destFormat != 6 && info.destFormat != 7 && info.destFormat != 10 && info.destFormat != 50 &&
+                                                  info.destFormat != 54 && info.destFormat != 36))
             return refuse(shape + "resolve destination texture format " + std::to_string(info.destFormat) +
                           " is not supported in M4 (6, 7, 10, 36, 50, 54 are; 25 from a 16_16 source)");
         // A 16 bpp store swaps with XeEndianSwap16 (resolve_full_16bpp.xesli:61-63), where only 8in16 does anything (endian.xesli
@@ -741,6 +779,8 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         if (info.destFormat == 10 && info.destEndian > 1)
             return refuse(shape + "resolve destination endian " + std::to_string(info.destEndian) + " on a 16 bpp destination (only 0 and 8in16 are supported)");
         info.destBytesLog2 = info.destFormat == 10 ? 1 : 2;  // X draw_util.cc:1133 (texture_info_formats.inl:11 k_8_8: 16 bits)
+        if (is64)
+            info.destBytesLog2 = 3;  // FM4 Recomp (alpha, 64 bpp resolve): texture_info_formats.inl:33 k_16_16_16_16_FLOAT, 64 bits
         // RB_COPY_DEST_INFO copy_dest_number (X registers.h:819): Xenia 67f16c4 declares it and never reads it in its resolve path.
         // FM4 resolves its k_32_FLOAT target into texture format 36 with number 7 (kFloat, xenos.h:216-224):
         // the natural value for float data. FM4 resolves its 16_16 target into texture format 25 with number 3
@@ -748,7 +788,8 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         // (edram_vk_plan.cpp PackFixed16; xenia-canary d119505 pixel_formats.xesli XePackFixed, ShiftGlue 72b7dd6f
         // fh1_native_resolve_memory.cs.hlsl:218-232 PackChannel).
         // Accepted for those two pairings only; every other non-zero value stays refused.
-        if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36) && !(destNumber == 3 && info.destFormat == 25))
+        // FM4 Recomp (alpha, 64 bpp resolve): and number 7 into 32 from a 64 bpp source (checked above).
+        if (destNumber != 0 && !(destNumber == 7 && info.destFormat == 36) && !(destNumber == 3 && info.destFormat == 25) && !is64)
             return refuse(shape + "resolve destination number format " + std::to_string(destNumber) + " is not unsigned repeating fraction (0)");
         // An exponent bias is X's full (converting) resolve's dest_exp_bias_factor (shaders/resolve.xesli:131-133), applied by
         // edram_vk_plan.cpp ResolveConvertToGuest; the range is the field's (6-bit signed, -32..31).
@@ -769,6 +810,16 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
         info.destBase = r.copyDestBase + TiledOffset2D(info.x0 & ~63u, info.y0 & ~63u, info.destPitch, 1);
         info.destExtentStart = r.copyDestBase + TiledOffset2D(info.x0 & ~31u, info.y0 & ~31u, info.destPitch, 1);
         info.destExtentLength = r.copyDestBase + TiledAddressUpperBound2D(info.x1, info.y1, info.destPitch, 1) - info.destExtentStart;
+    }
+    else if (info.destBytesLog2 == 3)
+    {
+        // FM4 Recomp (alpha, 64 bpp resolve): the same lines with bpp_log2 3 (draw_util.cc:1133-1173): the base granularity is 32x32
+        // texels (xenos.h:1188-1195: 7 - min(2, 3) = 5), so the base and the lower bound (texture_util.h:297-303) are both the 32x32
+        // tile of (x0, y0); the upper bound adds 0x400 << 3 (texture_util.cc:512-514). texture_untile.h's token-for-token transcriptions.
+        info.destOffsetX = info.x0 & 31, info.destOffsetY = info.y0 & 31;
+        info.destBase = r.copyDestBase + TiledOffset2D(info.x0 & ~31u, info.y0 & ~31u, info.destPitch, 3);
+        info.destExtentStart = info.destBase;
+        info.destExtentLength = r.copyDestBase + TiledAddressUpperBound2D(info.x1, info.y1, info.destPitch, 3) - info.destExtentStart;
     }
     else
     {
@@ -858,7 +909,9 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
         plan.ok = true;
         return plan;
     }
-    const uint32_t pitch32 = info.pitchTilesAt32bpp;  // :1168-1184 (the colour pitch >> 64 bpp; refused above for 64 bpp)
+    // FM4 Recomp (alpha, 64 bpp resolve): a clear in a resolve from a 64 bpp source is refused by DecodeResolve, so neither clear
+    // below sees one.
+    const uint32_t pitch32 = info.pitchTilesAt32bpp;  // :1168-1184 (the colour pitch >> 64 bpp; refused by DecodeResolve for 64 bpp)
     const uint32_t sx = SamplesXLog2(info.msaa), sy = SamplesYLog2(info.msaa);
     const uint32_t pitchPixels = pitch32 * (kTileWidthSamples >> sx);  // :1211-1213
     const uint32_t rtHeight = RenderTargetHeight(pitch32, info.msaa);  // :1225-1226
@@ -878,7 +931,7 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
     // :1252-1266: the tiles the rectangle covers, whole rows between its first and last tile.
     const uint32_t start32 = ((rect.y << sy) / kTileHeightSamples) * pitch32 + (rect.x << sx) / kTileWidthSamples;
     const uint32_t length32 = (((rect.y + rect.height - 1) << sy) / kTileHeightSamples) * pitch32 + ((rect.x + rect.width - 1) << sx) / kTileWidthSamples + 1 - start32;
-    // :1267-1289: at most up to the base's next addressing period (64 bpp doubling refused above).
+    // :1267-1289: at most up to the base's next addressing period (64 bpp doubling refused by DecodeResolve).
     uint32_t depthStart = 0, depthLength = 0, colorStart = 0, colorLength = 0;
     if (clearDepth)
         depthStart = std::min(start32, kTileCount), depthLength = std::min(start32 + length32, kTileCount) - depthStart;

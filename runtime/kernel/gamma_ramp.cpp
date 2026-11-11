@@ -96,16 +96,17 @@ uint32_t ApplyPwl10(uint32_t v, PwlEntry e)
 
 void ApplyPwlToFrame(uint32_t* pixels, size_t count, const PwlEntry (&pwl)[128][3])
 {
+    // FM4 Recomp (M7 CPU cost; measured: 381 ms of the windowed CP profile, ~1.5 ms a swap): every
+    // channel value's result, already shifted into place, in three 1024-entry tables built from ApplyPwl10 itself (3 x 1024
+    // evaluations instead of 3 a pixel); the per-pixel result is the same expression, so the frame is bit-identical.
+    uint32_t lut[3][1024];
+    for (uint32_t c = 0; c < 3; c++)
+        for (uint32_t v = 0; v < 1024; v++)
+            lut[c][v] = ApplyPwl10(v, pwl[v >> 3][c]) << (10 * c);
     for (size_t i = 0; i < count; i++)
     {
         const uint32_t p = pixels[i];
-        uint32_t out = 3u << 30;
-        for (uint32_t c = 0; c < 3; c++)
-        {
-            const uint32_t v = (p >> (10 * c)) & 0x3FF;
-            out |= ApplyPwl10(v, pwl[v >> 3][c]) << (10 * c);
-        }
-        pixels[i] = out;
+        pixels[i] = (3u << 30) | lut[0][p & 0x3FF] | lut[1][(p >> 10) & 0x3FF] | lut[2][(p >> 20) & 0x3FF];
     }
 }
 

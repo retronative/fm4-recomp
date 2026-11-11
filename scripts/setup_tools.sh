@@ -19,6 +19,8 @@
 # git -C tools/XenonRecomp branch -D fm4, then re-run (patches apply only when the branch is missing).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# The oldest macOS the shipped tools run on (the alpha targets macOS 26 on Apple silicon); clang and CMake read it.
+export MACOSX_DEPLOYMENT_TARGET=26.0
 TOOLS="$ROOT/tools"
 XENONRECOMP_URL=https://github.com/hedge-dev/XenonRecomp.git
 XENONRECOMP_COMMIT=ddd128bcca99fe8bfbb99bea583c972351fa6ace
@@ -50,7 +52,7 @@ fi
 # -include cstdlib: the bundled fmt relies on a transitive <cstdlib> that newer libc++ dropped.
 cmake -Wno-deprecated -S "$XR" -B "$XR/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER="$LLVM/clang" -DCMAKE_CXX_COMPILER="$LLVM/clang++" \
-  "-DCMAKE_CXX_FLAGS=-include cstdlib" > /dev/null
+  "-DCMAKE_CXX_FLAGS=-include cstdlib" -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" > /dev/null
 ninja -C "$XR/build" XenonRecomp XenonAnalyse
 
 XISO="$TOOLS/extract-xiso"
@@ -59,8 +61,9 @@ if [ "$(git -C "$XISO" rev-parse HEAD)" != "$EXTRACT_XISO_COMMIT" ]; then
   git -C "$XISO" checkout -q "$EXTRACT_XISO_COMMIT"
   rm -rf "$XISO/build"
 fi
-if [ ! -x "$XISO/build/extract-xiso" ]; then
-  cmake -Wno-deprecated -S "$XISO" -B "$XISO/build" -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null
+xiso_target() { otool -l "$XISO/build/extract-xiso" 2>/dev/null | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}'; }
+if [ ! -x "$XISO/build/extract-xiso" ] || [ "$(xiso_target)" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+  cmake -Wno-deprecated -S "$XISO" -B "$XISO/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" > /dev/null
   ninja -C "$XISO/build"
 fi
 
@@ -90,7 +93,7 @@ if [ ! -f "$tarball" ]; then
   mv "$tarball.part" "$tarball"
 fi
 echo "$FFMPEG_SHA256  $tarball" | shasum -a 256 -c --quiet || { echo "setup_tools: $tarball does not match its SHA-256" >&2; exit 1; }
-stamp="$( { echo "$FFMPEG_SHA256"; shasum -a 256 "$ROOT"/patches/ffmpeg/*.patch "$ROOT/scripts/build_ffmpeg_xma.sh" | cut -d' ' -f1; "$LLVM/clang" --version | head -1; } | shasum -a 256 | cut -d' ' -f1)"
+stamp="$( { echo "$FFMPEG_SHA256 target $MACOSX_DEPLOYMENT_TARGET"; shasum -a 256 "$ROOT"/patches/ffmpeg/*.patch "$ROOT/scripts/build_ffmpeg_xma.sh" | cut -d' ' -f1; "$LLVM/clang" --version | head -1; } | shasum -a 256 | cut -d' ' -f1)"
 if [ "$(cat "$FF/stamp" 2>/dev/null)" != "$stamp" ]; then
   "$ROOT/scripts/build_ffmpeg_xma.sh" "$tarball" "$FF" "$LLVM/clang"
   echo "$stamp" > "$FF/stamp"

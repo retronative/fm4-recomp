@@ -120,7 +120,9 @@ GUEST_IMPORT(XamContentOpenFile, "REFERENCE_DERIVED: XContent package mounting a
     if (disposition || license || overlapped)
         Stop(StopCode::Unimplemented, "XamContentOpenFile(\"%.32s\", \"%.64s\") with disposition %08X, license %08X, overlapped %08X "
              "is not modelled", rootName, text, disposition, license, overlapped);
-    if (std::strncmp(text, "update:\\", 8) == 0)
+    // FM4 Recomp: the device name is case-insensitive (file_system.h TitleUpdatePath, as imports_io.cpp);
+    // SpeechFacade opens "UPDATE:\nuisp1033" and fails unless the answer is exactly 2.
+    if (runtime::TitleUpdatePath(text))
         return (void)(ctx.r3.u64 = 2);  // ERROR_FILE_NOT_FOUND
     runtime::DiscEntry entry;
     std::string device;

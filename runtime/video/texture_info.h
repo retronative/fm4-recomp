@@ -42,7 +42,7 @@ namespace runtime::video {
 namespace vk {
 constexpr uint32_t kFormatUndefined = 0, kFormatR8Unorm = 9, kFormatR8G8B8A8Unorm = 37, kFormatA2B10G10R10UnormPack32 = 64,
                    kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133, kFormatR16G16Unorm = 77, kFormatR16G16Snorm = 78,
-                   kFormatR8G8Unorm = 16, kFormatR8G8Snorm = 17,
+                   kFormatR8G8Unorm = 16, kFormatR8G8Snorm = 17, kFormatR16G16B16A16Sfloat = 97,
                    kFormatBc2UnormBlock = 135, kFormatBc3UnormBlock = 137, kFormatBc4UnormBlock = 139, kFormatBc5UnormBlock = 141;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipmapModeNearest = 0, kMipmapModeLinear = 1;

@@ -284,3 +284,10 @@ GUEST_IMPORT(PsCamDeviceRequest, "INFERRED: no Xbox Live Vision camera (STATUS_D
     // replace (XamXStudioRequest fails here) and skips the rest on any negative result (VERIFIED in our translation).
     ctx.r3.u64 = (3u << 30) | 0x9D;  // STATUS_DEVICE_NOT_CONNECTED
 }
+
+// FM4 Recomp: reached by SpeechFacade_default.xex.
+GUEST_IMPORT(XamIsUIActive, "REFERENCE_DERIVED: Xenia 67f16c4 xam_ui.cc:207 (xeXamIsUIActive: a XAM dialog is shown); this runtime shows none")
+{
+    // (): whether a system UI (guide, dialog) is open. This runtime opens no XAM dialog, so never: FALSE.
+    ctx.r3.u64 = 0;
+}
