@@ -352,6 +352,21 @@ void TestRectClear()
         computed.computedIndex = true;
         Expect(VertexWindowDwords(computed, 1) == 12 && VertexWindowDwords(computed, 5) == 24 && VertexWindowDwords(d.vertexSlots[0], 1) == 8,
                "computed-index window: the whole constant (12) at high 1, 24 at high 5; the vertex-indexed one stays 8");
+        // FM4 Recomp (M7 GPU cost): the fetch is provably inside the 12-word constant while the window fits: high 2 -> 12 <= 12 yes,
+        // high 3 -> 16 no; a computed index, an invalid slot or an empty slot list never prove it.
+        Expect(VertexFetchProvablyInside(d, 2) && VertexFetchProvablyInside(d, 0) && !VertexFetchProvablyInside(d, 3) && !VertexFetchProvablyInside(d, 23),
+               "fetch provably inside: high 0 and 2 yes, high 3 and 23 no");
+        DrawState dc = d;
+        dc.vertexSlots[0].computedIndex = true;
+        DrawState di = d;
+        di.vertexSlots[0].valid = false;
+        DrawState de = d;
+        de.vertexSlots.clear();
+        Expect(!VertexFetchProvablyInside(dc, 0) && !VertexFetchProvablyInside(di, 0) && !VertexFetchProvablyInside(de, 0),
+               "fetch provably inside: never for a computed index, an invalid slot or no slot");
+        Expect(VertexFetchProof(d, 2) == FetchProof::Inside && VertexFetchProof(d, 3) == FetchProof::Past && VertexFetchProof(dc, 0) == FetchProof::Computed &&
+                   VertexFetchProof(di, 0) == FetchProof::Invalid && VertexFetchProof(de, 0) == FetchProof::NoSlots,
+               "fetch proof reasons: inside, past, computed, invalid, no slots");
     }
     Expect(d.aluConstants.size() == 2048 && d.aluConstants[0] == F(1.0f) && d.aluConstants[1024] == F(2.0f) && d.boolConstants[0] == 1 &&
                d.loopConstants[0] == 0x40,
@@ -374,6 +389,40 @@ void TestRectClear()
         Expect(bulk.aluConstants == d.aluConstants && std::equal(bulk.boolConstants, bulk.boolConstants + 8, d.boolConstants) &&
                    std::equal(bulk.loopConstants, bulk.loopConstants + 32, d.loopConstants) && wrong.aluConstants[0] != d.aluConstants[0],
                "bulk register read: the big-endian file gives the reader's constants (CONTROL: an unswapped file does not)");
+    }
+    {
+        // FM4 Recomp (M7 CPU cost): a VS that reads c0-c7 (ShaderTranslation::constantCount 8) and a PS that reads c0-c1 (2) make
+        // vsConstantWords 8 * 4 = 32 and psConstantWords 2 * 4 = 8; words 31 and 1031 (the last each stage reads) come from the file,
+        // words 32 and 1032 (the first past the range) are never read: decoded into a scratch holding 0x77777777 they keep it. The
+        // bool and loop constants are read whole. A translation that does not narrow (256) reads all 1024 words of each stage (d).
+        ShaderTranslation vs8 = Vs(), ps2 = Ps(0);
+        vs8.constantCount = 8, ps2.constantCount = 2;
+        File g = f;
+        g[xr::kAluConstants + 31] = F(3.0f), g[xr::kAluConstants + 32] = F(4.0f);
+        g[xr::kAluConstants + 1024 + 7] = F(5.0f), g[xr::kAluConstants + 1024 + 8] = F(6.0f);
+        std::vector<uint32_t> scratch(2048, 0x77777777u);
+        DrawInputs in;
+        in.read = ReadVector, in.context = &g.regs, in.opcode = 0x36, in.physicalBytes = kPhysical, in.vs = &vs8, in.ps = &ps2;
+        in.constantsScratch = &scratch;
+        const DrawState n = DecodeDrawState(in);
+        Expect(n.kind != DrawKind::Refused && n.vsConstantWords == 32 && n.psConstantWords == 8 && n.aluConstants.size() == 2048 &&
+                   n.aluConstants[0] == F(1.0f) && n.aluConstants[31] == F(3.0f) && n.aluConstants[32] == 0x77777777u &&
+                   n.aluConstants[1024] == F(2.0f) && n.aluConstants[1031] == F(5.0f) && n.aluConstants[1032] == 0x77777777u &&
+                   n.boolConstants[0] == 1 && n.loopConstants[0] == 0x40,
+               "constant range: only the 4 x constantCount words of each stage are read (register path)");
+        std::vector<uint8_t> be(g.regs.size() * 4);
+        for (size_t i = 0; i < g.regs.size(); i++)
+        {
+            const uint32_t sw = __builtin_bswap32(g.regs[i]);
+            std::memcpy(be.data() + 4 * i, &sw, 4);
+        }
+        scratch.assign(2048, 0x77777777u);
+        in.registers = be.data();
+        const DrawState b = DecodeDrawState(in);
+        Expect(b.vsConstantWords == 32 && b.psConstantWords == 8 && b.aluConstants[31] == F(3.0f) && b.aluConstants[32] == 0x77777777u &&
+                   b.aluConstants[1031] == F(5.0f) && b.aluConstants[1032] == 0x77777777u && b.boolConstants[0] == 1 && b.loopConstants[0] == 0x40,
+               "constant range: the same on the bulk register path");
+        Expect(d.vsConstantWords == 1024 && d.psConstantWords == 1024, "constant range: a translation that does not narrow reads all 1024 words a stage");
     }
     Expect(d.program.vsConstBase == 0 && d.program.psConstBase == 256 && d.program.psConstSize == 255, "SQ_VS_CONST / SQ_PS_CONST decoded");
     Expect(d.textureSlots.empty() && d.vsLoopRegisters.empty(), "no textures, no loops");
@@ -942,12 +991,68 @@ void TestObservedStates()
 
 }  // namespace
 
+// FM4 Recomp (M7 CPU cost): DecodeDrawState's `out` form (draw_state.h) decodes into a DrawState the renderer keeps across draws so
+// its vectors keep their storage. The result must equal a fresh decode: every scalar reset, every vector emptied of the previous
+// draw's entries (vertex slots, texture slots, loop registers), the error cleared. Checked on the SECOND and THIRD decode into one
+// object against the fixtures' hand-derived values (the same ones TestTextured, TestRectClear and TestPointDraws expect).
+void TestReusedDrawState()
+{
+    DrawState d;
+    // 1. The textured UI draw (TestTextured's state): vertex slot 0, texture slots 1 and 2 (ascending), no loops.
+    File t = Textured();
+    ShaderTranslation tvs = Vs({0}, {5}, {5}, 2), tps = Ps(2);
+    Sample(tvs, 1, 1);
+    Sample(tps, 1, 1);
+    Sample(tps, 2, 1, {0, 3, 3, 3, 3});
+    DrawInputs in;
+    in.read = ReadVector, in.context = &t.regs, in.opcode = 0x36, in.physicalBytes = kPhysical, in.vs = &tvs, in.ps = &tps;
+    DecodeDrawState(in, d);
+    Expect(d.kind == DrawKind::Draw && d.vertexSlots.size() == 1 && d.textureSlots.size() == 2 && d.textureSlots[0].slot == 1 && d.textureSlots[1].slot == 2 &&
+               d.blend.enabled && d.target.msaa == 0,
+           "reused DrawState, first decode: the textured draw's vertex slot, texture slots 1 and 2, blending, 1X target");
+    // 2. The clear (TestRectClear's state) into the same object: its slot 0 (type 3, 12 words at 1B400000, endian 2 = 8in32), no
+    //    texture slot (the UI draw's two are gone), c0.x 1.0 (VS) / 2.0 (PS, ALU 256), bool 1, loop 0x40, rect list of 3 auto indices
+    //    writing colour mask F, blend 00010001 = off, the 640-pitch 4X 2_10_10_10 target with D24FS8 at tile 720.
+    File c = RectClear();
+    const ShaderTranslation cvs = Vs({0}, {4}, {4}), cps = Ps(1);
+    in.context = &c.regs, in.vs = &cvs, in.ps = &cps;
+    DecodeDrawState(in, d);
+    Expect(d.kind == DrawKind::Draw && d.error.empty() && d.primitiveType == 8 && d.hostPrimitive == HostPrimitive::RectList && d.indices.count == 3 &&
+               !d.indices.indexed && d.colorWriteMask == 0xF,
+           "reused DrawState, second decode (clear): a rect list of 3 auto indices writing colour");
+    Expect(d.vertexSlots.size() == 1 && d.vertexSlots[0].slot == 0 && d.vertexSlots[0].valid && d.vertexSlots[0].physical == 0x1B400000 &&
+               d.vertexSlots[0].sizeWords == 12 && d.vertexSlots[0].endian == 2 && d.vertexSlots[0].stride == 4 && d.vertexSlots[0].end == 4,
+           "reused DrawState, second decode: slot 0 is the clear's constant (12 words at 1B400000, 8in32), not the UI draw's 40-word one");
+    Expect(d.textureSlots.empty() && d.vsLoopRegisters.empty() && d.psLoopRegisters.empty(),
+           "reused DrawState, second decode: the UI draw's texture slots are gone, no loop registers");
+    Expect(d.aluConstants.size() == 2048 && d.aluConstants[0] == F(1.0f) && d.aluConstants[1024] == F(2.0f) && d.boolConstants[0] == 1 &&
+               d.loopConstants[0] == 0x40,
+           "reused DrawState, second decode: the clear's ALU, bool and loop constants");
+    Expect(!d.blend.enabled && !d.alphaTest.enabled && d.target.pitch == 640 && d.target.msaa == 2 && d.target.samples == 4 && d.target.colorFormat == 2 &&
+               d.target.depthBase == 720 && d.depthStencil.zEnable && d.depthStencil.stencilEnable,
+           "reused DrawState, second decode: the clear's blend (off), target (640 pitch 4X, depth at 720) and depth/stencil (on)");
+    // 3. A no-write point draw (TestPointDraws' state) into the same object, with the clear's shaders: NoWrite, and the clear's vertex
+    //    slot gone although the decode returns before the fetch constants (nothing of the previous draw may remain).
+    File p = PointDraw();
+    in.context = &p.regs;
+    DecodeDrawState(in, d);
+    Expect(d.kind == DrawKind::NoWrite && d.error.empty() && d.hostPrimitive == HostPrimitive::PointNoWrite && d.primitiveType == 1 && d.indices.count == 1 &&
+               d.colorWriteMask == 0 && !d.depthStencil.zEnable && !d.depthStencil.stencilEnable && d.vertexSlots.empty() && d.textureSlots.empty(),
+           "reused DrawState, third decode (no-write point): NoWrite, the clear's vertex slot and state cleared");
+    // 4. The by-value decode of the same state is the reference: the two agree on what a NoWrite decode sets.
+    const DrawState fresh = DecodeDrawState(in);
+    Expect(fresh.kind == d.kind && fresh.hostPrimitive == d.hostPrimitive && fresh.primitiveType == d.primitiveType && fresh.indices.count == d.indices.count &&
+               fresh.colorWriteMask == d.colorWriteMask && fresh.edramMode == d.edramMode && fresh.vertexSlots.empty() && fresh.textureSlots.empty(),
+           "reused DrawState: the by-value decode of the same state agrees");
+}
+
 int main()
 {
     TestPointDraws();
     TestRectClear();
     TestScissor();
     TestTextured();
+    TestReusedDrawState();
     TestObservedStates();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

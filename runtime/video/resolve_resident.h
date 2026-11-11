@@ -31,9 +31,15 @@ bool ResolveResidentCheck();  // FM4_RESOLVE_RESIDENT_CHECK=1 (diagnostic: one C
 // FM4 Recomp (opt-in FM4_RESOLVE_GPU_WORDS=1, needs FM4_RESOLVE_RESIDENT=1; off while the check runs): a resolve converted on
 // the GPU is written back to guest memory from those words (copied to the staging buffer instead of its samples), tiled and
 // endian-swapped by edram_vk_plan.h ResolveWordsToGuest: no per-sample float conversion on the CPU, no sample dump pass.
+// 32 bpp destinations; k_8_8's 16 bpp words too with FM4_RESOLVE_GPU_WORDS16=1 (edram_vk.cpp ResolveGpuWords16, M7 CPU cost).
 bool ResolveGpuWords();
 // FM4 Recomp (opt-in FM4_RESOLVE_RESIDENT_K88=1): k_8_8 (16 bpp) resolves are converted on the GPU too (ResidentConvertible).
 bool ResolveResidentK88();
+bool ResolveResidentDepth();  // FM4_RESOLVE_RESIDENT_DEPTH=1 (opt-in): depth resolves as resident words (renderer.cpp)
+// FM4 Recomp (M7 CPU cost; opt-in FM4_RESOLVE_RESIDENT_1616=1, needs FM4_RESOLVE_RESIDENT=1): 16_16 (storage 4) resolves into k_16_16
+// (25) are converted on the GPU too (ResidentConvertible; edram_vk.cpp kResolveResident XE_SOURCE_UINT), so with FM4_RESOLVE_GPU_WORDS
+// their write-back is ResolveWordsToGuest instead of 4 sample unpacks + PackFixed16 per pixel (FM4's 512x512 4x one every race frame).
+bool ResolveResident1616();
 
 // A recorded resolve, as the texture unit sees it. `converted`: the GPU words exist (the image the EDRAM unit returns).
 struct ResidentResolve
@@ -50,17 +56,30 @@ struct ResidentResolve
 // texture format 6, 7, 50 or 54 (32 bpp).
 // FM4 Recomp: also storage 0 into k_8_8 (10), 16 bpp (r | g << 8; FM4's 512x512 k_8_8 chain, about 2.75
 // resolve-consumer waits a race frame).
+// FM4 Recomp (M7 CPU cost): also storage 4 (16_16) into k_16_16 (25), 32 bpp (the only pairing DecodeResolve admits for either side;
+// edram_vk.cpp gates it behind FM4_RESOLVE_RESIDENT_1616).
 inline bool ResidentConvertible(uint32_t storage, uint32_t destFormat, uint32_t destBytesLog2)
 {
     return ((storage == 0 || storage == 2 || storage == 3) && destBytesLog2 == 2 && (destFormat == 6 || destFormat == 7 || destFormat == 50 || destFormat == 54)) ||
-           (storage == 0 && destBytesLog2 == 1 && destFormat == 10);
+           (storage == 0 && destBytesLog2 == 1 && destFormat == 10) || (storage == 4 && destBytesLog2 == 2 && destFormat == 25);
 }
 
 // Texture formats whose host texel is the resolve format's guest word (texture_info.cpp: 6 and 50 R8G8B8A8, 7 and 54
 // A2B10G10R10; the component mapping is the view's, the same for an upload and a copy).
+// FM4 Recomp (M7 waits): 36 (k_32_FLOAT) with itself: a fast 32_FLOAT resolve's resident words are the source texels (edram_vk.cpp
+// residentCopy), read back as R32_SFLOAT without a load transform.
+// FM4 Recomp (FM4_RESOLVE_RESIDENT_DEPTH): a depth resolve (dest 22 k_24_8 or 23 k_24_8_FLOAT) read as a raw 32-bit colour format (6,
+// 7, 50, 54): the texel is the guest word (an upload is a detile and endian swap only). Not 23 read as 23 (that upload decodes the
+// 20e4 depth to a float: a second image would be needed) and never 22 <-> 23 (different depth encodings).
+// FM4 Recomp (M7 CPU cost): 25 (k_16_16) with itself: the host texel is R16G16_UNORM or _SNORM (texture_info.cpp HostFormatFor, by the
+// fetch's sign), 32 bits whose low half is red, i.e. the resolve's word r | g << 16 before its endian swap, which the upload undoes with
+// the same endian (texture_untile.h EndianSwap32 == edram.h GpuSwap32); R32_UINT -> R16G16_* is a size-compatible vkCmdCopyImage.
 inline bool ResidentFormatPair(uint32_t destFormat, uint32_t textureFormat)
 {
-    const auto group = [](uint32_t f) { return f == 6 || f == 50 ? 1 : f == 7 || f == 54 ? 2 : f == 10 ? 3 : 0; };
+    const auto raw32 = [](uint32_t f) { return f == 6 || f == 7 || f == 50 || f == 54; };
+    if (destFormat == 22 || destFormat == 23)
+        return raw32(textureFormat);
+    const auto group = [](uint32_t f) { return f == 6 || f == 50 ? 1 : f == 7 || f == 54 ? 2 : f == 10 ? 3 : f == 36 ? 4 : f == 25 ? 5 : 0; };
     return group(destFormat) != 0 && group(destFormat) == group(textureFormat);
 }
 

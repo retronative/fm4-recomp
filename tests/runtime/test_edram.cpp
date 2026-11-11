@@ -199,6 +199,14 @@ void TestOwnership()
     // Base-relative start (X :1683-1686): kAd at base 720, start 16 -> tiles [736, 752).
     t.clear();
     CHECK(o.Change(kAd, 16, 16, t, why) && t.empty() && o.At(735).Empty() && o.At(736) == kAd && o.At(751) == kAd && o.At(752).Empty());
+    // FM4 Recomp (M7 CPU cost): a claim dest already owns answers without a walk and without transfers; once another owner takes
+    // part of it, the next claim transfers that part again (the memo is per owner-map generation).
+    t.clear();
+    CHECK(o.Change(kAd, 16, 16, t, why) && t.empty() && o.Count(kAd) == 16);
+    CHECK(o.Change(kAd, 18, 4, t, why) && t.empty());  // inside the remembered claim
+    CHECK(o.Change(kBd, 20, 4, t, why) && t == T({{740, 744, kAd}}) && o.At(740) == kBd);
+    t.clear();
+    CHECK(o.Change(kAd, 16, 16, t, why) && t == T({{740, 744, kBd}}) && o.Count(kAd) == 16);
     // Wrapping (X :1688-1697): key at base 2040, 16 tiles -> [2040, 2048) and [0, 8); the second extent
     // transfers from kCc, the first from nothing.
     const Key kW = Key::Color(2040, 16, Msaa::X1, ColorFormat::k8_8_8_8);
@@ -1666,6 +1674,278 @@ void TestOverwriteCutout()
     CONTROL(b.transfers[1].empty() || b.transfers[0].empty());  // without cutouts both transfer, as TestBind
 }
 
+// FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the shadow map (edram.h Ownership::ShadowAt) and the skip. Family B of
+// FM4's transfers: the 4x kD24FS8 depth at 720 (kAd, 640x360 4x: tiles 720-1439) lends its tiles to the 1x kD24FS8 key at
+// the same base (kBd, 1280x720) and takes them back. Expected values by hand: a transfer of [720, 1440) is one run (16 tiles a row,
+// 45 rows, all from one owner, X render_target_cache.cc:1624-1632 coalescing); a skipped tile changes owner and emits nothing.
+void TestTransferSkip()
+{
+    std::vector<Transfer> t;
+    std::string why;
+    // Lend, no write, reclaim: no transfer, 1 run of 720 tiles skipped.
+    Ownership o;
+    o.skipUnwritten = true;
+    CHECK(o.Change(kAd, 0, 720, t, why) && t.empty() && o.ShadowAt(720).Empty());
+    CHECK(o.Change(kBd, 0, 720, t, why, nullptr, false) && t == T({{720, 1440, kAd}}) && o.ShadowAt(720) == kAd && o.ShadowAt(1439) == kAd);
+    t.clear();
+    CHECK(o.Change(kAd, 0, 720, t, why) && t.empty() && o.Count(kAd) == 720 && o.Skipped().transfers == 1 && o.Skipped().tiles == 720);
+    CHECK(o.ShadowAt(720).Empty());  // kAd's claim writes: kBd's image no longer holds kAd's content
+    CONTROL(o.Count(kBd) != 0);
+    // A testing-only reclaim keeps the shadow: the interim owner (kBd) holds the content now.
+    Ownership r;
+    r.skipUnwritten = true;
+    CHECK(r.Change(kAd, 0, 720, t, why) && r.Change(kBd, 0, 720, t, why, nullptr, false));
+    t.clear();
+    CHECK(r.Change(kAd, 0, 720, t, why, nullptr, false) && t.empty() && r.ShadowAt(720) == kBd);
+    CHECK(r.Change(kBd, 0, 720, t, why, nullptr, false) && t.empty() && r.Skipped().transfers == 2 && r.Skipped().tiles == 1440);  // and back again
+    // CONTROL: the interim owner writes (a depth-writing bind): the reclaim transfers the whole range.
+    Ownership w;
+    w.skipUnwritten = true;
+    t.clear();
+    CHECK(w.Change(kAd, 0, 720, t, why) && w.Change(kBd, 0, 720, t, why) && t == T({{720, 1440, kAd}}) && w.ShadowAt(720).Empty());
+    t.clear();
+    CHECK(w.Change(kAd, 0, 720, t, why) && t == T({{720, 1440, kBd}}) && w.Skipped().tiles == 0);
+    // A partial write: kBd lends read-only, then writes its first 112 tiles (rows 0-6, 720-831; the claim memo's read-only entry
+    // must not answer a writing claim). The reclaim transfers exactly the written run [720, 832) and skips [832, 1440): 608 tiles.
+    // Per tile, not whole: an unwritten tile's bytes are the reclaimer's own, whatever its neighbours hold.
+    Ownership p;
+    p.skipUnwritten = true;
+    t.clear();
+    CHECK(p.Change(kAd, 0, 720, t, why) && p.Change(kBd, 0, 720, t, why, nullptr, false) && p.Change(kBd, 0, 720, t, why, nullptr, false));
+    t.clear();
+    CHECK(p.Change(kBd, 0, 112, t, why) && t.empty() && p.ShadowAt(831).Empty() && p.ShadowAt(832) == kAd);
+    CHECK(p.Change(kAd, 0, 720, t, why) && t == T({{720, 832, kBd}}) && p.Skipped().transfers == 1 && p.Skipped().tiles == 608);
+    // The skip off (the default): the shadows are tracked, every transfer stays.
+    Ownership off;
+    t.clear();
+    CHECK(off.Change(kAd, 0, 720, t, why) && off.Change(kBd, 0, 720, t, why, nullptr, false) && off.ShadowAt(720) == kAd);
+    t.clear();
+    CHECK(off.Change(kAd, 0, 720, t, why) && t == T({{720, 1440, kBd}}) && off.Skipped().tiles == 0);
+    // CONTROL: a transfer into the interim owner from a third key replaces the shadow (kBd's image now holds the third key's
+    // content, not kAd's): kAd's reclaim transfers from the third key. The third key: 2x kD24FS8 at 720 (Key bits as X .h:269-279).
+    const Key kXd = Key::Depth(720, 16, Msaa::X2, DepthFormat::D24FS8);
+    Ownership x;
+    x.skipUnwritten = true;
+    t.clear();
+    CHECK(x.Change(kAd, 0, 720, t, why) && x.Change(kBd, 0, 720, t, why, nullptr, false) && x.Change(kXd, 0, 720, t, why, nullptr, false));
+    CHECK(x.ShadowAt(720) == kBd);
+    t.clear();
+    CHECK(x.Change(kAd, 0, 720, t, why) && t == T({{720, 1440, kXd}}) && x.Skipped().tiles == 0);
+    // MarkWritten (a resolve clear's rectangle past its claim, a draw's rows past a clamped claim): tiles 720-735 written in kBd's
+    // image and 736-751 in kAd's (while kBd owns them) both lose their shadow and transfer; 752-1439 are skipped (688 tiles).
+    Ownership m;
+    m.skipUnwritten = true;
+    t.clear();
+    CHECK(m.Change(kAd, 0, 720, t, why) && m.Change(kBd, 0, 720, t, why, nullptr, false));
+    m.MarkWritten(kBd, 0, 16);
+    m.MarkWritten(kAd, 16, 16);
+    t.clear();
+    CHECK(m.Change(kAd, 0, 720, t, why) && t == T({{720, 752, kBd}}) && m.Skipped().tiles == 688);
+    // MarkWritten wraps as Change does: a key at base 2040, 16 tiles: 2040-2047 then 0-7; tile 8 keeps its shadow.
+    const Key kW1 = Key::Color(2040, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float), kW4 = Key::Color(2040, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float);
+    Ownership wrap;
+    t.clear();
+    CHECK(wrap.Change(kW4, 0, 32, t, why) && wrap.Change(kW1, 0, 32, t, why, nullptr, false) && wrap.ShadowAt(0) == kW4 && wrap.ShadowAt(8) == kW4);
+    wrap.MarkWritten(kW1, 0, 16);
+    CHECK(wrap.ShadowAt(2040).Empty() && wrap.ShadowAt(7).Empty() && wrap.ShadowAt(8) == kW4);
+    // The exact pairs only (edram.cpp SkipExact): same aspect, same format, a float or integer host. CONTROL: kD24S8 (a UNORM host
+    // where supported) and colour storage 2 (A2B10G10R10_UNORM) keep their transfers; storage 3 (RGBA16F) is skipped.
+    const Key kS4 = Key::Depth(720, 16, Msaa::X4, DepthFormat::D24S8), kS1 = Key::Depth(720, 16, Msaa::X1, DepthFormat::D24S8);
+    Ownership s;
+    s.skipUnwritten = true;
+    t.clear();
+    CHECK(s.Change(kS4, 0, 720, t, why) && s.Change(kS1, 0, 720, t, why, nullptr, false) && s.ShadowAt(720) == kS4);
+    t.clear();
+    CHECK(s.Change(kS4, 0, 720, t, why) && t == T({{720, 1440, kS1}}) && s.Skipped().tiles == 0);
+    Ownership c;
+    c.skipUnwritten = true;
+    t.clear();
+    CHECK(c.Change(kAc, 0, 720, t, why) && c.Change(kBc, 0, 720, t, why, nullptr, false));
+    t.clear();
+    CHECK(c.Change(kAc, 0, 720, t, why) && t == T({{0, 720, kBc}}) && c.Skipped().tiles == 0);
+    const Key kH4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), kH1 = Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float);
+    Ownership h;
+    h.skipUnwritten = true;
+    t.clear();
+    CHECK(h.Change(kH4, 0, 720, t, why) && h.Change(kH1, 0, 720, t, why, nullptr, false));
+    t.clear();
+    CHECK(h.Change(kH4, 0, 720, t, why) && t.empty() && h.Skipped().tiles == 720);
+    // CONTROL: a pair across formats is never exact (colour storage 3 -> 2 repacks through the guest word).
+    const Key kT1 = Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10);
+    Ownership f;
+    f.skipUnwritten = true;
+    t.clear();
+    CHECK(f.Change(kH4, 0, 720, t, why) && f.Change(kT1, 0, 720, t, why, nullptr, false) && f.ShadowAt(0) == kH4);
+    t.clear();
+    CHECK(f.Change(kH4, 0, 720, t, why) && t == T({{0, 720, kT1}}) && f.Skipped().tiles == 0);
+
+    // Through Bind: a testing-only 1x depth draw (Bind1x with colour mask 0, depthReadOnly) borrows tiles 720-1439 (720 rows:
+    // 45 tile rows x 16), the 4x scene's depth bind (360 rows at 4x: (360 << 1) / 16 = 45 rows) takes them back without a transfer.
+    Ownership b;
+    b.skipUnwritten = true;
+    CHECK(Bind(b, Fm4Bind(4, 2, 0), 360).ok && b.Count(kAd) == 720);
+    Binding bb = Bind(b, Bind1x(2, 0), 720, nullptr, nullptr, true);
+    CHECK(bb.ok && bb.depth == kBd && bb.transfers[0] == T({{720, 1440, kAd}}));
+    bb = Bind(b, Fm4Bind(4, 2, 0), 360);
+    CHECK(bb.ok && bb.transfers[0].empty() && b.Skipped().tiles == 720);
+    // CONTROL: the same 1x draw with depth writes (depthReadOnly false) makes the reclaim transfer.
+    CHECK(Bind(b, Bind1x(2, 0), 720).ok);
+    bb = Bind(b, Fm4Bind(4, 2, 0), 360);
+    CHECK(bb.ok && bb.transfers[0] == T({{720, 1440, kBd}}) && b.Skipped().tiles == 720);
+    // CONTROL: a depth cutout overrides depthReadOnly (the draw overwrites): no transfer in (the cutout), and the reclaim transfers.
+    const Rect whole1x{0, 0, 1280, 720};
+    bb = Bind(b, Bind1x(2, 0), 720, &whole1x, nullptr, true);
+    CHECK(bb.ok && bb.transfers[0].empty() && b.ShadowAt(720).Empty());
+    bb = Bind(b, Fm4Bind(4, 2, 0), 360);
+    CHECK(bb.ok && bb.transfers[0] == T({{720, 1440, kBd}}));
+    // A draw's rows past its clamped claim: kAc (colour, base 0) owns tiles 720-1023 and lends them read-only to kAd. The 4x scene
+    // bind at 512 rows: (512 << 1) / 16 = 64 tile rows = 1024 tiles, but the bases' distance (720, X :819-857) clamps kAc's claim to
+    // 0-719; the host draw still writes rows 360-511 of kAc's image = tiles 720-1023, so their shadows (kAc) go. kAd's claim is
+    // read-only (depthReadOnly) and keeps nothing else from changing them.
+    Ownership k;
+    t.clear();
+    CHECK(k.Change(kAc, 720, 304, t, why) && k.Change(kAd, 0, 304, t, why, nullptr, false) && t == T({{720, 1024, kAc}}) && k.ShadowAt(720) == kAc);
+    bb = Bind(k, Fm4Bind(), 512, nullptr, nullptr, true);
+    CHECK(bb.ok && bb.lengthTiles[1] == 720 && bb.lengthTiles[0] == 720 && k.ShadowAt(720).Empty() && k.ShadowAt(1023).Empty());
+
+    // A depth resolve copy is a read-only claim: after the testing-only 1x draw, the resolve of the 4x depth (TestDepthResolve's
+    // registers: copy_src_select 4, the whole 640x360) reclaims the span row by row (45 rows of 16 tiles, PrepareResolve) with no
+    // copy transfer; one skipped run per row.
+    Ownership d;
+    d.skipUnwritten = true;
+    CHECK(Bind(d, Fm4Bind(4, 2, 0), 360).ok && Bind(d, Bind1x(2, 0), 720, nullptr, nullptr, true).ok);
+    ResolveRegisters rr = Fm4Resolve();
+    rr.copyControl = 1u << 20 | 4;
+    const ResolvePlan plan = PrepareResolve(d, DecodeResolve(rr));
+    CHECK(plan.ok && plan.copy && plan.copySource == kAd && plan.copyTransfers.empty() && d.Skipped().transfers == 45 && d.Skipped().tiles == 720);
+    CHECK(d.ShadowAt(720) == kBd);  // the copy wrote nothing: kBd's image still holds the content
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): whole-tile constants (edram.h Ownership::SetClearValue) move to a key of the same
+// aspect and format as `value` transfers. Tile sizes from X render_target_cache.cc:355-359: 4x 40x8 pixels, 2x 80x8, 1x 80x16; pitch 16
+// tiles a row. W is an arbitrary word: the model never decodes it.
+void TestClearValueOwnership()
+{
+    constexpr uint32_t W = 0x12345678u;
+    std::vector<Transfer> t;
+    std::string why;
+    uint32_t w = 0;
+    const Rect scene4x{0, 0, 640, 360};  // 16 x 45 tiles of 40x8 = tiles 0-719
+    // The whole 4x scene cleared: 720 tiles recorded; the 1x key of the same format (storage 2) takes them as one value transfer.
+    {
+        Ownership o;
+        CHECK(o.Change(kAc, 0, 720, t, why) && t.empty());
+        CHECK(o.SetClearValue(kAc, scene4x, W) == 720 && o.ClearValueTiles() == 720 && o.ClearValue(0, w) && w == W && o.ClearValue(719, w));
+        CONTROL(o.ClearValue(720, w));
+        CHECK(o.Change(kBc, 0, 720, t, why) && t == T({{0, 720, kAc, true, W}}) && o.Count(kBc) == 720);
+        CHECK(o.ClearValueTiles() == 0);  // the claimant writes them: no constant any more
+        CONTROL(t == T({{0, 720, kAc}}));  // not an ordinary copy
+    }
+    // Partial cover: 640x352 holds rows 0-43 (704 tiles); row 44 (pixel rows 352-359) is not a constant and is copied.
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, Rect{0, 0, 640, 352}, W) == 704);
+        CHECK(o.Change(kBc, 0, 720, t, why) && t == T({{0, 704, kAc, true, W}, {704, 720, kAc}}));
+    }
+    // A rectangle that starts mid-tile: y 4..360 leaves row 0 (y 0..8) out: tiles 16-719.
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, Rect{0, 4, 640, 356}, W) == 704);
+        CHECK(!o.ClearValue(15, w) && o.ClearValue(16, w));
+    }
+    // CONTROL: another format (1x storage 0) gets an ordinary copy, and the constants still go.
+    {
+        Ownership o;
+        t.clear();
+        const Key kCc = Key::Color(0, 16, Msaa::X1, ColorFormat::k8_8_8_8);
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, scene4x, W) == 720);
+        CHECK(o.Change(kCc, 0, 720, t, why) && t == T({{0, 720, kAc}}) && o.ClearValueTiles() == 0);
+    }
+    // A write by the owner itself drops its constants, also through the claim memo (the first claim of tiles 0-719 is remembered and
+    // SetClearValue does not invalidate it): tiles 0-111 are copied afterwards, 112-719 still move as a value.
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, scene4x, W) == 720);
+        CHECK(o.Change(kAc, 0, 112, t, why) && t.empty() && o.ClearValueTiles() == 608 && !o.ClearValue(111, w) && o.ClearValue(112, w));
+        CHECK(o.Change(kBc, 0, 720, t, why) && t == T({{0, 112, kAc}, {112, 720, kAc, true, W}}));
+    }
+    // FM4 Recomp (both flags): a value transfer leaves the source's constant possibly unrecorded in its image, so the source is no shadow
+    // of those tiles: the reclaim is a real transfer, even with the skip on, and never a skip. CONTROL: an ordinary lend of the same tiles is skipped.
+    {
+        const Key c4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), c1 = Key::Color(0, 16, Msaa::X1, ColorFormat::k2_10_10_10_Float);
+        Ownership o;
+        o.skipUnwritten = true;
+        t.clear();
+        CHECK(o.Change(c4, 0, 720, t, why) && o.SetClearValue(c4, scene4x, W) == 720);
+        CHECK(o.Change(c1, 0, 720, t, why, nullptr, false) && t == T({{0, 720, c4, true, W}}) && o.ShadowAt(0).Empty());
+        t.clear();
+        CHECK(o.Change(c4, 0, 720, t, why) && t == T({{0, 720, c1}}) && o.Skipped().tiles == 0);
+        Ownership p;
+        p.skipUnwritten = true;
+        t.clear();
+        CHECK(p.Change(c4, 0, 720, t, why) && p.Change(c1, 0, 720, t, why, nullptr, false) && p.ShadowAt(0) == c4);
+        t.clear();
+        CHECK(p.Change(c4, 0, 720, t, why) && t.empty() && p.Skipped().tiles == 720);
+    }
+    // A constant with no exact guest word travels by its host-colour index (Transfer::exact), kept through a run split; a different index does not coalesce.
+    {
+        const Key c4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), c2 = Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float);
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(c4, 0, 720, t, why) && o.SetClearValue(c4, Rect{0, 0, 640, 176}, 0, 3) == 352 && o.SetClearValue(c4, Rect{0, 176, 640, 184}, 0, 5) == 368);  // 22 and 23 rows of 16 tiles of 8 pixel rows
+        CHECK(o.Change(c2, 100, 10, t, why) && t == T({{100, 110, c4, true, 0, 3}}));  // [100, 110) cuts the first run in two
+        t.clear();
+        CHECK(o.Change(c2, 0, 720, t, why) && t == T({{0, 100, c4, true, 0, 3}, {110, 352, c4, true, 0, 3}, {352, 720, c4, true, 0, 5}}));
+        CONTROL(t == T({{0, 100, c4, true, 0, 3}, {110, 720, c4, true, 0, 3}}));
+    }
+    // A hole in a run: the 1x key claims tiles 100-109 (a value transfer); 99 and 110 keep the constant (the run split in two).
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, scene4x, W) == 720);
+        CHECK(o.Change(kBc, 100, 10, t, why) && t == T({{100, 110, kAc, true, W}}));
+        CHECK(o.ClearValue(99, w) && !o.ClearValue(105, w) && o.ClearValue(110, w) && o.ClearValueTiles() == 710);
+    }
+    // A claim whose cutout covers the tiles (a clear of the claimant) transfers nothing and drops the constants too.
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, scene4x, W) == 720);
+        const Rect whole1x{0, 0, 1280, 720};
+        CHECK(o.Change(kBc, 0, 720, t, why, &whole1x) && t.empty() && o.ClearValueTiles() == 0);
+    }
+    // CONTROL: tiles the key does not own are never recorded.
+    {
+        Ownership o;
+        t.clear();
+        CHECK(o.Change(kBc, 0, 720, t, why));
+        CHECK(o.SetClearValue(kAc, scene4x, W) == 0 && o.ClearValueTiles() == 0);
+    }
+    // FM4's transfer family A: the 4x 7e3 colour key at 0 and the 4x kD24FS8 key at 1024 are cleared over their
+    // 1024 tiles each (16 x 64 tiles of 40x8 = 640x512), then the 2x keys of the same tiles and formats claim them: one value transfer
+    // each, with the words; nothing is copied.
+    {
+        Ownership o;
+        t.clear();
+        const Key c4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), c2 = Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float);
+        const Key d4 = Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8), d2 = Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8);
+        CHECK(c4.packed == 0xD08000u && d4.packed == 0x708400u);  // the keys of the s202 tally (REPORT §2A)
+        CHECK(o.Change(c4, 0, 1024, t, why) && o.Change(d4, 0, 1024, t, why) && t.empty());
+        CHECK(o.SetClearValue(c4, Rect{0, 0, 640, 512}, 0xC0020180u) == 1024 && o.SetClearValue(d4, Rect{0, 0, 640, 512}, 0xF00000FFu) == 1024);
+        CHECK(o.Change(c2, 0, 1024, t, why) && t == T({{0, 1024, c4, true, 0xC0020180u}}));
+        t.clear();
+        CHECK(o.Change(d2, 0, 1024, t, why) && t == T({{1024, 2048, d4, true, 0xF00000FFu}}));
+        // CONTROL: a 4x 2_10_10_10 (storage 2) claimant of the 7e3 constants is a format change: copied.
+        Ownership p;
+        t.clear();
+        CHECK(p.Change(c4, 0, 1024, t, why) && p.SetClearValue(c4, Rect{0, 0, 640, 512}, 0xC0020180u) == 1024);
+        CHECK(p.Change(kAc, 0, 1024, t, why) && t == T({{0, 1024, c4}}));
+    }
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1)
@@ -1690,6 +1970,8 @@ int main(int argc, char** argv)
     TestDepthResolve();
     TestOverwriteCutout();
     TestK88ResolveDecode();
+    TestTransferSkip();
+    TestClearValueOwnership();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -9,6 +9,8 @@
 #include "render_targets_vk.h"
 #include "parallel_rows.h"  // FM4 Recomp (M7): the read-back conversions split by rows
 #include "texture_untile.h"  // TiledOffset2D, EndianSwap16Pair (X texture_util.cc:443-458; endian.xesli:25-31) for 16 bpp destinations
+#include <cstdlib>
+#include <mutex>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -192,6 +194,51 @@ SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, K
     const uint32_t sourcePitch = source.PitchTilesAt32bpp();  // X :2956-2965: the source's own pitch splits its tile index
     p.x += (sourceTile % sourcePitch) * stw, p.y += (sourceTile / sourcePitch) * sth;
     return p;
+}
+
+VkRect2D UnitPassArea(const VkRect2D* rects, size_t count, uint32_t width, uint32_t height)
+{
+    if (count == 0)
+        return {{0, 0}, {width, height}};
+    uint32_t y0 = height, y1 = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        const uint32_t top = rects[i].offset.y < 0 ? 0u : uint32_t(rects[i].offset.y);
+        y0 = std::min(y0, top);
+        y1 = std::max(y1, top + rects[i].extent.height);
+    }
+    y0 &= ~31u;
+    y1 = std::min(height, (y1 + 31) & ~31u);
+    if (y1 <= y0)
+        return {{0, 0}, {width, height}};
+    return {{0, int32_t(y0)}, {width, y1 - y0}};
+}
+
+// FM4 Recomp (M7 GPU cost): `r` lies wholly inside `add` (the one rule of MergePendingClear and PushPendingClear).
+static bool RectInside(const VkRect2D& r, const VkRect2D& add)
+{
+    return r.offset.x >= add.offset.x && r.offset.y >= add.offset.y && int64_t(r.offset.x) + r.extent.width <= int64_t(add.offset.x) + add.extent.width &&
+           int64_t(r.offset.y) + r.extent.height <= int64_t(add.offset.y) + add.extent.height;
+}
+
+size_t MergePendingClear(std::vector<VkRect2D>& rects, VkRect2D add)
+{
+    const size_t before = rects.size();
+    rects.erase(std::remove_if(rects.begin(), rects.end(), [&](const VkRect2D& r) { return RectInside(r, add); }), rects.end());
+    const size_t dropped = before - rects.size();
+    rects.push_back(add);
+    return dropped;
+}
+
+size_t PushPendingClear(std::vector<PendingClear>& pending, const PendingClear& add)
+{
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the same rule as MergePendingClear applied to the clears themselves (an older clear with
+    // exactly the new rectangle is inside it and goes; matching rectangles by equality would keep it: TestPushPendingClear).
+    const size_t before = pending.size();
+    pending.erase(std::remove_if(pending.begin(), pending.end(), [&](const PendingClear& old) { return RectInside(old.rect, add.rect); }), pending.end());
+    const size_t dropped = before - pending.size();
+    pending.push_back(add);
+    return dropped;
 }
 
 uint32_t Depth32To20e4(float depth)
@@ -390,6 +437,66 @@ void DecodeDepthClear(uint32_t value, DepthFormat format, float& depth, uint32_t
     const uint32_t d24 = (value >> 8) & 0xFFFFFF;
     depth = format == DepthFormat::D24S8 ? UNorm24To32(d24) : Float20e4To32(d24);
     stencil = value & 0xFF;
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): edram_vk_plan.h.
+bool ValueClear(Key dest, uint32_t word, const edram::Rect& rect, PendingClear& out)
+{
+    out = {};
+    if (dest.Empty() || rect.width == 0 || rect.height == 0)
+        return false;
+    if (dest.IsDepth())
+    {
+        out.attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        DecodeDepthClear(word, DepthFormat(dest.Format()), out.attachment.clearValue.depthStencil.depth, out.attachment.clearValue.depthStencil.stencil);
+    }
+    else
+    {
+        out.attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        out.attachment.colorAttachment = 0;
+        if (!DecodeColorClear(word, dest.Format(), out.attachment.clearValue.color.float32))  // storage 4 and 14 (transfer view) and the rest
+            return false;
+    }
+    out.rect = {{int32_t(rect.x), int32_t(rect.y)}, {rect.width, rect.height}};
+    return true;
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): edram_vk_plan.h.
+bool ClearRequestWord(const ClearRequest& request, Key key, uint32_t& word)
+{
+    word = 0;
+    if (key.Empty())
+        return false;
+    if (key.IsDepth())
+    {
+        if (!request.depth || !(request.depthValue >= 0.0f && request.depthValue <= 1.0f) || request.stencil > 0xFF)
+            return false;
+        const DepthFormat format = DepthFormat(key.Format());
+        const uint32_t w = PackDepthStencilWord(request.depthValue, request.stencil, format);
+        float depth = 0;
+        uint32_t stencil = 0;
+        DecodeDepthClear(w, format, depth, stencil);
+        if (std::memcmp(&depth, &request.depthValue, sizeof depth) != 0 || stencil != request.stencil)
+            return false;
+        word = w;
+        return true;
+    }
+    const uint32_t storage = key.Format();
+    if (!request.color || (storage != uint32_t(ColorFormat::k8_8_8_8) && storage != uint32_t(ColorFormat::k2_10_10_10) &&
+                           storage != uint32_t(ColorFormat::k2_10_10_10_Float)))
+        return false;
+    for (uint32_t i = 0; i < 4; i++)  // the format's range (PackTransferColor converts float -> uint: nothing negative or NaN reaches it)
+    {
+        const float limit = storage == uint32_t(ColorFormat::k2_10_10_10_Float) && i < 3 ? 31.875f : 1.0f;
+        if (!(request.rgba[i] >= 0.0f && request.rgba[i] <= limit))
+            return false;
+    }
+    const uint32_t w = PackTransferColor(request.rgba, storage);
+    float back[4];
+    if (!DecodeColorClear(w, storage, back) || std::memcmp(back, request.rgba, sizeof back) != 0)
+        return false;
+    word = w;
+    return true;
 }
 
 edram::ResolveRegisters GatherResolveRegisters(RegisterRead read, const void* context)
@@ -754,27 +861,219 @@ bool ResolveDepthConvertible(const edram::ResolveInfo& info, std::string& why)
     return true;
 }
 
+// FM4 Recomp: TiledOffset at 32 bpp (front_buffer.h) keeps the four texels of an aligned group (x & ~3) in one contiguous 16-byte run:
+// x contributes bits 2-3 of the offset inside the 64-byte block (x & 3) and bit 5 (x & 4), nothing else below bit 6. So a tiled store
+// computes one address per run and writes up to 16 bytes (tests/runtime/test_edram_vk.cpp TestTiledRuns checks the property over a
+// grid and the result against a per-texel store). The row-worker time of the write-back was 12 % of the command processor's thread
+// (6 ms of write-back a swap on the critical path).
+bool TiledRunsFit(uint32_t destOffsetX, uint32_t destOffsetY, uint32_t destPitch, uint32_t width, uint32_t height, uint32_t destBytes, std::string& why)
+{
+    // FM4 Recomp (M7 CPU cost): the walk over every texel group costs ~4 % of the command-processor thread and the
+    // same resolve shapes recur every frame: a shape that fitted once fits again (the answer depends only on the arguments).
+    struct Shape
+    {
+        uint32_t x, y, pitch, w, h, bytes;
+        bool operator==(const Shape& o) const { return x == o.x && y == o.y && pitch == o.pitch && w == o.w && h == o.h && bytes == o.bytes; }
+    };
+    static std::mutex fitLock;
+    static std::vector<Shape> fitted;  // shapes proven to fit (a refusal is never cached: it stops the run)
+    const Shape shape{destOffsetX, destOffsetY, destPitch, width, height, destBytes};
+    {
+        std::lock_guard<std::mutex> lock(fitLock);
+        for (const Shape& f : fitted)
+            if (f == shape)
+                return true;
+    }
+    for (uint32_t y = 0; y < height; y++)
+        for (uint32_t x = 0; x < width;)
+        {
+            const uint32_t ax = destOffsetX + x, run = std::min<uint32_t>(4 - (ax & 3), width - x);
+            const uint64_t end = uint64_t(TiledOffset(ax, destOffsetY + y, destPitch, 2)) + uint64_t(run) * 4;
+            if (end > destBytes)
+            {
+                const uint64_t startByte = end - uint64_t(run) * 4;
+                const uint32_t texel = x + uint32_t(destBytes > startByte ? (destBytes - startByte) / 4 : 0);
+                return Refuse(why, "resolve texel (" + std::to_string(texel) + ", " + std::to_string(y) + ") lands past the destination's " +
+                                       std::to_string(destBytes) + " bytes");
+            }
+            x += run;
+        }
+    std::lock_guard<std::mutex> lock(fitLock);
+    if (fitted.size() < 4096)
+        fitted.push_back(shape);
+    return true;
+}
+// One tiled row of 32-bit words: `wordAt(x)` the texel's word before the endian swap.
+// FM4_TILED_RUNS=1 (opt-in): the store in runs of four texels; neutral on the frame and on the workers' CPU
+// (write-back 5.7 vs 5.8 ms a swap), so the per-texel store stays the default (a change is kept only when the frame improves).
+bool TiledRuns()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_TILED_RUNS");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+template <typename WordAt>
+void StoreTiledRow32(uint8_t* dest, uint32_t destOffsetX, uint32_t ay, uint32_t destPitch, uint32_t width, uint32_t endian, WordAt wordAt)
+{
+    if (!TiledRuns())
+    {
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint32_t w = edram::GpuSwap32(wordAt(x), endian);
+            std::memcpy(dest + TiledOffset(destOffsetX + x, ay, destPitch, 2), &w, 4);
+        }
+        return;
+    }
+    for (uint32_t x = 0; x < width;)
+    {
+        const uint32_t ax = destOffsetX + x, run = std::min<uint32_t>(4 - (ax & 3), width - x);
+        uint32_t w[4];
+        for (uint32_t i = 0; i < run; i++)
+            w[i] = edram::GpuSwap32(wordAt(x + i), endian);  // resolve_full_32bpp.xesli:62-65
+        std::memcpy(dest + TiledOffset(ax, ay, destPitch, 2), w, size_t(run) * 4);
+        x += run;
+    }
+}
+
+// FM4 Recomp (M7 CPU cost): tile-major stores. Proof from TiledOffset at log2Bytes 2 (front_buffer.h, the formula of X
+// texture_util.cc:443-458 GetTiledOffset2D): the pre-swizzle offset is macro + micro with macro = ((y >> 5) * TilesPerRow(pitch) +
+// (x >> 5)) << 9 and micro = ((y & 14) << 5) + ((y & 1) << 4) + ((x & 4) << 3) + ((x & 3) << 2) <= 508 < 512, so `offset & ~0x1FF` is
+// macro alone and the result is (macro << 3) + inTile = tile index * 4096 + inTile, where inTile = ((y & 16) << 7) +
+// ((micro & 0x1C0) << 2) + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (micro & 0x3F) takes bit 11 from y & 16, bits 8-10 from y & 14,
+// bits 6-7 from ((x >> 3) + ((y & 8) >> 2)) & 3, bit 5 from x & 4, bit 4 from y & 1 and bits 2-3 from x & 3 (bits 0-1 are 0). Hence
+// (1) a 32x32 tile is one contiguous 4 KB block, the in-tile offset depends only on (x & 31, y & 31) and each of those ten bits owns an
+// offset bit: a bijection onto the tile's 1,024 word slots; (2) the rows ye = y & ~1 and ye + 1 fill the contiguous 256-byte stripe at
+// in-tile offset (y & 30) << 7, whose word s (0-63) holds the texel with x & 3 = s & 3, y & 1 = (s >> 2) & 1, (x >> 2) & 1 =
+// (s >> 3) & 1 and ((x >> 3) + ((ye & 8) >> 2)) & 3 = s >> 4, i.e. run r = s >> 2 is the four consecutive texels from
+// kTiledStripeRunX[(ye >> 3) & 1][r] of the row with parity r & 1 (edram_vk_plan.h; the static_assert below holds the table to the
+// formula, tests/runtime/test_edram_vk.cpp TestTiledStripes holds both to Xenia's). The pitch only scales the tile index and the
+// source's MSAA plays no part (the words are already one per destination texel), so the fast path covers every 32 bpp destination.
+//
+// StoreTiledRows32 writes the rectangle's `height` rows from a linear source (`src[y * stride + x]`). The work unit is a pair of
+// destination rows (absolute ye even, ye + 1): for each tile column the pair covers whole (32 aligned texels inside the rectangle) it
+// writes the stripe destination-sequentially, 16 runs of four words (four loads, the swaps, one 16-byte store; no address arithmetic per
+// texel), so a thread that holds consecutive pairs writes a whole tile as 4 KB in order; the partial columns at the rectangle's sides and
+// a row whose partner lies outside the rectangle keep the per-texel store. Destination-sequential rather than source-sequential: the
+// writes go to guest memory that is cold (full 128-byte lines written whole, no partial-line fill), while the reads are two 128-byte
+// source rows per stripe, hot in cache. The units (a lone leading row, the pairs, a lone trailing row) are built here and handed to
+// ParallelRows, so no chunk boundary splits a pair; every byte a unit writes lies in a stripe of its own rows (the per-texel edge
+// stores too: their row's stripe), so concurrent units never share a cache line and the result is the serial one byte for byte.
+// TiledRunsFit has proven the per-texel addresses of the whole rectangle before this runs, and a stripe's 64 words are exactly those
+// 64 texels' addresses (the bijection), so no store lands outside the proven set. FM4_TILED_STRIPES=0 restores the per-texel store
+// (the A/B; the default changes only when the frame improves).
+constexpr bool StripeTableMatchesTiledOffset()
+{
+    for (uint32_t ye = 0; ye < 32; ye += 2)
+        for (uint32_t r = 0; r < 16; r++)
+            for (uint32_t k = 0; k < 4; k++)
+                if (TiledOffset(kTiledStripeRunX[(ye >> 3) & 1][r] + k, ye + (r & 1), 32, 2) != ((ye & 30) << 7) + (r * 4 + k) * 4)
+                    return false;
+    // the tile index part: tile (1, 2) at pitch 128 (4 tiles a row) is block 9, and the in-tile part is the same as at tile (0, 0)
+    return TiledOffset(32 + 5, 64 + 3, 128, 2) == (9u << 12) + TiledOffset(5, 3, 32, 2);
+}
+static_assert(StripeTableMatchesTiledOffset(), "kTiledStripeRunX disagrees with TiledOffset");
+
+bool TiledStripes()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_TILED_STRIPES");
+        return v == nullptr || !(v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
+}
+
+void StoreTiledRows32(uint8_t* dest, uint32_t destOffsetX, uint32_t destOffsetY, uint32_t destPitch, uint32_t width, uint32_t height,
+                      uint32_t endian, const uint32_t* src, size_t stride)
+{
+    const auto texels = [&](uint32_t y, uint32_t x0, uint32_t x1) {  // the per-texel store of row y (local), texels [x0, x1)
+        if (x1 > x0)
+            StoreTiledRow32(dest, destOffsetX + x0, destOffsetY + y, destPitch, x1 - x0, endian,
+                            [&](uint32_t x) { return src[size_t(y) * stride + x0 + x]; });
+    };
+    // the tile columns the rectangle covers whole, absolute texels [fullX0, fullX1); none when fullX1 <= fullX0
+    const uint32_t fullX0 = (destOffsetX + 31) & ~31u, fullX1 = (destOffsetX + width) & ~31u;
+    if (height == 0)
+        return;
+    if (!TiledStripes() || fullX1 <= fullX0)
+    {
+        ParallelRows(height, width, [&](uint32_t y0, uint32_t y1) {
+            for (uint32_t y = y0; y < y1; y++)
+                texels(y, 0, width);
+        });
+        return;
+    }
+    const uint32_t leading = destOffsetY & 1;                  // 1: local row 0 is odd, its partner is above the rectangle
+    const uint32_t paired = (height - leading) & ~1u;          // rows that pair up
+    const uint32_t trailing = leading + paired < height ? 1 : 0;  // the last row's partner is below the rectangle
+    const uint32_t units = leading + paired / 2 + trailing;
+    ParallelRows(units, 2 * uint64_t(width), [&](uint32_t u0, uint32_t u1) {
+        for (uint32_t u = u0; u < u1; u++)
+        {
+            if ((u == 0 && leading != 0) || (u + 1 == units && trailing != 0))
+            {
+                texels(u == 0 && leading != 0 ? 0 : height - 1, 0, width);
+                continue;
+            }
+            const uint32_t y = 2 * u - leading;  // the pair's first (local) row; absolute ay is even
+            const uint32_t ay = destOffsetY + y, rot = (ay >> 3) & 1;
+            texels(y, 0, fullX0 - destOffsetX);
+            texels(y + 1, 0, fullX0 - destOffsetX);
+            texels(y, fullX1 - destOffsetX, width);
+            texels(y + 1, fullX1 - destOffsetX, width);
+            const uint32_t* rows[2] = {src + size_t(y) * stride, src + size_t(y + 1) * stride};
+            for (uint32_t ax = fullX0; ax < fullX1; ax += 32)
+            {
+                uint8_t* stripe = dest + TiledOffset(ax, ay & ~31u, destPitch, 2) + ((ay & 30) << 7);  // the tile's block, the pair's stripe
+                const uint32_t lx = ax - destOffsetX;
+                for (uint32_t r = 0; r < 16; r++)
+                {
+                    const uint32_t* s = rows[r & 1] + lx + kTiledStripeRunX[rot][r];
+                    uint32_t w[4];
+                    for (uint32_t k = 0; k < 4; k++)
+                        w[k] = edram::GpuSwap32(s[k], endian);  // resolve_full_32bpp.xesli:62-65
+                    std::memcpy(stripe + r * 16, w, 16);
+                }
+            }
+        }
+    });
+}
+
 bool ResolveWordsToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
                          std::string& why)
 {
     if (!ResolveFullConvertible(info, sourceStorage, why))
         return false;
-    if (info.destBytesLog2 != 2)
-        return Refuse(why, "GPU resolve words are 32 bpp; destination format " + std::to_string(info.destFormat) + " is not");
     const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
-    auto address = [&](uint32_t x, uint32_t y) { return TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2); };
-    if (const uint64_t past = FirstPastEnd(width, height, destBytes, [&](uint32_t x, uint32_t y) { return uint64_t(address(x, y)) + 4; });
-        past != kNonePast)
-        return Refuse(why, "resolve texel (" + std::to_string(uint32_t(past)) + ", " + std::to_string(uint32_t(past >> 32)) + ") lands past the destination's " +
-                               std::to_string(destBytes) + " bytes");
-    ParallelRows(height, width, [&](uint32_t y0, uint32_t y1) {
-    for (uint32_t y = y0; y < y1; y++)
-        for (uint32_t x = 0; x < width; x++)
-        {
-            const uint32_t w = edram::GpuSwap32(words[size_t(y) * width + x], info.destEndian);  // resolve_full_32bpp.xesli:62-65
-            std::memcpy(dest + address(x, y), &w, 4);
-        }
-    });
+    if (info.destBytesLog2 == 1)
+    {
+        // FM4 Recomp (M7 CPU cost, FM4_RESOLVE_GPU_WORDS16): k_8_8's words are the R16_UINT resident image's halfwords (edram_vk.cpp
+        // kResolveResident's destFormat 10 branch: r | g << 8, the low 16 bits of ResolveConvertPixel's result), tightly packed. Each
+        // is stored exactly as ResolveConvertToGuest's 16 bpp branch stores ResolveConvertPixel's: XeEndianSwap16 of the halfword
+        // (EndianSwap16Pair) at TiledOffset2D(destOffsetX + x, destOffsetY + y, destPitch, 1), 2 bytes; no float work. The bounds
+        // check is that branch's (every address first; a refusal writes nothing).
+        const uint16_t* words16 = reinterpret_cast<const uint16_t*>(words);
+        auto address = [&](uint32_t x, uint32_t y) { return TiledOffset2D(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 1); };
+        if (const uint64_t past = FirstPastEnd(width, height, destBytes, [&](uint32_t x, uint32_t y) { return uint64_t(address(x, y)) + 2; });
+            past != kNonePast)
+            return Refuse(why, "resolve texel (" + std::to_string(uint32_t(past)) + ", " + std::to_string(uint32_t(past >> 32)) + ") lands past the destination's " +
+                                   std::to_string(destBytes) + " bytes");
+        ParallelRows(height, width, [&](uint32_t y0, uint32_t y1) {
+            for (uint32_t y = y0; y < y1; y++)
+                for (uint32_t x = 0; x < width; x++)
+                {
+                    const uint16_t h = uint16_t(EndianSwap16Pair(words16[size_t(y) * width + x], info.destEndian));  // resolve_full_16bpp.xesli:63
+                    std::memcpy(dest + address(x, y), &h, 2);  // a little-endian store (arm64)
+                }
+        });
+        return true;
+    }
+    if (info.destBytesLog2 != 2)
+        return Refuse(why, "GPU resolve words are 32 or 16 bpp; destination format " + std::to_string(info.destFormat) + " is neither");
+    if (!TiledRunsFit(info.destOffsetX, info.destOffsetY, info.destPitch, width, height, destBytes, why))
+        return false;
+    StoreTiledRows32(dest, info.destOffsetX, info.destOffsetY, info.destPitch, width, height, info.destEndian, words, width);
     return true;
 }
 
@@ -784,22 +1083,15 @@ bool ResolveDepthToGuest(const edram::ResolveInfo& info, const uint32_t* words, 
         return false;
     const uint32_t width = info.x1 - info.x0, height = info.y1 - info.y0;
     // every address first: a refusal writes nothing
-    if (const uint64_t past = FirstPastEnd(width, height, destBytes, [&](uint32_t x, uint32_t y) {
-            return uint64_t(TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2)) + 4; });
-        past != kNonePast)
-        return Refuse(why, "resolve texel (" + std::to_string(uint32_t(past)) + ", " + std::to_string(uint32_t(past >> 32)) + ") lands past the destination's " +
-                               std::to_string(destBytes) + " bytes");
+    if (!TiledRunsFit(info.destOffsetX, info.destOffsetY, info.destPitch, width, height, destBytes, why))
+        return false;
     uint32_t indices[4], count = 0;
     ResolveSamples(info, indices, count);
     const DumpLayout l = DumpLayoutFor(info.msaa, width, height);
-    ParallelRows(height, width, [&](uint32_t y0, uint32_t y1) {
-    for (uint32_t y = y0; y < y1; y++)
-        for (uint32_t x = 0; x < width; x++)
-        {
-            const uint32_t w = edram::GpuSwap32(words[l.Word(x, y, indices[0])], info.destEndian);
-            std::memcpy(dest + TiledOffset(info.destOffsetX + x, info.destOffsetY + y, info.destPitch, 2), &w, 4);  // a little-endian store
-        }
-    });
+    // FM4 Recomp (M7 CPU cost): the selected sample's words are linear in the dump: l.Word(x, y, g) = l.Word(0, 0, g) + y * (l.width *
+    // l.columns) + x, so the tile-major store reads them as rows of that stride.
+    StoreTiledRows32(dest, info.destOffsetX, info.destOffsetY, info.destPitch, width, height, info.destEndian, words + l.Word(0, 0, indices[0]),
+                     size_t(l.width) * l.columns);
     return true;
 }
 

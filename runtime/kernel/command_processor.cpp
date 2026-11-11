@@ -148,6 +148,17 @@ struct BinTally { uint64_t run = 0, skipped = 0; };
 std::map<uint64_t, BinTally> binDraws;  // key: the bin select of a predicated draw; ~0 for draws that are not predicated
 uint64_t binSelectChanges = 0;
 
+uint32_t WaitPollSpinUs()
+{
+    static const uint32_t us = [] {
+        const char* v = std::getenv("FM4_WAIT_POLL_US");
+        const unsigned long n = v != nullptr ? std::strtoul(v, nullptr, 10) : 0;
+        if (v != nullptr && n != 0)
+            std::fprintf(stderr, "[cp] FM4_WAIT_POLL_US=%lu: a wait yields for its first %lu us, then sleeps 50 us at a time\n", n, n);
+        return n <= 100000 ? uint32_t(n) : 100000u;
+    }();
+    return us;
+}
 int immediateInterruptsOverride = -1;  // SetImmediateInterrupts (tests)
 bool ImmediateInterruptsOn()
 {
@@ -220,7 +231,8 @@ void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value)
     if (index == reg::kWaitUntil && value != 0)
         idleAsked = true, waitUntilAt = packetsSeen, waitUntilValue = value;
     WriteRegister(base, index, value);
-    OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);  // DC_LUT_* only (command_processor.cc:469-574)
+    if (gpu::gamma::IsStateRegister(index))  // DC_LUT_* only (command_processor.cc:469-574); the check inline: this runs per register write
+        OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);
     if (index >= reg::kScratchReg0 && index < reg::kScratchReg0 + 8 &&
         (ReadRegister(base, reg::kScratchUmsk) >> (index - reg::kScratchReg0) & 1))
         Store32(base, PhysicalToGuest(ReadRegister(base, reg::kScratchAddr) + 4 * (index - reg::kScratchReg0)), value);
@@ -287,7 +299,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 Stop(StopCode::Unimplemented, "GPU: IM_LOAD_IMMEDIATE of %u words in a %u-word packet", sizeWords, count);
             if (TraceEnabled() || renderer)
             {
-                std::vector<uint32_t> code(sizeWords);
+                static std::vector<uint32_t> code;  // FM4 Recomp (M7 CPU cost): storage kept across loads (one allocation a load before); fully overwritten
+                code.resize(sizeWords);
                 for (uint32_t i = 0; i < sizeWords; i++)
                     code[i] = next();
                 if (TraceEnabled())
@@ -302,7 +315,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             const uint32_t addressType = next(), sizeWords = next() & 0xFFFF;
             if (TraceEnabled() || renderer)
             {
-                std::vector<uint32_t> code(sizeWords);
+                static std::vector<uint32_t> code;  // FM4 Recomp (M7 CPU cost): as IM_LOAD_IMMEDIATE's
+                code.resize(sizeWords);
                 const uint32_t at = PhysicalToGuest(addressType & ~3u);
                 for (uint32_t i = 0; i < sizeWords; i++)
                     code[i] = Load32(base, at + 4 * i);
@@ -441,6 +455,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             bool synced = !cpuWord;
             const uint64_t syncNs = (info & 0x10) ? NowNs() - waitStart : 0;
             const uint32_t afterSync = (info & 0x10) ? LoadGpu(base, poll) : 0;
+            const uint64_t pollStart = NowNs();
             uint32_t polls = 0, idleFlushes = 0;
             state.waitingOn = poll;
             const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -476,7 +491,19 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 if (std::chrono::steady_clock::now() > give_up)
                     Stop(StopCode::Unimplemented, "GPU: WAIT_REG_MEM on %s %08X (value %08X & %08X, reference %08X, function %u) never satisfied",
                          info & 0x10 ? "memory" : "register", poll, value, mask, ref, info & 7);
-                std::this_thread::sleep_for(wait >= 0x100 ? std::chrono::microseconds(1000 * (wait / 0x100)) : std::chrono::microseconds(100));
+                // FM4 Recomp (opt-in FM4_WAIT_POLL_US=<us>): poll by yielding for the first <us> microseconds of a wait, then sleep
+                // 50 us at a time, instead of the packet's interval (FM4's: 1 ms sleeps, so up to 1 ms of latency after the
+                // GPU is done and the game's handler has flipped the word; measured: memory waits 19.7 ms a swap
+                // against 13.8 ms of GPU sync).
+                if (const uint32_t spinUs = WaitPollSpinUs(); spinUs != 0)
+                {
+                    if (NowNs() - pollStart < uint64_t(spinUs) * 1000)
+                        std::this_thread::yield();
+                    else
+                        std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                else
+                    std::this_thread::sleep_for(wait >= 0x100 ? std::chrono::microseconds(1000 * (wait / 0x100)) : std::chrono::microseconds(100));
             }
             state.waitingOn = 0;
             if (info & 0x10)

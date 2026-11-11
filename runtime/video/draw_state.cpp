@@ -410,6 +410,7 @@ struct Decoder
     bool VertexFetches()
     {
         const shader::ShaderTranslation& vs = *in.vs;
+        d.vertexSlots.reserve(vs.vertexFetchSlots.size());  // FM4 Recomp (M7 CPU cost): one allocation at most, not one per growth step
         for (size_t k = 0; k < vs.vertexFetchSlots.size(); k++)
         {
             VertexSlot s;
@@ -461,6 +462,7 @@ struct Decoder
     {
         struct Use { uint32_t slot, dimension; shader::ShaderTranslation::Filters filters; };
         std::vector<Use> uses;
+        uses.reserve(in.vs->textureSlots.size() + in.ps->textureSlots.size());  // FM4 Recomp (M7 CPU cost): the upper bound; one allocation
         for (const shader::ShaderTranslation* stage : {in.vs, in.ps})
             for (size_t i = 0; i < stage->textureSlots.size(); i++)
             {
@@ -474,6 +476,7 @@ struct Decoder
                     return Refuse("texture slot " + Num(u.slot) + " is fetched with different filters or dimensions by the vertex and pixel shaders");
             }
         std::sort(uses.begin(), uses.end(), [](const Use& a, const Use& b) { return a.slot < b.slot; });
+        d.textureSlots.reserve(uses.size());  // FM4 Recomp (M7 CPU cost): one allocation at most
         for (const Use& u : uses)
         {
             TextureSlot t;
@@ -617,7 +620,10 @@ struct Decoder
 
     void Constants()
     {
+        if (in.constantsScratch != nullptr)
+            d.aluConstants.swap(*in.constantsScratch);  // FM4 Recomp: the caller's scratch storage (DrawInputs::constantsScratch)
         d.aluConstants.resize(2048);
+        d.vsConstantWords = std::min<uint32_t>(in.vs->constantCount, 256) * 4, d.psConstantWords = std::min<uint32_t>(in.ps->constantCount, 256) * 4;
         if (in.registers != nullptr)  // DrawInputs::registers: the same words, byte-swapped in bulk
         {
             const auto bulk = [&](uint32_t first, uint32_t count, uint32_t* out) {
@@ -628,19 +634,24 @@ struct Decoder
                     out[i] = __builtin_bswap32(raw);
                 }
             };
-            bulk(xr::kAluConstants, 2048, d.aluConstants.data());
+            // FM4 Recomp (M7 CPU cost): only the words the shaders can read (the rest of the vector is stale and never uploaded).
+            bulk(xr::kAluConstants, d.vsConstantWords, d.aluConstants.data());
+            bulk(xr::kAluConstants + 1024, d.psConstantWords, d.aluConstants.data() + 1024);
             bulk(xr::kBoolConstants, 8, d.boolConstants);
             bulk(xr::kLoopConstants, 32, d.loopConstants);
         }
         else
         {
-            for (uint32_t i = 0; i < 2048; i++)
+            for (uint32_t i = 0; i < d.vsConstantWords; i++)
                 d.aluConstants[i] = Reg(xr::kAluConstants + i);
+            for (uint32_t i = 0; i < d.psConstantWords; i++)
+                d.aluConstants[1024 + i] = Reg(xr::kAluConstants + 1024 + i);
             for (uint32_t i = 0; i < 8; i++)
                 d.boolConstants[i] = Reg(xr::kBoolConstants + i);
             for (uint32_t i = 0; i < 32; i++)
                 d.loopConstants[i] = Reg(xr::kLoopConstants + i);
         }
+        d.vsLoopRegisters.reserve(in.vs->loopConstants.size()), d.psLoopRegisters.reserve(in.ps->loopConstants.size());  // FM4 Recomp (M7 CPU cost)
         for (uint32_t l : in.vs->loopConstants)
             d.vsLoopRegisters.push_back(d.loopConstants[l & 31]);
         for (uint32_t l : in.ps->loopConstants)
@@ -728,39 +739,71 @@ uint32_t VertexWindowDwords(const VertexSlot& s, uint32_t highIndex)
     return uint32_t(std::min<uint64_t>(needed, UINT32_MAX));
 }
 
-DrawState DecodeDrawState(const DrawInputs& in)
+FetchProof VertexFetchProof(const DrawState& d, uint32_t highIndex)
 {
-    DrawState d;
+    if (d.vertexSlots.empty())
+        return FetchProof::NoSlots;
+    for (const VertexSlot& s : d.vertexSlots)
+    {
+        if (s.computedIndex)
+            return FetchProof::Computed;
+        if (!s.valid || s.sizeWords == 0 || (s.stride == 0 && s.end == 0))
+            return FetchProof::Invalid;
+        if (VertexWindowDwords(s, highIndex) > s.sizeWords)
+            return FetchProof::Past;
+    }
+    return FetchProof::Inside;
+}
+bool VertexFetchProvablyInside(const DrawState& d, uint32_t highIndex) { return VertexFetchProof(d, highIndex) == FetchProof::Inside; }
+
+void DecodeDrawState(const DrawInputs& in, DrawState& out)
+{
+    // FM4 Recomp (M7 CPU cost): `out` is reset to a fresh DrawState but keeps its vectors' storage (moved out, cleared, moved back);
+    // aluConstants is kept whole (Constants() overwrites every word; the other kinds never read it).
+    std::vector<VertexSlot> vertexSlots = std::move(out.vertexSlots);
+    std::vector<TextureSlot> textureSlots = std::move(out.textureSlots);
+    std::vector<uint32_t> aluConstants = std::move(out.aluConstants), vsLoops = std::move(out.vsLoopRegisters), psLoops = std::move(out.psLoopRegisters);
+    out = DrawState{};
+    vertexSlots.clear(), textureSlots.clear(), vsLoops.clear(), psLoops.clear();
+    out.vertexSlots = std::move(vertexSlots), out.textureSlots = std::move(textureSlots), out.aluConstants = std::move(aluConstants);
+    out.vsLoopRegisters = std::move(vsLoops), out.psLoopRegisters = std::move(psLoops);
+    DrawState& d = out;
     if (!in.read || !in.vs || !in.ps)
     {
         d.error = "DecodeDrawState: no register reader or shader translation";
-        return d;
+        return;
     }
     Decoder x{in, d};
     d.edramMode = x.Reg(xr::kRbModeControl) & 7;  // X registers.h:609-616, xenos.h:903-926
     if (d.edramMode == 6)
     {
         d.kind = DrawKind::Resolve;
-        return d;
+        return;
     }
     if (d.edramMode != 4 && d.edramMode != 5)
     {
         x.Refuse("RB_MODECONTROL mode " + Num(d.edramMode) + " is not modelled (4 colour and depth, 5 depth, 6 copy)");
-        return d;
+        return;
     }
     if (!x.Packet())
-        return d;
+        return;
     x.DepthStencilDecode();
     d.colorWriteMask = d.edramMode == 5 ? 0 : x.Reg(xr::kRbColorMask) & 0xF;  // X registers.h:702-724; draw_util.cc:726-734
     d.kind = x.WritesNothing() ? DrawKind::NoWrite : d.edramMode == 5 ? DrawKind::DepthOnly : DrawKind::Draw;
     if (!x.Primitive())
-        return d;
+        return;
     if (d.kind == DrawKind::NoWrite)  // nothing reaches the GPU: the rest of the state is irrelevant and not validated
-        return d;
+        return;
     d.aaMask = x.Reg(xr::kPaScAaMask);
     if (!x.Raster() || !x.ScissorDecode() || !x.BlendDecode() || !x.ProgramDecode() || !x.Target() || !x.VertexFetches() || !x.TextureFetches())
-        return d;
+        return;
     x.Constants();
+}
+
+DrawState DecodeDrawState(const DrawInputs& in)
+{
+    DrawState d;
+    DecodeDrawState(in, d);
     return d;
 }
 

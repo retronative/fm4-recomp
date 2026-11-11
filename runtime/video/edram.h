@@ -210,13 +210,30 @@ struct Transfer
 {
     uint32_t startTiles = 0, endTiles = 0;
     Key source;
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): `value`: every tile of the range held the constant guest word `word` in
+    // `source` (Ownership::SetClearValue), and source and dest have the same aspect and format, so the GPU side needs no copy: it
+    // clears the range in dest with `word` decoded for dest (edram_vk.cpp ExecuteTransfers). False: an ordinary copy.
+    bool value = false;
+    uint32_t word = 0;
+    // FM4 Recomp (FM4_CLEAR_VALUE_OWNERSHIP): non-zero: the constant has no exact guest word; `exact` - 1 names the host colour the GPU side
+    // recorded for it (edram_vk.cpp). Opaque to this model; `word` is then unused.
+    uint32_t exact = 0;
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): the constructor keeps every existing three-value brace form ({start, end,
+    // source}) valid without a missing-initializer warning (-Wextra -Werror in the test runners).
+    constexpr Transfer() = default;
+    constexpr Transfer(uint32_t start, uint32_t end, Key from, bool isValue = false, uint32_t valueWord = 0, uint32_t exactColor = 0)
+        : startTiles(start), endTiles(end), source(from), value(isValue), word(valueWord), exact(exactColor) {}
     constexpr bool operator==(const Transfer&) const = default;
 };
 
 class Ownership
 {
 public:
-    Ownership() { owner_.fill(0); }
+    Ownership()
+    {
+        owner_.fill(0);
+        shadow_.fill(0);
+    }
     Key At(uint32_t tile) const { return {owner_[tile % kTileCount]}; }
     uint32_t Count(Key k) const;  // tiles k owns
 
@@ -233,11 +250,85 @@ public:
     // vulkan_render_target_cache.cc:4505-4532). FM4 Recomp difference: the decision is per tile, so a kept
     // Transfer needs no cutout downstream (its RangeRectangles are what the GPU copies); the bytes moved are
     // the whole partially-covered tiles, a superset of X's border strips and a subset of X's kept ranges.
+    // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): `destWrites` says whether dest's host image may be written at the
+    // claimed tiles after this claim (a drawing bind with depth/stencil or colour writes, a resolve clear, the cutout: true; a
+    // depth target bound for testing only, a resolve copy's source claim: false). It drives the shadow map below; the
+    // transfers emitted are the same either way, except for the skip described there.
     bool Change(Key dest, uint32_t startTilesBaseRelative, uint32_t lengthTiles, std::vector<Transfer>& transfers,
-                std::string& refusal, const Rect* clearCutout = nullptr);
+                std::string& refusal, const Rect* clearCutout = nullptr, bool destWrites = true);
+
+    // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the shadow map. ShadowAt(t) is a key whose host image also holds
+    // tile t's current content (through the transfer mapping), or Empty. A transfer from O into K sets it to O: K's image
+    // receives O's content and O's image keeps it, since no path writes a host image at a tile its key does not own (a draw
+    // or resolve clear claims first, a transfer lands only in the claimed tiles, FlushClears applies a key's pending clears
+    // before any read of it; the two exceptions, a resolve clear rectangle reaching past the range it claimed and a draw's
+    // rows past a claim the bases' distance shortened, are MarkWritten by PrepareResolve and Bind).
+    // Any claim with destWrites clears it. With `skipUnwritten`, a claim by the very key ShadowAt(t) names flips ownership
+    // without a transfer when the two keys have the same aspect and format and that format's host image is float or integer
+    // (kD24FS8, colour storage 3, 4, 14: edram.cpp SkipExact): the transfer would copy the bytes O's image already holds (the
+    // round trip source -> interim -> source is the identity for every MSAA pair of MapTransferTexel, and a same-format
+    // transfer copies the float depth, the stencil byte or the colour texel as is). After
+    // the skip the interim owner becomes the shadow (its image still holds the same content). Off by default: the shadows are
+    // tracked, the skip is not taken, so every transfer is today's.
+    Key ShadowAt(uint32_t tile) const { return {shadow_[tile % kTileCount]}; }
+    bool skipUnwritten = false;
+    struct SkipStats
+    {
+        uint64_t transfers = 0, tiles = 0;  // the transfers (coalesced runs) and tiles the skip did not copy
+    };
+    const SkipStats& Skipped() const { return skipped_; }
+    // `k`'s host image is written at tiles [base + start, base + start + length) of its layout without a claim (a resolve
+    // clear's rectangle past the range the overlap rule let it claim, PrepareResolve; a draw's rows past its clamped claim,
+    // Bind): the shadows that name k there are dropped, as are those of the tiles k owns there. Nothing else changes; the range
+    // wraps at tile 2047 as Change's does and covers at most the whole EDRAM.
+    void MarkWritten(Key k, uint32_t startTilesBaseRelative, uint32_t lengthTiles);
+
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP; after ShiftGlue's AbsorbClear / ClearClaimedTiles, ShiftGlue SDK
+    // vulkan/fm4_native_executor.cpp:350-436, facts only): a tile whose every sample a pending clear set to one guest
+    // word holds a known constant. SetClearValue records that for the tiles of `owner`'s layout that lie wholly inside `rect`
+    // (owner's pixels; TileInside, the cutout rule) and that `owner` owns now: a tile partly outside the rectangle is not a constant
+    // and is never recorded. `word` is the guest's 32-bit word of the clear (colour: the storage format's packing, RB_COLOR_CLEAR of a
+    // resolve clear; depth: depth bits 8-31 by the depth format, stencil 0-7, RB_DEPTH_CLEAR), the same word whichever MSAA mode
+    // describes the tile (a tile is 80x16 samples in every mode, so a whole-tile constant is one in every description). The state
+    // is kept as runs of consecutive tiles (at most kMaxClearRuns; a clear that would need more keeps what fits and returns the
+    // tiles recorded: an unrecorded tile is merely copied as before). Returns the tiles recorded.
+    // Change consumes it: a claimed tile loses its constant (the claimant writes it, or clears it again and SetClearValue follows),
+    // and a tile another owner held as a constant is reported as a `value` Transfer (Transfer::value) when the two keys have the
+    // same aspect and format (colour: the storage format; depth: the depth format), else as an ordinary copy.
+    uint32_t SetClearValue(Key owner, const Rect& rect, uint32_t word, uint32_t exact = 0);  // exact: Transfer::exact
+    // FM4 Recomp (M7 CPU cost): exactly what Change refuses; a caller making several claims checks them all first, so a refusal changes nothing.
+    static bool ChangeAllowed(Key dest, uint32_t start, uint32_t length) { return length == 0 || !(dest.Empty() || start > kTileCount - 1 || length > kTileCount); }
+    // Whether `tile` holds a recorded constant, and which.
+    bool ClearValue(uint32_t tile, uint32_t& word) const;
+    uint32_t ClearValueTiles() const;  // tiles recorded as constants
+    static constexpr uint32_t kMaxClearRuns = 32;
 
 private:
+    struct ClearRun
+    {
+        uint32_t first = 0, end = 0, word = 0, exact = 0;  // tiles [first, end), never wrapping past 2047; exact: Transfer::exact
+    };
+    const ClearRun* ClearRunOf(uint32_t tile) const;
+    void DropClearValues(uint32_t first, uint32_t end);  // tiles [first, end) lose their constant (a run split into two needs a free slot: else the run is dropped whole)
     std::array<uint32_t, kTileCount> owner_;
+    std::array<uint32_t, kTileCount> shadow_;  // FM4_TRANSFER_SKIP_UNWRITTEN (ShadowAt)
+    SkipStats skipped_;
+    std::array<ClearRun, kMaxClearRuns> clearRuns_{};
+    uint32_t clearRunCount_ = 0;
+    // FM4 Recomp (M7 CPU cost): a claim whose every tile dest already owns changes nothing; consecutive draws on one target make
+    // that the common case (~2,500 claims a frame over thousands of tiles each). The last few such claims are remembered with the
+    // generation of the owner map (bumped whenever a tile changes owner) and answered without the walk.
+    // FM4_TRANSFER_SKIP_UNWRITTEN: `written` records whether the remembered claim cleared the shadows (destWrites); a writing
+    // claim may reuse only a written entry, since within one generation a shadow can only be dropped, never set.
+    struct Claim
+    {
+        uint32_t dest = 0, first = 0, end = 0;
+        uint64_t generation = 0;
+        bool written = true;
+    };
+    uint64_t generation_ = 1;
+    std::array<Claim, 4> claims_{};
+    uint32_t nextClaim_ = 0;
 };
 
 // ---- Bind: the targets of a draw ---------------------------------------------------------------------------
@@ -278,7 +369,11 @@ struct Binding
 // FM4 Recomp (FM4_OVERWRITE_CLAIM): `depthCutout` / `colorCutout`, a rectangle of the target's pixels the draw provably overwrites
 // (draw_record.h FindOverwriteRect), is passed to Ownership::Change as its clearCutout: tiles wholly inside are claimed without
 // a transfer, as a resolve clear's are.
-Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout = nullptr, const Rect* colorCutout = nullptr);
+// FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): `depthReadOnly`: the draw tests depth or stencil but writes neither (the
+// renderer's RenderTarget::depthWritten is false: no z write, stencil off), so the depth target's claim passes destWrites = false
+// to Ownership::Change; a depthCutout contradicts it and wins (the claim is a writing one). The colour target always writes.
+Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout = nullptr, const Rect* colorCutout = nullptr,
+             bool depthReadOnly = false);
 
 // ---- Resolve: a draw in copy mode -----------------------------------------------------------------------
 
@@ -453,6 +548,16 @@ bool PassThroughPositions(const uint32_t* words, size_t wordCount, uint32_t endi
 // X ui/graphics_util.cc:17-60: D3D11 float -> 16.8 fixed point, round to nearest even, saturating.
 int32_t FloatToFixed16p8(float f);
 // X xenos.h:1070-1092 GpuSwap for a 32-bit word: 0 none, 1 bytes in halves, 2 all bytes, 3 halves.
-uint32_t GpuSwap32(uint32_t v, uint32_t endian);
+// FM4 Recomp (M7 CPU cost): inline, it is called per texel by the resolve write-back (edram_vk_plan.cpp StoreTiledRow32) on 7 threads.
+inline uint32_t GpuSwap32(uint32_t v, uint32_t endian)  // X xenos.h:1070-1086
+{
+    switch (endian & 3)
+    {
+    case 1: return ((v << 8) & 0xFF00FF00u) | ((v >> 8) & 0x00FF00FFu);
+    case 2: return __builtin_bswap32(v);
+    case 3: return ((v >> 16) & 0xFFFF) | (v << 16);
+    default: return v;
+    }
+}
 
 }  // namespace runtime::video::edram

@@ -161,6 +161,8 @@ void TracePsDraw(const uint8_t* base, uint64_t draw, uint64_t vsHash, uint64_t p
     }
 }
 
+bool TracePsBindWanted(uint64_t draw) { return active && draw == lastTraced; }
+
 void TracePsBind(uint64_t draw, const PsBindTrace& b)
 {
     if (!active || draw != lastTraced)

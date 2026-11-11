@@ -327,6 +327,11 @@ public:
     }
     // `uniform`: the block is bound as a uniform buffer (else storage). Returns false when the ring
     // cannot hold `bytes` more (nothing is allocated then). Alignments must be powers of two.
+    // FM4 Recomp (M7 CPU cost): a ring across parts. NewPart(minFree) keeps the offset where the previous part ended unless fewer
+    // than `minFree` bytes remain, in which case the next lap starts at 0. Allocations never wrap inside a part, so a block of
+    // the current lap below the offset is never overwritten before the next lap, and the next lap starts only at a part
+    // boundary: renderer.cpp reuses vertex windows copied by earlier parts of the same lap (Intact) instead of copying them
+    // again after each flush. Reset() empties everything.
     bool Allocate(uint64_t bytes, bool uniform, uint64_t& offset)
     {
         const uint64_t align = uniform ? uniformAlign_ : storageAlign_;
@@ -340,8 +345,19 @@ public:
         allocations_++;
         return true;
     }
-    void Reset() { used_ = 0, allocations_ = 0, resets_++; }
+    void NewPart(uint64_t minFree)
+    {
+        if (capacity_ - used_ < minFree)
+            lap_++, used_ = 0;
+        partStart_ = used_, allocations_ = 0, resets_++;
+    }
+    void Reset() { used_ = 0, lap_ = 0, partStart_ = 0, allocations_ = 0, resets_++; }
+    uint64_t Available() const { return capacity_ - used_; }
+    // Whether [offset, offset + bytes), allocated in `lap`, is still in the buffer: only this lap's blocks below the offset are
+    // (the lap's allocations only move forward, and the next lap starts at a part boundary).
+    bool Intact(uint64_t offset, uint64_t bytes, uint64_t lap) const { return lap == lap_ && offset + bytes <= used_; }
     uint64_t Used() const { return used_; }
+    uint64_t Lap() const { return lap_; }
     uint64_t Capacity() const { return capacity_; }
     uint64_t Allocations() const { return allocations_; }
     uint64_t Resets() const { return resets_; }
@@ -349,6 +365,7 @@ public:
 private:
     const uint64_t capacity_, uniformAlign_, storageAlign_;
     uint64_t used_ = 0, allocations_ = 0, resets_ = 0;
+    uint64_t lap_ = 0, partStart_ = 0;
 };
 
 }  // namespace runtime::video

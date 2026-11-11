@@ -51,6 +51,13 @@ TESTS = {
     "runtime": dict(cmd=["bash", "tests/run_runtime_tests.sh"], timeout=300, build=True, ran=r"^runtime tests: ",
                     deps=["tests/run_runtime_tests.sh", "tests/runtime", "runtime", "recomp", "scripts/preflight.sh",
                           "tools/XenonRecomp/XenonUtils", "tools/XenonRecomp/thirdparty/simde"]),
+    # FM4 Recomp (M7 CPU cost): the CPU-only video unit runners (address and endianness arithmetic of the resolve write-back,
+    # the shader cache's load memo). Their binaries compile from runtime/video sources; no GPU work.
+    "edram_vk": dict(cmd=["bash", "tests/run_edram_vk_tests.sh"], timeout=300, build=True, ran=r"^(PASS|FAIL): \d+ failure",
+                     deps=["tests/run_edram_vk_tests.sh", "tests/runtime/test_edram_vk.cpp", "runtime/video", "runtime/kernel", "scripts/preflight.sh"]),
+    "shader_pipeline": dict(cmd=["bash", "tests/run_shader_pipeline_tests.sh"], timeout=300, build=True, ran=r"^\d+ failure\(s\), \d+ negative control",
+                            deps=["tests/run_shader_pipeline_tests.sh", "tests/runtime/test_shader_cache.cpp", "tests/runtime/test_pipeline_cache.cpp",
+                                  "runtime/video", "runtime/shader", "runtime/kernel", "scripts/preflight.sh"]),
     "gpu_safety": dict(cmd=['bash', 'tests/run_gpu_safety_tests.sh'], timeout=300, build=False, ran=r"^gpu safety tests: ",
                        deps=['tests/run_gpu_safety_tests.sh', 'tests/runtime/test_gpu_safety.cpp', 'runtime/gpu', 'scripts/preflight.sh']),
     "fxobj": dict(cmd=PY + ["tests/test_fxobj.py"], timeout=60, build=False, ran=r"^Ran \d+ tests?",
@@ -342,11 +349,13 @@ MUTANTS = [
 
     # ---- M1: scripts/artifacts.py (storage inventory, dry-run plan, reviewed apply; tests/test_artifacts.py) ----
     dict(id='AR1', milestone="M1", file=ARTIFACTS, test='artifacts', fault='no inode re-validation',
-         old='if os.stat(p).st_ino != it["inode"]:',
-         new='if False:', expect='test_replaced_directory_is_skipped'),
+         # the build/ validation (the capture validation, 94049c3, has the same line at a deeper indent; the preceding line keeps this unique)
+         old='        return "resolves outside build/"\n    if os.stat(p).st_ino != it["inode"]:',
+         new='        return "resolves outside build/"\n    if False:', expect='test_replaced_directory_is_skipped'),
     dict(id='AR2', milestone="M1", file=ARTIFACTS, test='artifacts', fault='symlinks not refused',
-         old='    if os.path.islink(p):\n        return "symlink"\n',
-         new='', expect='test_each_path_check_on_its_own'),
+         # the build/ validation (the capture validation, 94049c3, has the same two lines; the preceding line keeps this unique)
+         old='        return "not a path under build/"\n    if os.path.islink(p):\n        return "symlink"\n',
+         new='        return "not a path under build/"\n', expect='test_each_path_check_on_its_own'),
     dict(id='AR3', milestone="M1", file=ARTIFACTS, test='artifacts', fault='resolved path not checked',
          old='    if not os.path.realpath(p).startswith(real_build + os.sep):',
          new='    if False:', expect='test_each_path_check_on_its_own'),
@@ -1962,6 +1971,20 @@ MUTANTS = [
          old="result = std::make_unique<uint8_t[]>(security->imageSize.get());",
          new="result = std::unique_ptr<uint8_t[]>(new uint8_t[security->imageSize.get()]);",
          expect="xex_basic_allocation_test"),  # re-expressed: make_unique_for_overwrite needs C++20; the CMake build is not
+    # FM4 Recomp (M7 CPU cost): the resolve write-back's address/endian arithmetic and the shader load memo.
+    # (the first EV1 candidate, (ay & 30) -> (ay & 31), is equivalent: ay is the pair's even row at that line; SURVIVED, replaced)
+    dict(id='EV1', milestone="M7", file='runtime/video/edram_vk_plan.cpp', test='edram_vk', fault='stripe store ignores the tile-row rotation (rows 8-15 and 24-31 use run table 1)',
+         old='            const uint32_t ay = destOffsetY + y, rot = (ay >> 3) & 1;',
+         new='            const uint32_t ay = destOffsetY + y, rot = 0;',
+         expect='rectangle(80, 60, 8, 5, 128, 2)'),
+    dict(id='EV2', milestone="M7", file='runtime/video/edram_vk_plan.cpp', test='edram_vk', fault='the 16 bpp GPU-words write-back drops the destination endian',
+         old='                    const uint16_t h = uint16_t(EndianSwap16Pair(words16[size_t(y) * width + x], info.destEndian));  // resolve_full_16bpp.xesli:63',
+         new='                    const uint16_t h = uint16_t(EndianSwap16Pair(words16[size_t(y) * width + x], 0));  // resolve_full_16bpp.xesli:63',
+         expect='dest[0] == 0x22 && dest[1] == 0x11'),
+    dict(id='SC1', milestone="M7", file='runtime/video/shader_cache.cpp', test='shader_pipeline', fault='the load memo compares half the program',
+         old='                if (std::memcmp(candidate->microcode.data(), words, size_t(count) * 4) == 0)',
+         new='                if (std::memcmp(candidate->microcode.data(), words, size_t(count) * 2) == 0)',
+         expect='memo: one word changed in the middle is another program'),
 ]
 
 # Retired from the active registry (mutation-suite audit): proven EQUIVALENT, so no test can kill them and each cost a run in every gate.

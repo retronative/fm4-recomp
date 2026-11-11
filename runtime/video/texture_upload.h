@@ -30,6 +30,7 @@
 //    mapping without imageViewFormatSwizzle, anisotropy, a gamma decision that disagrees with DrawState's,
 //    a guest range that is not wholly in one committed view.
 #pragma once
+#include <algorithm>
 #include <memory>
 #include "texture_cache.h"
 #include "texture_info.h"
@@ -38,6 +39,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <deque>
 #include <vector>
 
 namespace runtime::video {
@@ -89,11 +91,14 @@ inline uint64_t ReservedStagingBytes(bool reuse, bool imageHashed, bool hashRead
 class GuestWriteLog
 {
 public:
-    void Mark(uint32_t physical, uint32_t bytes)
+    // FM4 Recomp (FM4_PARTIAL_RETIRE): `serial` names the submission part that recorded the resolve (0: unknown); a part retired
+    // on its own retires only the ranges it recorded (RetiredUpTo), the way ReCarbon's completion thread harvests submissions one
+    // by one (runtime/gpu/renderer.cpp:9301) instead of the whole slot.
+    void Mark(uint32_t physical, uint32_t bytes, uint64_t serial = 0)
     {
         if (bytes == 0)
             return;
-        pending_.push_back({physical, bytes});
+        pending_.push_back({{physical, bytes}, serial});
         marks_++;
     }
     bool Pending() const { return !pending_.empty(); }
@@ -102,13 +107,24 @@ public:
     {
         if (bytes == 0)
             return false;
-        for (const GuestRange& r : pending_)
-            if (uint64_t(physical) < uint64_t(r.physical) + r.size && uint64_t(r.physical) < uint64_t(physical) + bytes)
+        for (const Entry& e : pending_)
+            if (uint64_t(physical) < uint64_t(e.range.physical) + e.range.size && uint64_t(e.range.physical) < uint64_t(physical) + bytes)
             {
-                hit = r;
+                hit = e.range;
                 return true;
             }
         return false;
+    }
+    // FM4_PARTIAL_RETIRE: the newest part whose pending range shares a byte with [physical, physical + bytes) (0: none).
+    uint64_t PendingSerial(uint32_t physical, uint32_t bytes) const
+    {
+        uint64_t serial = 0;
+        if (bytes == 0)
+            return 0;
+        for (const Entry& e : pending_)
+            if (uint64_t(physical) < uint64_t(e.range.physical) + e.range.size && uint64_t(e.range.physical) < uint64_t(physical) + bytes)
+                serial = std::max(serial, e.serial);
+        return serial;
     }
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): as Overlaps, over every pending range but the last marked one.
     bool OverlapsEarlier(uint32_t physical, uint32_t bytes) const
@@ -119,11 +135,21 @@ public:
             earlier.pending_.assign(pending_.begin(), pending_.end() - 1);
         return earlier.Overlaps(physical, bytes, hit);
     }
+    // FM4_PARTIAL_RETIRE: the ranges recorded by parts up to `serial` are complete (their write-backs landed).
+    void RetiredUpTo(uint64_t serial)
+    {
+        pending_.erase(std::remove_if(pending_.begin(), pending_.end(), [&](const Entry& e) { return e.serial <= serial; }), pending_.end());
+    }
     void Retired() { pending_.clear(); }
     uint64_t Marks() const { return marks_; }
 
 private:
-    std::vector<GuestRange> pending_;
+    struct Entry
+    {
+        GuestRange range;
+        uint64_t serial = 0;
+    };
+    std::vector<Entry> pending_;
     uint64_t marks_ = 0;
 };
 
@@ -190,25 +216,39 @@ public:
     // from it; the binding must agree).
     // `allowPending` (FM4_RESOLVE_RESIDENT): no refusal of a range a recorded resolve has not written back; the caller binds
     // a host image that already holds the resolve's words (texture_vk.cpp) or refuses itself.
-    PreparedTexture Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
+    // Returns a reference the caller uses within the bind (the next Prepare may replace it).
+    const PreparedTexture& Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
                             bool allowPending = false);
+    PreparedTexture PrepareUncached(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device, bool allowPending);
     // After the copies are recorded (texture_cache.h rule 2).
     bool Loaded(TextureEntry& e, const LoadPlan& plan) { return cache_.Loaded(e, plan); }
 
-    void MarkWritten(uint32_t physical, uint32_t bytes)
+    void MarkWritten(uint32_t physical, uint32_t bytes, uint64_t serial = 0)
     {
         watch_.MarkWritten(physical, bytes);
         if (protecting_)
             protecting_->MarkWritten(physical, bytes);
-        log_.Mark(physical, bytes);
+        log_.Mark(physical, bytes, serial);
+        prepared_.clear();  // the pending log changed: Prepare's answers may change
     }
     bool Pending() const { return log_.Pending(); }
-    void Retired() { log_.Retired(); }
+    void Retired() { log_.Retired(), prepared_.clear(); }
+    void RetiredUpTo(uint64_t serial) { log_.RetiredUpTo(serial), prepared_.clear(); }  // FM4_PARTIAL_RETIRE
+    uint64_t PendingSerial(uint32_t physical, uint32_t bytes) const { return log_.PendingSerial(physical, bytes); }
+    // FM4_PARTIAL_RETIRE: the newest part whose pending range a texture's guest ranges share a byte with (0: none).
+    uint64_t ReadsPendingSerial(const uint32_t fetch[6])
+    {
+        const TextureCache::Lookup lookup = cache_.Find(fetch, false);  // FM4 Recomp (M7 CPU cost): a range question, no validity walk
+        if (lookup.entry == nullptr)
+            return 0;
+        const TextureDescription& d = lookup.entry->description;
+        return std::max(log_.PendingSerial(d.base.physical, d.base.size), log_.PendingSerial(d.mips.physical, d.mips.size));
+    }
     // FM4 Recomp (FM4_RESOLVE_DEFER): whether a texture's guest ranges share a byte with a range a recorded resolve has not yet
     // written back (the renderer flushes before the draw that binds it); false for a constant the cache cannot describe.
     bool ReadsPending(const uint32_t fetch[6])
     {
-        const TextureCache::Lookup lookup = cache_.Find(fetch);
+        const TextureCache::Lookup lookup = cache_.Find(fetch, false);  // FM4 Recomp (M7 CPU cost): a range question, no validity walk
         if (lookup.entry == nullptr)
             return false;
         const TextureDescription& d = lookup.entry->description;
@@ -234,6 +274,20 @@ private:
     TextureCache cache_;
     GuestWriteLog log_;
     const TextureValidity validity_;
+    // FM4 Recomp (M7 CPU cost): Prepare runs two or three times per texture slot per draw (StagingBytes, ReadsPendingWrite, Bind)
+    // with the same inputs; its answer depends only on them, the cache's entries (created on first sight, never removed between
+    // Prepares) and the pending log, so the last few answers are kept until the log changes. The plan's sequence is the one of
+    // the first call: a lower bound, which only makes a later validity check stricter.
+    struct Prepared
+    {
+        uint32_t fetch[6];
+        ShaderFetch shader;
+        TextureDeviceFeatures device;
+        bool gamma, allowPending;
+        PreparedTexture p;
+    };
+    std::deque<Prepared> prepared_;  // references into it stay valid across push_back/pop_front (the callers use the answer within one bind)
+    PreparedTexture scratch_;         // the answer when the cache does not apply
 };
 
 // ---- Staging in the slot's upload ring -------------------------------------------------------------

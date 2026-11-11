@@ -10,8 +10,10 @@
 // 67f16c4e315f src/xenia/gpu (BSD-3-Clause), re-derived here, never copied.
 #pragma once
 #include "edram.h"
+#include "render_hooks.h"  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): PendingClear (PushPendingClear)
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace runtime::video {
@@ -36,6 +38,24 @@ struct RenderTarget;  // draw_state.h
 // target 0 only, and RB_DEPTHCONTROL stencil_enable alone for a depth target (Bind's normalization, X
 // draw_util.cc:60-79, then keeps it; z_enable without a write and with zfunc always would be dropped).
 edram::BindRegisters BindRegistersFor(const RenderTarget& rt, bool needColor, bool needDepth);
+
+// ---- The render area of an EDRAM-unit pass (M7 GPU cost) -------------------------------------------------------
+
+// FM4 Recomp: the render area of a transfer or resolve-clear pass over host target `width` x `height`: the full width and only
+// the rows the rectangles touch, rounded outwards to 32 and clamped to the target; no rectangle -> the whole target. Load
+// and store act only inside the render area (Vulkan VkRenderPassBeginInfo::renderArea; pixels outside it are untouched),
+// and every transfer draw and clear is scissored to its rectangle, so nothing is rendered outside the area. A tile-based
+// GPU loads and stores the area, not the image: FM4 touches 360-720 rows of 1024- and 2048-row host targets.
+VkRect2D UnitPassArea(const VkRect2D* rects, size_t count, uint32_t width, uint32_t height);
+
+// FM4 Recomp: a new pending clear of `add` on a target with the pending rectangles `rects` (oldest first): every older clear whose
+// rectangle lies wholly inside `add` is dropped (the new clear overwrites it), the rest stay in order, `add` goes last. Returns how
+// many were dropped. Values are not compared: order alone keeps the result right.
+size_t MergePendingClear(std::vector<VkRect2D>& rects, VkRect2D add);
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): `add` appended to a target's pending clears (oldest first) under MergePendingClear's rule:
+// the older clears whose rectangles lie wholly inside add's are dropped with their values, the rest keep their order and values.
+// Returns how many were dropped. The resolve clears (edram_vk.cpp Clear) and the clear-class draws (AcquireTargets) both go through it.
+size_t PushPendingClear(std::vector<PendingClear>& pending, const PendingClear& add);
 
 // ---- Ownership transfers (render_targets_vk.h plan 4) ----------------------------------------------------------
 
@@ -185,6 +205,30 @@ void DecodeDepthClear(uint32_t value, edram::DepthFormat format, float& depth, u
 float UNorm24To32(uint32_t n24);     // X xenos.h:432-438
 float Float20e4To32(uint32_t f24);   // X xenos.cc:150-166
 
+// ---- Clear-value ownership (FM4 Recomp, M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP; edram.h Ownership::SetClearValue) -----------
+//
+// A `value` Transfer (edram.h Transfer::value) moves a whole-tile constant between two keys of the same aspect and format without a
+// copy: the destination gets a pending clear of the range with the guest word decoded for it, exactly as a resolve clear of that word
+// on the destination would be (edram_vk.cpp Clear). Exactness per pair: the source held the
+// clear DecodeColorClear / DecodeDepthClear(word, format) (a resolve clear's own value; a clear draw's value is recorded only when
+// ClearRequestWord's round trip reproduces it bit for bit), and a same-format transfer copies the host value verbatim
+// (edram_vk.cpp kTransferColor: `sourceFormat == destFormat ? v : ...`; the stencil-export depth transfer writes the source float32
+// depth and stencil byte), so the destination holds the same clear value whether copied or cleared; a constant is the same for every
+// sample, so the MSAA pair does not matter (4x -> 2x: every destination sample reads a source sample of the constant).
+
+// The pending clear `out` of `dest` for a value transfer of `word` (ClearRun word) over `rect` (dest's pixels, a RangeRectangles
+// rectangle of the range): colour storage 0, 2 or 3 as the float clear DecodeColorClear gives, depth as DecodeDepthClear by dest's
+// depth format (depth + stencil aspects). False for a storage cleared through its transfer view (4, 14: the renderer's draw pass
+// records pending clears through the typed view; left to the ordinary copy) and for anything else.
+bool ValueClear(edram::Key dest, uint32_t word, const edram::Rect& rect, PendingClear& out);
+// The guest word a clear-class draw's values (render_hooks.h ClearRequest) stand for on `key` (colour: PackTransferColor of `rgba`
+// in key's storage format; depth: PackDepthStencilWord of `depthValue` and `stencil` in key's depth format), accepted only when
+// decoding the word for key (DecodeColorClear / DecodeDepthClear: what a value transfer or a resolve clear would clear with)
+// reproduces the request's floats bit for bit and its stencil: the host clear of the request and the clear of the word are then
+// the same clear. Values outside the format's range (NaN, negative, above 1 for a UNORM, above 31.875 for 7e3) are refused before
+// packing. False: the tiles are not recorded as constants and keep today's copy path.
+bool ClearRequestWord(const ClearRequest& request, edram::Key key, uint32_t& word);
+
 // ---- Resolve registers --------------------------------------------------------------------------------------------
 
 using RegisterRead = uint32_t (*)(const void* context, uint32_t index);
@@ -285,8 +329,20 @@ bool ResolveConvertToGuest(const edram::ResolveInfo& info, uint32_t sourceStorag
                            std::string& why);
 // FM4 Recomp (FM4_RESOLVE_GPU_WORDS): `words` are the rectangle's converted 32 bpp words, row-major and tightly packed, as
 // ResolveConvertPixel computes them (edram_vk.cpp kResolveResident on the GPU); each is endian-swapped and stored at its tiled
-// address exactly as ResolveConvertToGuest stores ResolveConvertPixel's result. 32 bpp destinations only; nothing written on a
-// refusal.
+// address exactly as ResolveConvertToGuest stores ResolveConvertPixel's result. Nothing written on a refusal.
+// FM4 Recomp (M7 CPU cost, FM4_RESOLVE_GPU_WORDS16): for a 16 bpp destination (k_8_8, info.destBytesLog2 1) `words` holds the
+// R16_UINT resident image's halfwords (ResolveConvertPixel's low 16 bits), tightly packed; each is stored as ResolveConvertToGuest's
+// 16 bpp branch stores it (EndianSwap16Pair, TiledOffset2D(..., 1), 2 bytes).
+// FM4 Recomp: the bounds check of a tiled 32-bit store in runs of 4 texels (edram_vk_plan.cpp StoreTiledRow32); false with `why`
+// naming the first texel past `destBytes`.
+bool TiledRunsFit(uint32_t destOffsetX, uint32_t destOffsetY, uint32_t destPitch, uint32_t width, uint32_t height, uint32_t destBytes, std::string& why);
+// FM4 Recomp (M7 CPU cost): the tile-major store's run table (edram_vk_plan.cpp StoreTiledRows32, the layout proof above it). The two
+// rows ye (even) and ye + 1 of a 32x32 tile at 32 bpp fill one contiguous 256-byte stripe at in-tile offset (ye & 30) << 7; its run r
+// (16 bytes, words 4r-4r+3) holds the four consecutive texels [kTiledStripeRunX[(ye >> 3) & 1][r], + 4) of the row with parity r & 1.
+// This is the tile's 1,024-entry inverse map (stripe word -> texel) factored by that structure. tests/runtime/test_edram_vk.cpp
+// TestTiledStripes checks every derived entry against Xenia's GetTiledOffset2D, with a shifted entry as the control.
+constexpr uint8_t kTiledStripeRunX[2][16] = {{0, 0, 4, 4, 8, 8, 12, 12, 16, 16, 20, 20, 24, 24, 28, 28},
+                                              {16, 16, 20, 20, 24, 24, 28, 28, 0, 0, 4, 4, 8, 8, 12, 12}};
 bool ResolveWordsToGuest(const edram::ResolveInfo& info, uint32_t sourceStorage, const uint32_t* words, uint8_t* dest, uint32_t destBytes,
                          std::string& why);
 

@@ -22,7 +22,9 @@ std::recursive_mutex lock;
 std::unique_ptr<Heap> v00000000, v40000000, vA0000000, vC0000000, vE0000000;
 // Which physical view holds each 4 KB physical frame (by its base address; 0 none), under `lock`.
 constexpr uint32_t kFrame = 4096;
-std::vector<uint32_t> frames(kPhysicalSize / kFrame);
+// FM4 Recomp (M7 CPU cost): each frame's view is atomic so PhysicalToGuest (every GPU memory access on the command-processor thread)
+// reads it without the lock; Claim writes it under the lock, and a reader sees the frame before or after a claim, as it did under the lock.
+std::vector<std::atomic<uint32_t>> frames(kPhysicalSize / kFrame);
 
 bool Writable(uint32_t protect)
 {
@@ -298,10 +300,11 @@ bool PhysicalAddress(uint32_t address, uint32_t& physical)
 
 bool PhysicalToGuest(uint32_t physical, uint32_t& address)
 {
-    std::lock_guard guard(lock);
-    if (physical >= kPhysicalSize || frames[physical / kFrame] == 0)
+    if (physical >= kPhysicalSize)
         return false;
-    const uint32_t view = frames[physical / kFrame];
+    const uint32_t view = frames[physical / kFrame].load(std::memory_order_relaxed);  // lock-free (see `frames`): one read of the frame
+    if (view == 0)
+        return false;
     address = view == 0xE0000000u ? view + physical - 0x1000 : view + physical;
     return true;
 }
@@ -360,14 +363,14 @@ bool WatchUnprotect(uint32_t physical, uint32_t size)
 {
     if (membaseAll == nullptr || size == 0 || physical % kWatchHostPage || uint64_t(physical) + size > kPhysicalSize)
         return false;
+    // FM4 Recomp (M7 CPU cost): every page checked first, then one mprotect per view over the whole range (the resolve write-back
+    // unwatches whole render targets: hundreds of pages at a time). Signal-safe: no allocation, no lock.
     for (uint32_t p = physical; p < physical + size; p += kWatchHostPage)
-    {
         if (!PhysicalHostWritable(p))
             return false;
-        for (const uint32_t view : {0xA0000000u, 0xC0000000u})
-            if (mprotect(membaseAll + view + p, kWatchHostPage, PROT_READ | PROT_WRITE) != 0)
-                return false;
-    }
+    for (const uint32_t view : {0xA0000000u, 0xC0000000u})
+        if (mprotect(membaseAll + view + physical, size, PROT_READ | PROT_WRITE) != 0)
+            return false;
     return true;
 }
 

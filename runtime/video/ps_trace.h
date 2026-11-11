@@ -55,6 +55,9 @@ struct PsBindTrace
     const char* psDefines = "";
 };
 void TracePsBind(uint64_t draw, const PsBindTrace& b);
+// FM4 Recomp (M7 CPU cost): whether TracePsBind(draw, ...) would print (the trace is active and TracePsDraw traced this draw), so the
+// renderer gathers the registers and the defines text only then instead of at every draw.
+bool TracePsBindWanted(uint64_t draw);
 
 // The stored depth of a fragment at clip-space (z, w) as the renderer produces it (the folded z, then the
 // Vulkan viewport transform: minDepth + (maxDepth - minDepth) * z_ndc). Pure; tested on the traced glow / text values.

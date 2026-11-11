@@ -12,6 +12,7 @@
 #include "resolve_resident.h"
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 namespace runtime::video {
@@ -28,11 +29,35 @@ namespace runtime::video {
 // does not use is VK_NULL_HANDLE. The views live for the run (the renderer's framebuffers reference
 // them) and the images outlive every submission that uses them: destroyed only at shutdown, after
 // GpuGuard::Shutdown confirmed that no submission's completion is unknown (EdramHooks::shutdown).
+// FM4 Recomp (M7 GPU cost): a resolve clear the EDRAM unit has not applied yet. The unit hands the
+// pending clears of the acquired targets to the renderer, which records them (vkCmdClearAttachments) as the first commands of the
+// draw's render pass, before the draw; the unit applies them itself before any other read or write of the target.
+struct PendingClear
+{
+    VkClearAttachment attachment{};  // colour attachment 0, or depth + stencil
+    VkRect2D rect{};
+};
+
 struct HostTargets
 {
     VkImageView color = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED, depthFormat = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0, samples = 1;
+    std::vector<PendingClear> clears;  // to record first in the draw's pass (the unit has forgotten them)
+};
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): a clear-class draw (draw_record.h FindClearDraw) handed to acquireTargets instead of being
+// drawn. After the bind (its cutouts are `rect`) and the transfers of the tiles outside the rectangle, the unit keeps a pending
+// clear of `rect` on each bound target (`color`: colour 0 with `rgba`, as the pixel shader would export it; `depth`: depth + stencil
+// with `depthValue` / `stencil`), recorded first in the next pass that touches the target exactly as a deferred resolve clear is; the
+// targets' older pending clears stay pending (nothing is recorded for this draw) and HostTargets::clears stays empty.
+struct ClearRequest
+{
+    edram::Rect rect;
+    bool color = false, depth = false;
+    float rgba[4] = {0, 0, 0, 0};
+    float depthValue = 0;
+    uint32_t stencil = 0;
 };
 
 // FM4 Recomp (FM4_PASS_MERGE=1): the renderer may leave a draw's render pass open for the next draw on the same framebuffer.
@@ -45,6 +70,19 @@ inline const char* passActivity = "other";
 // FM4 Recomp (FM4_DIAG_OVERWRITE, diagnostic): the tiles the last acquireTargets transferred into the draw's targets (0: none); the
 // renderer prints the draw that follows a transfer, once per signature, to find clear-style draws that overwrite what was moved.
 inline uint32_t lastBindTransferTiles = 0;
+// FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the EDRAM unit's running count of reclaims taken without a transfer
+// (edram::Ownership::Skipped); null when the skip is off. The renderer prints the difference on each swap line.
+inline const edram::Ownership::SkipStats* transferSkipStats = nullptr;
+// FM4 Recomp (FM4_DIAG_TRANSFERS=2, diagnostic): the draw about to acquire its targets (shader hashes, primitive, depth/stencil and
+// colour write state), filled by the renderer only at that level; the EDRAM unit names it as the first consumer of the tiles the
+// last transfers moved into a target the draw binds. Empty otherwise.
+inline char diagDrawSignature[192] = "";
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): since the renderer's last swap line, the ownership transfers the EDRAM unit
+// recorded as a clear of the destination instead of a copy (edram.h Transfer::value), and their tiles; the renderer prints and clears them.
+inline uint64_t clearValueTransfersSinceSwap = 0, clearValueTilesSinceSwap = 0;
+// FM4 Recomp (FM4_PARTIAL_RETIRE): the serial of the submission part being recorded (the renderer bumps it at each submit); a
+// resolve recorded now, and the guest ranges it will write, carry it (edram_vk.cpp Pending, texture_upload.h GuestWriteLog).
+inline uint64_t currentPartSerial = 1;
 struct PassActivity
 {
     const char* saved;
@@ -79,8 +117,9 @@ struct EdramHooks
     // draw uses (`needColor`: DrawKind::Draw with a colour write; `needDepth`: a depth or stencil test).
     // False with `error` refuses the draw (the renderer stops with it).
     // FM4 Recomp (FM4_OVERWRITE_CLAIM): `depthCutout` / `colorCutout` (null: none) are the rectangles the draw overwrites (edram::Bind).
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): `clear` (null: a drawn draw) is the clear the draw stands for (ClearRequest above).
     bool (*acquireTargets)(VkCommandBuffer commands, const RenderTarget& target, bool needColor, bool needDepth, const edram::Rect* depthCutout,
-                           const edram::Rect* colorCutout, HostTargets& out, std::string& error);
+                           const edram::Rect* colorCutout, const ClearRequest* clear, HostTargets& out, std::string& error);
     // A DrawKind::Resolve draw (RB_MODECONTROL 6, X xenos.h:926-960): the EDRAM unit decodes RB_COPY_*
     // from `base`'s register file and records the resolve into `commands` (D-f; the M4 unit takes the
     // fallback: a copy of the rectangle into its staging buffer, written into guest memory by `retired`).
@@ -89,8 +128,9 @@ struct EdramHooks
     bool (*resolve)(VkCommandBuffer commands, const uint8_t* base, const DrawState& d, uint64_t draw, std::string& error);
     // From RetireSlot, after the slot's submission was confirmed complete (GpuGuard::Retire) and before
     // GuestWritesRetired (guest_writes.h): the EDRAM unit writes that submission's read-back resolves into
-    // guest memory. False with `error` stops.
-    bool (*retired)(std::string& error);
+    // guest memory. False with `error` stops. FM4_PARTIAL_RETIRE: only the resolves recorded by parts up to
+    // `upToSerial` (UINT64_MAX: every pending one, the whole slot).
+    bool (*retired)(uint64_t upToSerial, std::string& error);
     // Renderer shutdown, only after GpuGuard::Shutdown kept nothing and after the renderer destroyed its
     // framebuffers (they reference the EDRAM unit's views): destroys every resource of the unit.
     void (*shutdown)();
@@ -134,6 +174,8 @@ struct TextureHooks
     // FM4 Recomp (FM4_RESOLVE_DEFER): whether the slot's texture reads a range a recorded resolve has not yet written back.
     // FM4_RESOLVE_RESIDENT: false for an image that already holds the resolves' words (adoptResolve).
     bool (*readsPendingWrite)(const TextureSlot& slot);
+    // FM4_PARTIAL_RETIRE: the newest part whose pending resolve the texture reads (0: none; readsPendingWrite false means 0).
+    uint64_t (*pendingWriteSerial)(const TextureSlot& slot);
     // FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): after every recorded resolve. Copies the resolve's converted words
     // (`words`, EdramHooks::lastResolve) into each host image that takes them verbatim and is otherwise in step with guest
     // memory; every other image over the resolve's range stops being resident. Returns the images written.

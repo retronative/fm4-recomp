@@ -29,7 +29,15 @@
 namespace runtime::video {
 
 void MarkGuestWritten(uint32_t physical, uint32_t bytes);
+// FM4 Recomp (FM4_RESOLVE_HOST_WRITE): before the host writes [physical, physical + bytes) itself (a resolve write-back): the
+// range's watched pages are made writable and unwatched in one pass (texture_cache.h WriteWatch::BeforeHostWrite, the path a
+// system-call write uses) instead of faulting page by page; the range counts as written. Nothing without the write watch.
+void GuestRangeHostWrite(uint32_t physical, uint32_t bytes);
 bool GuestWritesPending();
+// FM4_PARTIAL_RETIRE: the newest part whose pending range shares a byte with [physical, physical + bytes) (0: none), and the
+// retirement of the ranges recorded by parts up to `serial` (GuestWritesRetired retires every one).
+uint64_t GuestWritesPendingSerial(uint32_t physical, uint32_t bytes);
+void GuestWritesRetiredUpTo(uint64_t serial);
 void GuestWritesRetired();
 // FM4 Recomp (FM4_RESOLVE_DEFER): whether [physical, physical + bytes) shares a byte with a pending range.
 bool GuestWritesOverlap(uint32_t physical, uint32_t bytes);

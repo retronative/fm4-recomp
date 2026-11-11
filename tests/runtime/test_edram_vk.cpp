@@ -13,6 +13,8 @@
 #include "edram_vk_plan.h"
 #include "front_buffer.h"  // TiledOffset (the serial reference scan)
 #include "render_targets_vk.h"
+#include "resolve_resident.h"  // FM4 Recomp (M7 CPU cost): the pure resident-pair answers (header-only; the flag readers are not called)
+#include "texture_untile.h"  // TiledOffset2D (the 16 bpp hand table's slip check, TestResolveWords16ToGuest)
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -496,7 +498,7 @@ void TestResolveWordsToGuest()
     CHECK(small == std::vector<uint8_t>(16, 0xEE));                                                 // ... and nothing written
     edram::ResolveInfo half = fb;
     half.destBytesLog2 = 1;
-    CONTROL(ResolveWordsToGuest(half, 2, words.data(), untouched.data(), uint32_t(untouched.size()), why));  // not 32 bpp
+    CONTROL(ResolveWordsToGuest(half, 2, words.data(), untouched.data(), uint32_t(untouched.size()), why));  // format 7 is never 16 bpp (ResolveFullConvertible)
 }
 
 void TestResolveToGuest()
@@ -1591,6 +1593,57 @@ void TestRg16Resolve()
     CONTROL(WordAt(dest, 0) == 0x00010000u);  // without the endian swap
 }
 
+// FM4 Recomp (M7 CPU cost, FM4_RESOLVE_RESIDENT_1616): the 16_16 4x -> k_16_16 resolve (TestRg16Resolve's shape; FM4's 512x512 one every
+// race frame) takes the resident GPU-words path: the pure answers of resolve_resident.h with controls, and the write-back from converted
+// words (ResolveWordsToGuest, FM4_RESOLVE_GPU_WORDS) against the CPU conversion of the same samples (ResolveConvertToGuest), byte for
+// byte, with TestRg16Resolve's hand-derived words. The GPU conversion itself (edram_vk.cpp kResolveResident XE_SOURCE_UINT) is checked
+// only by a run: glslang at Create, then FM4_RESOLVE_RESIDENT_CHECK per pixel against ResolveConvertPixel.
+void TestResident1616()
+{
+    std::string why;
+    // Storage 4 into 25 at 32 bpp is convertible; CONTROLS: 25 at 16 bpp, storage 4 into 6, 25 from storage 0 or 14.
+    CHECK(ResidentConvertible(4, 25, 2));
+    CONTROL(ResidentConvertible(4, 25, 1) || ResidentConvertible(4, 6, 2) || ResidentConvertible(0, 25, 2) || ResidentConvertible(14, 25, 2));
+    // 25 pairs with itself only (texture_info.cpp HostFormatFor: R16G16_UNORM / _SNORM, the texel the guest word r | g << 16).
+    CHECK(ResidentFormatPair(25, 25));
+    CONTROL(ResidentFormatPair(25, 6) || ResidentFormatPair(6, 25) || ResidentFormatPair(25, 36) || ResidentFormatPair(25, 10) || ResidentFormatPair(25, 22));
+    // The reader (a consumer tally's "format 25 512x512"): a tiled single-level 512x512 format-25 texture at the
+    // resolve's base, pitch 512, endian 1 (k8in16, the resolve's: TestRg16Resolve) takes the whole rectangle at texel (0, 0).
+    // CONTROLS: another endian; a format-6 reader of the same words.
+    const ResidentTextureShape t{0x10000000u, 512, 512, 512, 25, 1, 1, 1, 1, true, false, false};
+    const ResidentResolve r{true, 0x10000000u, 512 * 512 * 4, 0x10000000u, 25, 512, 1, 0, 0, 512, 512};
+    uint32_t x = 9, y = 9;
+    CHECK(ResidentTextureMatches(t, r, &why, &x, &y) && x == 0 && y == 0);
+    ResidentTextureShape e = t, f = t;
+    e.endian = 0, f.format = 6;
+    CONTROL(ResidentTextureMatches(e, r, &why));
+    CHECK(why == "another endian");
+    CONTROL(ResidentTextureMatches(f, r, &why));
+    CHECK(why == "a format whose texel is not the resolve's word");
+
+    // The write-back: TestRg16Resolve's pixels A at (0, 0) and B at (2, 3) of the 32x32 4x rectangle (hand-derived there: 0x00010000
+    // and 0x0000E100; every all-zero pixel packs 0: 0 * 256 + 0.5 -> int 0). The GPU words are those converted words, row-major.
+    const uint32_t destInfo = 1 | 25u << 7 | 3u << 13 | 10u << 16;
+    const edram::ResolveInfo rg = edram::DecodeResolve(Rg16Resolve(0x00020050, 0x00100060, destInfo));
+    CHECK(rg.ok && rg.destNumber == 3 && rg.destExpBias == 10 && rg.destEndian == 1 && rg.destBytesLog2 == 2);
+    const uint32_t a[4] = {0x00010001u, 0x00010000u, 0x00010000u, 0}, b[4] = {0x00008001u, 0x00000400u, 0, 0};
+    const DumpLayout l = DumpLayoutFor(Msaa::X4, 32, 32);
+    std::vector<uint32_t> samples(size_t(l.width) * l.columns * l.height * l.rows, 0), words(32 * 32, 0);
+    for (uint32_t g = 0; g < 4; g++)
+        samples[l.Word(0, 0, g)] = a[g], samples[l.Word(2, 3, g)] = b[g];
+    words[0] = 0x00010000u, words[3 * 32 + 2] = 0x0000E100u;
+    CHECK(ResolveConvertPixel(rg, 4, a) == words[0] && ResolveConvertPixel(rg, 4, b) == words[3 * 32 + 2]);
+    std::vector<uint8_t> fromWords(rg.destExtentLength, 0xEE), fromSamples(rg.destExtentLength, 0xEE);
+    CHECK(ResolveWordsToGuest(rg, 4, words.data(), fromWords.data(), uint32_t(fromWords.size()), why));
+    CHECK(ResolveConvertToGuest(rg, 4, samples.data(), fromSamples.data(), uint32_t(fromSamples.size()), why));
+    CHECK(fromWords == fromSamples);
+    // The bytes (TestRg16Resolve): endian 1 swaps the bytes of each half: 0x00010000 -> 0x01000000 at tiled offset 0, little-endian
+    // 00 00 00 01; 0x0000E100 -> 0x000000E1 at TiledOffset(2, 3) = 280; (1, 0) at 4 is 0.
+    CHECK(fromWords[0] == 0x00 && fromWords[1] == 0x00 && fromWords[2] == 0x00 && fromWords[3] == 0x01);
+    CHECK(WordAt(fromWords, 280) == 0x000000E1u && WordAt(fromWords, 4) == 0u);
+    CONTROL(WordAt(fromWords, 0) == 0x00010000u);  // without the endian swap
+}
+
 // The k_8_8 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 0
 // (storage 0, 8_8_8_8), 1x, sample select 0, into texture format 10 (k_8_8) with number 0, exp bias 0, no swap, endian 1.
 // The registers are a stand-in of that shape (the run logs no raw values): Float32Resolve's 32x32 rectangle of a pitch-80
@@ -1675,6 +1728,393 @@ void TestK88Resolve()
     CHECK(shortDest[0] == 0xEE);
 }
 
+// FM4 Recomp (M7 CPU cost, FM4_RESOLVE_GPU_WORDS16): ResolveWordsToGuest's 16 bpp branch stores k_8_8's R16 words (kResolveResident's
+// destFormat 10 output, r | g << 8) at the 16 bpp tiled address with XeEndianSwap16, byte for byte as ResolveConvertToGuest's 16 bpp
+// branch. Expected bytes by hand from X texture_util.cc:443-458 GetTiledOffset2D at log2 bytes 1 and endian.xesli:25-31 (8in16 swaps
+// the two bytes; endian 0 stores the halfword little-endian).
+void TestResolveWords16ToGuest()
+{
+    std::string why;
+    // (1) TestK88Resolve's 32x32 resolve (pitch 32, endian 8in16, extent 0xC00): the words 0x2211 at (0, 0) and (9, 3), 0 elsewhere.
+    // TiledOffset2D(9, 3, 32, 1) = 114 (derived at TestK88Resolve); (1, 0): micro 1 << 1 = 2, offset 2, no mix term -> 2; (8, 0):
+    // micro 0, offset 0, ((0 + (8 >> 3)) & 3) << 6 = 64 -> 64; (0, 1): micro 0, offset (1 & 1) << 4 = 16 -> 16; (0, 2): micro
+    // ((2 & 0xE) << 2) << 1 = 16, offset (16 & ~0xF) << 1 = 32 -> 32. Under 8in16 0x2211 is stored as bytes 22 11.
+    const edram::ResolveInfo k = edram::DecodeResolve(K88Resolve(1 | 10u << 7));
+    CHECK(k.ok && k.destBytesLog2 == 1 && k.destEndian == 1 && k.destExtentLength == 3072);
+    std::vector<uint16_t> words(32 * 32, 0);
+    words[0] = words[3 * 32 + 9] = 0x2211u;
+    std::vector<uint8_t> dest(k.destExtentLength, 0xEE);
+    CHECK(ResolveWordsToGuest(k, 0, reinterpret_cast<const uint32_t*>(words.data()), dest.data(), uint32_t(dest.size()), why));
+    CHECK(dest[0] == 0x22 && dest[1] == 0x11 && dest[114] == 0x22 && dest[115] == 0x11);
+    CONTROL(dest[0] == 0x11 && dest[1] == 0x22);      // without the endian swap
+    CONTROL(dest[340] == 0x22 && dest[341] == 0x11);  // the 32 bpp address of (9, 3) (TestK88Resolve)
+    CHECK(dest[2] == 0x00 && dest[3] == 0x00 && dest[64] == 0x00 && dest[65] == 0x00 && dest[16] == 0x00 && dest[32] == 0x00);  // (1,0) (8,0) (0,1) (0,2): zero words
+    size_t written = 0;
+    for (uint8_t b : dest)
+        written += b != 0xEE;
+    CHECK(written == 2048);  // 32 * 32 texels, 2 bytes each, at distinct addresses; the rest of the 0xC00 extent untouched
+    // Endian 0: the halfword little-endian, bytes 11 22.
+    const edram::ResolveInfo plain = edram::DecodeResolve(K88Resolve(10u << 7));
+    std::vector<uint8_t> dest0(plain.destExtentLength, 0xEE);
+    CHECK(plain.ok && plain.destEndian == 0 &&
+          ResolveWordsToGuest(plain, 0, reinterpret_cast<const uint32_t*>(words.data()), dest0.data(), uint32_t(dest0.size()), why) &&
+          dest0[0] == 0x11 && dest0[1] == 0x22 && dest0[114] == 0x11 && dest0[115] == 0x22);
+    // The same bytes as the CPU path: for storage 0 into k_8_8 without bias or swap the word is the texel's low 16 bits (the 8-bit
+    // UNORM unpack and pack are the identity, TestFastResidentWords same8; TestK88Resolve: 0x44332211 -> 0x2211).
+    std::vector<uint32_t> texels(32 * 32);
+    std::vector<uint16_t> texelWords(32 * 32);
+    for (uint32_t i = 0; i < 32 * 32; i++)
+        texels[i] = 0x9D000000u | (((i * 0x01010101u) ^ (i << 7)) & 0x00FFFFFFu), texelWords[i] = uint16_t(texels[i]);
+    std::vector<uint8_t> a(k.destExtentLength, 0xEE), b(k.destExtentLength, 0xEE);
+    CHECK(ResolveWordsToGuest(k, 0, reinterpret_cast<const uint32_t*>(texelWords.data()), a.data(), uint32_t(a.size()), why) &&
+          ResolveConvertToGuest(k, 0, texels.data(), b.data(), uint32_t(b.size()), why) && a == b);
+    // A 2048-byte destination: rows 0-15 stay below 1024 (micro at most 126, offset at most 254: (254 & 0x1C0) << 2 = 768, group at most
+    // 192, low bits at most 62), and (0, 16) is the first texel (row-major) past the end: micro 0, offset 0, (16 & 16) << 7 = 2048, so it
+    // ends at 2050 > 2048. Refused naming (0, 16), nothing written.
+    std::vector<uint8_t> shortDest(2048, 0xEE);
+    CONTROL(ResolveWordsToGuest(k, 0, reinterpret_cast<const uint32_t*>(words.data()), shortDest.data(), uint32_t(shortDest.size()), why));
+    CHECK(why.find("(0, 16)") != std::string::npos && shortDest == std::vector<uint8_t>(2048, 0xEE));
+
+    // (2) A 7x2 rectangle at destination offset (30, 5), pitch 80 (aligned to 96: 3 tiles a row), crossing the tile boundary at x = 32.
+    // By hand (log2 bytes 1): macro = ((x >> 5) + (y >> 5) * 3) << 8; micro = ((x & 7) + ((y & 0xE) << 2)) << 1;
+    // offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+    // result = ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F).
+    // Row y = 5 ((y & 0xE) << 2 = 16, (y & 1) << 4 = 16, (y & 8) >> 2 = 0):
+    //   x = 30: micro (6 + 16) << 1 = 44, offset 64 + 12 + 16 = 92; (92 & 0x1C0) << 2 = 256, group (3 & 3) << 6 = 192, 92 & 0x3F = 28 -> 476
+    //   x = 31: micro 46, offset 94 -> 256 + 192 + 30 = 478
+    //   x = 32: macro 256, micro (0 + 16) << 1 = 32, offset 256 + 64 + 0 + 16 = 336; (336 & 0x1C0) << 2 = 1280, group (4 & 3) = 0, 336 & 0x3F = 16 -> 1296
+    //   x = 33: micro 34, offset 338 -> 1280 + 18 = 1298;  x = 34: micro 36, offset 340 -> 1300;  x = 35: micro 38, offset 342 -> 1302
+    //   x = 36: micro (4 + 16) << 1 = 40, offset 256 + 64 + 8 + 16 = 344 -> 1280 + 24 = 1304
+    // Row y = 6 ((y & 0xE) << 2 = 24, (y & 1) << 4 = 0):
+    //   x = 30: micro (6 + 24) << 1 = 60, offset (48 << 1) + 12 = 108; (108 & 0x1C0) << 2 = 256, group 192, 108 & 0x3F = 44 -> 492
+    //   x = 31: micro 62, offset 110 -> 256 + 192 + 46 = 494
+    //   x = 32: micro 48, offset 256 + 96 + 0 = 352; (352 & 0x1C0) << 2 = 1280, 352 & 0x3F = 32 -> 1312
+    //   x = 33..36: micro 50, 52, 54, 56; offset 354, 356, 358, 360 -> 1314, 1316, 1318, 1320
+    // (The hand table against the transcribed formula, texture_untile.h TiledOffset2D, as a slip check on the arithmetic above.)
+    const uint32_t at[2][7] = {{476, 478, 1296, 1298, 1300, 1302, 1304}, {492, 494, 1312, 1314, 1316, 1318, 1320}};
+    bool formula = true;
+    for (uint32_t y = 0; y < 2; y++)
+        for (uint32_t x = 0; x < 7; x++)
+            formula = formula && TiledOffset2D(30 + x, 5 + y, 80, 1) == at[y][x];
+    CHECK(formula);
+    CONTROL(TiledOffset2D(32, 5, 80, 1) == TiledOffset2D(31, 5, 80, 1) + 2);  // the tile boundary is not contiguous
+    edram::ResolveInfo r = k;
+    r.x0 = 0, r.y0 = 0, r.x1 = 7, r.y1 = 2, r.destOffsetX = 30, r.destOffsetY = 5, r.destPitch = 80;
+    alignas(4) uint16_t rect[2][7];  // the words pointer is passed as the staging buffer's (uint32_t*)
+    for (uint32_t y = 0; y < 2; y++)
+        for (uint32_t x = 0; x < 7; x++)
+            rect[y][x] = uint16_t(0xA100u | y << 4 | x);  // high byte A1, low byte y << 4 | x
+    const uint32_t bytes = 1320 + 2;  // texel (36, 6) ends the surface here
+    std::vector<uint8_t> tiled(bytes, 0xEE);
+    CHECK(ResolveFullConvertible(r, 0, why) && ResolveWordsToGuest(r, 0, reinterpret_cast<const uint32_t*>(&rect[0][0]), tiled.data(), bytes, why));
+    bool placed = true;
+    for (uint32_t y = 0; y < 2; y++)
+        for (uint32_t x = 0; x < 7; x++)
+            placed = placed && tiled[at[y][x]] == 0xA1 && tiled[at[y][x] + 1] == uint8_t(y << 4 | x);  // 8in16: the high byte first
+    CHECK(placed);
+    written = 0;
+    for (uint8_t v : tiled)
+        written += v != 0xEE;
+    CHECK(written == 28);  // 14 texels, 2 bytes each, nothing else
+    CONTROL(tiled[1296] == (0 << 4 | 2) && tiled[1297] == 0xA1);  // endian 0's byte order
+    // One byte short of texel (36, 6): refused naming rectangle texel (6, 1), nothing written.
+    std::vector<uint8_t> shortTiled(bytes - 1, 0xEE);
+    CONTROL(ResolveWordsToGuest(r, 0, reinterpret_cast<const uint32_t*>(&rect[0][0]), shortTiled.data(), bytes - 1, why));
+    CHECK(why.find("(6, 1)") != std::string::npos && shortTiled == std::vector<uint8_t>(bytes - 1, 0xEE));
+    // Endian 0 on the same rectangle: the low byte first.
+    r.destEndian = 0;
+    std::vector<uint8_t> tiled0(bytes, 0xEE);
+    CHECK(ResolveWordsToGuest(r, 0, reinterpret_cast<const uint32_t*>(&rect[0][0]), tiled0.data(), bytes, why) && tiled0[476] == 0x00 && tiled0[477] == 0xA1 &&
+          tiled0[1320] == (1 << 4 | 6) && tiled0[1321] == 0xA1);
+    // A 32 bpp destination (format 7, k's registers with bytes log2 2) still takes the 32-bit branch: the 16 bpp store is not reached, so
+    // TestResolveWordsToGuest's offsets stand; and a 16 bpp info whose format is not k_8_8 is refused before any branch.
+    edram::ResolveInfo wrong = k;
+    wrong.destFormat = 7, wrong.destBytesLog2 = 1;
+    CONTROL(ResolveWordsToGuest(wrong, 0, reinterpret_cast<const uint32_t*>(words.data()), dest.data(), uint32_t(dest.size()), why));
+}
+
+// FM4 Recomp: the tiled store in runs (edram_vk_plan.cpp StoreTiledRow32): (1) TiledOffset's property at 32 bpp, from its formula
+// (front_buffer.h): within an aligned group of four texels consecutive x are 4 bytes apart, over a grid of pitches and offsets;
+// (2) ResolveWordsToGuest against a per-texel reference store on unaligned offsets and widths, byte for byte; (3) the bounds check
+// names the first texel past the end.
+// FM4 Recomp (M7 GPU cost): the render area of an EDRAM-unit pass covers the touched rows only (edram_vk_plan.h UnitPassArea).
+// Expected values by hand: rows rounded outwards to 32, full width, clamped to the target; no rectangle -> the whole target.
+void TestUnitPassArea()
+{
+    const auto eq = [](VkRect2D a, int32_t x, int32_t y, uint32_t w, uint32_t h) {
+        return a.offset.x == x && a.offset.y == y && a.extent.width == w && a.extent.height == h;
+    };
+    // The 4x 640x360 scene on a 640x1024 host target: tile rows 0-44 (8 rows each) = rows 0-360 -> 0-384.
+    const VkRect2D scene{{0, 0}, {640, 360}};
+    CHECK(eq(UnitPassArea(&scene, 1, 640, 1024), 0, 0, 640, 384));
+    CONTROL(eq(UnitPassArea(&scene, 1, 640, 1024), 0, 0, 640, 1024));
+    // Three rectangles of one tile range (edram::RangeRectangles: a partial first row, full rows, a partial last row).
+    const VkRect2D three[3] = {{{400, 40}, {240, 8}}, {{0, 48}, {640, 200}}, {{0, 248}, {120, 8}}};
+    CHECK(eq(UnitPassArea(three, 3, 640, 1024), 0, 32, 640, 256 - 32));  // rows 40-256 -> 32-256
+    // A 1x 1280x720 clear on a 1280x2048 target: 720 is not a multiple of 32 -> 736.
+    const VkRect2D clear{{0, 0}, {1280, 720}};
+    CHECK(eq(UnitPassArea(&clear, 1, 1280, 2048), 0, 0, 1280, 736));
+    // Rows that reach the bottom are clamped to the target, never beyond it.
+    const VkRect2D bottom{{0, 1000}, {640, 24}};
+    CHECK(eq(UnitPassArea(&bottom, 1, 640, 1024), 0, 992, 640, 32));
+    // No rectangle: the whole target (the caller has nothing to draw, but the area stays valid).
+    CHECK(eq(UnitPassArea(nullptr, 0, 640, 1024), 0, 0, 640, 1024));
+    // A negative offset (never produced by RangeRectangles) is treated as row 0.
+    const VkRect2D negative{{0, -5}, {640, 10}};
+    CHECK(eq(UnitPassArea(&negative, 1, 640, 1024), 0, 0, 640, 32));
+}
+
+// FM4 Recomp (M7 GPU cost): a pending resolve clear drops the older pending clears its rectangle covers (edram_vk_plan.h
+// MergePendingClear); expected lists by hand.
+void TestMergePendingClear()
+{
+    const auto same = [](VkRect2D a, VkRect2D b) { return std::memcmp(&a, &b, sizeof a) == 0; };
+    std::vector<VkRect2D> rects;
+    CHECK(MergePendingClear(rects, {{0, 0}, {1280, 720}}) == 0 && rects.size() == 1);
+    // A clear inside the first stays (it is newer: applied after), the list keeps order.
+    CHECK(MergePendingClear(rects, {{0, 0}, {640, 360}}) == 0 && rects.size() == 2 && same(rects[1], {{0, 0}, {640, 360}}));
+    // The full rectangle again: both older clears are inside it and go; it alone remains.
+    CHECK(MergePendingClear(rects, {{0, 0}, {1280, 720}}) == 2 && rects.size() == 1 && same(rects[0], {{0, 0}, {1280, 720}}));
+    // A rectangle that only overlaps (one pixel wider) drops nothing.
+    CHECK(MergePendingClear(rects, {{0, 0}, {1281, 100}}) == 0 && rects.size() == 2);
+    std::vector<VkRect2D> copy = rects;  // a narrower strip contains neither pending rectangle: nothing dropped
+    CONTROL(MergePendingClear(copy, {{0, 0}, {1280, 100}}) == 1);
+    CHECK(copy.size() == 3);
+    // Exactly equal rectangles: the older one goes.
+    rects = {{{40, 8}, {80, 16}}};
+    CHECK(MergePendingClear(rects, {{40, 8}, {80, 16}}) == 1 && rects.size() == 1);
+    // Offsets matter: the same size one pixel to the left is not inside.
+    rects = {{{40, 8}, {80, 16}}};
+    CHECK(MergePendingClear(rects, {{41, 8}, {80, 16}}) == 0 && rects.size() == 2);
+    rects = {{{40, 8}, {80, 16}}};
+    CHECK(MergePendingClear(rects, {{39, 8}, {82, 16}}) == 1 && rects.size() == 1);
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): PushPendingClear keeps each value with its rectangle under MergePendingClear's rule
+// (TestMergePendingClear): an older clear wholly inside the new one goes with its value, the rest keep their order, the new one is last.
+void TestPushPendingClear()
+{
+    PendingClear whole, inner, whole2, strip;
+    whole.attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, whole.attachment.clearValue.color.float32[0] = 0.25f, whole.rect = {{0, 0}, {1280, 720}};
+    inner = whole, inner.attachment.clearValue.color.float32[0] = 0.5f, inner.rect = {{0, 0}, {640, 360}};
+    whole2 = whole, whole2.attachment.clearValue.color.float32[0] = 0.75f;
+    strip = whole, strip.attachment.clearValue.color.float32[0] = 1.0f, strip.rect = {{0, 0}, {1281, 100}};
+    std::vector<PendingClear> pending;
+    CHECK(PushPendingClear(pending, whole) == 0 && pending.size() == 1 && pending[0].attachment.clearValue.color.float32[0] == 0.25f);
+    // A newer clear inside the first stays after it, with its own value.
+    CHECK(PushPendingClear(pending, inner) == 0 && pending.size() == 2 && pending[0].attachment.clearValue.color.float32[0] == 0.25f &&
+          pending[1].attachment.clearValue.color.float32[0] == 0.5f && pending[1].rect.extent.width == 640);
+    // The whole rectangle again: both older clears go; its value alone remains.
+    CHECK(PushPendingClear(pending, whole2) == 2 && pending.size() == 1 && pending[0].attachment.clearValue.color.float32[0] == 0.75f);
+    // A rectangle that only overlaps drops nothing: the older value keeps its place, the new one is last.
+    CHECK(PushPendingClear(pending, strip) == 0 && pending.size() == 2 && pending[0].attachment.clearValue.color.float32[0] == 0.75f &&
+          pending[1].attachment.clearValue.color.float32[0] == 1.0f && pending[1].rect.extent.width == 1281);
+    CONTROL(pending[0].rect.extent.width == 1281);  // the order is the push order, not by size
+    // A depth + stencil clear keeps both values.
+    PendingClear ds;
+    ds.attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, ds.attachment.clearValue.depthStencil = {1.0f, 0x5A}, ds.rect = {{0, 0}, {1280, 256}};
+    std::vector<PendingClear> depth;
+    CHECK(PushPendingClear(depth, ds) == 0 && depth.size() == 1 && depth[0].attachment.clearValue.depthStencil.depth == 1.0f &&
+          depth[0].attachment.clearValue.depthStencil.stencil == 0x5A &&
+          depth[0].attachment.aspectMask == VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
+}
+
+void TestTiledRuns()
+{
+    bool runs = true;
+    for (uint32_t pitch : {32u, 80u, 1280u})
+        for (uint32_t y = 0; y < 64; y++)
+            for (uint32_t x = 0; x + 1 < 96; x++)
+                if ((x & 3) != 3 && TiledOffset(x + 1, y, pitch, 2) != TiledOffset(x, y, pitch, 2) + 4)
+                    runs = false;
+    CHECK(runs);
+    CONTROL(TiledOffset(4, 0, 32, 2) == TiledOffset(3, 0, 32, 2) + 4);  // a group boundary is not contiguous (x & 4 -> bit 5)
+    // A 32_FLOAT 1x resolve shape (TestResolveWordsToGuest's registers): 13x7 texels at destination offset (3, 5), pitch 80.
+    edram::ResolveInfo info = edram::DecodeResolve(Float32Resolve(2 | 36u << 7 | 7u << 13));
+    CHECK(info.ok);
+    info.x0 = 0, info.y0 = 0, info.x1 = 13, info.y1 = 7, info.destOffsetX = 3, info.destOffsetY = 5, info.destPitch = 80, info.destEndian = 2;
+    const uint32_t width = 13, height = 7;
+    std::vector<uint32_t> words(width * height);
+    for (uint32_t i = 0; i < words.size(); i++)
+        words[i] = 0x01010101u * (i + 1) ^ (i << 24);
+    const uint32_t bytes = uint32_t(TiledSize32(80, 64));
+    std::vector<uint8_t> fast(bytes, 0xCC), ref(bytes, 0xCC);
+    std::string why;
+    CHECK(ResolveWordsToGuest(info, 14, words.data(), fast.data(), bytes, why));
+    for (uint32_t y = 0; y < height; y++)
+        for (uint32_t x = 0; x < width; x++)
+        {
+            const uint32_t w = edram::GpuSwap32(words[y * width + x], 2);
+            std::memcpy(ref.data() + TiledOffset(3 + x, 5 + y, 80, 2), &w, 4);
+        }
+    CHECK(fast == ref);
+    info.destEndian = 0;
+    CHECK(ResolveWordsToGuest(info, 14, words.data(), fast.data(), bytes, why));
+    CONTROL(fast == ref);  // endian 0 stores the words unswapped: different bytes
+    // The bounds check: pitch 32, 8 rows of 8 texels at (0, 0) need TiledOffset(7, 7) + 4 bytes; one byte less refuses, naming (7, 7).
+    const uint32_t need = TiledOffset(7, 7, 32, 2) + 4;
+    CHECK(TiledRunsFit(0, 0, 32, 8, 8, need, why));
+    CONTROL(TiledRunsFit(0, 0, 32, 8, 8, need - 1, why));
+    CHECK(why.find("(7, 7)") != std::string::npos);
+    CONTROL(TiledRunsFit(0, 0, 32, 8, 8, need - 16, why) || why.find("(4, 7)") == std::string::npos);  // the run's first texel past the end
+}
+
+// FM4 Recomp (M7 CPU cost): the tile-major store (edram_vk_plan.cpp StoreTiledRows32, run table edram_vk_plan.h kTiledStripeRunX). The
+// reference is X texture_util.cc:443-458 GetTiledOffset2D transcribed here for 4-byte texels, and the endian swap is written out as the
+// byte permutation of X xenos.h:1070-1086 (8in32 reverses the four bytes; 0 none): neither calls the code under test. (1) The run table:
+// every one of the tile's 1,024 texels derived from the table lands at the stripe word the table claims, at four tile positions and
+// pitches, and the derived texels are all distinct; a table entry shifted by one texel never lands there (CONTROL). (2)
+// ResolveWordsToGuest on 80x60 at destination offset (8, 5), pitch 128: a lone leading row (5), the pairs (6, 7) ... (62, 63), a lone
+// trailing row (64), tile (1, 1) covered whole, partial columns on both sides; the whole destination byte for byte against the
+// per-texel reference at endian 2, then 0. (3) 1280x66 at offset (0, 3), pitch 1280: above kParallelMinWork, so the pairs split over the
+// row pool. (4) ResolveDepthToGuest 40x40 at (0, 0), 4x, sample k2: a full tile read through the dump layout's stride.
+uint32_t XeniaTiledOffset4(uint32_t x, uint32_t y, uint32_t pitch)
+{
+    pitch = (pitch + 31) & ~31u;                                                                   // :446 xe::align(pitch, 32)
+    const uint32_t macro = ((x >> 5) + (y >> 5) * (pitch >> 5)) << 9;                              // :448-449, bpp_log2 2 + 7
+    const uint32_t micro = ((x & 7) + ((y & 0xE) << 2)) << 2;                                       // :451
+    const uint32_t offset = macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 1) << 4);       // :453-454
+    return ((offset & ~0x1FFu) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +                 // :456-457
+           (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+void ReferenceTiledStore(std::vector<uint8_t>& ref, uint32_t offX, uint32_t offY, uint32_t pitch, uint32_t w, uint32_t h, uint32_t endian,
+                         const std::vector<uint32_t>& words, size_t stride)
+{
+    for (uint32_t y = 0; y < h; y++)
+        for (uint32_t x = 0; x < w; x++)
+        {
+            const uint32_t v = words[size_t(y) * stride + x];
+            uint8_t* at = ref.data() + XeniaTiledOffset4(offX + x, offY + y, pitch);
+            const uint8_t le[4] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)};  // endian 0: the word as the host stores it
+            for (uint32_t i = 0; i < 4; i++)
+                at[i] = endian == 2 ? le[3 - i] : le[i];  // 8in32: the four bytes reversed
+        }
+}
+void TestTiledStripes()
+{
+    // (1) The run table against Xenia's formula.
+    bool table = true, distinct = true, shifted = false;
+    std::vector<bool> seen(32 * 32, false);
+    const uint32_t positions[4][3] = {{0, 0, 32}, {1, 1, 128}, {3, 2, 1280}, {39, 22, 1280}};  // tile column, tile row, pitch
+    for (uint32_t ye = 0; ye < 32; ye += 2)
+        for (uint32_t r = 0; r < 16; r++)
+            for (uint32_t k = 0; k < 4; k++)
+            {
+                const uint32_t x = kTiledStripeRunX[(ye >> 3) & 1][r] + k, y = ye + (r & 1), want = ((ye & 30) << 7) + (r * 4 + k) * 4;
+                for (const uint32_t* p : positions)
+                    table = table && XeniaTiledOffset4(p[0] * 32 + x, p[1] * 32 + y, p[2]) == ((p[1] * ((p[2] + 31) >> 5) + p[0]) << 12) + want;
+                distinct = distinct && !seen[y * 32 + x];
+                seen[y * 32 + x] = true;
+                shifted = shifted || XeniaTiledOffset4(x + 1, y, 32) == want;  // the entry one texel off would claim this word
+            }
+    CHECK(table);
+    CHECK(distinct);
+    CONTROL(shifted);
+    // (2) 80x60 at (8, 5), pitch 128: a 32_FLOAT 1x resolve shape as TestTiledRuns, destination endian 2 then 0.
+    edram::ResolveInfo info = edram::DecodeResolve(Float32Resolve(2 | 36u << 7 | 7u << 13));
+    CHECK(info.ok);
+    const auto rectangle = [&](uint32_t w, uint32_t h, uint32_t offX, uint32_t offY, uint32_t pitch, uint32_t endian) {
+        info.x0 = 0, info.y0 = 0, info.x1 = w, info.y1 = h, info.destOffsetX = offX, info.destOffsetY = offY, info.destPitch = pitch, info.destEndian = endian;
+        std::vector<uint32_t> words(size_t(w) * h);
+        for (uint32_t i = 0; i < words.size(); i++)
+            words[i] = i * 0x9E3779B1u + 0x12345u;
+        const uint32_t bytes = uint32_t(TiledSize32(pitch, (offY + h + 31) & ~31u));
+        std::vector<uint8_t> fast(bytes, 0xCC), ref(bytes, 0xCC);
+        std::string why;
+        const bool ok = ResolveWordsToGuest(info, 14, words.data(), fast.data(), bytes, why);
+        ReferenceTiledStore(ref, offX, offY, pitch, w, h, endian, words, w);
+        return ok && fast == ref;
+    };
+    CHECK(rectangle(80, 60, 8, 5, 128, 2));
+    CHECK(rectangle(80, 60, 8, 5, 128, 0));
+    CHECK(rectangle(64, 64, 0, 0, 64, 2));  // whole tiles only: no per-texel edge at all
+    CHECK(rectangle(40, 2, 0, 31, 64, 2));  // rows 31 and 32: two lone rows, no pair
+    // (3) Above kParallelMinWork (1280 x 66 = 84,480 > 16,384): the units go through the pool.
+    CHECK(rectangle(1280, 66, 0, 3, 1280, 2));
+    // (4) Depth: a 4x kD24FS8 40x40 resolve of sample k2 at (0, 0), pitch 64, endian 0 (TestDepthResolveVk's registers).
+    edram::ResolveInfo depth;
+    depth.ok = depth.copy = depth.isDepth = true;
+    depth.msaa = Msaa::X4;
+    depth.source = Key::Depth(0, 16, Msaa::X4, DepthFormat::D24FS8);
+    depth.sampleSelect = edram::SampleSelect::k2;
+    depth.destFormat = 23, depth.destPitch = 64, depth.destHeight = 64;
+    depth.x1 = 40, depth.y1 = 40;
+    depth.destExtentLength = uint32_t(TiledSize32(64, 64));
+    const DumpLayout l = DumpLayoutFor(Msaa::X4, 40, 40);
+    std::vector<uint32_t> dump(size_t(l.width) * l.height * l.samples), sample2(size_t(40) * 40);
+    for (uint32_t y = 0; y < 40; y++)
+        for (uint32_t x = 0; x < 40; x++)
+            for (uint32_t g = 0; g < 4; g++)
+                dump[l.Word(x, y, g)] = g << 28 | y << 8 | x, sample2[size_t(y) * 40 + x] = 2u << 28 | y << 8 | x;
+    std::vector<uint8_t> dest(depth.destExtentLength, 0xCC), ref(depth.destExtentLength, 0xCC);
+    std::string why;
+    CHECK(ResolveDepthToGuest(depth, dump.data(), dest.data(), uint32_t(dest.size()), why));
+    ReferenceTiledStore(ref, 0, 0, 64, 40, 40, 0, sample2, 40);
+    CHECK(dest == ref);
+    ReferenceTiledStore(ref, 0, 0, 64, 40, 40, 0, dump, l.width * l.columns);  // sample 0's words instead
+    CONTROL(dest == ref);
+}
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): the word of a clear-class draw's values (ClearRequestWord, accepted only when its
+// decode is the request bit for bit) and the destination's pending clear of a value transfer (ValueClear). Expected values by hand:
+// 7e3 (X xenos.h:303): e > 0: 2^(e - 3) * (1 + m / 128), so 1.0 = e 3 m 0 = 0x180, 0.25 = e 1 m 0 = 0x080; alpha bits 30-31, 3 -> 1.0.
+// Word 0x180 | 0x080 << 10 | 0 << 20 | 3 << 30 = 0xC0020180. 20e4 (X xenos.cc:150-166): 1.0 = exponent 15, mantissa 0 = 0xF00000, so
+// depth 1.0 + stencil 0xFF = 0xF00000FF. unorm24 (X xenos.h:432-438): 0xFFFFFF -> (0xFFFFFF + 1) / 2^24 = 1.0.
+void TestClearValueOwnership()
+{
+    const Key c4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k2_10_10_10_Float), c2 = Key::Color(0, 16, Msaa::X2, ColorFormat::k2_10_10_10_Float);
+    const Key d4 = Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24FS8), d2 = Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24FS8);
+    ClearRequest color;
+    color.color = true;
+    const float rgba[4] = {1.0f, 0.25f, 0.0f, 1.0f};
+    std::memcpy(color.rgba, rgba, sizeof rgba);
+    uint32_t word = 0;
+    CHECK(ClearRequestWord(color, c4, word) && word == 0xC0020180u);
+    CONTROL(ClearRequestWord(color, kAc, word));   // storage 2: 0.25 * 1023 + 0.5 -> 256, 256 / 1023 != 0.25
+    CONTROL(ClearRequestWord(color, kBc0, word));  // storage 0: 0.25 * 255 + 0.5 -> 64, 64 / 255 != 0.25
+    ClearRequest grey = color;
+    grey.rgba[0] = 0.3f;  // 0.3 is not a 7e3 value (7 mantissa bits)
+    CONTROL(ClearRequestWord(grey, c4, word));
+    grey.rgba[0] = -0.0f;  // packs to 7e3 0, which decodes to +0: not the request bit for bit
+    CONTROL(ClearRequestWord(grey, c4, word));
+    grey.rgba[0] = -1.0f;  // outside the format's range: refused before packing
+    CONTROL(ClearRequestWord(grey, c4, word));
+    CONTROL(ClearRequestWord(color, d4, word));  // no depth value in the request
+    ClearRequest depth;
+    depth.depth = true, depth.depthValue = 1.0f, depth.stencil = 0xFF;
+    CHECK(ClearRequestWord(depth, d4, word) && word == 0xF00000FFu);
+    depth.depthValue = 0.0f, depth.stencil = 0;
+    CHECK(ClearRequestWord(depth, d4, word) && word == 0u);
+    depth.depthValue = 1.0f;
+    CHECK(ClearRequestWord(depth, Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24S8), word) && word == 0xFFFFFF00u);
+    depth.depthValue = 0.3f;  // 0x3E99999A: its low three mantissa bits (010) are lost in 20e4
+    CONTROL(ClearRequestWord(depth, d4, word));
+    depth.depthValue = 0.5f;  // kD24S8: RoundEven(0.5 * 0xFFFFFF) = 0x800000 -> (0x800000 + 1) / 2^24 != 0.5
+    CONTROL(ClearRequestWord(depth, Key::Depth(1024, 16, Msaa::X4, DepthFormat::D24S8), word));
+
+    // The value transfers of family A land on the 2x keys as one rectangle each: tiles [0, 1024) and [1024, 2048) at 16 tiles a row of
+    // 80x8 pixels (2x) = 1280 x 512 (edram::RangeRectangles), cleared with the word decoded for the destination.
+    edram::Rect r[3];
+    CHECK(edram::RangeRectangles(0, 1024, c2, r) == 1 && r[0] == edram::Rect{0, 0, 1280, 512});
+    CHECK(edram::RangeRectangles(1024, 2048, d2, r) == 1 && r[0] == edram::Rect{0, 0, 1280, 512});
+    PendingClear pc;
+    CHECK(ValueClear(c2, 0xC0020180u, r[0], pc) && pc.attachment.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && pc.attachment.colorAttachment == 0 &&
+          pc.attachment.clearValue.color.float32[0] == 1.0f && pc.attachment.clearValue.color.float32[1] == 0.25f &&
+          pc.attachment.clearValue.color.float32[2] == 0.0f && pc.attachment.clearValue.color.float32[3] == 1.0f && pc.rect.offset.x == 0 &&
+          pc.rect.offset.y == 0 && pc.rect.extent.width == 1280 && pc.rect.extent.height == 512);
+    CHECK(ValueClear(d2, 0xF00000FFu, r[0], pc) && pc.attachment.aspectMask == VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) &&
+          pc.attachment.clearValue.depthStencil.depth == 1.0f && pc.attachment.clearValue.depthStencil.stencil == 0xFF);
+    CONTROL(pc.attachment.clearValue.depthStencil.depth == 0.0f);
+    CHECK(ValueClear(Key::Depth(1024, 16, Msaa::X2, DepthFormat::D24S8), 0xFFFFFF00u, r[0], pc) && pc.attachment.clearValue.depthStencil.depth == 1.0f &&
+          pc.attachment.clearValue.depthStencil.stencil == 0);
+    // The round trip a value transfer stands for: the 4x source's clear of the request and the 2x destination's clear of the word are
+    // the same clear (the same format; a same-format transfer copies the host value verbatim, edram_vk.cpp kTransferColor).
+    CHECK(ClearRequestWord(color, c4, word) && ValueClear(c2, word, r[0], pc) && std::memcmp(pc.attachment.clearValue.color.float32, rgba, sizeof rgba) == 0);
+    // CONTROLs: storages cleared through their transfer view (4, 14) and an empty rectangle are left to the copy.
+    CONTROL(ValueClear(Key::Color(0, 16, Msaa::X2, ColorFormat::k16_16), 0x12345678u, r[0], pc));
+    CONTROL(ValueClear(Key::Color(0, 16, Msaa::X2, ColorFormat::k32_Float), 0x3F800000u, r[0], pc));
+    CONTROL(ValueClear(c2, 0xC0020180u, edram::Rect{0, 0, 0, 512}, pc));
+}
+
 int main()
 {
     TestFormats();
@@ -1702,7 +2142,15 @@ int main()
     TestDepth4xTo2x();
     TestK16_16();
     TestRg16Resolve();
+    TestResident1616();
     TestK88Resolve();
+    TestResolveWords16ToGuest();
+    TestTiledRuns();
+    TestTiledStripes();
+    TestUnitPassArea();
+    TestMergePendingClear();
+    TestPushPendingClear();
+    TestClearValueOwnership();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

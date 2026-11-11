@@ -5,6 +5,7 @@
 
   /opt/homebrew/bin/python3 -I scripts/artifacts.py inventory            # sizes by class (read-only)
   /opt/homebrew/bin/python3 -I scripts/artifacts.py plan                 # dry run: writes a manifest
+  /opt/homebrew/bin/python3 -I scripts/artifacts.py plan --captures frame-ring[,keep-frames] [--keep s1,s2]
   /opt/homebrew/bin/python3 -I scripts/artifacts.py apply --manifest F --approve ID
 
 Method: dry run first, a
@@ -16,16 +17,24 @@ Candidates (only under build/, never followed through a symlink):
     remains is from a failing run or from before that rule (status not recorded): listed for
     review, never deleted without approval;
   - directories whose .retention.json says class temp-build, status done.
-Never candidates: research/ (evidence), ppc/, game/, tools/, sources, the gate's scratch sources
-and XenonRecomp build (they keep the next run incremental), the harness caches (capped by
-size-based eviction instead), unmarked data. Nothing is touched while a gate or a test runner is
-running (a live build/mutate/.gate.lock, or a matching process).
+Capture PNGs of recorded GPU runs (only with `plan --captures`): under
+research/m<N>/<scenario>/run/<run>.captures, the per-frame ring `frame_<N>.png` (class frame-ring:
+the last swaps before the stop) and, only when asked, the every-Nth `keep_<N>.png` (class
+keep-frames). A run qualifies when its scenario directory carries a .retention.json (registered
+evidence), its log <run>.err lies beside the captures (the recorded result stays) and the scenario
+is not named in --keep. Only files of the chosen classes go; the directory, the logs, the shader
+dumps, traces, user-data and every other file stay.
+Never candidates: anything else under research/ (evidence), ppc/, game/, tools/, sources, the
+gate's scratch sources and XenonRecomp build (they keep the next run incremental), the harness
+caches (capped by size-based eviction instead), unmarked data. Nothing is touched while a gate, a
+test runner or a game run is running (a live build/mutate/.gate.lock, or a matching process).
 """
 import argparse
 import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,7 +44,10 @@ RUN_OUTPUTS = ["build/tests/translator", "build/tests/loader", "build/tests/anal
                "build/mutate/build/tests/translator", "build/mutate/build/tests/loader",
                "build/mutate/build/tests/analysis"]
 CACHES = ["build/tests/translator_cache", "build/mutate/build/tests/translator_cache"]
-RUNNERS = ["tests/mutate.py", "run_translator_tests.sh", "run_loader_tests.sh", "test_analysis.py"]
+RUNNERS = ["tests/mutate.py", "run_translator_tests.sh", "run_loader_tests.sh", "test_analysis.py",
+           "gpu_run.sh", "run_attempt.sh", "fm4recomp"]
+CAPTURES_RE = re.compile(r"^research/m\d+/[^/]+/run/([^/]+)\.captures$")
+CAPTURE_CLASSES = {"frame-ring": re.compile(r"^frame_\d+\.png$"), "keep-frames": re.compile(r"^keep_\d+\.png$")}
 INVENTORY = [  # (path, class)
     ("build/tests", "per-run outputs + harness cache"),
     ("build/mutate", "gate scratch tree (sources, XenonRecomp build, outputs, cache)"),
@@ -116,8 +128,61 @@ def candidates(root):
     return items
 
 
+def capture_files(path, classes):
+    """The files of the given capture classes directly in a captures directory (never symlinks)."""
+    out = []
+    for name in sorted(os.listdir(path)):
+        fp = os.path.join(path, name)
+        if os.path.isfile(fp) and not os.path.islink(fp) and any(CAPTURE_CLASSES[c].match(name) for c in classes):
+            out.append(fp)
+    return out
+
+
+def capture_run_ok(root, rel):
+    """Why this captures path is not a recorded run's captures directory, or None."""
+    m = CAPTURES_RE.match(rel)
+    p = os.path.join(root, rel)
+    if not m or ".." in rel.split("/"):
+        return "not research/m<N>/<scenario>/run/<run>.captures"
+    if os.path.islink(p):
+        return "symlink"
+    if not os.path.isdir(p):
+        return "gone"
+    research = os.path.realpath(os.path.join(root, "research"))
+    if not os.path.realpath(p).startswith(research + os.sep):
+        return "resolves outside research/"
+    scenario = os.path.dirname(os.path.dirname(p))
+    if marker(scenario) is None:
+        return "scenario has no .retention.json"
+    if not os.path.isfile(os.path.join(os.path.dirname(p), m.group(1) + ".err")):
+        return "no run log beside the captures"
+    return None
+
+
+def capture_candidates(root, classes, keep):
+    items = []
+    for ms in sorted(os.listdir(os.path.join(root, "research"))) if os.path.isdir(os.path.join(root, "research")) else []:
+        if not re.match(r"^m\d+$", ms):
+            continue
+        for scenario in sorted(os.listdir(os.path.join(root, "research", ms))):
+            run = os.path.join(root, "research", ms, scenario, "run")
+            if scenario in keep or not os.path.isdir(run):
+                continue
+            for name in sorted(os.listdir(run)):
+                rel = "research/%s/%s/run/%s" % (ms, scenario, name)
+                if not name.endswith(".captures") or capture_run_ok(root, rel):
+                    continue
+                files = capture_files(os.path.join(root, rel), classes)
+                if files:
+                    items.append(dict(path=rel, kind="captures", classes=list(classes), files=len(files),
+                                      inode=os.stat(os.path.join(root, rel)).st_ino,
+                                      bytes=sum(os.path.getsize(f) for f in files),
+                                      reason="capture PNGs (%s) of a recorded run, %d files" % (",".join(classes), len(files))))
+    return items
+
+
 def manifest_id(items):
-    canon = json.dumps([[i["path"], i["inode"], i["bytes"]] for i in items], sort_keys=True)
+    canon = json.dumps([[i["path"], i["inode"], i["bytes"], i.get("kind"), i.get("classes")] for i in items], sort_keys=True)
     return hashlib.sha256(canon.encode()).hexdigest()[:12]
 
 
@@ -140,6 +205,17 @@ def validate(root, it):
     """Why this manifest item may not be deleted now, or None."""
     rel = it["path"]
     p = os.path.join(root, rel)
+    if it.get("kind") == "captures":
+        if os.path.isabs(rel):
+            return "absolute path"
+        why = capture_run_ok(root, rel)
+        if why:
+            return why
+        if not it.get("classes") or any(c not in CAPTURE_CLASSES for c in it["classes"]):
+            return "unknown capture class"
+        if os.stat(p).st_ino != it["inode"]:
+            return "replaced since the plan (inode changed)"
+        return None
     real_build = os.path.realpath(os.path.join(root, "build"))
     if os.path.isabs(rel) or ".." in rel.split("/") or not rel.startswith("build/"):
         return "not a path under build/"
@@ -173,8 +249,8 @@ def cmd_inventory(root):
     return 0
 
 
-def cmd_plan(root, out):
-    items = candidates(root)
+def cmd_plan(root, out, captures=(), keep=()):
+    items = candidates(root) + (capture_candidates(root, captures, set(keep)) if captures else [])
     mid = manifest_id(items)
     for it in items:
         print("candidate %-40s %12s  %s" % (it["path"], mib(it["bytes"]), it["reason"]))
@@ -211,7 +287,14 @@ def cmd_apply(root, manifest, approve, audit, patterns=None):
     with open(audit, "a") as log:
         for it in man["items"]:
             why = validate(root, it)
-            if why is None:
+            if why is None and it.get("kind") == "captures":
+                files = capture_files(os.path.join(root, it["path"]), it["classes"])
+                n = sum(os.path.getsize(f) for f in files)
+                for f in files:
+                    os.remove(f)
+                freed += n
+                result = "deleted %d files (%s), directory kept" % (len(files), mib(n))
+            elif why is None:
                 n = size(os.path.join(root, it["path"]))
                 shutil.rmtree(os.path.join(root, it["path"]))
                 freed += n
@@ -233,14 +316,21 @@ def main(argv=None):
     ap.add_argument("--out", help="plan: manifest path (default research/storage/plan-<time>.json)")
     ap.add_argument("--manifest")
     ap.add_argument("--approve")
+    ap.add_argument("--captures", help="plan: capture classes to list under research/, comma-separated: %s"
+                    % ", ".join(CAPTURE_CLASSES))
+    ap.add_argument("--keep", default="", help="plan --captures: scenario directory names left out, comma-separated")
     a = ap.parse_args(argv)
     root = os.path.abspath(a.root)
+    captures = [c for c in (a.captures or "").split(",") if c]
+    if any(c not in CAPTURE_CLASSES for c in captures):
+        print("unknown capture class; known: %s" % ", ".join(CAPTURE_CLASSES), file=sys.stderr)
+        return 2
     if a.command == "inventory":
         return cmd_inventory(root)
     if a.command == "plan":
         out = a.out or os.path.join(root, "research", "storage",
                                     "plan-%s.json" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
-        return cmd_plan(root, out)
+        return cmd_plan(root, out, captures, [k for k in a.keep.split(",") if k])
     if not (a.manifest and a.approve):
         print("apply needs --manifest and --approve", file=sys.stderr)
         return 2

@@ -255,6 +255,14 @@ struct VertexSlot
     bool computedIndex = false;    // FM4 Recomp: a fetch of it is indexed by a computed value (shader_glsl.h vertexFetchComputedIndex)
 };
 uint32_t VertexWindowDwords(const VertexSlot& s, uint32_t highIndex);
+// FM4 Recomp (M7 GPU cost): true when every vertex fetch of the draw is inside its slot's data for every index the draw can
+// use, so the shader's bounds flag (xe_error) cannot fire: every slot valid, none indexed by a shader-computed value, and the
+// window the indices reach (VertexWindowDwords) within the constant's size. The renderer then compiles the vertex shader's
+// XE_FETCH_UNCHECKED variant (no device write in the vertex stage). False for a draw with no fetch slot information.
+struct DrawState;
+enum class FetchProof : uint8_t { Inside = 0, NoSlots = 1, Invalid = 2, Computed = 3, Past = 4 };  // why a draw is not provable (the renderer tallies them)
+FetchProof VertexFetchProof(const DrawState& d, uint32_t highIndex);
+bool VertexFetchProvablyInside(const DrawState& d, uint32_t highIndex);
 
 // A texture fetch constant a stage samples (X xenos.h:1206-1307 xe_gpu_texture_fetch_t), decoded in
 // full; the host's image and sampler come from it. `magFilter` / `minFilter` / `mipFilter` are the
@@ -372,6 +380,9 @@ struct DrawState
     std::vector<VertexSlot> vertexSlots;    // vs.vertexFetchSlots order
     std::vector<TextureSlot> textureSlots;  // every slot either stage samples, ascending; both stages agree
     std::vector<uint32_t> aluConstants;     // 2048 host-order words: VS float4 0-255 at 0, PS 256-511 at 1024 (shader_glsl.h bindings 2/3)
+    // FM4 Recomp (M7 CPU cost): the words of each stage's block the shaders can read (4 x ShaderTranslation::constantCount): only those
+    // are decoded (the rest of aluConstants is stale), compared for reuse and uploaded.
+    uint32_t vsConstantWords = 1024, psConstantWords = 1024;
     uint32_t boolConstants[8] = {};         // SHADER_CONSTANT_BOOL_000_031.. (binding 2/3 xe_bool)
     uint32_t loopConstants[32] = {};        // SHADER_CONSTANT_LOOP_00.. (xe_loop)
     std::vector<uint32_t> vsLoopRegisters, psLoopRegisters;  // the loop registers each stage reads (gpu/loop_work.h LoopWorkAllowed)
@@ -396,6 +407,9 @@ struct DrawInputs
     // 2,080 constant registers instead of one `read` call each (Decoder::Constants was ~3 % of the command thread).
     // Must hold what `read` returns, byte-swapped.
     const uint8_t* registers = nullptr;
+    // FM4 Recomp (M7 CPU cost, optional): a vector whose storage the decoder takes for aluConstants (swap) instead of allocating 8 KB a
+    // draw; the caller swaps it back when it is done with the DrawState.
+    std::vector<uint32_t>* constantsScratch = nullptr;
     uint32_t opcode = 0;          // 0x22 DRAW_INDX or 0x36 DRAW_INDX_2
     uint32_t vizQueryToken = 0;   // DRAW_INDX's first word; 0 for DRAW_INDX_2
     uint64_t physicalBytes = 0;   // the guest's physical memory size: every address range the draw reads must fit (512 MB on the console)
@@ -404,6 +418,12 @@ struct DrawInputs
 };
 
 DrawState DecodeDrawState(const DrawInputs& in);
+// FM4 Recomp (M7 CPU cost): the same decode into `out`, whose vectors (vertexSlots, textureSlots, the loop registers, aluConstants)
+// keep their storage from one call to the next instead of being allocated per draw (~5-8 allocations a draw by value). Every field
+// is reset and every vector cleared first, so the result equals DecodeDrawState(in), except that aluConstants' words are left as
+// they were when the decode does not reach the constants (Resolve, NoWrite, a refusal): nothing reads them then, and a Draw
+// overwrites all 2048.
+void DecodeDrawState(const DrawInputs& in, DrawState& out);
 
 // Names for messages (X xenos.h:41-57).
 const char* PrimitiveTypeName(uint32_t type);

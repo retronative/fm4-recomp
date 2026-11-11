@@ -417,6 +417,23 @@ void TestUploads()
     uint32_t pb0 = 0;
     std::memcpy(&pb0, psC + 4096, 4);
     Expect(pb0 == 0x5, "the PS block carries the same bool dwords");
+    {
+        // FM4 Recomp (M7 CPU cost): the VS reads 8 words (c0-c1) and the PS 4 (c0): FillConstants copies only those (bytes 0-31 / 0-15); the
+        // bytes from there to 4096 keep the caller's 0xAA (never read by the shader), the bool/loop tail is written as before and the rest
+        // of the tail (after the loops, byte 4128 + 128 = 4256 on) is cleared. CONTROL: the full range (1024 words) overwrites byte 32.
+        DrawState n = d;
+        n.vsConstantWords = 8, n.psConstantWords = 4;
+        std::memset(vsC, 0xAA, sizeof vsC), std::memset(psC, 0xAA, sizeof psC);
+        FillConstants(n, false, vsC);
+        FillConstants(n, true, psC);
+        std::memcpy(&c0, vsC, 4), std::memcpy(&p0, psC, 4), std::memcpy(&b0, vsC + 4096, 4), std::memcpy(&l31, psC + 4128 + 31 * 4, 4);
+        Expect(c0 == 0x3F800000 && p0 == 0x40000000 && vsC[31] == 0 && vsC[32] == 0xAA && vsC[4095] == 0xAA && psC[15] == 0 && psC[16] == 0xAA &&
+                   b0 == 0x5 && l31 == 0x40 && vsC[kConstantsBytes - 1] == 0,
+               "constants: only the range each stage reads is copied; the bytes past it up to 4096 are left alone, the tail is written");
+        std::memset(vsC, 0xAA, sizeof vsC);
+        FillConstants(d, false, vsC);
+        CONTROL(vsC[32] == 0xAA, "the full 1024-word range overwrites byte 32");
+    }
     Expect(kNoWriteDraws == NoWriteDraws::Skip, "the NoWrite policy switch is Skip (decision pending; one place to change)");
 }
 
@@ -444,6 +461,17 @@ void TestOverwrite()
         window[v * 7] = be(xs[v]), window[v * 7 + 1] = be(ys[v]), window[v * 7 + 2] = be(0.0f);
     OverwriteRect o = FindOverwriteRect(d, vs.t, false, window.data(), window.size(), 2);
     Expect(o.depth && o.color && o.rect.x == 0 && o.rect.y == 0 && o.rect.width == 640 && o.rect.height == 360, "the clear overwrites depth, stencil and colour of 640x360");
+    // FM4 Recomp (M7 GPU cost): the same rectangle as a DepthOnly draw (RB_MODECONTROL 5, colour writes off) overwrites depth and stencil; CONTROL: a
+    // Resolve is no overwrite.
+    {
+        DrawState k = d;
+        k.kind = DrawKind::DepthOnly, k.colorWriteMask = 0;
+        OverwriteRect q = FindOverwriteRect(k, vs.t, false, window.data(), window.size(), 2);
+        Expect(q.depth && !q.color && q.rect.width == 640 && q.rect.height == 360, "a DepthOnly clear overwrites depth and stencil, no colour");
+        k.kind = DrawKind::Resolve;
+        q = FindOverwriteRect(k, vs.t, false, window.data(), window.size(), 2);
+        CONTROL(q.depth || q.color, "a Resolve is no overwrite");
+    }
     // The scissor cuts the rectangle: rows 100-199 of columns 0-639.
     DrawState s = d;
     s.scissor = {0, 100, 8192, 100};
@@ -492,6 +520,135 @@ void TestOverwrite()
     Expect(o.depth && o.rect.width == 1 && o.rect.height == 360, "a 0.9-pixel-wide rectangle covers pixel column 0 only");
 }
 
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): FindClearDraw on TestOverwrite's clear (TRACE draw 48 with the observed positions), the
+// clear colour at dwords 3-6 of each 7-dword vertex as the clear VS fetches it (vs_b6cb6460159a82b1.vert
+// xe_fetch1) and the PS passing interpolator 0 through (ps_277a2f4a3e7ec198.frag). Expected values from the rules in draw_record.h,
+// never from the code: the depth is clamp(z, 0, 1) under depth clamp (PA_CL_CLIP_CNTL clip_disable, trace13 draw 48 clip 00010000;
+// vte 0x300 leaves the z viewport scale 1 and offset 0), the stencil is RB_STENCILREFMASK's reference (trace13: 00FF0000, ref 0), the
+// colour is the vertices' value through the target's conversion (storage 2: UNORM clamp; storage 3: the 7e3 clamp).
+void TestClearDraw()
+{
+    DrawState d = Clear();
+    d.systemFlags = runtime::shader::kFlagXyDividedByW | runtime::shader::kFlagZDividedByW;
+    d.viewport.scale[0] = d.viewport.scale[1] = 1, d.viewport.offset[0] = d.viewport.offset[1] = 0;
+    d.viewport.offsetAddXy[0] = d.viewport.offsetAddXy[1] = 0.5f;
+    d.viewport.clipDisabled = true;
+    d.scissor = {0, 0, 640, 8192};
+    d.vertexSlots[0].stride = 7, d.vertexSlots[0].end = 7, d.vertexSlots[0].sizeWords = 21;
+    runtime::shader::ShaderTranslation vs = Vs().t;
+    vs.positionFetch.valid = true, vs.positionFetch.slot = 0, vs.positionFetch.strideDwords = 7, vs.positionFetch.offsetDwords = 0, vs.positionFetch.format = 57;
+    vs.interpolator0Fetch.valid = true, vs.interpolator0Fetch.slot = 0, vs.interpolator0Fetch.strideDwords = 7, vs.interpolator0Fetch.offsetDwords = 3,
+    vs.interpolator0Fetch.format = 38;
+    runtime::shader::ShaderTranslation ps = Ps().t;
+    ps.colorPassThrough.valid = true, ps.colorPassThrough.interpolator = 0;
+    const auto be = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return __builtin_bswap32(u); };  // guest big-endian floats; endian 2 swaps the host's load
+    // Three vertices (x, y, z, r, g, b, a): the 640x360 corners at z 0 with the colour (0.25, 0.5, 0.75, 1).
+    const auto vertices = [&](float z, float r, float g, float b, float a) {
+        std::vector<uint32_t> w(21, 0);
+        const float xs[3] = {-0.5f, 639.5f, 639.5f}, ys[3] = {-0.5f, -0.5f, 359.5f};
+        for (uint32_t v = 0; v < 3; v++)
+            w[v * 7] = be(xs[v]), w[v * 7 + 1] = be(ys[v]), w[v * 7 + 2] = be(z), w[v * 7 + 3] = be(r), w[v * 7 + 4] = be(g), w[v * 7 + 5] = be(b), w[v * 7 + 6] = be(a);
+        return w;
+    };
+    const std::vector<uint32_t> window = vertices(0.0f, 0.25f, 0.5f, 0.75f, 1.0f);
+    const auto find = [&](const DrawState& s, const runtime::shader::ShaderTranslation& v, const runtime::shader::ShaderTranslation& p,
+                          const std::vector<uint32_t>& w, uint32_t targetHeight = 360) {
+        return FindClearDraw(s, FindOverwriteRect(s, v, p.kills, w.data(), w.size(), 2), v, p, w.data(), w.size(), 2, targetHeight);
+    };
+    const auto rgbaIs = [](const ClearDraw& c, float r, float g, float b, float a) { return c.rgba[0] == r && c.rgba[1] == g && c.rgba[2] == b && c.rgba[3] == a; };
+    ClearDraw c = find(d, vs, ps, window);
+    Expect(c.ok && c.color && c.depth && c.rect.x == 0 && c.rect.y == 0 && c.rect.width == 640 && c.rect.height == 360,
+           "the clear is a colour + depth/stencil clear of 640x360");
+    Expect(rgbaIs(c, 0.25f, 0.5f, 0.75f, 1.0f) && c.depthValue == 0.0f && c.stencil == 0, "colour (0.25, 0.5, 0.75, 1), depth 0, stencil 0 (the reference)");
+    // The rows the bind claims cut the rectangle; a rectangle below them is refused.
+    c = find(d, vs, ps, window, 200);
+    Expect(c.ok && c.rect.height == 200, "the rectangle is cut to the rows the draw can touch (200)");
+    CONTROL(find(d, vs, ps, window, 0).ok, "no row the draw can touch");
+    // Depth: z 1.5 clamps to 1, an observed draw's -3.72529e-09 to 0 (the pipeline's depth clamp); the stencil reference 0x5A.
+    Expect(find(d, vs, ps, vertices(1.5f, 0, 0, 0, 0)).depthValue == 1.0f, "z 1.5 is written as 1.0 (depth clamp)");
+    Expect(find(d, vs, ps, vertices(-3.72529e-09f, 0, 0, 0, 0)).depthValue == 0.0f, "a negative z is written as 0.0 (depth clamp)");
+    DrawState s = d;
+    s.depthStencil.front.ref = s.depthStencil.back.ref = 0x5A;
+    Expect(find(s, vs, ps, window).stencil == 0x5A, "the stencil clear value is the front reference");
+    // Depth-only: colour mask 0 (as observed) binds no colour attachment.
+    s = d, s.colorWriteMask = 0;
+    c = find(s, vs, ps, window);
+    Expect(c.ok && c.depth && !c.color, "a colour-mask-0 clear defers depth and stencil only");
+    s.blend.enabled = true;  // draw 167893: mask 0 with blending on
+    Expect(find(s, vs, ps, window).ok, "blending with colour mask 0 does not matter");
+    // Colour conversions: storage 3 clamps rgb to [0, 31.875] and alpha to [0, 1], negatives to 0; storage 0 clamps to [0, 1].
+    s = d, s.target.colorFormat = 3;
+    c = find(s, vs, ps, vertices(0, 40.0f, -1.0f, 0.5f, 2.0f));
+    Expect(c.ok && rgbaIs(c, 31.875f, 0.0f, 0.5f, 1.0f), "storage 3: the 7e3 clamp");
+    s.target.colorFormat = 0;
+    c = find(s, vs, ps, vertices(0, 1.5f, -0.25f, 0.5f, 1.0f));
+    Expect(c.ok && rgbaIs(c, 1.0f, 0.0f, 0.5f, 1.0f), "storage 0: the UNORM clamp");
+    // Controls (each breaks one condition of draw_record.h FindClearDraw).
+    s = d, s.blend.enabled = true;
+    c = find(s, vs, ps, window);
+    CONTROL(c.ok, "blending with colour written");
+    Expect(Has(c.why, "colour is written"), "names the colour");
+    s = d, s.alphaTest.enabled = true;
+    CONTROL(find(s, vs, ps, window).ok, "an alpha test");
+    s = d, s.colorWriteMask = 0x7;
+    CONTROL(find(s, vs, ps, window).ok, "a partial colour mask");
+    s = d, s.depthStencil.zFunc = 3;
+    CONTROL(find(s, vs, ps, window).ok, "a LESS-EQUAL depth test");
+    s = d, s.depthStencil.zEnable = s.depthStencil.zWriteEnable = false;  // stencil still REPLACEs: depth is bound but not replaced
+    CONTROL(find(s, vs, ps, window).ok, "stencil only, no depth write");
+    s = d;
+    TextureSlot t;
+    t.slot = 0, t.type = 2, t.fetchDimension = 1, t.dimension = 1;
+    s.textureSlots.push_back(t);
+    CONTROL(find(s, vs, ps, window).ok, "a texture bound");
+    s = d, s.program.paramGen = true;
+    CONTROL(find(s, vs, ps, window).ok, "pixel parameter generation");
+    std::vector<uint32_t> tri = window;
+    tri[2 * 7] = be(300.0f), tri[2 * 7 + 1] = be(200.0f);
+    CONTROL(find(d, vs, ps, tri).ok, "a triangle that is not an axis-aligned rectangle");
+    std::vector<uint32_t> colours = window;
+    colours[2 * 7 + 4] = be(0.75f);  // the third vertex's green differs
+    CONTROL(find(d, vs, ps, colours).ok, "the vertices' colours differ");
+    std::vector<uint32_t> zs = window;
+    zs[7 + 2] = be(0.5f);
+    CONTROL(find(d, vs, ps, zs).ok, "the vertices' z differ");
+    CONTROL(find(d, vs, ps, vertices(-0.0f, 0, 0, 0, 0)).ok, "z -0");
+    s = d, s.viewport.clipDisabled = false;
+    CONTROL(find(s, vs, ps, window).ok, "clipping on (no depth clamp)");
+    s = d, s.viewport.scale[2] = 0.5f;
+    CONTROL(find(s, vs, ps, window).ok, "a z viewport scale");
+    s = d, s.polyOffsetOffset = 1.0f;
+    CONTROL(find(s, vs, ps, window).ok, "polygon offset");
+    s = d, s.depthStencil.backfaceEnable = true, s.depthStencil.back.ref = 1;
+    CONTROL(find(s, vs, ps, window).ok, "a back-face stencil reference that differs");
+    s = d, s.target.colorFormat = 1;
+    CONTROL(find(s, vs, ps, window).ok, "storage 1 (gamma)");
+    s.target.colorFormat = 4;
+    CONTROL(find(s, vs, ps, window).ok, "storage 4 (16_16)");
+    // A fractional edge (x 0.9, TestOverwrite's `tiny`): refused at 4x, where pixel 0's other samples are not covered; exact at 1x.
+    std::vector<uint32_t> tiny = window;
+    tiny[7] = be(0.4f), tiny[14] = be(0.4f);
+    CONTROL(find(d, vs, ps, tiny).ok, "a fractional edge on a 4x target");
+    s = d, s.target.samples = 1, s.target.msaa = 0;
+    c = find(s, vs, ps, tiny);
+    Expect(c.ok && c.rect.width == 1, "a fractional edge on a 1x target (the pixel-centre rule is exact)");
+    runtime::shader::ShaderTranslation p2 = ps;
+    p2.colorPassThrough.valid = false;
+    CONTROL(find(d, vs, p2, window).ok, "the PS is not a pass-through");
+    DrawState depthOnly = d;
+    depthOnly.colorWriteMask = 0;
+    Expect(find(depthOnly, vs, p2, window).ok, "the PS does not matter for a depth-only clear");
+    p2 = ps, p2.colorPassThrough.interpolator = 2;
+    CONTROL(find(d, vs, p2, window).ok, "the PS passes interpolator 2 through");
+    runtime::shader::ShaderTranslation v2 = vs;
+    v2.interpolator0Fetch.valid = false;
+    CONTROL(find(d, v2, ps, window).ok, "the VS interpolator is not a plain fetch");
+    v2 = vs, v2.interpolator0Fetch.slot = 1;
+    CONTROL(find(d, v2, ps, window).ok, "the colour's fetch slot differs from the position's");
+    CONTROL(FindClearDraw(d, FindOverwriteRect(d, vs, false, window.data(), window.size(), 2), vs, ps, window.data(), 17, 2, 360).ok,
+            "a window short of the third vertex's colour");
+}
+
 int main()
 {
     TestKeys();
@@ -499,6 +656,7 @@ int main()
     TestIndices();
     TestUploads();
     TestOverwrite();
+    TestClearDraw();
     std::printf("%d failure(s), %d negative control(s)\n", failures, controls);
     return failures == 0 ? 0 : 1;
 }

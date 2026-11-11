@@ -70,6 +70,11 @@ struct HostImage
     // hash that established the content), the pending arm of the current bind, and StagingBytes' "clean" decision for its draw.
     uint64_t watchSequence = 0, armSequence = 0;
     bool watchArmed = false, armed = false, cleanReserved = false;
+    mutable uint64_t cleanEpoch = ~0ull;  // FM4 Recomp (M7 CPU cost): WriteWatch::Epoch at the last WatchClean walk that found it clean
+    // FM4 Recomp (M7 CPU cost): at the last GPU-write mark over this image (MarkGuestWritten), whether it was clean (its content
+    // known through the watch), and the sequence right after the mark: AdoptResolve's "in step" test without a hash.
+    bool cleanAtMark = false;
+    uint64_t markSequence = 0;
 };
 
 // FM4 Recomp (opt-in FM4_WRITE_WATCH=1; ReCarbon
@@ -531,22 +536,32 @@ void ArmWatch(HostImage& image)
     WriteWatch& w = *unit->model.ProtectingWatch();
     const TextureDescription& d = image.description;
     const uint64_t start = MonotonicNs();
+    // The sequence is read before the protection (a store that faults between the two bumps above it and is seen as a write).
+    image.armSequence = w.Current();
     image.armed = w.Watch(d.base.physical, d.base.size) && w.Watch(d.mips.physical, d.mips.size);
     unit->watchProtectNsSince += MonotonicNs() - start;
-    image.armSequence = w.Current();
 }
 void CommitWatch(HostImage& image)
 {
     image.watchSequence = image.armSequence, image.watchArmed = image.armed;
     image.armed = false;
+    image.cleanEpoch = ~0ull, image.cleanAtMark = false;
 }
+// FM4 Recomp (M7 CPU cost): the image's content may be established by a hash or by the write-back of its resident resolves
+// (GuestWritesRetired arms and commits the watch instead of hashing), so `hashed` is not required here.
 bool WatchClean(const HostImage& image)
 {
-    if (!WriteWatchOn() || !image.watchArmed || !image.hashed || !image.initialized)
+    if (!WriteWatchOn() || !image.watchArmed || !image.initialized)
         return false;
     const WriteWatch& w = *unit->model.ProtectingWatch();
+    const uint64_t epoch = w.Epoch();  // every bump moves it: an unchanged epoch means no page sequence moved since the last clean walk
+    if (image.cleanEpoch == epoch)
+        return true;
     const TextureDescription& d = image.description;
-    return w.WriteSequence(d.base.physical, d.base.size) <= image.watchSequence && w.WriteSequence(d.mips.physical, d.mips.size) <= image.watchSequence;
+    const bool clean = w.WriteSequence(d.base.physical, d.base.size) <= image.watchSequence && w.WriteSequence(d.mips.physical, d.mips.size) <= image.watchSequence;
+    if (clean)
+        image.cleanEpoch = epoch;
+    return clean;
 }
 
 bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, VkSampler& sampler, std::string& error)
@@ -568,7 +583,7 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, t.anisoFilter, t.fetchDimension};
     unit->guestBase = c.base;
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): a range a recorded resolve has not written back is refused below unless the image holds it.
-    PreparedTexture p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, ResolveResident());
+    const PreparedTexture& p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, ResolveResident());
     if (p.entry == nullptr)
     {
         error = p.error;
@@ -614,7 +629,7 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     if (clean)
     {
         image->reserved = false;
-        if (WriteWatchVerify())
+        if (WriteWatchVerify() && image->hashed)
         {
             uint64_t check = 0;
             if (SourceHash(d, c.base, check, error) && check != image->sourceHash)
@@ -687,15 +702,15 @@ uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
     if (!unit || t.null)
         return 0;
     const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, 7, t.fetchDimension};
-    const PreparedTexture p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, ResolveResident());
+    const PreparedTexture& p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, ResolveResident());
     if (p.entry == nullptr)
         return 0;
-    if (const auto r = unit->images.find(p.entry->key); r != unit->images.end() && r->second.resident)
+    const auto it = unit->images.find(p.entry->key);  // FM4 Recomp (M7 CPU cost): one lookup (it was two of the same key per texture per draw)
+    if (it != unit->images.end() && it->second.resident)
         return 0;  // FM4 Recomp (FM4_RESOLVE_RESIDENT): bound without an upload
     const uint64_t alignment = StagingAlignment(1u << p.entry->description.log2BytesPerBlock, unit->copyAlignment);
     const uint64_t full = p.plan.stagingBytes + alignment;  // the worst-case padding PlaceInRing can add
-    const auto it = unit->images.find(p.entry->key);
-    if (!TextureReuse() || !p.load || base == nullptr || it == unit->images.end() || !it->second.initialized || !it->second.hashed)
+    if (!TextureReuse() || !p.load || base == nullptr || it == unit->images.end() || !it->second.initialized)
         return full;
     HostImage& image = it->second;
     if (WatchClean(image))  // FM4 Recomp (FM4_WRITE_WATCH): unwritten: no hash, no ring bytes; its Bind reuses it
@@ -703,6 +718,8 @@ uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
         image.cleanReserved = true, image.reserved = false;
         return 0;
     }
+    if (!image.hashed)  // content known only through the watch, and written since: Bind hashes once and uploads
+        return full;
     std::string ignored;  // an unreadable range reserves the full size; Bind names the error
     uint64_t hash = 0;
     ArmWatch(image);
@@ -719,7 +736,7 @@ bool ReadsPendingWrite(const TextureSlot& t)
         return true;
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): an image that holds the resolves' words reads nothing pending.
     const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, 7, t.fetchDimension};
-    const PreparedTexture p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, true);
+    const PreparedTexture& p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, true);
     const auto it = p.entry == nullptr ? unit->images.end() : unit->images.find(p.entry->key);
     return it == unit->images.end() || !it->second.resident;
 }
@@ -771,10 +788,26 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
         {
             uint64_t hash = 0;
             std::string ignored;
-            take = TextureReuse() && image.hashed && unit->guestBase != nullptr &&
-                   !unit->model.OverlapsEarlierPending(d.base.physical, uint32_t(d.base.size)) &&
-                   !unit->model.OverlapsEarlierPending(d.mips.physical, uint32_t(d.mips.size)) &&
-                   SourceHash(d, unit->guestBase, hash, ignored) && hash == image.sourceHash;
+            // In step: its reuse hash equals the guest bytes, or (M7 CPU cost: an image whose content the write watch established, e.g.
+            // a resident image re-armed at the retire) it was clean when this resolve's range was marked and nothing wrote it since.
+            const bool noEarlierPending = !unit->model.OverlapsEarlierPending(d.base.physical, uint32_t(d.base.size)) &&
+                                          !unit->model.OverlapsEarlierPending(d.mips.physical, uint32_t(d.mips.size));
+            // FM4 Recomp (M7 waits): a resolve that covers the whole single-level texture replaces every texel, so the image is in
+            // step by construction whatever it held (FM4's bloom chain resolves 160x96, 64x32 and 32x32 textures at one base in turn:
+            // each lands over the previous one's bytes, so no hash or watch could call the image clean).
+            const bool covers = level == 0 && d.levelCount == 1 && x == 0 && y == 0 && r.width == d.width && r.height == d.height;
+            bool inStep = covers && noEarlierPending;
+            if (!inStep && TextureReuse() && unit->guestBase != nullptr && noEarlierPending)
+            {
+                if (image.hashed)
+                    inStep = SourceHash(d, unit->guestBase, hash, ignored) && hash == image.sourceHash;
+                else if (image.cleanAtMark && WriteWatchOn())
+                {
+                    const WriteWatch& w = *unit->model.ProtectingWatch();
+                    inStep = w.WriteSequence(d.base.physical, d.base.size) <= image.markSequence && w.WriteSequence(d.mips.physical, d.mips.size) <= image.markSequence;
+                }
+            }
+            take = inStep;
             why = "its host image is not in step with guest memory";
         }
         static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool>> named;  // once per (image, resolve base, outcome)
@@ -806,7 +839,13 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
     return adopted;
 }
 
-const TextureHooks hooks{Bind, StagingBytes, ReadsPendingWrite, AdoptResolve};
+uint64_t PendingWriteSerial(const TextureSlot& t)  // FM4_PARTIAL_RETIRE
+{
+    if (!ReadsPendingWrite(t))
+        return 0;
+    return unit->model.ReadsPendingSerial(t.words);
+}
+const TextureHooks hooks{Bind, StagingBytes, ReadsPendingWrite, PendingWriteSerial, AdoptResolve};
 
 }  // namespace
 
@@ -941,8 +980,31 @@ void MarkGuestWritten(uint32_t physical, uint32_t bytes)
 {
     if (!unit)
         Stop(StopCode::Unimplemented, "renderer: guest range %08X + %u bytes written by the GPU before the texture unit exists", physical, bytes);
-    unit->model.MarkWritten(physical, bytes);
+    // FM4 Recomp (M7 CPU cost): before the mark moves the page sequences, remember which overlapping images were clean (AdoptResolve).
+    std::vector<HostImage*> over;
+    if (WriteWatchOn() && unit->model.ProtectingWatch() != nullptr)
+        for (auto& [key, image] : unit->images)
+            if (!image.resident && !image.hashed && image.initialized &&
+                (RangesOverlap(image.description.base.physical, image.description.base.size, physical, bytes) ||
+                 RangesOverlap(image.description.mips.physical, image.description.mips.size, physical, bytes)))
+                image.cleanAtMark = WatchClean(image), over.push_back(&image);
+    unit->model.MarkWritten(physical, bytes, currentPartSerial);  // FM4_PARTIAL_RETIRE: tagged with the recording part
+    for (HostImage* image : over)
+        image->markSequence = unit->model.ProtectingWatch()->Current();
     DiagTextureGpuWrite(physical, bytes);  // FM4_DIAG_TEXTURE_UPLOADS (diagnostic)
+}
+
+uint64_t GuestWritesPendingSerial(uint32_t physical, uint32_t bytes) { return unit ? unit->model.PendingSerial(physical, bytes) : 0; }
+void GuestWritesRetiredUpTo(uint64_t serial)
+{
+    if (unit)
+        unit->model.RetiredUpTo(serial);
+}
+
+void GuestRangeHostWrite(uint32_t physical, uint32_t bytes)
+{
+    if (unit && WriteWatchOn() && unit->model.ProtectingWatch() != nullptr && bytes != 0)
+        unit->model.ProtectingWatch()->BeforeHostWrite(physical, bytes);
 }
 
 bool GuestWritesPending() { return unit && unit->model.Pending(); }
@@ -955,9 +1017,9 @@ bool WatchGuestRange(uint32_t physical, uint32_t bytes, uint64_t& sequence)
         return false;
     WriteWatch& w = *unit->model.ProtectingWatch();
     const uint64_t start = MonotonicNs();
+    sequence = w.Current();  // before the protection: a store that faults in between bumps above it (guest_writes.h)
     const bool watched = w.Watch(physical, bytes);
     unit->watchProtectNsSince += MonotonicNs() - start;
-    sequence = w.Current();
     return watched;
 }
 
@@ -972,15 +1034,17 @@ void GuestWritesRetired()
         return;
     unit->model.Retired();
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): the write-back just landed; a resident image's content is taken as those guest bytes
-    // (resolve_resident.h HYPOTHESIS; FM4_RESOLVE_RESIDENT_CHECK compares the words), so its reuse hash is the guest's now.
+    // (resolve_resident.h HYPOTHESIS; FM4_RESOLVE_RESIDENT_CHECK compares the words). M7 CPU cost: instead of hashing the guest
+    // bytes the image already holds (3.6 MiB per 1280x720 target, every frame, on the command-processor thread), the write watch is
+    // armed and committed now: the image is clean until a write moves a page sequence (WatchClean), and `hashed` is cleared so a
+    // later dirty bind never matches a stale hash (it hashes once and uploads).
     for (auto it = unit->images.begin(); unit->residentImages != 0 && it != unit->images.end(); ++it)
         if (HostImage& image = it->second; image.resident)
         {
             image.resident = false, unit->residentImages--;
-            uint64_t hash = 0;
-            std::string ignored;
-            image.hashed = unit->guestBase != nullptr && SourceHash(image.description, unit->guestBase, hash, ignored);
-            image.sourceHash = hash;
+            image.hashed = false, image.sourceHash = 0;
+            if (WriteWatchOn())
+                ArmWatch(image), CommitWatch(image);
         }
 }
 

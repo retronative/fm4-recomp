@@ -174,9 +174,23 @@ public:
     {
         if (size == 0 || !InRange(physical, size))
             return;
-        for (uint32_t h = physical / hostPage_; h <= (physical + size - 1) / hostPage_; h++)
-            if (watched_[h].exchange(0, std::memory_order_acq_rel) != 0)
-                backend_.Protect(h * hostPage_, hostPage_, false);
+        // FM4 Recomp (M7 CPU cost): contiguous watched pages are made writable with one call per run (a render target's write-back
+        // covers hundreds of pages), the flags cleared first as before.
+        const uint32_t last = (physical + size - 1) / hostPage_;
+        for (uint32_t h = physical / hostPage_; h <= last;)
+        {
+            if (watched_[h].exchange(0, std::memory_order_acq_rel) == 0)
+            {
+                h++;
+                continue;
+            }
+            uint32_t end = h + 1;
+            while (end <= last && watched_[end].exchange(0, std::memory_order_acq_rel) != 0)
+                end++;
+            backend_.Protect(h * hostPage_, (end - h) * hostPage_, false);
+            stats_.unprotects++;
+            h = end;
+        }
         MarkWritten(physical, size);
     }
 
@@ -297,6 +311,10 @@ struct TextureEntry
     TextureDescription description;  // valid (ok) for every entry the cache holds
     uint64_t loadedSequence = 0;     // WriteWatch::Current when last loaded
     uint64_t checkedEpoch = ~0ull;   // WriteWatch::Epoch at the last validity check
+    // FM4 Recomp (M7 CPU cost): TextureCache::Plan's per-description part, computed once (mutable: Plan is const)
+    mutable bool planned = false;
+    mutable size_t planStaging = 0;
+    mutable std::vector<size_t> planOffsets, planBytes;
     bool uploaded = false;           // a host image holds the guest data of loadedSequence
     uint32_t generation = 0;         // incremented per load: the renderer keys its host image by it
     uint64_t lastUse = 0;            // Find count at the last lookup (eviction is a later unit)
@@ -332,7 +350,9 @@ public:
     // is DescribeBinding(fetch, entry->description.host, shader), computed at every draw by the
     // renderer (bit arithmetic, no level loop) and refused per draw. Two fetch constants with the
     // same key and different swizzles or samplers share one entry and one host image.
-    Lookup Find(const uint32_t fetch[6])
+    // FM4 Recomp (M7 CPU cost): `validate` false skips rule 1's page walk (Valid) when the caller reloads at every bind anyway
+    // (TextureValidity::ReloadEveryBind): the lookup then always says load.
+    Lookup Find(const uint32_t fetch[6], bool validate = true)
     {
         stats_.finds++;
         const TextureKey key = KeyOf(DecodeTextureFetch(fetch));
@@ -346,24 +366,36 @@ public:
                 return {nullptr, false, d.error};
             }
             stats_.described++;
-            it = entries_.emplace(key, TextureEntry{key, std::move(d)}).first;
+            TextureEntry fresh;
+            fresh.key = key, fresh.description = std::move(d);
+            it = entries_.emplace(key, std::move(fresh)).first;
         }
         TextureEntry& e = it->second;
         e.lastUse = stats_.finds;
-        return {&e, !Valid(e), {}};
+        return {&e, !validate || !Valid(e), {}};
     }
 
+    // FM4 Recomp (M7 CPU cost): the level offsets and bytes depend only on the description, so they are computed once per entry
+    // and copied; the sequence is fresh at every call (WriteWatch::Current before the untile reads guest memory).
     LoadPlan Plan(const TextureEntry& e) const
     {
+        if (!e.planned)
+        {
+            e.planStaging = 0;
+            for (const MipLevel& l : e.description.levels)
+            {
+                e.planOffsets.push_back(e.planStaging);
+                const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks * l.depth * e.description.layers) << e.description.log2BytesPerBlock;
+                e.planBytes.push_back(bytes);
+                e.planStaging += (bytes + 15) & ~size_t(15);
+            }
+            e.planned = true;
+        }
         LoadPlan p;
         p.sequence = watch_.Current();
-        for (const MipLevel& l : e.description.levels)
-        {
-            p.levelOffsets.push_back(p.stagingBytes);
-            const size_t bytes = (size_t(l.widthBlocks) * l.heightBlocks * l.depth * e.description.layers) << e.description.log2BytesPerBlock;
-            p.levelBytes.push_back(bytes);
-            p.stagingBytes += (bytes + 15) & ~size_t(15);
-        }
+        p.stagingBytes = e.planStaging;
+        p.levelOffsets = e.planOffsets;
+        p.levelBytes = e.planBytes;
         return p;
     }
 

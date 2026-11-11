@@ -106,7 +106,9 @@ HostDepthBias DepthBiasFor(const DrawState& d)
 KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, ShaderVariantDefines& vsDefines,
                                 ShaderVariantDefines& psDefines)
 {
-    vsDefines = {}, psDefines = {};
+    // FM4 Recomp (M7 CPU cost): cleared, not reassigned, so a caller's reused defines keep their vectors' storage (`= {}` freed and
+    // reallocated both every draw).
+    vsDefines.lines.clear(), psDefines.lines.clear();
     if (d.hostPrimitive == HostPrimitive::RectList)
         vsDefines.Add("XE_RECT_LIST");
     // FM4 Recomp: the pixel shader reads interpolators the vertex shader does not export: they are declared and written as 0
@@ -286,9 +288,13 @@ void FillXeSystem(const std::vector<VertexWindow>& windows, const HostViewport& 
 
 void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes])
 {
-    std::memset(out, 0, kConstantsBytes);
+    // FM4 Recomp (M7 CPU cost): only the words the stage's shader can read are written (DrawState::vsConstantWords / psConstantWords; the
+    // block beyond them is never read), then the bool/loop tail.
+    const uint32_t words = std::min<uint32_t>(pixel ? d.psConstantWords : d.vsConstantWords, 1024);
     if (d.aluConstants.size() >= 2048)
-        std::memcpy(out + kConstantsAluOffset, d.aluConstants.data() + (pixel ? 1024 : 0), 4096);
+        std::memcpy(out + kConstantsAluOffset, d.aluConstants.data() + (pixel ? 1024 : 0), size_t(words) * 4), std::memset(out + 4096, 0, kConstantsBytes - 4096);
+    else
+        std::memset(out, 0, kConstantsBytes);
     std::memcpy(out + kConstantsBoolOffset, d.boolConstants, sizeof d.boolConstants);
     std::memcpy(out + kConstantsLoopOffset, d.loopConstants, sizeof d.loopConstants);
 }
@@ -339,7 +345,9 @@ OverwriteRect FindOverwriteRect(const DrawState& d, const shader::ShaderTranslat
 {
     OverwriteRect o;
     const auto no = [&](std::string why) { o.why = std::move(why); return o; };
-    if (d.kind != DrawKind::Draw || d.primitiveType != 8 || d.indices.indexed || d.indices.count != 3)
+    // FM4 Recomp (M7 GPU cost): DepthOnly (RB_MODECONTROL 5) rasterizes and writes depth exactly as Draw with every colour write off; FM4's
+    // depth clears of the 4x scene depth are this kind (720 tiles were copied in twice a swap just before it).
+    if ((d.kind != DrawKind::Draw && d.kind != DrawKind::DepthOnly) || d.primitiveType != 8 || d.indices.indexed || d.indices.count != 3)
         return no("not a rect-list draw of three auto-indexed vertices");
     if (d.cullFront || d.cullBack)
         return no("culling is on");
@@ -389,6 +397,112 @@ OverwriteRect FindOverwriteRect(const DrawState& d, const shader::ShaderTranslat
     if (!o.depth && !o.color)
         o.why = "neither depth and stencil (ALWAYS, write, REPLACE 0xFF) nor all colour channels without blending are replaced";
     return o;
+}
+
+ClearDraw FindClearDraw(const DrawState& d, const OverwriteRect& o, const shader::ShaderTranslation& vs, const shader::ShaderTranslation& ps,
+                        const uint32_t* window, size_t windowDwords, uint32_t endian, uint32_t targetHeight)
+{
+    ClearDraw c;
+    const auto no = [&](std::string why) { c.why = std::move(why); return c; };
+    if (!o.depth && !o.color)
+        return no(o.why.empty() ? std::string("not an overwriting draw") : o.why);
+    const bool colorBound = d.kind == DrawKind::Draw && d.colorWriteMask != 0;  // KeyFromDrawState's colorUsed
+    const bool depthBound = d.depthStencil.zEnable || d.depthStencil.stencilEnable;  // its depthUsed
+    if (colorBound && !o.color)
+        return no("colour is written but not all of it replaced (a partial mask, blending or a rejecting test)");
+    if (depthBound && !o.depth)
+        return no("depth or stencil is tested but not both replaced (z ALWAYS with write, stencil ALWAYS REPLACE 0xFF)");
+    if (!colorBound && !depthBound)
+        return no("no attachment");
+    if (!d.textureSlots.empty())
+        return no("a texture is bound");
+    if (d.program.paramGen)
+        return no("pixel parameter generation is on");
+    c.rect = o.rect;
+    if (c.rect.y >= targetHeight)
+        return no("the rectangle lies below the rows the draw can touch");
+    c.rect.height = std::min(c.rect.height, targetHeight - c.rect.y);
+    // The vertices as the GPU loads them (the window, swapped by the fetch's endian, as PassThroughPositions reads x and y).
+    const shader::ShaderTranslation::PositionFetch& p = vs.positionFetch;
+    if (!p.valid || window == nullptr)
+        return no("the vertex shader's position is not a plain vertex fetch with a data window");
+    const auto dword = [&](uint32_t vertex, uint32_t stride, uint32_t offset, uint32_t component, uint32_t& out) {
+        const size_t at = size_t(vertex) * stride + offset + component;
+        if (at >= windowDwords)
+            return false;
+        out = edram::GpuSwap32(window[at], endian);
+        return true;
+    };
+    const auto asFloat = [](uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; };
+    uint32_t xy[3][2], z[3];
+    for (uint32_t v = 0; v < 3; v++)
+        if (!dword(v, p.strideDwords, p.offsetDwords, 0, xy[v][0]) || !dword(v, p.strideDwords, p.offsetDwords, 1, xy[v][1]) ||
+            !dword(v, p.strideDwords, p.offsetDwords, 2, z[v]))
+            return no("the vertex window is shorter than three positions");
+    if (d.target.samples > 1)
+        for (uint32_t v = 0; v < 3; v++)
+            for (uint32_t axis = 0; axis < 2; axis++)
+            {
+                const float s = asFloat(xy[v][axis]) + d.viewport.offsetAddXy[axis];  // the screen position, as FindOverwriteRect
+                if (s != std::floor(s))
+                    return no("a rectangle edge is not on a pixel boundary: on a multisampled target the draw would not write every sample");
+            }
+    if (depthBound)
+    {
+        if (z[0] != z[1] || z[0] != z[2])
+            return no("the three vertices' z differ");
+        const float zf = asFloat(z[0]);
+        if (!std::isfinite(zf) || z[0] == 1u << 31)  // -0: the clamp's sign is the implementation's
+            return no("z is not finite or is -0");
+        const GuestViewport& v = d.viewport;
+        if (!v.clipDisabled || v.scale[2] != 1.0f || v.offset[2] != 0.0f)
+            return no("the depth fold is not the identity under depth clamp (clip_disable with z viewport scale 1 and offset 0)");
+        if (d.polyOffsetScale != 0 || d.polyOffsetOffset != 0)
+            return no("polygon offset is on");
+        const DepthStencil& ds = d.depthStencil;
+        if (ds.backfaceEnable && ds.back.ref != ds.front.ref)
+            return no("the back-face stencil reference differs from the front's");
+        c.depthValue = std::min(std::max(zf, 0.0f), 1.0f);  // the pipeline's depth clamp (depthClampEnable = clipDisabled) over 0..1
+        c.stencil = ds.front.ref & 0xFF;
+        c.depth = true;
+    }
+    if (colorBound)
+    {
+        if (!ps.colorPassThrough.valid)
+            return no("the pixel shader is not a pass-through of an interpolator: " + ps.colorPassThrough.why);
+        if (ps.colorPassThrough.interpolator != 0)
+            return no("the pixel shader passes interpolator " + std::to_string(ps.colorPassThrough.interpolator) + " through (only 0 is modelled)");
+        if (vs.interpolatorCount < 1)
+            return no("the vertex shader exports no interpolator");
+        const shader::ShaderTranslation::PositionFetch& k = vs.interpolator0Fetch;
+        if (!k.valid)
+            return no("the vertex shader's interpolator 0 is not a plain vertex fetch: " + k.why);
+        if (k.slot != p.slot)
+            return no("the colour's vertex fetch slot differs from the position's");
+        uint32_t rgba[3][4];
+        for (uint32_t v = 0; v < 3; v++)
+            for (uint32_t i = 0; i < 4; i++)
+                if (!dword(v, k.strideDwords, k.offsetDwords, i, rgba[v][i]))
+                    return no("the vertex window is shorter than three colours");
+        for (uint32_t i = 0; i < 4; i++)
+            if (rgba[0][i] != rgba[1][i] || rgba[0][i] != rgba[2][i])
+                return no("the three vertices' colours differ");
+        for (uint32_t i = 0; i < 4; i++)
+        {
+            const float f = asFloat(rgba[0][i]);
+            if (!std::isfinite(f))
+                return no("a colour component is not finite");
+            switch (d.target.colorFormat)
+            {
+            case 0: case 2: c.rgba[i] = std::min(std::max(f, 0.0f), 1.0f); break;         // the UNORM attachment's clamp
+            case 3: c.rgba[i] = f > 0.0f ? std::min(f, i < 3 ? 31.875f : 1.0f) : 0.0f; break;  // XE_COLOR0_7E3 (shader_glsl.cpp)
+            default: return no("colour storage format " + std::to_string(d.target.colorFormat) + " is not cleared from a draw (0, 2 and 3 are)");
+            }
+        }
+        c.color = true;
+    }
+    c.ok = true;
+    return c;
 }
 
 }  // namespace runtime::video

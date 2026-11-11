@@ -446,6 +446,50 @@ void TestCacheErrorPath()
     Expect(capped.Variant(*q, empty, reason) != nullptr, "the existing variant is still served");
 }
 
+// FM4 Recomp (M7 CPU cost): the load memo (shader_cache.h `memo`). The expected counters follow from the load sequence alone: each
+// distinct program translates once; a re-load of identical words (from another buffer, as the CP copies each load afresh) is a
+// memo hit; a program differing in one word, or the same words for the other stage, is not. ColourPs is 6
+// words: 3 of control flow (alloc, exec_end), then its export ALU's 3; the ALU's second word (index 4) holds the source negates at
+// bits 24-26 (Put: s1.neg << 26), so flipping bit 26 negates src1 of the export: another valid program of the same size whose
+// first and last words are unchanged (the memo must compare every word, not the ends).
+void TestLoadMemo()
+{
+    GlslangCompiler glslang;
+    ShaderCache cache(glslang, nullptr, ShaderCache::kDefaultMaxVariants, true);
+    std::string reason;
+    const std::vector<uint32_t> ps = ColourPs();
+    Expect(cache.Memo(), "memo: on when asked");
+    const CachedShader* p = cache.Load(1, ps.data(), uint32_t(ps.size()), reason);
+    Expect(p != nullptr && p->microcode == ps && cache.Stats().translations == 1 && cache.Stats().hits == 0 && cache.Stats().memoHits == 0,
+           "memo: the first load translates and keeps the program's words");
+    const std::vector<uint32_t> copy = ps;
+    Expect(cache.Load(1, copy.data(), uint32_t(copy.size()), reason) == p && cache.Stats().translations == 1 && cache.Stats().hits == 1 &&
+               cache.Stats().memoHits == 1 && cache.Current(true) == p,
+           "memo: identical words in another buffer are the same shader, no translation (a memo hit counted as a hit)");
+    std::vector<uint32_t> negated = ps;
+    negated[4] ^= 1u << 26;
+    CONTROL(negated.front() != ps.front() || negated.back() != ps.back(), "the changed program keeps its first and last words");
+    const CachedShader* n = cache.Load(1, negated.data(), uint32_t(negated.size()), reason);
+    Expect(n != nullptr && n != p && n->hash != p->hash && n->microcode == negated && cache.Stats().translations == 2 && cache.Stats().memoHits == 1,
+           "memo: one word changed in the middle is another program: translated, with its own hash");
+    CONTROL(n == p, "a program differing in one middle word is not matched by the memo");
+    Expect(cache.Load(1, negated.data(), uint32_t(negated.size()), reason) == n && cache.Load(1, ps.data(), uint32_t(ps.size()), reason) == p &&
+               cache.Stats().memoHits == 3 && cache.Stats().translations == 2 && cache.Current(true) == p,
+           "memo: two programs of one type and size are told apart by their words");
+    const uint64_t attempts = cache.Stats().translations + cache.Stats().refusals;
+    // As a vertex shader the program reads r0.y before writing it: the translation is attempted (translations 3) and refused (refusals 1);
+    // the memo (type in its key) and the hash (type in it) never answer it with the pixel shader.
+    Expect(cache.Load(0, ps.data(), uint32_t(ps.size()), reason) == nullptr && cache.Stats().memoHits == 3 && cache.Stats().translations == attempts + 1 &&
+               cache.Stats().refusals == 1 && reason.find("refused") != std::string::npos,
+           "memo: the same words for the other stage are not a hit (translated on their own, here refused)");
+
+    ShaderCache plain(glslang, nullptr);
+    const CachedShader* q = plain.Load(1, ps.data(), uint32_t(ps.size()), reason);
+    Expect(!plain.Memo() && q != nullptr && q->microcode.empty() && plain.Load(1, copy.data(), uint32_t(copy.size()), reason) == q &&
+               plain.Stats().hits == 1 && plain.Stats().memoHits == 0,
+           "memo off (the default): a re-load is a hash hit and no words are kept");
+}
+
 }  // namespace
 
 int main(int argc, char** argv)
@@ -467,6 +511,7 @@ int main(int argc, char** argv)
     TestGlslang();
     TestCache();
     TestCacheErrorPath();
+    TestLoadMemo();
     std::printf("%d failure(s), %d negative control(s)\n", failures, controls);
     return failures == 0 ? 0 : 1;
 }

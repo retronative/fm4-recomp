@@ -41,6 +41,14 @@ using ResolveWriteObserver = void (*)(uint32_t physical, uint32_t bytes);
 const EdramHooks* InitializeEdramVk(const VulkanDevice& device, SpirvCompiler& compiler, uint8_t* guestBase, ResolveWriteObserver observer,
                                     std::string& error);
 
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): opt-in FM4_CLEAR_VALUE_OWNERSHIP=1 (logged once): the tiles a pending clear
+// covers wholly are recorded as constants (edram.h Ownership::SetClearValue); when a key of the same aspect and format claims them,
+// the unit records no copy and no flush of the source but a pending clear of the same word on the destination (edram_vk.cpp
+// ExecuteTransfers). Resolve clears alone are enough for it to act; with FM4_CLEAR_DRAWS=1 the clear-class draws' clears are
+// recorded too (FM4's 4x fast clears of the 2x main target). The renderer prints its swap-line
+// counters (render_hooks.h clearValue*SinceSwap) when this is on.
+bool ClearValueOwnership();
+
 
 // The isolated GPU check of the 4x -> 2x depth transfer (renderer.cpp RunSelfCheck with FM4_SELFCHECK_EDRAM=depth4x2x;
 // expectations edram_vk_plan.h DepthSelfCheck*): RecordDepthSelfCheck records into `commands`, after InitializeEdramVk,

@@ -1212,9 +1212,16 @@ void TestResidentResolve()
     Expect(ResidentTextureMatches(kk, k8, &why, &kx, &ky) && kx == 0 && ky == 0, "resident k_8_8: FM4's 512x256 resolve at the texture's base, texel (0, 0)");
     k8.textureBase = 0x0CE50000u + 0x1000;
     Expect(!ResidentTextureMatches(kk, k8, &why) && why == "another base", "CONTROL: a 16 bpp resolve at a tile delta is refused (4-byte rule only)");
-    Expect(ResidentFormatPair(6, 50) && ResidentFormatPair(54, 7) && !ResidentFormatPair(7, 6) && !ResidentFormatPair(36, 36) &&
-               ResidentConvertible(0, 6, 2) && !ResidentConvertible(4, 25, 2) && !ResidentConvertible(3, 10, 1) && !ResidentConvertible(14, 36, 2),
-           "resident: format pairs (6/50, 7/54) and the convertible storages and formats");
+    Expect(ResidentFormatPair(22, 6) && ResidentFormatPair(23, 54) && ResidentFormatPair(23, 50) && !ResidentFormatPair(23, 23) && !ResidentFormatPair(22, 23) &&
+               !ResidentFormatPair(23, 36) && !ResidentFormatPair(6, 22), "resident: a depth resolve (22/23) pairs with the raw 32-bit colour readers only");
+    Expect(ResidentFormatPair(6, 50) && ResidentFormatPair(54, 7) && !ResidentFormatPair(7, 6) && ResidentFormatPair(36, 36) && !ResidentFormatPair(36, 6) &&
+               ResidentConvertible(0, 6, 2) && ResidentConvertible(4, 25, 2) && !ResidentConvertible(3, 10, 1) && !ResidentConvertible(14, 36, 2),
+           "resident: format pairs (6/50, 7/54, 36/36: the fast 32_FLOAT copy) and the convertible storages and formats (14 -> 36 is a copy, not a conversion)");
+    // FM4 Recomp (M7 CPU cost): 16_16 (storage 4) into k_16_16 (25) at 32 bpp is convertible and 25 takes 25's words only. CONTROLS: 25 at
+    // 16 bpp, storage 4 into 6, 25 from storage 0 or 14, 25 with the other 32-bit readers.
+    Expect(ResidentFormatPair(25, 25) && !ResidentFormatPair(25, 6) && !ResidentFormatPair(6, 25) && !ResidentFormatPair(25, 36) && !ResidentFormatPair(25, 10) &&
+               !ResidentConvertible(4, 25, 1) && !ResidentConvertible(4, 6, 2) && !ResidentConvertible(0, 25, 2) && !ResidentConvertible(14, 25, 2),
+           "resident k_16_16: storage 4 -> format 25 at 32 bpp, 25 pairs only with 25");
 
     // The earlier-pending query (texture_upload.h GuestWriteLog::OverlapsEarlier): the last mark does not count.
     GuestWriteLog log;
@@ -1246,6 +1253,29 @@ void TestProtectingWatch()
     Expect(plain.ProtectingWatch() == nullptr, "CONTROL: without a backend there is no protecting watch");
 }
 
+
+// FM4_PARTIAL_RETIRE (texture_upload.h GuestWriteLog): ranges tagged with the part that recorded them; PendingSerial is the newest
+// overlapping part; RetiredUpTo retires only the parts up to a serial. Expected values by hand from the ranges below.
+void TestGuestWriteLogSerials()
+{
+    GuestWriteLog log;
+    log.Mark(0x1000, 0x100, 1);   // part 1: [1000, 1100)
+    log.Mark(0x2000, 0x100, 1);   // part 1: [2000, 2100)
+    log.Mark(0x1080, 0x100, 2);   // part 2: [1080, 1180), overlapping part 1's first range
+    log.Mark(0x3000, 0x10, 3);    // part 3
+    Expect(log.PendingSerial(0x1000, 0x10) == 1, "serials: a byte only part 1 wrote");
+    Expect(log.PendingSerial(0x10F0, 0x20) == 2, "serials: bytes parts 1 and 2 wrote: the newest, 2");
+    Expect(log.PendingSerial(0x2000, 0x100) == 1 && log.PendingSerial(0x3000, 1) == 3, "serials: single owners");
+    Expect(log.PendingSerial(0x4000, 0x100) == 0 && log.PendingSerial(0x1000, 0) == 0, "serials: nothing pending there, an empty range");
+    log.RetiredUpTo(1);
+    GuestRange hit;
+    Expect(!log.Overlaps(0x2000, 0x100, hit) && log.Overlaps(0x1100, 0x10, hit) && hit.physical == 0x1080, "serials: part 1 retired, part 2's range stays");
+    Expect(log.PendingSerial(0x1000, 0x80) == 0 && log.PendingSerial(0x1080, 0x80) == 2, "serials: the overlap now belongs to part 2 only");
+    log.RetiredUpTo(2);
+    Expect(!log.Overlaps(0x1080, 0x100, hit) && log.Overlaps(0x3000, 1, hit) && log.Pending(), "serials: part 3 remains");
+    log.Retired();
+    Expect(!log.Pending(), "serials: Retired clears every part");
+}
 int main()
 {
     TestStagingPlacement();
@@ -1272,6 +1302,7 @@ int main()
     TestCube();
     TestResidentResolve();
     TestProtectingWatch();
+    TestGuestWriteLogSerials();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

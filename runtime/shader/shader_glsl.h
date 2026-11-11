@@ -103,6 +103,9 @@ struct ShaderTranslation
     // shader reads (registers r0..r(n-1) read before written, preloaded from xe_interp_i); the
     // host must check the paired VS exports at least this many.
     uint32_t interpolatorCount = 0;
+    // FM4 Recomp (M7 CPU cost): the float4 constants the program can read, 0..constantCount-1 (256 when it addresses them relatively
+    // through a0): the host uploads only those (draw_record.cpp FillConstants); the binding stays the full 256 + bool/loop block.
+    uint32_t constantCount = 256;  // 256 until the translator narrows it (a hand-built translation uploads everything)
     bool kills = false;  // FM4 Recomp: a pixel shader with a kill op (xe_kill): a fragment may write neither colour nor depth (draw_record.h FindOverwriteRect)
     // FM4 Recomp: vertex shader register reads that some analysis path reaches before any write on it (the program writes the
     // register earlier on another path, e.g. under a predicate): they read the zero every temp starts at, as Xenia zeroes its
@@ -169,10 +172,34 @@ struct ShaderTranslation
         uint32_t strideDwords = 0, offsetDwords = 0, format = 0;
         std::string why;                         // the first unmet condition when !valid
     } positionFetch;
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): interpolator 0 (export 0) as exactly one vertex fetch's xyzw, unmodified: the
+    // PositionFetch conditions with export 0 in place of 62, format k_32_32_32_32_FLOAT (38), destination swizzle x y z w and an
+    // element of 4 dwords within the stride. The fetch may be a mini fetch: it then takes its slot, stride and index from the nearest
+    // full vertex fetch before it (the translator's rule), which must meet the index conditions (unpredicated, indexed by the
+    // untouched r0.x). FM4's clear VS writes the clear colour this way (vs_b6cb6460159a82b1:
+    // xe_fetch1 at dwords 3-6 of the position's 7-dword vertex); the host reads each vertex's colour from the fetch's data
+    // (runtime/video/draw_record.h FindClearDraw).
+    PositionFetch interpolator0Fetch;
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): a pixel shader whose colour 0 is exactly interpolator `interpolator`, unmodified (FM4's clear PS,
+    // ps_277a2f4a3e7ec198: xe_color0 = xe_interp_0). Fail closed; `valid` only when:
+    //   - straight-line control flow (as PositionFetch) with no fetch instruction and no kill opcode (vector or scalar);
+    //   - exactly one instruction exports, to colour 0 (export 0): MAXv with both sources the same temp rK, identity swizzle, no
+    //     negate, abs, clamp, predicate or relative addressing, vector mask xyzw and scalar mask 0 (no oDepth, memexport or other
+    //     colour export anywhere);
+    //   - no instruction writes rK (K < 16), so it holds interpolator K as preloaded (interpolatorCount covers it).
+    struct ColorPassThrough
+    {
+        bool valid = false;
+        uint32_t interpolator = 0;
+        std::string why;
+    } colorPassThrough;
 };
 
 // The PositionFetch analysis alone (TranslateShader runs it on every vertex shader it accepts).
 ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, size_t count, bool pixel);
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the two clear-draw analyses alone (TranslateShader runs them on every shader it accepts).
+ShaderTranslation::PositionFetch AnalyzeInterpolator0Fetch(const uint32_t* words, size_t count, bool pixel);
+ShaderTranslation::ColorPassThrough AnalyzeColorPassThrough(const uint32_t* words, size_t count, bool pixel);
 
 // `words` are host-order (already byte-swapped). Returns false with `error` set on anything
 // outside the supported subset; `out` is then unspecified.

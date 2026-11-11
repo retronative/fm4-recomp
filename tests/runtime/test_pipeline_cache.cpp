@@ -626,6 +626,22 @@ void TestUploadRing()
     UploadRing small(16, 16, 16);
     Expect(small.Allocate(16, true, at) && at == 0 && !small.Allocate(1, true, at), "a 16-byte ring holds one 16-byte block");
     CONTROL(UploadRing(1024, 256, 16).Allocate(1025, false, at), "more than the capacity never fits");
+    // FM4 Recomp (M7 CPU cost): a ring across parts (16-byte alignment throughout). NewPart keeps the offset unless less than
+    // minFree remains, then the next lap starts at 0; no wrap inside a part; Intact only for this lap's blocks below the offset.
+    UploadRing r(1024, 16, 16);
+    Expect(r.Allocate(608, false, at) && at == 0 && r.Lap() == 0 && r.Intact(0, 608, 0), "part 0: [0, 608) in lap 0");
+    r.NewPart(256);
+    Expect(r.Used() == 608 && r.Lap() == 0 && r.Available() == 416 && r.Intact(0, 608, 0), "part 1 starts at 608 (416 >= 256 remain): the previous data stays intact");
+    Expect(r.Allocate(304, false, at) && at == 608 && r.Intact(608, 304, 0) && !r.Allocate(192, false, at) && r.Used() == 912,
+           "part 1: [608, 912); 192 more does not fit (112 left) and is refused, nothing changes");
+    r.NewPart(256);
+    Expect(r.Used() == 0 && r.Lap() == 1 && r.Available() == 1024 && !r.Intact(0, 608, 0) && !r.Intact(608, 304, 0),
+           "part 2: 112 < 256 remain, so lap 1 starts at 0 and every lap-0 block is gone");
+    Expect(r.Allocate(100, false, at) && at == 0 && r.Intact(0, 100, 1) && !r.Intact(0, 100, 0) && !r.Intact(0, 200, 1),
+           "lap 1: [0, 100) is intact; the same range of lap 0 is not; a block past the offset is not");
+    CONTROL(r.Intact(0, 100, 2), "a lap that has not started is never intact");
+    r.Reset();
+    Expect(r.Used() == 0 && r.Lap() == 0 && r.Available() == 1024, "Reset empties the ring");
 }
 
 }  // namespace

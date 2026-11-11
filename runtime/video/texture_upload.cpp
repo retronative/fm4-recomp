@@ -3,6 +3,8 @@
 //
 // texture_upload.h (see its header comment).
 #include "texture_upload.h"
+#include <cstring>
+#include <type_traits>
 #include <cstdlib>
 #include "edram_vk_plan.h"
 #include <algorithm>
@@ -31,22 +33,47 @@ std::string Hex(uint32_t v)
 
 }  // namespace
 
-PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
-                                          bool allowPending)
+const PreparedTexture& TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
+                                                 bool allowPending)
+{
+    // Only under ReloadEveryBind (load is always true, so the answer does not depend on the watch); the device features are part
+    // of the key (the unit's never change; tests vary them).
+    if (validity_ != TextureValidity::ReloadEveryBind)
+        return scratch_ = PrepareUncached(fetch, shader, drawStateGamma, device, allowPending);
+    static_assert(std::is_trivially_copyable_v<TextureDeviceFeatures> && std::is_trivially_copyable_v<ShaderFetch>);
+    const auto same = [&](const Prepared& c) {
+        return std::memcmp(c.fetch, fetch, sizeof c.fetch) == 0 && std::memcmp(&c.shader, &shader, sizeof shader) == 0 &&
+               std::memcmp(&c.device, &device, sizeof device) == 0 && c.gamma == drawStateGamma && c.allowPending == allowPending;
+    };
+    for (const Prepared& c : prepared_)
+        if (same(c))
+            return c.p;
+    if (prepared_.size() >= 16)
+        prepared_.pop_front();
+    prepared_.push_back(Prepared{{fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]}, shader, device, drawStateGamma, allowPending,
+                                 PrepareUncached(fetch, shader, drawStateGamma, device, allowPending)});
+    return prepared_.back().p;
+}
+
+PreparedTexture TextureUnitModel::PrepareUncached(const uint32_t fetch[6], const ShaderFetch& shader, bool drawStateGamma, const TextureDeviceFeatures& device,
+                                                  bool allowPending)
 {
     PreparedTexture p;
-    TextureCache::Lookup lookup = cache_.Find(fetch);
+    TextureCache::Lookup lookup = cache_.Find(fetch, validity_ != TextureValidity::ReloadEveryBind);  // FM4 Recomp: no page walk when every bind reloads
     if (lookup.entry == nullptr)
     {
         p.error = lookup.error;
         return p;
     }
     const TextureDescription& d = lookup.entry->description;
-    const std::string where = std::string(d.info.name) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) +
-                              (d.dimension == 2 ? "x" + std::to_string(d.depth) + " (3D)" : std::string()) + " at " + Hex(d.base.physical);
+    // FM4 Recomp (M7 CPU cost): the name is built only for an error (Prepare runs two or three times per slot per draw).
+    const auto where = [&] {
+        return std::string(d.info.name) + " " + std::to_string(d.width) + "x" + std::to_string(d.height) +
+               (d.dimension == 2 ? "x" + std::to_string(d.depth) + " (3D)" : std::string()) + " at " + Hex(d.base.physical);
+    };
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 10, 18, 20, 23, 25, 36, 50, 51, 53, 54) this unit was checked for";
+        p.error = where() + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 10, 18, 20, 23, 25, 36, 50, 51, 53, 54) this unit was checked for";
         return p;
     }
     // Every level the description holds (texture_info.cpp, Xenia's level range texture_util.cc:60-92 and layout :200-438,
@@ -54,20 +81,20 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
     // base map, vulkan_texture_cache.cc:804-809). 3D mips stay refused by DescribeTexture.
     if (d.host.blockCompressed && !device.textureCompressionBC)
     {
-        p.error = where + ": a BC format, and the device has no textureCompressionBC (the DXT1 -> RGBA8 decode is not implemented)";
+        p.error = where() + ": a BC format, and the device has no textureCompressionBC (the DXT1 -> RGBA8 decode is not implemented)";
         return p;
     }
     p.binding = DescribeBinding(fetch, d.host, shader);
     if (!p.binding.ok)
     {
-        p.error = where + ": " + p.binding.error;
+        p.error = where() + ": " + p.binding.error;
         return p;
     }
     if (p.binding.sampler.anisotropyEnable)
     {
         if (!device.samplerAnisotropy)
         {
-            p.error = where + ": anisotropic filtering (the device feature is not enabled)";
+            p.error = where() + ": anisotropic filtering (the device feature is not enabled)";
             return p;
         }
         // X vulkan_texture_cache.cc:675, :2591-2596: clamped to the device's maximum.
@@ -75,21 +102,21 @@ PreparedTexture TextureUnitModel::Prepare(const uint32_t fetch[6], const ShaderF
     }
     if (!IdentityComponents(p.binding.components) && !device.imageViewFormatSwizzle)
     {
-        p.error = where + ": component mapping " + std::to_string(p.binding.components[0]) + std::to_string(p.binding.components[1]) +
+        p.error = where() + ": component mapping " + std::to_string(p.binding.components[0]) + std::to_string(p.binding.components[1]) +
                   std::to_string(p.binding.components[2]) + std::to_string(p.binding.components[3]) +
                   " needs imageViewFormatSwizzle, which the device did not enable";
         return p;
     }
     if (p.binding.gamma != drawStateGamma)
     {
-        p.error = where + ": the binding's gamma (" + std::to_string(p.binding.gamma) + ") disagrees with DrawState's (" + std::to_string(drawStateGamma) +
+        p.error = where() + ": the binding's gamma (" + std::to_string(p.binding.gamma) + ") disagrees with DrawState's (" + std::to_string(drawStateGamma) +
                   "), which chose the shader define";
         return p;
     }
     GuestRange hit;
     if (!allowPending && (log_.Overlaps(d.base.physical, d.base.size, hit) || log_.Overlaps(d.mips.physical, d.mips.size, hit)))
     {
-        p.error = where + ": its guest range was written by a resolve recorded into the open submission (" + Hex(hit.physical) + " + " +
+        p.error = where() + ": its guest range was written by a resolve recorded into the open submission (" + Hex(hit.physical) + " + " +
                   std::to_string(hit.size) + " bytes) that is not confirmed complete; the renderer must retire it first";
         return p;
     }

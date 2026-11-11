@@ -30,6 +30,14 @@ check "a ForzaRecomp binary is running (never run alongside it)" '/forzarecomp[^
 check "an FM4 Recomp binary is running" "$ROOT/build/[^ ]*"
 check "a headless Chrome is running (another project's GPU work)" 'Chrome.*--headless'
 check "a ReCarbon game build is running (another game: never run alongside it)" 'ReCarbon\.app/Contents/MacOS/|/recarbon[^ ]*/build/[^ ]*/(ReCarbon|recarbon)( |$)'
+# Spotlight's indexer (mds_stores) ran at 4-5 cores for days on the test Mac and slowed timing runs:
+# busy while its instantaneous CPU (top's second sample; ps %cpu is a decaying average) exceeds 150 %. research/, build/,
+# game/, ppc/ and tools/ carry .metadata_never_index.
+mds_cpu="$(top -l 2 -s 1 -stats cpu,command 2>/dev/null | awk '/^CPU/ {n++} n == 2 && $2 == "mds_stores" {s += $1} END {printf "%d", s + 0}')"
+if [ "${mds_cpu:-0}" -gt 150 ]; then
+  echo "preflight: BUSY: Spotlight (mds_stores) is indexing at ${mds_cpu}% CPU" >&2
+  busy=1
+fi
 if [ "${1:-}" = --gpu ] && [ -e "$ROOT/research/GPU_STOP" ]; then
   echo "preflight: BUSY: research/GPU_STOP is set: no GPU run until the owner removes it" >&2
   sed 's/^/  /' "$ROOT/research/GPU_STOP" >&2 || true

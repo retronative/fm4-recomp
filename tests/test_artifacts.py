@@ -172,5 +172,153 @@ class Artifacts(unittest.TestCase):
         self.assertIn("build/tests/translator_cache", out)
 
 
+class Captures(unittest.TestCase):
+    """plan --captures / apply on capture PNGs of recorded GPU runs: only the chosen
+    classes, only in a marked scenario with its run log, never anything else under research/."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+        r = self.root
+        marker = json.dumps({"kind": "evidence", "created": "2026-11-09", "keep": "until M7 close"})
+        # a recorded run: marker, log, ring + kept frames + another file
+        put(r, "research/m5/scenario10/.retention.json", marker)
+        put(r, "research/m5/scenario10/run/run1.err", "[stop 11] swap 5400")
+        put(r, "research/m5/scenario10/run/run1.captures/frame_5390.png", "f" * 3000)
+        put(r, "research/m5/scenario10/run/run1.captures/frame_5391.png", "f" * 3000)
+        put(r, "research/m5/scenario10/run/run1.captures/keep_5340.png", "k" * 5000)
+        put(r, "research/m5/scenario10/run/run1.captures/selfcheck_planted_GPU_STOP", "s")
+        put(r, "research/m5/scenario10/shaders/vs.bin")
+        # unmarked scenario (never), marked scenario without its log (never), marked scenario named in --keep
+        put(r, "research/m4/scenario2/run/run1.err")
+        put(r, "research/m4/scenario2/run/run1.captures/frame_1.png", "f" * 3000)
+        put(r, "research/m5/scenario11/.retention.json", marker)
+        put(r, "research/m5/scenario11/run/run1.captures/frame_1.png", "f" * 3000)
+        put(r, "research/m5/scenario12/.retention.json", marker)
+        put(r, "research/m5/scenario12/run/run1.err")
+        put(r, "research/m5/scenario12/run/run1.captures/frame_1.png", "f" * 3000)
+        put(r, "build/tests/translator/fx/out/a.cpp")
+        self.manifest = os.path.join(r, "research", "storage", "plan.json")
+        self.audit = os.path.join(r, "research", "storage", "audit.jsonl")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def quiet(self, fn, *args, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = fn(*args, **kw)
+        return code, buf.getvalue()
+
+    def plan(self, captures=("frame-ring",), keep=("scenario12",)):
+        code, out = self.quiet(artifacts.cmd_plan, self.root, self.manifest, captures, keep)
+        self.assertEqual(code, 0, out)
+        with open(self.manifest) as f:
+            return json.load(f), out
+
+    def apply(self, approve=None):
+        with open(self.manifest) as f:
+            man = json.load(f)
+        return self.quiet(artifacts.cmd_apply, self.root, self.manifest, approve or man["id"], self.audit, patterns=IDLE)
+
+    def exists(self, rel):
+        return os.path.lexists(os.path.join(self.root, rel))
+
+    def test_plan_without_captures_never_lists_research(self):
+        code, out = self.quiet(artifacts.cmd_plan, self.root, self.manifest)
+        with open(self.manifest) as f:
+            man = json.load(f)
+        self.assertEqual([i["path"] for i in man["items"]], ["build/tests/translator"])
+
+    def test_plan_lists_only_the_ring_of_recorded_unkept_runs(self):
+        man, out = self.plan()
+        caps = [i for i in man["items"] if i.get("kind") == "captures"]
+        self.assertEqual([i["path"] for i in caps], ["research/m5/scenario10/run/run1.captures"])
+        self.assertEqual(caps[0]["files"], 2)
+        self.assertEqual(caps[0]["bytes"], 6000)  # the two ring frames, not the kept frame or the other file
+        self.assertEqual(caps[0]["classes"], ["frame-ring"])
+        self.assertIn("dry run: nothing deleted", out)
+        self.assertTrue(self.exists("research/m5/scenario10/run/run1.captures/frame_5390.png"))
+
+    def test_apply_removes_the_class_files_and_keeps_everything_else(self):
+        self.plan()
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertIn("deleted 2 files", out)
+        for rel in ("research/m5/scenario10/run/run1.captures/frame_5390.png",
+                    "research/m5/scenario10/run/run1.captures/frame_5391.png", "build/tests/translator"):
+            self.assertFalse(self.exists(rel), rel)
+        for rel in ("research/m5/scenario10/run/run1.captures", "research/m5/scenario10/run/run1.captures/keep_5340.png",
+                    "research/m5/scenario10/run/run1.captures/selfcheck_planted_GPU_STOP", "research/m5/scenario10/run/run1.err",
+                    "research/m5/scenario10/shaders/vs.bin", "research/m5/scenario10/.retention.json",
+                    "research/m4/scenario2/run/run1.captures/frame_1.png", "research/m5/scenario11/run/run1.captures/frame_1.png",
+                    "research/m5/scenario12/run/run1.captures/frame_1.png"):
+            self.assertTrue(self.exists(rel), rel)
+        with open(self.audit) as f:
+            lines = [json.loads(l) for l in f]
+        self.assertEqual([l["bytes"] for l in lines if "captures" in l["path"]], [6000])
+
+    def test_keep_frames_class_only_when_asked(self):
+        man, _ = self.plan(captures=("frame-ring", "keep-frames"))
+        caps = [i for i in man["items"] if i.get("kind") == "captures"][0]
+        self.assertEqual((caps["files"], caps["bytes"]), (3, 11000))
+        code, out = self.apply()
+        self.assertFalse(self.exists("research/m5/scenario10/run/run1.captures/keep_5340.png"))
+        self.assertTrue(self.exists("research/m5/scenario10/run/run1.captures/selfcheck_planted_GPU_STOP"))
+
+    def test_edited_classes_change_the_id(self):
+        man, _ = self.plan()
+        for it in man["items"]:
+            if it.get("kind") == "captures":
+                it["classes"] = ["frame-ring", "keep-frames"]
+        with open(self.manifest, "w") as f:
+            json.dump(man, f)
+        self.assertEqual(self.apply(approve=man["id"])[0], 2)
+        self.assertTrue(self.exists("research/m5/scenario10/run/run1.captures/keep_5340.png"))
+        self.assertTrue(self.exists("research/m5/scenario10/run/run1.captures/frame_5390.png"))
+
+    def test_each_capture_check_on_its_own(self):
+        r = self.root
+        good = "research/m5/scenario10/run/run1.captures"
+        ino = os.stat(os.path.join(r, good)).st_ino
+        item = lambda **kw: dict(dict(path=good, kind="captures", classes=["frame-ring"], inode=ino), **kw)
+        self.assertIsNone(artifacts.validate(r, item()))
+        self.assertEqual(artifacts.validate(r, item(path="research/m5/scenario10/run")), "not research/m<N>/<scenario>/run/<run>.captures")
+        self.assertEqual(artifacts.validate(r, item(path="research/m5/scenario10/run/../run/run1.captures")),
+                         "not research/m<N>/<scenario>/run/<run>.captures")
+        self.assertEqual(artifacts.validate(r, item(path="research/m5/scenario11/run/run1.captures")), "no run log beside the captures")
+        self.assertEqual(artifacts.validate(r, item(path="research/m4/scenario2/run/run1.captures")), "scenario has no .retention.json")
+        self.assertEqual(artifacts.validate(r, item(classes=["everything"])), "unknown capture class")
+        self.assertEqual(artifacts.validate(r, item(inode=ino + 1)), "replaced since the plan (inode changed)")
+        # a symlinked captures directory, and one that resolves outside research/
+        os.symlink(os.path.join(r, "build"), os.path.join(r, "research/m5/scenario10/run/run2.captures"))
+        put(r, "research/m5/scenario10/run/run2.err")
+        self.assertEqual(artifacts.validate(r, item(path="research/m5/scenario10/run/run2.captures")), "symlink")
+        os.symlink(os.path.join(r, "build"), os.path.join(r, "research/m5/scenario13"))
+        self.assertEqual(artifacts.validate(r, item(path="research/m5/scenario13/run/run1.captures", inode=0)), "gone")
+
+    def test_marker_removed_after_plan_is_skipped(self):
+        self.plan()
+        os.remove(os.path.join(self.root, "research/m5/scenario10/.retention.json"))
+        code, out = self.apply()
+        self.assertIn("scenario has no .retention.json", out)
+        self.assertTrue(self.exists("research/m5/scenario10/run/run1.captures/frame_5390.png"))
+
+    def test_game_run_refuses_apply(self):
+        self.plan()
+        p = subprocess.Popen(["bash", "-c", "sleep 30; true", "gpu_run.sh"])
+        try:
+            reasons = artifacts.active_runs(self.root, ["gpu_run.sh"])
+            self.assertTrue(any("gpu_run.sh" in x for x in reasons), reasons)
+        finally:
+            p.kill()
+            p.wait()
+
+    def test_cli_rejects_unknown_class(self):
+        code, out = self.quiet(artifacts.main, ["plan", "--root", self.root, "--captures", "all", "--out", self.manifest])
+        self.assertEqual(code, 2)
+        self.assertFalse(self.exists("research/storage/plan.json"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

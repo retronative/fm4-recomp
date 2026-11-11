@@ -20,6 +20,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 namespace runtime::video {
 
@@ -63,6 +64,62 @@ std::string WithoutPrecise(const std::string& glsl)
     return out;
 }
 
+// FM4 Recomp (diagnostics, never in a kept stack; the WithoutPrecise pattern): text rewrites of the translated GLSL that answer
+// where the vertex channel's GPU time goes. Each is opt-in by its own variable and
+// logged once; a run with either is a measurement, not a candidate.
+//  FM4_DIAG_VS_NO_ATOMICS=1: vertex shaders lose their `atomicOr(xe_error, ...)` stores (a fetch outside its slot no longer stops
+//    the run: NOT shippable) to measure what a vertex function with device writes costs.
+//  FM4_DIAG_FAST_MUL=1: xe_mul / xe_dp4 / xe_dp3 / xe_dp2add become plain products and dot() (breaks the D3D9 0 * x = 0 rule the
+//    helpers implement: a semantics change not approved) to measure the ALU share of that rule.
+bool DiagVsNoAtomics()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_VS_NO_ATOMICS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[shader] FM4_DIAG_VS_NO_ATOMICS=1 (diagnostic): vertex shaders without their xe_error stores; a bad fetch no longer stops the run\n");
+        return enabled;
+    }();
+    return on;
+}
+bool DiagFastMul()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_FAST_MUL");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[shader] FM4_DIAG_FAST_MUL=1 (diagnostic): xe_mul/xe_dp* as plain products (the D3D9 zero rule is off)\n");
+        return enabled;
+    }();
+    return on;
+}
+std::string ReplaceAll(std::string text, const std::string& from, const std::string& to, size_t& count)
+{
+    for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size()))
+        text.replace(at, from.size(), to), count++;
+    return text;
+}
+std::string DiagRewrite(std::string glsl, bool pixel)
+{
+    size_t n = 0;
+    if (DiagVsNoAtomics() && !pixel)
+        glsl = ReplaceAll(std::move(glsl), "atomicOr(xe_error, 1u);", "", n), glsl = ReplaceAll(std::move(glsl), "atomicOr(xe_error, 2u);", "", n);
+    if (DiagFastMul())
+    {
+        glsl = ReplaceAll(std::move(glsl), "float xe_mul(float a, float b)\n{\n    precise float p = a * b;\n    return (a == 0.0 || b == 0.0) ? 0.0 : p;\n}",
+                          "float xe_mul(float a, float b) { return a * b; }", n);
+        glsl = ReplaceAll(std::move(glsl), "vec4 xe_mul(vec4 a, vec4 b)\n{\n    return vec4(xe_mul(a.x, b.x), xe_mul(a.y, b.y), xe_mul(a.z, b.z), xe_mul(a.w, b.w));\n}",
+                          "vec4 xe_mul(vec4 a, vec4 b) { return a * b; }", n);
+        glsl = ReplaceAll(std::move(glsl), "float xe_dp2add(vec4 a, vec4 b, vec4 c)\n{\n    precise float s = xe_mul(a.x, b.x) + xe_mul(a.y, b.y);\n    precise float r = s + c.x;\n    return r;\n}",
+                          "float xe_dp2add(vec4 a, vec4 b, vec4 c) { return dot(a.xy, b.xy) + c.x; }", n);
+        glsl = ReplaceAll(std::move(glsl), "float xe_dp4(vec4 a, vec4 b)\n{\n    precise float s = xe_mul(a.x, b.x) + xe_mul(a.y, b.y);\n    precise float t = s + xe_mul(a.z, b.z);\n    precise float r = t + xe_mul(a.w, b.w);\n    return r;\n}",
+                          "float xe_dp4(vec4 a, vec4 b) { return dot(a, b); }", n);
+        glsl = ReplaceAll(std::move(glsl), "float xe_dp3(vec4 a, vec4 b)\n{\n    precise float s = xe_mul(a.x, b.x) + xe_mul(a.y, b.y);\n    precise float r = s + xe_mul(a.z, b.z);\n    return r;\n}",
+                          "float xe_dp3(vec4 a, vec4 b) { return dot(a.xyz, b.xyz); }", n);
+    }
+    return glsl;
+}
+
 }  // namespace
 
 // ---- GlslangCompiler ---------------------------------------------------------------------------
@@ -84,8 +141,9 @@ bool GlslangCompiler::Compile(bool pixel, const std::string& glsl, std::vector<u
     const EShLanguage stage = pixel ? EShLangFragment : EShLangVertex;
     const EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     glslang::TShader shader(stage);
-    const std::string text = NoPrecise() ? WithoutPrecise(glsl) : std::string();  // FM4_SHADER_NO_PRECISE
-    const char* source = NoPrecise() ? text.c_str() : glsl.c_str();
+    const bool rewrite = NoPrecise() || DiagVsNoAtomics() || DiagFastMul();  // FM4_SHADER_NO_PRECISE; the diagnostics above
+    const std::string text = rewrite ? DiagRewrite(NoPrecise() ? WithoutPrecise(glsl) : glsl, pixel) : std::string();
+    const char* source = rewrite ? text.c_str() : glsl.c_str();
     shader.setStrings(&source, 1);
     shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
     shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_0);
@@ -123,8 +181,8 @@ std::string VariantGlsl(const std::string& glsl, const ShaderVariantDefines& def
 
 // ---- ShaderCache -------------------------------------------------------------------------------
 
-ShaderCache::ShaderCache(SpirvCompiler& compiler, const char* dumpDir, size_t maxVariants)
-    : compiler_(compiler), dumpDir_(dumpDir == nullptr ? "" : dumpDir), maxVariants_(maxVariants)
+ShaderCache::ShaderCache(SpirvCompiler& compiler, const char* dumpDir, size_t maxVariants, bool memo)
+    : compiler_(compiler), dumpDir_(dumpDir == nullptr ? "" : dumpDir), maxVariants_(maxVariants), memo_(memo)
 {
 }
 
@@ -154,8 +212,21 @@ const CachedShader* ShaderCache::Load(uint32_t type, const uint32_t* words, uint
         return reason = "IM_LOAD type " + std::to_string(type) + " is neither vertex (0) nor pixel (1)", nullptr;
     if (count == 0 || count % 3 != 0)
         return reason = std::string(type ? "ps" : "vs") + " of " + std::to_string(count) + " words is not whole 3-word slots", nullptr;
-    const uint64_t hash = runtime::gpu::ShaderHash(type, words, count);
     const bool pixel = type == 1;
+    // FM4 Recomp (M7 CPU cost): the memo (shader_cache.h `memo`): an exact comparison with every translated shader of this type and
+    // size answers a re-load without the hash. A refused program is not memoised (it has no CachedShader) and takes the hash path
+    // to its remembered reason; a candidate that differs is rejected at the first differing byte.
+    const uint64_t sizeKey = uint64_t(type) << 32 | count;
+    if (memo_)
+        if (const auto bucket = bySize_.find(sizeKey); bucket != bySize_.end())
+            for (const CachedShader* candidate : bucket->second)
+                if (std::memcmp(candidate->microcode.data(), words, size_t(count) * 4) == 0)
+                {
+                    stats_.hits++, stats_.memoHits++;
+                    current_[pixel] = candidate;
+                    return candidate;
+                }
+    const uint64_t hash = runtime::gpu::ShaderHash(type, words, count);
     if (const CachedShader* hit = Find(hash))
     {
         stats_.hits++;
@@ -186,8 +257,12 @@ const CachedShader* ShaderCache::Load(uint32_t type, const uint32_t* words, uint
         return nullptr;
     }
     Dump(Name(*shader) + (pixel ? ".frag" : ".vert"), shader->t.glsl);
+    if (memo_)
+        shader->microcode.assign(words, words + count);
     const CachedShader* result = shader.get();
     shaders_[hash] = std::move(shader);
+    if (memo_)
+        bySize_[sizeKey].push_back(result);
     current_[pixel] = result;
     return result;
 }

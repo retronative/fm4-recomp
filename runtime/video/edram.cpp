@@ -129,16 +129,75 @@ bool TileInside(uint32_t tile, Key dest, const Rect& cutout)
 
 }  // namespace
 
-bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Transfer>& transfers, std::string& refusal, const Rect* clearCutout)
+namespace {
+
+// FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the pairs whose transfer copies host values unchanged, so that a
+// source -> interim -> source round trip is the identity on the source's image: the same aspect and the
+// same format (a colour storage format, or a depth format). kTransferDepth / kTransferDepthStencilExport copy the float depth and
+// the stencil byte as they are when sourceFormat == destFormat (edram_vk.cpp); kTransferColor writes the fetched texel `v` itself
+// then (its XE_SOURCE_UINT / XE_DEST_UINT variants pack and unpack the identical word). Every MSAA pair of MapTransferTexel is a
+// bijection whose inverse is the opposite pair (edram_vk_plan.cpp:157-173), so
+// the interim image holds every sample of the source exactly once and the way back lands each where it came from. Formats that
+// differ (a colour repacked through the guest word, a depth format conversion, colour <-> depth) quantise: never skipped.
+// Restricted to formats whose host image is float or integer (edram_vk_plan.cpp HostDepthFormat / HostColorFormat /
+// TransferViewFormat), so that the copy involves no float -> normalized conversion whose rounding we would have to trust: depth
+// kD24FS8 (always D32_SFLOAT_S8_UINT: float32 depth copied through gl_FragDepth, the stencil byte as an integer), colour storage
+// 3 (7e3, R16G16B16A16_SFLOAT: half -> float -> half is exact), 4 (16_16, through R16G16_UINT) and 14 (32_FLOAT, through R32_UINT).
+// kD24S8 (D24_UNORM_S8_UINT where supported) and storage 0 / 2 (UNORM hosts) are not skipped: their round trip is very likely
+// exact too, but proving it means proving the device's conversion.
+bool SkipExact(Key dest, Key interim)
+{
+    if (dest.IsDepth() != interim.IsDepth() || dest.Format() != interim.Format())
+        return false;
+    if (dest.IsDepth())
+        return dest.Format() == uint32_t(DepthFormat::D24FS8);
+    const ColorFormat f = ColorFormat(dest.Format());
+    return f == ColorFormat::k2_10_10_10_Float || f == ColorFormat::k16_16 || f == ColorFormat::k32_Float;
+}
+
+}  // namespace
+
+void Ownership::MarkWritten(Key k, uint32_t start, uint32_t length)
+{
+    if (k.Empty() || length == 0)
+        return;
+    // k's host image row r holds tiles base + r * pitch + column, modulo the addressing period (as Change wraps), at most 2048.
+    const uint32_t first = (k.Base() + start) & (kTileCount - 1), n = std::min(length, kTileCount);
+    for (uint32_t i = 0; i < n; i++)
+    {
+        const uint32_t t = (first + i) & (kTileCount - 1);
+        if (owner_[t] == k.packed || shadow_[t] == k.packed)
+            shadow_[t] = 0;
+    }
+}
+
+bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Transfer>& transfers, std::string& refusal, const Rect* clearCutout,
+                       bool destWrites)
 {
     if (length == 0)
         return true;
-    if (dest.Empty() || start > kTileCount - 1 || length > kTileCount)  // X :1543-1547 asserts
+    if (!ChangeAllowed(dest, start, length))  // X :1543-1547 asserts
         return Refuse(refusal, "ownership change outside the EDRAM (start " + std::to_string(start) + ", length " + std::to_string(length) + ")");
     // X :1683-1697: the start wraps into dest's addressing period; a claim past tile 2047 continues at 0 up
     // to the start (the whole EDRAM at most).
     const uint32_t first = (dest.Base() + start) & (kTileCount - 1), end = first + length;
     const uint32_t extents[2][2] = {{first, std::min(end, kTileCount)}, {0, end > kTileCount ? std::min(end & (kTileCount - 1), first) : 0}};
+    // FM4 Recomp (M7 CPU cost): a remembered claim that covers this one, made since the last owner change: dest owns every tile
+    // already (no transfer, no cutout question), the walk is skipped. Only claims that do not wrap are remembered.
+    // FM4_TRANSFER_SKIP_UNWRITTEN: a writing claim reuses only an entry whose claim already cleared the shadows (Claim::written).
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): dest's own constants in the range still go (dest writes them now); the
+    // memo does not know about them, so they are dropped here before the early return (a run table of a few entries: O(runs)).
+    if (end <= kTileCount)
+        for (const Claim& k : claims_)
+            if (k.generation == generation_ && k.dest == dest.packed && first >= k.first && end <= k.end && (k.written || !destWrites))
+            {
+                if (clearRunCount_ != 0)
+                    DropClearValues(first, end);
+                return true;
+            }
+    bool changed = false;
+    // FM4_TRANSFER_SKIP_UNWRITTEN: the skipped runs are counted as the transfers they would have been (the coalescing rule below).
+    uint32_t skipEnd = ~0u, skipSource = 0;
     // Every owner change is accepted (FM4 Recomp: the depth-format refusal was the last one):
     // Depth -> colour is X's kDepthToColor (vulkan_render_target_cache.cc:4910-4913) and needs no host-depth owner: X tracks
     // those only for a depth destination (render_target_cache.cc:1553-1555, :1606-1609).
@@ -152,25 +211,169 @@ bool Ownership::Change(Key dest, uint32_t start, uint32_t length, std::vector<Tr
     // ConvertDepthFormat; FM4: tile 720, kD24FS8 -> kD24S8). X's host-depth owner refines only a kD24FS8
     // destination, so kD24FS8 -> kD24S8 is exact against X and kD24S8 -> kD24FS8 APPROXIMATE as colour -> depth above.
     for (const auto& e : extents)
+    {
         for (uint32_t t = e[0]; t < e[1]; t++)
         {
             const Key o = At(t);
             // :1599-1600: only a real, different owner is a source; :1601-1607: not a tile the clear overwrites.
             if (!o.Empty() && o != dest && !(clearCutout && clearCutout->width && clearCutout->height && TileInside(t, dest, *clearCutout)))
             {
-                if (!transfers.empty() && transfers.back().endTiles == t && transfers.back().source == o)  // :1624-1632
+                // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): a tile the previous owner held as a constant moves as a value
+                // when the keys have the same aspect and format (edram.h SetClearValue); the GPU side clears instead of copying.
+                const ClearRun* run = clearRunCount_ != 0 ? ClearRunOf(t) : nullptr;
+                const bool value = run != nullptr && o.IsDepth() == dest.IsDepth() && o.Format() == dest.Format();
+                const uint32_t word = value ? run->word : 0, exact = value ? run->exact : 0;
+                // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): dest's image still holds this tile (it was the source of the
+                // transfer into o, and o never wrote it): ownership flips, nothing is copied, and o's image is the shadow now.
+                if (skipUnwritten && shadow_[t] == dest.packed && SkipExact(dest, o))
+                {
+                    if (skipEnd != t || skipSource != o.packed)
+                        skipped_.transfers++;
+                    skipped_.tiles++;
+                    skipEnd = t + 1, skipSource = o.packed;
+                }
+                else if (!transfers.empty() && transfers.back().endTiles == t && transfers.back().source == o && transfers.back().value == value &&
+                         transfers.back().word == word && transfers.back().exact == exact)  // :1624-1632, FM4 Recomp: equal value state too
                     transfers.back().endTiles = t + 1;
                 else
-                    transfers.push_back({t, t + 1, o});
+                    transfers.push_back({t, t + 1, o, value, word, exact});
+                // o's image holds what dest's does now (the transfer copies it, or the skip found it there). Not after a value transfer:
+                // the constant may still be a pending clear of o that was never recorded into o's image, so o is no shadow of it.
+                shadow_[t] = value ? 0 : o.packed;
             }
+            else if (o != dest)
+                shadow_[t] = 0;  // an empty previous owner, or a tile the cutout says dest overwrites: no other image holds it
+            if (o != dest)
+                changed = true;
             owner_[t] = dest.packed;  // :1655
+            if (destWrites)
+                shadow_[t] = 0;  // FM4_TRANSFER_SKIP_UNWRITTEN: dest may write the tile after this claim
         }
+        if (clearRunCount_ != 0 && e[0] < e[1])
+            DropClearValues(e[0], e[1]);  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): every claimed tile loses its constant (edram.h)
+    }
+    if (changed)
+        generation_++;
+    if (end <= kTileCount)
+    {
+        claims_[nextClaim_] = {dest.packed, first, end, generation_, destWrites};  // dest owns [first, end) now, whether or not it did before
+        nextClaim_ = (nextClaim_ + 1) % uint32_t(claims_.size());
+    }
     return true;
+}
+
+// ---- Clear values (FM4 Recomp, M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP; edram.h SetClearValue) ----------------------------
+
+const Ownership::ClearRun* Ownership::ClearRunOf(uint32_t tile) const
+{
+    for (uint32_t i = 0; i < clearRunCount_; i++)
+        if (tile >= clearRuns_[i].first && tile < clearRuns_[i].end)
+            return &clearRuns_[i];
+    return nullptr;
+}
+
+void Ownership::DropClearValues(uint32_t first, uint32_t end)
+{
+    for (uint32_t i = 0; i < clearRunCount_;)
+    {
+        ClearRun& r = clearRuns_[i];
+        if (end <= r.first || first >= r.end)  // disjoint
+        {
+            i++;
+            continue;
+        }
+        if (first <= r.first && end >= r.end)  // the run goes whole: the last run takes its slot
+        {
+            r = clearRuns_[--clearRunCount_];
+            continue;
+        }
+        if (first > r.first && end < r.end)  // a hole in the middle: two runs, if a slot is free, else none (conservative: copied as before)
+        {
+            if (clearRunCount_ == kMaxClearRuns)
+            {
+                r = clearRuns_[--clearRunCount_];
+                continue;
+            }
+            clearRuns_[clearRunCount_++] = {end, r.end, r.word, r.exact};
+            r.end = first;
+        }
+        else if (first <= r.first)  // the head goes
+            r.first = end;
+        else  // the tail goes
+            r.end = first;
+        i++;
+    }
+}
+
+uint32_t Ownership::SetClearValue(Key owner, const Rect& rect, uint32_t word, uint32_t exact)
+{
+    if (owner.Empty() || owner.PitchTiles() == 0 || rect.width == 0 || rect.height == 0)
+        return 0;
+    // The tiles of owner's layout the rectangle touches (X render_target_cache.cc:355-359 tile size by MSAA and bpp), row by row; a
+    // tile is recorded when owner owns it and its whole pixel rectangle lies inside `rect` (TileInside, the cutout rule): consecutive
+    // such tiles form one run (a full-width rectangle: one run for all its rows; the wrap at 2047 -> 0 breaks a run).
+    const uint32_t pitch = owner.PitchTiles();
+    const uint32_t tileWidth = kTileWidthSamples >> (SamplesXLog2(owner.MsaaMode()) + (owner.Is64bpp() ? 1 : 0));
+    const uint32_t tileHeight = kTileHeightSamples >> SamplesYLog2(owner.MsaaMode());
+    const uint32_t rowFirst = rect.y / tileHeight, rowEnd = (rect.y + rect.height - 1) / tileHeight + 1;
+    const uint32_t colFirst = rect.x / tileWidth, colEnd = std::min(pitch, (rect.x + rect.width - 1) / tileWidth + 1);
+    uint32_t recorded = 0;
+    ClearRun run{0, 0, word, exact};
+    const auto flush = [&]() {
+        if (run.first == run.end)
+            return;
+        DropClearValues(run.first, run.end);  // the new constant replaces an older one on the same tiles
+        if (clearRunCount_ < kMaxClearRuns)
+        {
+            clearRuns_[clearRunCount_++] = run;
+            recorded += run.end - run.first;
+        }
+        run.first = run.end = 0;
+    };
+    for (uint32_t row = rowFirst; row < rowEnd; row++)
+        for (uint32_t col = colFirst; col < colEnd; col++)
+        {
+            const uint32_t local = row * pitch + col;
+            if (local >= kTileCount)  // beyond the addressing period: not this key's tile
+                break;
+            const uint32_t tile = (owner.Base() + local) & (kTileCount - 1);
+            if (At(tile) != owner || !TileInside(tile, owner, rect))
+            {
+                flush();
+                continue;
+            }
+            if (run.first != run.end && run.end == tile)
+                run.end = tile + 1;
+            else
+            {
+                flush();
+                run.first = tile, run.end = tile + 1;
+            }
+        }
+    flush();
+    return recorded;  // the claim memo stays valid: a memo hit drops the constants of its range itself (Change)
+}
+
+bool Ownership::ClearValue(uint32_t tile, uint32_t& word) const
+{
+    const ClearRun* run = ClearRunOf(tile % kTileCount);
+    if (run == nullptr)
+        return false;
+    word = run->word;
+    return true;
+}
+
+uint32_t Ownership::ClearValueTiles() const
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < clearRunCount_; i++)
+        n += clearRuns_[i].end - clearRuns_[i].first;
+    return n;
 }
 
 // ---- Bind (X render_target_cache.cc:574-1015) ---------------------------------------------------------------
 
-Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout, const Rect* colorCutout)
+Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUsed, const Rect* depthCutout, const Rect* colorCutout, bool depthReadOnly)
 {
     Binding b;
     const SurfaceInfo surface = DecodeSurfaceInfo(regs.surfaceInfo);
@@ -276,19 +479,36 @@ Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUse
         lengths[index] = std::min(std::min(lengthUsed32 << shift, maxDistance64 >> (shift ^ 1)), next - base);
     }
 
-    // :888-894: claim in base order; a refusal leaves the map as it was.
-    const Ownership before = ownership;
+    // :888-894: claim in base order; a refusal leaves the map as it was. FM4 Recomp (M7 CPU cost): Change refuses only what ChangeAllowed
+    // does, so every claim is checked first and nothing has to be undone (a copy of the whole map per draw before: ~60 MB of memcpy a race frame).
     for (const auto& [base, index] : sorted)
     {
         (void)base;
-        if (!ownership.Change(keys[index], 0, lengths[index], b.transfers[index], b.refusal, index == 0 ? depthCutout : colorCutout))  // FM4_OVERWRITE_CLAIM
+        if (!Ownership::ChangeAllowed(keys[index], 0, lengths[index]))
         {
-            ownership = before;
             b.ok = false;
+            b.refusal = "ownership change outside the EDRAM (start 0, length " + std::to_string(lengths[index]) + ")";
+            return b;
+        }
+    }
+    for (const auto& [base, index] : sorted)
+    {
+        (void)base;
+        // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the depth target of a testing-only draw is claimed as read-only (its
+        // shadows survive); a depth cutout means the draw overwrites, so it writes. Colour targets are bound only for a colour write.
+        const bool writes = !(index == 0 && depthReadOnly && depthCutout == nullptr);
+        if (!ownership.Change(keys[index], 0, lengths[index], b.transfers[index], b.refusal, index == 0 ? depthCutout : colorCutout, writes))  // FM4_OVERWRITE_CLAIM
+        {
+            b.ok = false;  // unreachable after ChangeAllowed: kept fail-closed
             for (auto& t : b.transfers)
                 t.clear();
             return b;
         }
+        // FM4_TRANSFER_SKIP_UNWRITTEN: the host draw reaches every row up to `height` (the renderer's scissor stops there), so the
+        // tiles past a claim the bases' distance shortened are written in this key's image too. Rare: only when a clamp applied.
+        const uint32_t reach = std::min(lengthUsed32 << (is64[index] ? 1 : 0), kTileCount);
+        if (writes && reach > lengths[index])
+            ownership.MarkWritten(keys[index], lengths[index], reach - lengths[index]);
     }
     b.depth = used[0] ? keys[0] : Key{};
     for (uint32_t i = 0; i < kColorTargets; i++)
@@ -322,17 +542,6 @@ int32_t FloatToFixed16p8(float f)  // X ui/graphics_util.cc:17-60
         r.s >>= extra;
     }
     return r.s;
-}
-
-uint32_t GpuSwap32(uint32_t v, uint32_t endian)  // X xenos.h:1070-1086
-{
-    switch (endian & 3)
-    {
-    case 1: return ((v << 8) & 0xFF00FF00u) | ((v >> 8) & 0x00FF00FFu);
-    case 2: return __builtin_bswap32(v);
-    case 3: return ((v >> 16) & 0xFFFF) | (v << 16);
-    default: return v;
-    }
 }
 
 namespace {
@@ -628,7 +837,9 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
         for (uint32_t row = 0; row < info.spanRows; row++)
         {
             std::string why;
-            if (!ownership.Change(info.source, relative + row * info.spanPitch, info.spanRowLength, plan.copyTransfers, why))
+            // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the copy only reads the source (destWrites false); the transfers
+            // into it and the FlushClears before the read are the writes the shadow map already accounts for (edram.h ShadowAt).
+            if (!ownership.Change(info.source, relative + row * info.spanPitch, info.spanRowLength, plan.copyTransfers, why, nullptr, false))
             {
                 ownership = before;
                 plan.copyTransfers.clear();
@@ -705,6 +916,9 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
             ownership = before;
             return refuse("resolve depth clear: " + why);
         }
+        // FM4 Recomp (M7 GPU cost, FM4_TRANSFER_SKIP_UNWRITTEN): the host clear covers the whole rectangle (edram_vk.cpp Clear), also the
+        // tiles the overlap rule above kept this claim from (depthLength < length32): their shadows of this key are dropped too.
+        ownership.MarkWritten(depthKey, start32, length32);
         plan.hasDepthClear = true;
     }
     if (colorLength)
@@ -715,6 +929,7 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
             ownership = before;
             return refuse("resolve colour clear: " + why);
         }
+        ownership.MarkWritten(colorKey, start32, length32);  // FM4_TRANSFER_SKIP_UNWRITTEN: as the depth clear above
         plan.hasColorClear = true;
     }
     plan.ok = true;

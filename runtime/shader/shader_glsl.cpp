@@ -588,6 +588,8 @@ private:
     // FM4 Recomp: slots some full fetch indexes with anything but the untouched vertex index (r0.x before any write to it): the
     // draw's indices do not bound such a fetch (ShaderTranslation::vertexFetchComputedIndex).
     std::set<uint32_t> computedIndexSlots_;
+    uint32_t constantMax_ = 0;         // FM4 Recomp: highest literal xe_c index read + 1
+    bool constantsRelative_ = false;   // FM4 Recomp: a relatively addressed constant read (any of the 256)
     bool predicatedFetchInPlace_ = false;
     std::vector<std::string> vertexIndexVars_;  // Emit: the full fetches' index variables, declared at the top of main  // Exec: the current texture fetch is predicated in a predicated jump's region (its own `if`)
     bool vertexIndexOverwritten_ = false;
@@ -719,7 +721,9 @@ bool Translator::VectorOperand(const AluInstruction& a, uint32_t n, uint32_t pos
             if (!a0Written_)
                 return Fail("ALU source " + Num(n) + " reads a0 before any MAXAs sets it");
             index = "clamp(xe_a0 + " + index + ", 0, 255)";
+            constantsRelative_ = true;  // FM4 Recomp: any constant may be read (ShaderTranslation::constantCount)
         }
+        constantMax_ = std::max(constantMax_, uint32_t(s.reg) + 1);  // FM4 Recomp: the host uploads constants 0..constantCount-1
         base = a.absConstants ? "abs(xe_c[" + index + "])" : "xe_c[" + index + "]";
     }
     out = base + "." + swizzle;
@@ -754,6 +758,7 @@ bool Translator::ConstTempOperands(const AluInstruction& a, const std::string& w
     if (!ReadTemp(temp, 1u << SwizzleComponent(s.swizzle, 0)))
         return false;
     c = "xe_c[" + Num(s.reg) + "]." + kComponents[SwizzleComponent(s.swizzle, 3)];
+    constantMax_ = std::max(constantMax_, uint32_t(s.reg) + 1);  // FM4 Recomp (ShaderTranslation::constantCount)
     r = "r" + Num(temp) + "." + kComponents[SwizzleComponent(s.swizzle, 0)];
     if (a.absConstants)
         c = "abs(" + c + ")", r = "abs(" + r + ")";
@@ -1430,7 +1435,9 @@ bool Translator::VertexFetchOp(const uint32_t w[3], uint32_t slot)
     const uint32_t s = fullSlot_, n = VertexFormatComponents(f.format);
     auto& extent = vertexExtents_[s];
     extent.first = std::max(extent.first, fullStride_);
-    extent.second = std::max(extent.second, uint32_t(std::max(0, f.offset + int32_t(n))));
+    // FM4 Recomp: the element's end in dwords (layout.words), not components: a packed 16_16 element is one dword of two
+    // components, and the window/proof must match what the generated code reads (one xe_vertex_word per dword).
+    extent.second = std::max(extent.second, uint32_t(std::max(0, f.offset + int32_t(layout.words))));
     const std::string word1 = "xe_fetch[" + Num(s / 2) + "]." + (s % 2 ? "w" : "y"), value = "xe_fetch" + Num(id);
     // Every dword of the element goes through xe_vertex_word, which checks it against the slot's
     // size (fetch word 1 bits 2-25) and flags an out-of-range fetch for the host to stop on.
@@ -2255,6 +2262,7 @@ void Translator::Finish(const std::vector<Translator>& analyses, ShaderTranslati
     out.glsl = Assemble(interpolators);
     out.interpolatorCount = interpolators;
     out.kills = kills_;
+    out.constantCount = constantsRelative_ ? 256 : std::min<uint32_t>(constantMax_, 256);  // FM4 Recomp: what the host must upload
     out.pathZeroReads.assign(zeroReads.begin(), zeroReads.end());
     out.vertexFetchSlots.assign(vertexSlots_.begin(), vertexSlots_.end());
     for (uint32_t slot : out.vertexFetchSlots)
@@ -2498,12 +2506,18 @@ uint xe_vertex_word(uint base, int index, uint stride, int offset, uint word1)
     uint at = inside ? uint(index) * stride + uint(offset) : 0u;
     if (!inside || at >= size)
     {
+#ifndef XE_FETCH_UNCHECKED
         atomicOr(xe_error, 1u);
+#endif
         return 0u;
     }
     return xe_swap(xe_vertex_words[base + at], word1 & 3u);
 }
 )";
+// FM4 Recomp (M7 GPU cost): XE_FETCH_UNCHECKED is defined by the host for a draw whose every fetch it has proved inside its slot
+// (draw_state.h VertexFetchProvablyInside: no computed index, the index window within the constant's size), so the vertex
+// function needs no device write: a race profile measured the xe_error store at about a third of the vertex channel's GPU time.
+// The bounds test and the 0 read stay; only the flag is left out, and only when it could not fire.
 
 // The texture declarations; the host rewrites each binding by matching this exact text.
 std::string Translator::SamplerDeclarations() const
@@ -2726,26 +2740,24 @@ void main()
 
 }  // namespace
 
-// FM4 Recomp: ShaderTranslation::PositionFetch (shader_glsl.h). A syntactic scan of the
-// microcode with ucode.h's decoders (Xenia 67f16c4e315f ucode.h layouts), independent of the GLSL emitter, so
-// that what it accepts is exactly the documented pattern and nothing the emitter would also accept.
-ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, size_t count, bool pixel)
+namespace {
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the straight-line scan AnalyzePositionFetch makes, shared with the clear-draw analyses
+// below: the instructions in execution order (`ops`) and the temps each writes (`writes`, bit per temp). False with `why` for
+// control flow that is not straight-line, an exec past the shader, no exec_end, an unmodelled fetch opcode or a relatively
+// addressed destination.
+struct ScanOp
+{
+    bool fetch;
+    const uint32_t* w;
+    uint32_t slot;
+};
+bool ScanStraightLine(const uint32_t* words, size_t count, std::vector<ScanOp>& ops, std::vector<uint64_t>& writes, std::string& why)
 {
     using namespace ucode;
-    ShaderTranslation::PositionFetch r;
-    const auto fail = [&](std::string why) { r = {}; r.why = std::move(why); return r; };
-    if (pixel)
-        return fail("a pixel shader has no position export");
+    ops.clear(), writes.clear();
     if (!words || count == 0 || count % 3 != 0)
-        return fail("not whole 3-word slots");
-    // The instructions in execution order (straight-line control flow only).
-    struct Op
-    {
-        bool fetch;
-        const uint32_t* w;
-        uint32_t slot;
-    };
-    std::vector<Op> ops;
+        return why = "not whole 3-word slots", false;
     uint32_t firstInstruction = uint32_t(count / 3);
     bool ended = false;
     CfWords cf;
@@ -2753,7 +2765,7 @@ ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, siz
     {
         const CfOpcode op = CfOpcodeOf(cf);
         if (!IsStraightLineCf(op))
-            return fail("control-flow instruction " + std::to_string(i) + " (opcode " + std::to_string(uint32_t(op)) + ") is not straight-line");
+            return why = "control-flow instruction " + std::to_string(i) + " (opcode " + std::to_string(uint32_t(op)) + ") is not straight-line", false;
         if (!IsExec(op))
             continue;
         const CfExec e = DecodeExec(cf);
@@ -2762,15 +2774,15 @@ ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, siz
         {
             const uint32_t* w;
             if (!ReadSlot(words, uint32_t(count), e.address + k, w))
-                return fail("exec " + std::to_string(i) + " addresses slot " + std::to_string(e.address + k) + " past the shader");
+                return why = "exec " + std::to_string(i) + " addresses slot " + std::to_string(e.address + k) + " past the shader", false;
             ops.push_back({IsFetch(e, k), w, e.address + k});
         }
         ended = op == CfOpcode::ExecEnd;
     }
     if (!ended)
-        return fail("no exec_end");
+        return why = "no exec_end", false;
     // The temps each instruction writes (bit per temp); any relative destination fails.
-    std::vector<uint64_t> writes(ops.size(), 0);
+    writes.assign(ops.size(), 0);
     for (size_t n = 0; n < ops.size(); n++)
     {
         const uint32_t* w = ops[n].w;
@@ -2793,12 +2805,12 @@ ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, siz
                 dest = t.destReg, swizzle = t.destSwizzle, relative = t.destRelative;
             }
             else
-                return fail("fetch opcode " + std::to_string(fop) + at + " is not modelled here");
+                return why = "fetch opcode " + std::to_string(fop) + at + " is not modelled here", false;
             bool any = false;
             for (uint32_t c = 0; c < 4; c++)
                 any |= FetchDestSwizzle(swizzle, c) != FetchDestComponent::Keep;
             if (any && relative)
-                return fail("a fetch writes a relatively addressed register" + at);
+                return why = "a fetch writes a relatively addressed register" + at, false;
             if (any)
                 writes[n] |= uint64_t(1) << (dest & 63);
             continue;
@@ -2807,72 +2819,137 @@ ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, siz
         if (!a.isExport && a.vectorMask != 0)
         {
             if (a.vectorDestRelative)
-                return fail("an ALU instruction writes a relatively addressed register" + at);
+                return why = "an ALU instruction writes a relatively addressed register" + at, false;
             writes[n] |= uint64_t(1) << (a.vectorDest & 63);
         }
         if (!a.isExport && ScalarResultMask(a) != 0)
         {
             if (a.scalarDestRelative)
-                return fail("an ALU instruction writes a relatively addressed register" + at);
+                return why = "an ALU instruction writes a relatively addressed register" + at, false;
             writes[n] |= uint64_t(1) << (a.scalarDest & 63);
         }
     }
-    // The one position export.
-    size_t exportAt = ops.size();
+    return true;
+}
+
+// The one instruction exporting to `dest` with a non-empty write (`name` for the messages).
+bool OneExport(const std::vector<ScanOp>& ops, uint32_t dest, const char* name, size_t& exportAt, std::string& why)
+{
+    using namespace ucode;
+    exportAt = ops.size();
     for (size_t n = 0; n < ops.size(); n++)
     {
         if (ops[n].fetch)
             continue;
         const AluInstruction a = DecodeAlu(ops[n].w);
-        if (!a.isExport || a.vectorDest != 62 || (a.vectorMask | a.scalarMask | Constant0Mask(a)) == 0)
+        if (!a.isExport || a.vectorDest != dest || (a.vectorMask | a.scalarMask | Constant0Mask(a)) == 0)
             continue;
         if (exportAt != ops.size())
-            return fail("more than one instruction writes the position (export 62)");
+            return why = "more than one instruction writes " + std::string(name), false;
         exportAt = n;
     }
     if (exportAt == ops.size())
-        return fail("no instruction writes the position (export 62)");
-    const AluInstruction e = DecodeAlu(ops[exportAt].w);
-    const std::string eat = " (slot " + std::to_string(ops[exportAt].slot) + ")";
+        return why = "no instruction writes " + std::string(name), false;
+    return true;
+}
+
+// The export at `op` as the compiler's move of one temp: MAXv(rN, rN), an unpredicated, unclamped xyzw vector write with no scalar
+// write, both sources plain temps with the identity swizzle. `what` names the export in the messages; `temp` is N.
+bool ExportMove(const ScanOp& op, const char* what, uint32_t& temp, std::string& why)
+{
+    using namespace ucode;
+    const AluInstruction e = DecodeAlu(op.w);
+    const std::string eat = " (slot " + std::to_string(op.slot) + ")";
     if (e.vectorOpcode != uint32_t(VectorOpcode::Max))
-        return fail("the position export is vector opcode " + std::to_string(e.vectorOpcode) + ", not MAXv (a move)" + eat);
+        return why = std::string(what) + " is vector opcode " + std::to_string(e.vectorOpcode) + ", not MAXv (a move)" + eat, false;
     if (e.vectorMask != 0xF || e.scalarMask != 0 || e.vectorClamp || e.predicated || e.vectorDestRelative)
-        return fail("the position export is not an unpredicated, unclamped xyzw vector write" + eat);
+        return why = std::string(what) + " is not an unpredicated, unclamped xyzw vector write" + eat, false;
     const AluSource& s1 = e.src[0];
     const AluSource& s2 = e.src[1];
     for (const AluSource* s : {&s1, &s2})
     {
         if (!s->isTemp || s->tempRelative || s->tempAbs || s->negate)
-            return fail("a position export source is not a plain temp (constant, relative, abs or negated)" + eat);
+            return why = "a source of " + std::string(what) + " is not a plain temp (constant, relative, abs or negated)" + eat, false;
         for (uint32_t c = 0; c < 4; c++)
             if (SwizzleComponent(s->swizzle, c) != c)
-                return fail("a position export source is swizzled" + eat);
+                return why = "a source of " + std::string(what) + " is swizzled" + eat, false;
     }
     if (s1.tempIndex != s2.tempIndex)
-        return fail("the position export is max(r" + std::to_string(s1.tempIndex) + ", r" + std::to_string(s2.tempIndex) + "), not a move" + eat);
-    const uint32_t temp = s1.tempIndex;
-    // rN: written exactly once, by the fetch.
-    size_t fetchAt = ops.size();
+        return why = std::string(what) + " is max(r" + std::to_string(s1.tempIndex) + ", r" + std::to_string(s2.tempIndex) + "), not a move" + eat, false;
+    temp = s1.tempIndex;
+    return true;
+}
+
+// The one instruction writing `temp`, before ops[before] (`what` names that instruction in the messages).
+bool OneWriter(const std::vector<ScanOp>& ops, const std::vector<uint64_t>& writes, uint32_t temp, size_t before, const char* what, size_t& at,
+               std::string& why)
+{
+    at = ops.size();
     for (size_t n = 0; n < ops.size(); n++)
         if (writes[n] >> temp & 1)
         {
-            if (fetchAt != ops.size())
-                return fail("r" + std::to_string(temp) + " is written more than once");
-            fetchAt = n;
+            if (at != ops.size())
+                return why = "r" + std::to_string(temp) + " is written more than once", false;
+            at = n;
         }
-    if (fetchAt == ops.size() || fetchAt > exportAt)
-        return fail("r" + std::to_string(temp) + " is not written before the position export");
+    if (at == ops.size() || at > before)
+        return why = "r" + std::to_string(temp) + " is not written before " + std::string(what), false;
+    return true;
+}
+
+// The vertex fetch at ops[at] (a vertex fetch, checked by the caller) as a full fetch of the untouched vertex index: not a mini
+// fetch, not predicated, indexed by r0.x with r0 written by no earlier instruction. `whose` names it in the messages.
+bool FullFetchByVertexIndex(const std::vector<ScanOp>& ops, const std::vector<uint64_t>& writes, size_t at, const std::string& whose, std::string& why)
+{
+    using namespace ucode;
+    const VertexFetch f = DecodeVertexFetch(ops[at].w);
+    const std::string fat = " (slot " + std::to_string(ops[at].slot) + ")";
+    if (f.isMiniFetch || f.predicated)
+        return why = whose + " vertex fetch is a mini fetch or predicated" + fat, false;
+    if (f.srcReg != 0 || f.srcRelative || f.srcSwizzle != 0)
+        return why = whose + " vertex fetch is not indexed by r0.x" + fat, false;
+    for (size_t n = 0; n < at; n++)
+        if (writes[n] & 1)
+            return why = "r0 (the vertex index) is written before " + whose + " vertex fetch" + fat, false;
+    return true;
+}
+
+}  // namespace
+
+// FM4 Recomp: ShaderTranslation::PositionFetch (shader_glsl.h). A syntactic scan of the
+// microcode with ucode.h's decoders (Xenia 67f16c4e315f ucode.h layouts), independent of the GLSL emitter, so
+// that what it accepts is exactly the documented pattern and nothing the emitter would also accept.
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the scan and the export, writer and index checks are the helpers above, shared with
+// AnalyzeInterpolator0Fetch and AnalyzeColorPassThrough; the pattern accepted here is unchanged.
+ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, size_t count, bool pixel)
+{
+    using namespace ucode;
+    ShaderTranslation::PositionFetch r;
+    const auto fail = [&](std::string why) { r = {}; r.why = std::move(why); return r; };
+    if (pixel)
+        return fail("a pixel shader has no position export");
+    std::vector<ScanOp> ops;
+    std::vector<uint64_t> writes;
+    std::string why;
+    if (!ScanStraightLine(words, count, ops, writes, why))
+        return fail(why);
+    // The one position export, a move of rN.
+    size_t exportAt;
+    if (!OneExport(ops, 62, "the position (export 62)", exportAt, why))
+        return fail(why);
+    uint32_t temp;
+    if (!ExportMove(ops[exportAt], "the position export", temp, why))
+        return fail(why);
+    // rN: written exactly once, by the fetch.
+    size_t fetchAt;
+    if (!OneWriter(ops, writes, temp, exportAt, "the position export", fetchAt, why))
+        return fail(why);
     if (!ops[fetchAt].fetch || FetchOpcodeOf(ops[fetchAt].w) != kVertexFetch)
         return fail("r" + std::to_string(temp) + " is written by an ALU or texture instruction, not a vertex fetch");
+    if (!FullFetchByVertexIndex(ops, writes, fetchAt, "the position's", why))
+        return fail(why);
     const VertexFetch f = DecodeVertexFetch(ops[fetchAt].w);
     const std::string fat = " (slot " + std::to_string(ops[fetchAt].slot) + ")";
-    if (f.isMiniFetch || f.predicated)
-        return fail("the position's vertex fetch is a mini fetch or predicated" + fat);
-    if (f.srcReg != 0 || f.srcRelative || f.srcSwizzle != 0)
-        return fail("the position's vertex fetch is not indexed by r0.x" + fat);
-    for (size_t n = 0; n < fetchAt; n++)
-        if (writes[n] & 1)
-            return fail("r0 (the vertex index) is written before the position's vertex fetch" + fat);
     if (f.format != uint32_t(VertexFormat::F32_32_32_FLOAT) && f.format != uint32_t(VertexFormat::F32_32_32_32_FLOAT))
         return fail("the position's vertex fetch has format " + std::to_string(f.format) + " (57 or 38 only)" + fat);
     if (FetchDestSwizzle(f.destSwizzle, 0) != FetchDestComponent::X || FetchDestSwizzle(f.destSwizzle, 1) != FetchDestComponent::Y ||
@@ -2887,6 +2964,117 @@ ShaderTranslation::PositionFetch AnalyzePositionFetch(const uint32_t* words, siz
     r.strideDwords = f.stride;
     r.offsetDwords = uint32_t(f.offset);
     r.format = f.format;
+    return r;
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): ShaderTranslation::interpolator0Fetch (shader_glsl.h). The position's pattern on export 0
+// with a 4-dword element; a mini fetch rides the nearest full fetch before it (Translator::VertexFetch keeps the last full fetch's
+// slot, stride and index for a mini fetch).
+ShaderTranslation::PositionFetch AnalyzeInterpolator0Fetch(const uint32_t* words, size_t count, bool pixel)
+{
+    using namespace ucode;
+    ShaderTranslation::PositionFetch r;
+    const auto fail = [&](std::string why) { r = {}; r.why = std::move(why); return r; };
+    if (pixel)
+        return fail("a pixel shader exports no interpolator");
+    std::vector<ScanOp> ops;
+    std::vector<uint64_t> writes;
+    std::string why;
+    if (!ScanStraightLine(words, count, ops, writes, why))
+        return fail(why);
+    size_t exportAt;
+    if (!OneExport(ops, 0, "interpolator 0 (export 0)", exportAt, why))
+        return fail(why);
+    uint32_t temp;
+    if (!ExportMove(ops[exportAt], "the interpolator 0 export", temp, why))
+        return fail(why);
+    size_t fetchAt;
+    if (!OneWriter(ops, writes, temp, exportAt, "the interpolator 0 export", fetchAt, why))
+        return fail(why);
+    if (!ops[fetchAt].fetch || FetchOpcodeOf(ops[fetchAt].w) != kVertexFetch)
+        return fail("r" + std::to_string(temp) + " is written by an ALU or texture instruction, not a vertex fetch");
+    const VertexFetch f = DecodeVertexFetch(ops[fetchAt].w);
+    const std::string fat = " (slot " + std::to_string(ops[fetchAt].slot) + ")";
+    if (f.predicated)
+        return fail("interpolator 0's vertex fetch is predicated" + fat);
+    // The full fetch that holds the slot, stride and index: this one, or for a mini fetch the nearest full vertex fetch before it.
+    size_t fullAt = fetchAt;
+    if (f.isMiniFetch)
+    {
+        fullAt = ops.size();
+        for (size_t n = fetchAt; n-- > 0;)
+            if (ops[n].fetch && FetchOpcodeOf(ops[n].w) == kVertexFetch && !DecodeVertexFetch(ops[n].w).isMiniFetch)
+            {
+                fullAt = n;
+                break;
+            }
+        if (fullAt == ops.size())
+            return fail("interpolator 0's mini vertex fetch has no full vertex fetch before it" + fat);
+    }
+    if (!FullFetchByVertexIndex(ops, writes, fullAt, "interpolator 0's", why))
+        return fail(why);
+    const VertexFetch full = DecodeVertexFetch(ops[fullAt].w);
+    if (f.format != uint32_t(VertexFormat::F32_32_32_32_FLOAT))
+        return fail("interpolator 0's vertex fetch has format " + std::to_string(f.format) + " (38 only)" + fat);
+    if (FetchDestSwizzle(f.destSwizzle, 0) != FetchDestComponent::X || FetchDestSwizzle(f.destSwizzle, 1) != FetchDestComponent::Y ||
+        FetchDestSwizzle(f.destSwizzle, 2) != FetchDestComponent::Z || FetchDestSwizzle(f.destSwizzle, 3) != FetchDestComponent::W)
+        return fail("interpolator 0's vertex fetch swizzle is not x y z w" + fat);
+    if (f.expAdjust != 0)
+        return fail("interpolator 0's vertex fetch has exp_adjust " + std::to_string(f.expAdjust) + fat);
+    if (full.stride == 0 || f.offset < 0 || uint32_t(f.offset) + 4 > full.stride)
+        return fail("interpolator 0's element (offset " + std::to_string(f.offset) + ", 4 dwords) does not fit stride " + std::to_string(full.stride) + fat);
+    r.valid = true;
+    r.slot = FetchConstantSlot(full);
+    r.strideDwords = full.stride;
+    r.offsetDwords = uint32_t(f.offset);
+    r.format = f.format;
+    return r;
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): ShaderTranslation::colorPassThrough (shader_glsl.h).
+ShaderTranslation::ColorPassThrough AnalyzeColorPassThrough(const uint32_t* words, size_t count, bool pixel)
+{
+    using namespace ucode;
+    ShaderTranslation::ColorPassThrough r;
+    const auto fail = [&](std::string why) { r = {}; r.why = std::move(why); return r; };
+    if (!pixel)
+        return fail("a vertex shader exports no colour");
+    std::vector<ScanOp> ops;
+    std::vector<uint64_t> writes;
+    std::string why;
+    if (!ScanStraightLine(words, count, ops, writes, why))
+        return fail(why);
+    // No fetch, no kill, and exactly one export: colour 0.
+    size_t exportAt = ops.size();
+    for (size_t n = 0; n < ops.size(); n++)
+    {
+        const std::string at = " (slot " + std::to_string(ops[n].slot) + ")";
+        if (ops[n].fetch)
+            return fail("a fetch instruction" + at);
+        const AluInstruction a = DecodeAlu(ops[n].w);
+        if ((a.vectorOpcode >= uint32_t(VectorOpcode::KillEq) && a.vectorOpcode <= uint32_t(VectorOpcode::KillNe)) ||
+            (a.scalarOpcode >= uint32_t(ScalarOpcode::KillsEq) && a.scalarOpcode <= uint32_t(ScalarOpcode::KillsOne)))
+            return fail("a kill instruction" + at);
+        if (!a.isExport || (a.vectorMask | a.scalarMask | Constant0Mask(a)) == 0)
+            continue;
+        if (a.vectorDest != 0)
+            return fail("an export to register " + std::to_string(a.vectorDest) + ", not colour 0" + at);
+        if (exportAt != ops.size())
+            return fail("more than one instruction writes colour 0 (export 0)");
+        exportAt = n;
+    }
+    if (exportAt == ops.size())
+        return fail("no instruction writes colour 0 (export 0)");
+    uint32_t temp;
+    if (!ExportMove(ops[exportAt], "the colour 0 export", temp, why))
+        return fail(why);
+    for (size_t n = 0; n < ops.size(); n++)
+        if (writes[n] >> temp & 1)
+            return fail("r" + std::to_string(temp) + " is written (slot " + std::to_string(ops[n].slot) + "): not interpolator " + std::to_string(temp) + " as preloaded");
+    if (temp >= 16)
+        return fail("r" + std::to_string(temp) + " is not an interpolator register (r0-r15)");
+    r.valid = true;
+    r.interpolator = temp;
     return r;
 }
 
@@ -2931,6 +3119,8 @@ bool TranslateShader(const uint32_t* words, size_t count, bool pixel, ShaderTran
     }
     emit.Finish(analyses, out);
     out.positionFetch = AnalyzePositionFetch(words, count, pixel);
+    out.interpolator0Fetch = AnalyzeInterpolator0Fetch(words, count, pixel);  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS)
+    out.colorPassThrough = AnalyzeColorPassThrough(words, count, pixel);
     return true;
 }
 

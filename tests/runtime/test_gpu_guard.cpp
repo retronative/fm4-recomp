@@ -16,6 +16,7 @@
 #include "capture_keep.h"
 #include "front_buffer.h"
 #include "gpu_guard.h"
+#include "async_submit.h"
 #include "png.h"
 #include <algorithm>
 #include <cstdio>
@@ -467,6 +468,65 @@ void TestPng()
 
 }  // namespace
 
+
+// FM4_ASYNC_SUBMIT (async_submit.h): the worker submits in queue order; a wait or status query first awaits the worker; a failed
+// real submit surfaces as that VkResult at the fence wait, so the guard strands the slot, and nothing is submitted after it.
+struct Ordered final : SubmissionBackend<char>
+{
+    std::vector<uint32_t> order;
+    int failAtSubmit = -1, submits = 0;  // the n-th real Submit (0-based) fails with -4 (VK_ERROR_DEVICE_LOST)
+    std::string destroyed;
+    int Submit(uint32_t s) override
+    {
+        const int n = submits++;
+        if (n == failAtSubmit)
+            return -4;
+        order.push_back(s);
+        return 0;
+    }
+    int WaitFence(uint32_t, uint64_t) override { return 0; }
+    int FenceStatus(uint32_t) override { return 0; }
+    void Destroy(char& r) override { destroyed += r; }
+};
+void TestAsyncSubmit()
+{
+    const std::string flag = Path("stop_absent_async");
+    {
+        Ordered real;
+        gpu::SubmissionGate gate;
+        AsyncSubmitBackend<char> async(real, 4, nullptr);
+        GpuGuard<char, 4> g(async, gate, flag, k2s);
+        for (uint32_t s = 0; s < 4; s++)
+            Expect(g.Hold(s, char('a' + s)), "async: a resource held per slot");
+        for (uint32_t s = 0; s < 4; s++)
+            Expect(bool(g.Submit(s)), "async: the guard accepts the queued submit");
+        for (uint32_t s = 0; s < 4; s++)
+            Expect(bool(g.Retire(s)), "async: the retire awaits the worker, then the fence");
+        Expect(real.order == std::vector<uint32_t>{0, 1, 2, 3}, "async: the real submits in queue order");
+        Expect(real.destroyed == "abcd", "async: resources destroyed after confirmed completions, in order");
+        Expect(async.Submits() == 4 && async.Failed() == 0, "async: four submits, no failure");
+        async.Stop();
+        Expect(async.FenceStatus(0) == 0, "async: a status query after the worker stopped reaches the real backend");
+    }
+    {
+        Ordered real;
+        real.failAtSubmit = 1;
+        gpu::SubmissionGate gate;
+        AsyncSubmitBackend<char> async(real, 4, nullptr);
+        GpuGuard<char, 4> g(async, gate, flag, k2s);
+        for (uint32_t s = 0; s < 3; s++)
+            g.Hold(s, char('a' + s));
+        Expect(bool(g.Submit(0)) && bool(g.Submit(1)) && bool(g.Submit(2)), "async: the guard cannot see the failure at submit time");
+        Expect(bool(g.Retire(0)), "async: slot 0 retires");
+        const Verdict r1 = g.Retire(1);
+        Expect(!r1 && r1.stranded, "async: the failed real submit strands slot 1 at its retire");
+        Expect(async.Failed() == -4, "async: the failure is remembered");
+        async.Stop();
+        Expect(real.order == std::vector<uint32_t>{0}, "async: nothing reached the queue after the failure (slot 2 refused)");
+        Expect(async.FenceStatus(2) == -4, "async: slot 2 reports the failure, not VK_NOT_READY");
+        Expect(!bool(g.Retire(2)), "async control: slot 2 is not confirmed (stranded or no longer awaited)");
+    }
+}
 int main(int argc, char** argv)
 {
     if (argc != 2)
@@ -491,6 +551,7 @@ int main(int argc, char** argv)
     TestDetileProperties();
     TestTiledOffsetAgainstXenia();
     TestPng();
+    TestAsyncSubmit();
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

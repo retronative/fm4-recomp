@@ -155,4 +155,41 @@ struct OverwriteRect
 OverwriteRect FindOverwriteRect(const DrawState& d, const shader::ShaderTranslation& vs, bool psKills, const uint32_t* window, size_t windowDwords,
                                 uint32_t endian);
 
+// ---- Clear-class draws (FM4 Recomp, M7 GPU cost, FM4_CLEAR_DRAWS) ---------------------------------------------------------
+
+// An overwriting draw (FindOverwriteRect) whose every bound attachment is written with one constant the host can read without
+// running the shaders: the renderer hands it to the EDRAM unit as a pending clear of its targets (render_hooks.h ClearRequest, the
+// deferred resolve clears' path) instead of recording a one-draw render pass. The values are what the host draw itself would write,
+// so the deferred clear stands in for the draw.
+// Fail closed: `ok` only when all of these hold, else `why` names the first that does not:
+//   - FindOverwriteRect proved the rectangle (`o`); the colour attachment is bound (colour mask != 0) only when it proved `color`
+//     and the depth attachment (z or stencil test on) only when it proved `depth`; no texture slot is bound; no pixel parameter
+//     generation (the pixel shader's register would be xe_param_gen, not the interpolator);
+//   - on a multisampled target the rectangle's edges (the three vertices' screen x and y) are whole pixels, so the draw writes every
+//     sample of the pixels it covers, as vkCmdClearAttachments does (at 1x the pixel-centre rule is exact and fractional edges pass);
+//   - depth: the three vertices' z (the position fetch's third dword) are one finite value, not -0; PA_CL_CLIP_CNTL clip_disable
+//     (the pipeline's depth clamp with the depth range 0..1) with the z viewport scale 1 and offset 0, so the fold is the identity
+//     (draw_state.h FoldViewport; xe_fixup's w is the fetch's constant 1) and the depth written is clamp(z, 0, 1); no polygon offset;
+//     the stencil written is the front reference (REPLACE, write mask 0xFF), equal to the back reference when back-face state is on;
+//   - colour: the pixel shader passes interpolator 0 through (shader_glsl.h ShaderTranslation::colorPassThrough) and the vertex
+//     shader exports interpolator 0 from a 4-dword vertex fetch of the position's slot (interpolator0Fetch); the three vertices' four
+//     dwords are bitwise equal and finite; the target's storage format is 0 or 2 (the attachment's UNORM conversion clamps to [0, 1]:
+//     applied here too, so the value does not depend on whether the clear path clamps) or 3 (shader_glsl.h XE_COLOR0_7E3: rgb to
+//     [0, 31.875], alpha to [0, 1], NaN and negatives to 0, applied here). Format 1 (the PWL gamma encode), 4 and 14 (cleared
+//     through the uint transfer view) and the rest are refused.
+// `rect` is FindOverwriteRect's cut to `targetHeight` rows: the rows the bind claims and the host scissor stops at (renderer.cpp
+// scissorBottom), so the clear touches nothing the draw could not.
+struct ClearDraw
+{
+    bool ok = false;
+    bool color = false, depth = false;  // the attachments the draw binds; the clear writes exactly these
+    edram::Rect rect;
+    float rgba[4] = {0, 0, 0, 0};
+    float depthValue = 0;
+    uint32_t stencil = 0;
+    std::string why;
+};
+ClearDraw FindClearDraw(const DrawState& d, const OverwriteRect& o, const shader::ShaderTranslation& vs, const shader::ShaderTranslation& ps,
+                        const uint32_t* window, size_t windowDwords, uint32_t endian, uint32_t targetHeight);
+
 }  // namespace runtime::video

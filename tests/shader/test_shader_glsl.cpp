@@ -833,6 +833,13 @@ void TestClearVs()
     // Out-of-range fetches are flagged for the host, never read past the slot.
     CHECK(Has(g, "layout(std430, set = 0, binding = 5) buffer XeErrors { uint xe_error; };"));
     CHECK(Has(g, "if (!inside || at >= size)") && Has(g, "atomicOr(xe_error, 1u);"));
+    // FM4 Recomp (M7 GPU cost): the host's XE_FETCH_UNCHECKED variant leaves the flag out (the bounds test and the 0 read stay) and compiles.
+    CHECK(Has(g, "    {\n#ifndef XE_FETCH_UNCHECKED\n        atomicOr(xe_error, 1u);\n#endif\n        return 0u;\n    }\n"));
+    {
+        std::string unchecked = g;
+        unchecked.insert(unchecked.find('\n') + 1, "#define XE_FETCH_UNCHECKED 1\n");
+        CHECK(Compiles(unchecked, false) && Compiles(g, false));
+    }
     // MAX(r, r) is a move.
     CHECK(Has(g, "precise vec4 xe_v0 = r0.xyzw;") && Has(g, "xe_interp_out[0].w = xe_v0.w;"));
     CHECK(Has(g, "precise vec4 xe_v1 = r1.xyzw;") && Has(g, "xe_position_out.x = xe_v1.x;"));
@@ -854,6 +861,27 @@ void TestClearVs()
     VFetch rounded = ClearFull();
     rounded.rounded = true;
     CHECK(Translate(ClearVs(rounded, ClearMini()), false, t) && Has(t.glsl, "int(floor(r0.x + 0.5))"));
+
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS; shader_glsl.h PositionFetch, interpolator0Fetch, colorPassThrough): the position is the
+    // full fetch (slot 0, stride 7, offset 0, format 57); interpolator 0 is the mini fetch's element (offset 3, format 38) under the
+    // full fetch's slot and stride; a vertex shader has no colour pass-through.
+    CHECK(Translate(ClearVs(ClearFull(), ClearMini()), false, t));
+    CHECK(t.positionFetch.valid && t.positionFetch.slot == 0 && t.positionFetch.strideDwords == 7 && t.positionFetch.offsetDwords == 0 && t.positionFetch.format == 57);
+    CHECK(t.interpolator0Fetch.valid && t.interpolator0Fetch.slot == 0 && t.interpolator0Fetch.strideDwords == 7 && t.interpolator0Fetch.offsetDwords == 3 &&
+          t.interpolator0Fetch.format == 38);
+    CONTROL(t.colorPassThrough.valid);
+    {
+        // Controls: a three-component colour element (format 57, swizzle x y z 1) and a four-component fetch whose swizzle is not x y z w
+        // are no colour fetch; the position proof is unaffected.
+        ShaderTranslation u;
+        VFetch mini = ClearMini();
+        mini.format = 57, mini.dswz = DSwz("xyz1");
+        CHECK(Translate(ClearVs(ClearFull(), mini), false, u) && u.positionFetch.valid);
+        CONTROL(u.interpolator0Fetch.valid);
+        mini = ClearMini(), mini.dswz = DSwz("xyz1");
+        CHECK(Translate(ClearVs(ClearFull(), mini), false, u) && u.positionFetch.valid);
+        CONTROL(u.interpolator0Fetch.valid);
+    }
 }
 
 void TestColourPs()
@@ -866,12 +894,41 @@ void TestColourPs()
     CHECK(Has(g, "vec4 r0 = xe_interp_0;") && Has(g, "xe_color0.z = xe_v0.z;"));
     CHECK(Has(g, "layout(std140, set = 0, binding = 3) uniform XePsConstants { vec4 xe_c[256]; };"));
     CHECK(Compiles(g, true));
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS; shader_glsl.h colorPassThrough): colour 0 = r0 = interpolator 0, nothing else.
+    CHECK(t.colorPassThrough.valid && t.colorPassThrough.interpolator == 0);
+    CONTROL(t.positionFetch.valid);
+    CONTROL(t.interpolator0Fetch.valid);
 
     // A PS reading r2 before writing it receives interpolators 0-2.
     Alu e;
     e.exp = true, e.vdest = 0, e.vmask = 0xF, e.s1 = T(2), e.s2 = T(2), e.s3 = T(0);
     CHECK(Translate(ColourPs(e), true, t) && t.interpolatorCount == 3 && Has(t.glsl, "vec4 r2 = xe_interp_2;"));
     CHECK(Compiles(t.glsl, true));
+    CHECK(t.colorPassThrough.valid && t.colorPassThrough.interpolator == 2);  // FM4_CLEAR_DRAWS: the pass-through of interpolator 2
+    {
+        // FM4_CLEAR_DRAWS controls, on the words (the translator refuses an oDepth export, so the analysis is called directly): a second
+        // export (oDepth, 61) before the colour export; a kill (KILLGTv, 25) before it; a textured PS (a fetch instruction).
+        std::vector<uint32_t> two;
+        PackCf(two, AllocCf(2), ExecCf(1, 2, 0, true));
+        Alu depth;
+        depth.exp = true, depth.vdest = 61, depth.vmask = 0x1, depth.s1 = T(0), depth.s2 = T(0), depth.s3 = T(0);
+        Put(two, depth);
+        Alu colour;
+        colour.exp = true, colour.vdest = 0, colour.vmask = 0xF, colour.s1 = T(0), colour.s2 = T(0), colour.s3 = T(0);
+        Put(two, colour);
+        CONTROL(AnalyzeColorPassThrough(two.data(), two.size(), true).valid);
+        std::vector<uint32_t> killed;
+        PackCf(killed, AllocCf(2), ExecCf(1, 2, 0, true));
+        Alu kill;
+        kill.vop = 25, kill.vmask = 0, kill.s1 = T(0), kill.s2 = C(0), kill.s3 = T(0);
+        Put(killed, kill);
+        Put(killed, colour);
+        CONTROL(AnalyzeColorPassThrough(killed.data(), killed.size(), true).valid);
+        const std::vector<uint32_t> alone = ColourPs();
+        CHECK(AnalyzeColorPassThrough(alone.data(), alone.size(), true).valid);  // the same export alone passes
+        const std::vector<uint32_t> textured = TexturedPs();
+        CONTROL(AnalyzeColorPassThrough(textured.data(), textured.size(), true).valid);
+    }
 
     // MAX of different operands keeps a >= b ? a : b, per component; clamp to [0, 1], NaN -> 0;
     // negate and the constant abs flag.
@@ -881,9 +938,13 @@ void TestColourPs()
     m.s1.neg = true;
     CHECK(Translate(ColourPs(m), true, t));
     CHECK(Has(t.glsl, "precise vec4 xe_v0 = xe_sat(xe_max((-r0.xyzw), abs(xe_c[7]).wzyx));"));
+    // FM4 Recomp (M7 CPU cost): c7 is the highest constant read by literal index, so the host uploads c0-c7 (constantCount 8).
+    CHECK(t.constantCount == 8);
+    CONTROL(t.constantCount == 256);
     CHECK(Has(t.glsl, "vec4 xe_max(vec4 a, vec4 b) { return mix(b, a, greaterThanEqual(a, b)); }"));
     CHECK(Has(t.glsl, "vec4 xe_sat(vec4 x) { return mix(vec4(0.0), min(x, vec4(1.0)), greaterThanEqual(x, vec4(0.0))); }"));
     CHECK(Compiles(t.glsl, true));
+    CONTROL(t.colorPassThrough.valid);  // FM4_CLEAR_DRAWS: a clamped max of different operands is no pass-through
 }
 
 void TestQuadsVs()
@@ -921,6 +982,9 @@ void TestQuadsVs()
     CHECK(Has(g, "precise vec4 xe_v4 = (r0.wwww + xe_c[1].wwww);") && Has(g, "xe_position_out.y = xe_v4.y;"));
     CHECK(Has(g, "precise float xe_s4 = (xe_c[0].w + r0.y);") && Has(g, "xe_position_out.x = xe_s4;"));
     CHECK(Has(g, "precise float xe_s5 = (xe_c[2].w + r0.x);") && Has(g, "xe_position_out.z = xe_s5;"));
+    // FM4 Recomp (M7 CPU cost): the program reads c0-c3 and c255 (the MULv below) by literal index: the host uploads all 256 float4s.
+    CHECK(t.constantCount == 256);
+    CONTROL(t.constantCount == 4);
     CHECK(Has(g, "xe_position_out.w = xe_v5.w;"));
     // MULv with the Direct3D 9 zero rule.
     CHECK(Has(g, "precise vec4 xe_v6 = xe_mul(r1.xxxy, xe_c[255].xxxy);") && Has(g, "r1.w = xe_v6.w;"));
@@ -3016,13 +3080,14 @@ void TestAddressRegister()
 {
     ShaderTranslation t;
     CHECK(Translate(IndexedPs(), true, t));
-    const std::string write = "    xe_a0 = xe_maxa(r0.w);\n", read5 = "xe_c[clamp(xe_a0 + 5, 0, 255)].xyzw",
+    const std::string write = "    xe_a0 = xe_maxa(r0.w);\n", read5 = "xe_c[clamp(xe_a0 + 5, 0, 255)].xyzw",  // (constantCount 256: checked below)
                       read7 = "xe_c[clamp(xe_a0 + 7, 0, 255)].xyzw";
     CHECK(Has(t.glsl, "    int xe_a0 = 0;\n") && Has(t.glsl, write) && Has(t.glsl, "xe_mul(r0.xyzw, " + read5 + ")") &&
           Has(t.glsl, read7) && Has(t.glsl, "xe_c[2].xyzw") &&
           Has(t.glsl, "int xe_maxa(float a)\n{\n    precise float t = floor(a + 0.5);\n"
                       "    return isnan(t) ? -256 : int(clamp(t, -256.0, 255.0));\n}\n") &&
           t.glsl.find(write) < t.glsl.find(read5) && Compiles(t.glsl, true));
+    CHECK(t.constantCount == 256);  // FM4 Recomp: a relatively addressed constant read: the host uploads all 256 float4s
     CONTROL(Has(t.glsl, "xe_c[clamp(xe_a0 + 2, 0, 255)]"));  // src1 of slot 4 is absolute (const_0 clear)
     CONTROL(Has(t.glsl, "xe_c[5]"));                         // slot 3's constant is not absolute
     {
@@ -3603,6 +3668,13 @@ int main(int argc, char** argv)
         if (!why.empty())
             std::fprintf(stderr, "  %s\n", why.c_str());
         CHECK(Translate(ComputedIndexVs(true), false, ct) && ct.vertexFetchComputedIndex == std::vector<uint8_t>{0});
+        // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): interpolator 0's mini fetch rides the full fetch before it: a plain fetch when that one is indexed
+        // by the untouched r0.x, not when it is indexed by the computed r1.x; the position (r1, written by the copy and the fetch) is no
+        // plain fetch either way.
+        CHECK(ct.interpolator0Fetch.valid && ct.interpolator0Fetch.slot == 0 && ct.interpolator0Fetch.strideDwords == 7 && ct.interpolator0Fetch.offsetDwords == 3);
+        CONTROL(ct.positionFetch.valid);
+        CHECK(Translate(ComputedIndexVs(false), false, ct));
+        CONTROL(ct.interpolator0Fetch.valid);
     }
     TestVertexFormats();
     TestMiniFetchScope();

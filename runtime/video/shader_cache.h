@@ -6,7 +6,7 @@
 // shader module. Two levels, because the two inputs arrive at different times:
 //   1. Load (every IM_LOAD / IM_LOAD_IMMEDIATE): the hash (kernel/shader_hash.h: the census recipe,
 //      so logs, dumps and census rows name one shader the same way) is a map key; a miss translates
-//      and tags the class (shader_class.h); a hit costs the hash alone. The ~18 loads per frame are
+//      and tags the class (shader_class.h); a hit costs the hash alone (or, with `memo`, a memcmp). The ~18 loads per frame are
 //      mostly re-loads of the same hash, so this is cheap, and a refused shader stops at its load,
 //      before any draw, naming the hash (the census does the same offline). Translation needs only
 //      the microcode, so nothing of the draw state is guessed here.
@@ -117,11 +117,15 @@ struct CachedShader
     runtime::shader::ShaderTranslation t;  // the GLSL and the reflection (texture slots, fetch slots, bools, loops)
     ShaderClass cls = kClassStraight;
     std::vector<std::unique_ptr<ShaderVariant>> variants;  // stable addresses: pipelines keep pointers
+    // FM4 Recomp (M7 CPU cost): the program's words as loaded (host order), kept only with the load memo (ShaderCache `memo`):
+    // a later load of the same (type, size) is answered by comparing its words with these, without hashing them.
+    std::vector<uint32_t> microcode;
 };
 
 struct ShaderCacheStats
 {
-    uint64_t loads = 0, hits = 0, translations = 0, refusals = 0, compiles = 0, compileFailures = 0;
+    // `hits`: loads answered by a cached shader (the memo's and the hash map's); `memoHits`: those the memo answered (no hash).
+    uint64_t loads = 0, hits = 0, memoHits = 0, translations = 0, refusals = 0, compiles = 0, compileFailures = 0;
 };
 
 class ShaderCache
@@ -133,7 +137,12 @@ public:
     // <vs|ps>_<hash>.bin (kernel/cp_trace.cpp), so a run's evidence dir can feed the census.
     // `maxVariants`: variants per shader before Variant refuses (XE_ALPHA_REF bakes a float into the
     // source: a per-frame reference would otherwise grow without bound).
-    ShaderCache(SpirvCompiler& compiler, const char* dumpDir, size_t maxVariants = kDefaultMaxVariants);
+    // `memo` (FM4 Recomp, M7 CPU cost; opt-in FM4_SHADER_MEMO=1 in the renderer): Load first compares the words with the
+    // translated shaders of the same type and size (CachedShader::microcode, memcmp) and answers an exact match without hashing.
+    // Exact, so never less safe than the hash path: a match is byte-identical to the program it names; a miss hashes as before.
+    // The race loads ~2,600 shaders of ~150 words a frame, re-loads of ~300 programs, and the hash's
+    // serial multiply chain was 2.6 % of the command processor's thread.
+    ShaderCache(SpirvCompiler& compiler, const char* dumpDir, size_t maxVariants = kDefaultMaxVariants, bool memo = false);
 
     static constexpr size_t kDefaultMaxVariants = 64, kDumpCap = 4096;
 
@@ -153,6 +162,7 @@ public:
 
     const ShaderCacheStats& Stats() const { return stats_; }
     size_t Size() const { return shaders_.size(); }
+    bool Memo() const { return memo_; }
 
 private:
     bool Dump(const std::string& name, const std::string& text);
@@ -161,7 +171,9 @@ private:
     std::string dumpDir_;
     size_t dumped_ = 0;
     const size_t maxVariants_;
+    const bool memo_;
     std::unordered_map<uint64_t, std::unique_ptr<CachedShader>> shaders_;  // by hash
+    std::unordered_map<uint64_t, std::vector<const CachedShader*>> bySize_;  // memo: type << 32 | words -> the translated shaders of that size
     std::unordered_map<uint64_t, std::string> refused_;                    // hash -> the translator's reason
     std::unordered_map<uint64_t, std::string> failedVariants_;             // hash ^ variant id -> the compiler's reason
     const CachedShader* current_[2] = {nullptr, nullptr};
