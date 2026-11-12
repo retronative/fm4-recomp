@@ -351,11 +351,14 @@ public:
         allocations_++;
         return true;
     }
-    void NewPart(uint64_t minFree)
+    // FM4 Recomp (M7, vertex reuse across submissions): returns whether a new lap started (the swap line's "ring laps").
+    bool NewPart(uint64_t minFree)
     {
-        if (capacity_ - used_ < minFree)
+        const bool lapped = capacity_ - used_ < minFree;
+        if (lapped)
             lap_++, used_ = 0;
         partStart_ = used_, allocations_ = 0, resets_++;
+        return lapped;
     }
     void Reset() { used_ = 0, lap_ = 0, partStart_ = 0, allocations_ = 0, resets_++; }
     uint64_t Available() const { return capacity_ - used_; }

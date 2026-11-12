@@ -176,8 +176,14 @@ fi
 if [ "$RENDERER" != headless ] && [ "$VALIDATION" = off ]; then
   ICD=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
   [ -f "$ICD" ] || { echo "gpu_run: the MoltenVK ICD $ICD is missing" >&2; exit 1; }
-  [ "$RENDERER" != window ] || { echo "gpu_run: GPU_RUN_VALIDATION_OFF is not supported with window" >&2; exit 2; }
   export VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer
+  # FM4 Recomp: normal windowed gameplay runs without Vulkan or Metal API validation:
+  # a window without validation, SDL on the same loader as the validated path below.
+  if [ "$RENDERER" = window ]; then
+    LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib
+    otool -L "$BIN" | grep -qF "$LOADER" || { echo "gpu_run: fm4recomp does not link $LOADER" >&2; exit 1; }
+    export SDL_VULKAN_LIBRARY="$LOADER"
+  fi
   shasum -a 256 "$ICD" | tee -a "$OUT/binary.sha256"
   echo "validation: OFF (no layer, no Metal API validation); approval: $GPU_RUN_VALIDATION_OFF" | tee "$OUT/validation.txt"
 elif [ "$RENDERER" != headless ]; then

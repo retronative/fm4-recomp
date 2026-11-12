@@ -153,6 +153,12 @@ void TestFormatsAndDescriptions()
         Expect(block[0] == 0x00 && block[1] == 0x3C && block[2] == 0x00 && block[3] == 0x40 && block[4] == 0x00 && block[5] == 0xC0,
                "k_16_16_16_16_FLOAT 8in16: each halfword's bytes exchanged (host half 1.0, 2.0, -2.0)");
     }
+    // FM4 Recomp (alpha): k_16_16_16_16_EXPAND (xenos.h:546, 29) -> R16G16B16A16_SFLOAT (97), RGBA, 64bpb load
+    // (vulkan_texture_cache.cc:243-247), 64 bits a texel (texture_info_formats.inl:30).
+    Expect(HostFormatFor(29, h) && h.vkFormat == 97 && h.formatSwizzle == kSwizzleRGBA && !h.blockCompressed && h.signIgnored && h.floatData &&
+               BytesPerBlock(GetFormatInfo(29)) == 8,
+           "host format: k_16_16_16_16_EXPAND -> R16G16B16A16_SFLOAT (97), RGBA, float, 8-byte blocks (:243-247)");
+    Expect(!HostFormatFor(27, h) && !HostFormatFor(28, h), "CONTROL: k_16_EXPAND (27) and k_16_16_EXPAND (28) are not mapped (not observed)");
     Expect(!HostFormatFor(26, h) && !HostFormatFor(33, h), "CONTROL: k_16_16_16_16 (26) and k_32_32_FLOAT (33) still have no host mapping");
     Expect(!HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
            "CONTROL: 5_6_5 and 2_10_10_10 have no host mapping yet");

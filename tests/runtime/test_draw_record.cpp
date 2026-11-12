@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace runtime::video;
@@ -212,6 +213,16 @@ void TestVariants()
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok &&
                p.lines == std::vector<std::string>{"XE_TEXTURE_0_GAMMA", "XE_TEXTURE_0_LOD_BIAS -0.5", "XE_TEXTURE_0_SCALE ldexp(1.0, -2)"},
            "exp_adjust -2 and lod_bias -16: SCALE ldexp(1.0, -2), LOD_BIAS -0.5");
+    // FM4 Recomp (the rectangular car shadow): a signed-integer k_16_16 fetch (format 25, number format 1) reads the int16 itself:
+    // its R16G16_SNORM view (int16 / 32767) scaled by 32767; with exp_adjust 3 also 2^3.
+    d = Ui(), d.textureSlots[0].gamma = false, d.textureSlots[0].format = 25, d.textureSlots[0].numFormat = 1;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_SCALE 32767.0 * ldexp(1.0, 0)"},
+           "signed-integer k_16_16: SCALE 32767.0 * ldexp(1.0, 0)");
+    d.textureSlots[0].expAdjust = 3;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_TEXTURE_0_SCALE 32767.0 * ldexp(1.0, 3)"},
+           "signed-integer k_16_16 with exp_adjust 3: SCALE 32767.0 * ldexp(1.0, 3)");
+    d = Ui(), d.textureSlots[0].gamma = false, d.textureSlots[0].format = 25, d.textureSlots[0].numFormat = 0;
+    Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines.empty(), "CONTROL: a fraction k_16_16 fetch gets no integer scale");
     d = Ui(), d.alphaTest.enabled = true, d.alphaTest.func = 4, d.alphaTest.ref = 0.5f;
     Expect(VariantsFromDrawState(d, uvs, ups, v, p).ok && p.lines == std::vector<std::string>{"XE_ALPHA_REF 0.5", "XE_ALPHA_TEST 4", "XE_TEXTURE_0_GAMMA"},
            "alpha test func 4 ref 0.5");
@@ -275,6 +286,143 @@ void TestVariants()
                "a PS reading 3 interpolators of a VS exporting 1: XE_PS_INTERPOLATORS 3");
         Expect(VariantsFromDrawState(Ui(), uvs, ups, v, p).ok && v.lines.empty(), "equal interpolator counts: no XE_PS_INTERPOLATORS");
     }
+}
+
+// FM4 Recomp (M7 CPU cost, FM4_VARIANT_MEMO; draw_record.h VariantMemoKeyFor / VariantMemo). The memo is sound when every input of
+// VariantsFromDrawState is in the key: for each input, a change whose define text differs (written by hand, from the define rules
+// in draw_record.h and the checks of TestVariants above) must give another key; a change of a field VariantsFromDrawState does not
+// read (the defines written by hand stay the base's) keeps the key, so such draws hit. The shader objects stand for the pair.
+void TestVariantMemo()
+{
+    const CachedShader uvs = Vs({95}), ups = Ps({0});
+    const CachedShader both = Vs({95}, {0});  // a VS that lists slot 0 too: XE_TEXTURE_0_GAMMA on the VS
+    CachedShader ps3 = Ps({0});
+    ps3.t.interpolatorCount = 3;  // XE_PS_INTERPOLATORS 3 on the VS
+    VariantMemoKey base, k;
+    Expect(VariantMemoKeyFor(Ui(), uvs, ups, false, base), "variant memo: the UI draw is keyed");
+    Expect(VariantMemoKeyFor(Ui(), uvs, ups, false, k) && k == base && VariantMemoKeyHash{}(k) == VariantMemoKeyHash{}(base),
+           "variant memo: the same draw gives the same key and hash");
+    ShaderVariantDefines v, p;
+    const auto defines = [&](const DrawState& d, const CachedShader& vs, const CachedShader& ps) {
+        v.lines.clear(), p.lines.clear();
+        return VariantsFromDrawState(d, vs, ps, v, p).ok;
+    };
+    const auto keyOf = [&](const DrawState& d, const CachedShader& vs, const CachedShader& ps, bool unchecked) {
+        VariantMemoKey out;
+        if (!VariantMemoKeyFor(d, vs, ps, unchecked, out))
+            out.count = 0;
+        return out;
+    };
+    const std::vector<std::string> gamma{"XE_TEXTURE_0_GAMMA"};
+
+    // Inputs VariantsFromDrawState reads: each changed once; the expected defines by hand; the key must differ.
+    struct Case
+    {
+        const char* name;
+        DrawState d;
+        std::vector<std::string> ps;  // the PS defines by hand
+    };
+    std::vector<Case> cases;
+    DrawState d = Ui();
+    d.textureSlots[0].gamma = false;
+    cases.push_back({"variant memo: gamma off (no define) is keyed", d, {}});
+    d = Ui(), d.textureSlots[0].gamma = false, d.textureSlots[0].biasedMask = 7;
+    cases.push_back({"variant memo: biasedMask 7 is keyed", d, {"XE_TEXTURE_0_BIASED bvec4(true, true, true, false)"}});
+    d = Ui(), d.textureSlots[0].expAdjust = -2;
+    cases.push_back({"variant memo: exp_adjust -2 is keyed", d, {"XE_TEXTURE_0_GAMMA", "XE_TEXTURE_0_SCALE ldexp(1.0, -2)"}});
+    d = Ui(), d.textureSlots[0].lodBias = -16;
+    cases.push_back({"variant memo: lod_bias -16 is keyed", d, {"XE_TEXTURE_0_GAMMA", "XE_TEXTURE_0_LOD_BIAS -0.5"}});
+    d = Ui(), d.textureSlots[0].gamma = false, d.textureSlots[0].format = 25, d.textureSlots[0].numFormat = 1;
+    cases.push_back({"variant memo: the signed-integer k_16_16 fetch is keyed", d, {"XE_TEXTURE_0_SCALE 32767.0 * ldexp(1.0, 0)"}});
+    d = Ui(), d.textureSlots[0].slot = 1;  // the PS lists slot 0 only: no define for slot 1
+    cases.push_back({"variant memo: the texture slot number is keyed", d, {}});
+    d = Ui(), d.alphaTest.enabled = true, d.alphaTest.func = 4, d.alphaTest.ref = 0.5f;
+    cases.push_back({"variant memo: the alpha test is keyed", d, {"XE_ALPHA_REF 0.5", "XE_ALPHA_TEST 4", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.alphaTest.enabled = true, d.alphaTest.func = 4, d.alphaTest.ref = 0.25f;
+    cases.push_back({"variant memo: the alpha reference alone is keyed (0.25 vs 0.5)", d, {"XE_ALPHA_REF 0.25", "XE_ALPHA_TEST 4", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.alphaTest.enabled = true, d.alphaTest.func = 3, d.alphaTest.ref = 0.5f;
+    cases.push_back({"variant memo: the alpha function alone is keyed (3 vs 4)", d, {"XE_ALPHA_REF 0.5", "XE_ALPHA_TEST 3", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.program.paramGen = true, d.program.paramGenPos = 3, d.primitiveType = 4;
+    cases.push_back({"variant memo: param_gen at 3 is keyed", d, {"XE_PARAM_GEN 3", "XE_PARAM_GEN_POLYGONAL 1", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.program.paramGen = true, d.program.paramGenPos = 5, d.primitiveType = 4;
+    cases.push_back({"variant memo: the param_gen position alone is keyed (5 vs 3)", d, {"XE_PARAM_GEN 5", "XE_PARAM_GEN_POLYGONAL 1", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.program.paramGen = true, d.program.paramGenPos = 3, d.primitiveType = 8;
+    cases.push_back({"variant memo: the primitive type alone is keyed (rect list: not polygonal)", d,
+                     {"XE_PARAM_GEN 3", "XE_PARAM_GEN_POLYGONAL 0", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.alphaToMask = 0x1AA, d.target.samples = 4;
+    cases.push_back({"variant memo: alpha to mask is keyed", d, {"XE_ALPHA_TO_MASK 170u", "XE_ALPHA_TO_MASK_SAMPLES 4", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.alphaToMask = 0x1AA, d.target.samples = 2;
+    cases.push_back({"variant memo: the sample count alone is keyed (2 vs 4)", d, {"XE_ALPHA_TO_MASK 170u", "XE_ALPHA_TO_MASK_SAMPLES 2", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.target.colorFormat = 1;
+    cases.push_back({"variant memo: colour format 1 is keyed", d, {"XE_COLOR0_GAMMA", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.target.colorFormat = 5, d.target.colorFormatRaw = 5, d.target.colorExpBias = 0;
+    cases.push_back({"variant memo: colour format 5 bias 0 is keyed", d, {"XE_COLOR0_SCALE 0.03125", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.target.colorFormat = 5, d.target.colorFormatRaw = 5, d.target.colorExpBias = -1;
+    cases.push_back({"variant memo: the colour exp bias alone is keyed (-1 vs 0)", d, {"XE_COLOR0_SCALE 0.015625", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.colorWriteMask = 0;
+    cases.push_back({"variant memo: the colour mask is keyed", d, {"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"}});
+    d = Ui(), d.kind = DrawKind::DepthOnly;
+    cases.push_back({"variant memo: the kind is keyed (DepthOnly)", d, {"XE_NO_COLOR_OUTPUT", "XE_TEXTURE_0_GAMMA"}});
+    const DrawState colour5 = cases[15].d;  // format 5 bias 0, for the pairwise check below
+    for (const Case& c : cases)
+    {
+        const VariantMemoKey ck = keyOf(c.d, uvs, ups, false);
+        Expect(defines(c.d, uvs, ups) && p.lines == c.ps && p.lines != gamma && ck.count != 0 && !(ck == base), c.name);
+    }
+    // Pairs whose difference is one input on top of a non-base state (the inputs above that only matter together with another).
+    Expect(!(keyOf(cases[6].d, uvs, ups, false) == keyOf(cases[7].d, uvs, ups, false)), "variant memo: alpha ref 0.5 and 0.25 have different keys");
+    Expect(!(keyOf(cases[6].d, uvs, ups, false) == keyOf(cases[8].d, uvs, ups, false)), "variant memo: alpha func 4 and 3 have different keys");
+    Expect(!(keyOf(cases[9].d, uvs, ups, false) == keyOf(cases[10].d, uvs, ups, false)), "variant memo: param_gen positions 3 and 5 have different keys");
+    Expect(!(keyOf(cases[9].d, uvs, ups, false) == keyOf(cases[11].d, uvs, ups, false)), "variant memo: triangle and rect lists have different keys");
+    Expect(!(keyOf(cases[12].d, uvs, ups, false) == keyOf(cases[13].d, uvs, ups, false)), "variant memo: 4 and 2 samples have different keys");
+    Expect(!(keyOf(colour5, uvs, ups, false) == keyOf(cases[16].d, uvs, ups, false)), "variant memo: exp bias 0 and -1 have different keys");
+    Expect(!(keyOf(cases[17].d, uvs, ups, false) == keyOf(cases[18].d, uvs, ups, false)), "variant memo: a zero colour mask and DepthOnly have different keys");
+    // The rect list (XE_RECT_LIST on the VS) and the renderer's XE_FETCH_UNCHECKED (added to the VS after VariantsFromDrawState).
+    d = Ui(), d.hostPrimitive = HostPrimitive::RectList;
+    Expect(defines(d, uvs, ups) && v.lines == std::vector<std::string>{"XE_RECT_LIST"} && !(keyOf(d, uvs, ups, false) == base),
+           "variant memo: the host primitive (rect list) is keyed");
+    Expect(!(keyOf(Ui(), uvs, ups, true) == base), "variant memo: the XE_FETCH_UNCHECKED decision is keyed");
+    // The pair: another VS object that lists slot 0, another PS object that reads 3 interpolators.
+    Expect(defines(Ui(), both, ups) && v.lines == gamma && !(keyOf(Ui(), both, ups, false) == base), "variant memo: the vertex shader is keyed");
+    Expect(defines(Ui(), uvs, ps3) && v.lines == std::vector<std::string>{"XE_PS_INTERPOLATORS 3"} && !(keyOf(Ui(), uvs, ps3, false) == base),
+           "variant memo: the pixel shader is keyed");
+
+    // Fields VariantsFromDrawState does not read: the defines stay the base's (by hand: XE_TEXTURE_0_GAMMA only) and the key too.
+    d = Ui(), d.scissor = {16, 16, 640, 360}, d.blend.constant[0] = 0.5f, d.depthStencil.front.ref = 0x80, d.vertexSlots[0].physical = 0x40000;
+    d.textureSlots[0].physical = 0x123000, d.textureSlots[0].words[0] = 0xDEADBEEF, d.textureSlots[0].width = 256, d.aluConstants[5] = 0x3F800000;
+    d.cullBack = false, d.target.pitch = 640, d.target.depthBase = 0, d.indices.count = 96;
+    Expect(defines(d, uvs, ups) && v.lines.empty() && p.lines == gamma && keyOf(d, uvs, ups, false) == base,
+           "variant memo: scissor, blend constant, stencil ref, vertex and texture addresses, constants, cull and pitch keep the key (a hit)");
+    CONTROL(keyOf(d, uvs, ups, false) == keyOf(d, uvs, ups, true), "variant memo: the fetch decision on top of unread fields still differs");
+
+    // More texture slots than the key holds: no key (the renderer takes the full path).
+    d = Ui();
+    const TextureSlot slot0 = d.textureSlots[0];
+    d.textureSlots.resize(VariantMemoKey::kMaxTextures + 1, slot0);
+    CONTROL(VariantMemoKeyFor(d, uvs, ups, false, k), "variant memo: 33 texture slots are not keyed");
+    d.textureSlots.resize(VariantMemoKey::kMaxTextures);
+    Expect(VariantMemoKeyFor(d, uvs, ups, false, k) && k.count == VariantMemoKey::kMaxWords, "variant memo: 32 texture slots fill the key exactly");
+
+    // The memo: a held key returns the variants inserted for it; another key, nothing; a full memo is cleared whole.
+    ShaderVariant a, b, c2, e;
+    VariantMemo memo(2);
+    Expect(memo.Find(base) == nullptr && memo.Size() == 0, "variant memo: empty, nothing held");
+    memo.Insert(base, &a, &b);
+    const VariantMemo::Entry* hit = memo.Find(base);
+    Expect(hit != nullptr && hit->vs == &a && hit->ps == &b, "variant memo: a held key returns its two variants");
+    const VariantMemoKey other = keyOf(Ui(), uvs, ups, true);
+    CONTROL(memo.Find(other) != nullptr, "variant memo: another key finds nothing");
+    memo.Insert(other, &c2, nullptr);
+    CONTROL(memo.Find(other) != nullptr, "variant memo: an entry without both variants is not held");
+    memo.Insert(other, &c2, &e);
+    Expect(memo.Size() == 2 && memo.Clears() == 0, "variant memo: two entries in a memo of 2");
+    const VariantMemoKey third = keyOf(cases[0].d, uvs, ups, false);
+    memo.Insert(third, &e, &a);
+    hit = memo.Find(third);
+    Expect(memo.Size() == 1 && memo.Clears() == 1 && memo.Find(base) == nullptr && hit != nullptr && hit->vs == &e && hit->ps == &a,
+           "variant memo: a third entry clears the memo of 2 whole and is held alone");
+    memo.Clear();
+    Expect(memo.Size() == 0 && memo.Find(third) == nullptr, "variant memo: Clear drops every entry");
 }
 
 struct FakeIndices
@@ -671,10 +819,51 @@ void TestClearDraw()
             "a window short of the third vertex's colour");
 }
 
+// FM4 Recomp (FM4_SUBSET_MERGE): a colour-only draw's key for the open colour + depth pass (draw_record.h SubsetMergeKey). By hand from
+// the clear (TRACE draw 48: colour format 2, depth format 1, 4 samples, depth always + write, stencil replace): the same clear with z
+// and stencil off keys colour-only (depthUsed 0, depthFunc 0); merged with depth format 1 its attachment part (colorUsed, colour
+// format, depthUsed, depthFormat, samples: pipeline_cache.cpp RenderPass's key) equals the clear's, so the pipeline is
+// render-pass compatible; depth is attached but func 7 (always) with no write, stencil 0, bias 0 (no test, no write: the depth
+// image is untouched); the colour state is the colour-only draw's. Controls: the merged key differs from the clear's (it does not
+// write depth); a colour-only draw of another colour format does not match the clear's attachment part.
+void TestSubsetMergeKey()
+{
+    const CachedShader vs = Vs({0}), ps = Ps();
+    const PipelineKey open = KeyOf(Clear(), vs, ps);
+    DrawState colourOnly = Clear();
+    colourOnly.depthStencil.zEnable = false, colourOnly.depthStencil.stencilEnable = false;
+    const PipelineKey c = KeyOf(colourOnly, vs, ps);
+    const PipelineKey m = SubsetMergeKey(c, open.depthFormat);
+    auto passPart = [](const PipelineKey& k) { return std::make_tuple(k.colorUsed, k.color[0].format, k.depthUsed, k.depthFormat, k.samples); };
+    const uint8_t zero[4] = {0, 0, 0, 0};
+    Expect(c.depthUsed == 0 && c.depthFunc == 0 && passPart(m) == passPart(open) && m.depthWrite == 0 && m.depthFunc == 7 && m.stencilEnable == 0 &&
+               std::memcmp(m.stencilFront, zero, 4) == 0 && std::memcmp(m.stencilBack, zero, 4) == 0 && m.depthBias == 0 &&
+               std::memcmp(&m.color[0], &c.color[0], sizeof c.color[0]) == 0 && m.vsHash == c.vsHash && m.psHash == c.psHash,
+           "subset merge: the colour-only key gets the open pass's attachments (render-pass compatible), depth always with no write, no stencil, no bias");
+    CONTROL(m == open, "the merged key is not the open pass's own (it neither tests nor writes depth)");
+    DrawState other = colourOnly;
+    other.target.colorFormat = 3;
+    CONTROL(passPart(SubsetMergeKey(KeyOf(other, vs, ps), open.depthFormat)) == passPart(open), "another colour format is not render-pass compatible");
+    // The depth-only case: the clear as DepthOnly (colour mask 0) keys without colour; merged with the clear's colour format 2 its
+    // attachment part equals the clear's, colour write mask 0 with blend off (1, 0, add both), and its depth/stencil state is
+    // unchanged (depth always + write, stencil replace). Control: merged with colour format 3, not compatible.
+    DrawState depthOnly = Clear();
+    depthOnly.kind = DrawKind::DepthOnly, depthOnly.colorWriteMask = 0;
+    const PipelineKey dk = KeyOf(depthOnly, vs, ps);
+    const PipelineKey dm = SubsetMergeKeyDepthOnly(dk, open.color[0].format);
+    Expect(dk.colorUsed == 0 && passPart(dm) == passPart(open) && dm.color[0].writeMask == 0 && dm.color[0].srcColor == 1 && dm.color[0].dstColor == 0 &&
+               dm.color[0].colorOp == 0 && dm.color[0].srcAlpha == 1 && dm.color[0].dstAlpha == 0 && dm.color[0].alphaOp == 0 && dm.depthWrite == dk.depthWrite &&
+               dm.depthFunc == dk.depthFunc && dm.stencilEnable == dk.stencilEnable && std::memcmp(dm.stencilFront, dk.stencilFront, 4) == 0,
+           "subset merge, depth only: the colour attachment declared with write mask 0 and no blend; the draw's depth and stencil state kept");
+    CONTROL(passPart(SubsetMergeKeyDepthOnly(dk, 3)) == passPart(open), "a depth-only draw merged with another colour format is not compatible");
+}
+
 int main()
 {
+    TestSubsetMergeKey();
     TestKeys();
     TestVariants();
+    TestVariantMemo();
     TestIndices();
     TestUploads();
     TestOverwrite();

@@ -57,6 +57,10 @@ uint32_t ApplyPwl10(uint32_t v, PwlEntry e);
 // A2B10G10R10 after front_buffer.h's red/blue exchange). Red uses component 0, green 1, blue 2 (X apply_gamma_pwl.xesli:
 // 82-93); alpha becomes 3 (1.0, :99).
 void ApplyPwlToFrame(uint32_t* pixels, size_t count, const PwlEntry (&pwl)[128][3]);
+// FM4 Recomp (M7, FM4_GPU_PRESENT): ApplyPwlToFrame's tables: lut[c][v] = ApplyPwl10(v, pwl[v >> 3][c]) << (10 * c) for every 10-bit
+// channel value v of component c (0 red, 1 green, 2 blue). A pixel's result is 3 << 30 | lut[0][r] | lut[1][g] | lut[2][b]; the GPU
+// present (runtime/video/gpu_present.h) reads the same tables, so both paths share one evaluation of ApplyPwl10.
+void BuildPwlLut(const PwlEntry (&pwl)[128][3], uint32_t (&lut)[3][1024]);
 
 // FNV-1a 64 over the PWL table as (base, delta) little-endian 16-bit pairs, entry-major, red-green-blue: the log's digest.
 uint64_t PwlDigest(const PwlEntry (&pwl)[128][3]);

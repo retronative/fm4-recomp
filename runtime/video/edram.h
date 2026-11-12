@@ -47,6 +47,7 @@
 // at or above 2^31 never appear.
 #pragma once
 #include <array>
+#include <bitset>  // FM4 Recomp (FM4_CLEAR_FLUSH_OVERLAP): TileSet
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -205,6 +206,18 @@ struct Rect
 // Precondition: start < end <= 2048, and either start >= dest.Base() or end <= dest.Base() (the wrapped tail).
 uint32_t RangeRectangles(uint32_t startTiles, uint32_t endTiles, Key dest, Rect out[3]);
 
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP): a set of EDRAM tiles by absolute index 0-2047, the unit in which two keys'
+// host images describe the same memory (a pixel of one key and a pixel of another touch the same EDRAM only through their tiles:
+// pitch, MSAA and bpp differ between keys, the tiles do not).
+using TileSet = std::bitset<kTileCount>;
+// The tiles of `k`'s layout that pixel rectangle `r` of its host image touches, partly or wholly: the inverse of RangeRectangles
+// (X render_target_cache.cc:355-359 tile size by MSAA and bpp), the same arithmetic as Ownership::SetClearValue (columns clamped
+// to the pitch: a host image is PitchTiles tiles wide); tile = (base + row * pitch + column) modulo 2048 (the addressing period,
+// as Change wraps). An empty rectangle touches no tile; a key without a pitch, every tile (never "none" for a real clear).
+TileSet RectTiles(Key k, const Rect& r);
+// Tiles [start, end) (a Transfer's range: end <= 2048, never wrapping); start >= end gives the empty set.
+TileSet RangeTiles(uint32_t startTiles, uint32_t endTiles);
+
 // The host target `source` holds the newest contents of tiles [start, end) (never wrapping: a wrapped
 // claim yields two transfers) that `dest` now needs. The GPU side copies them before the next use of dest:
 // the rectangles in each image come from RangeRectangles(start, end, key, ...).
@@ -263,7 +276,8 @@ public:
     // tile t's current content (through the transfer mapping), or Empty. A transfer from O into K sets it to O: K's image
     // receives O's content and O's image keeps it, since no path writes a host image at a tile its key does not own (a draw
     // or resolve clear claims first, a transfer lands only in the claimed tiles, FlushClears applies a key's pending clears
-    // before any read of it; the two exceptions, a resolve clear rectangle reaching past the range it claimed and a draw's
+    // before any read of it (FM4_CLEAR_FLUSH_OVERLAP: those whose tiles the read touches, and the older ones under them; a kept
+    // clear touches none of the tiles read, so it never changes a tile a shadow names); the two exceptions, a resolve clear rectangle reaching past the range it claimed and a draw's
     // rows past a claim the bases' distance shortened, are MarkWritten by PrepareResolve and Bind).
     // Any claim with destWrites clears it. With `skipUnwritten`, a claim by the very key ShadowAt(t) names flips ownership
     // without a transfer when the two keys have the same aspect and format and that format's host image is float or integer
@@ -425,6 +439,9 @@ struct ResolveInfo
     // `spanRowLength` tiles from `spanBase` (not reduced modulo 2048), at `spanPitch` tiles a row.
     uint32_t spanBase = 0, spanRowLength = 0, spanRows = 0, spanPitch = 0;
     uint32_t edramOffsetXDiv8 = 0, edramOffsetYDiv8 = 0;  // of the rectangle within its first tile
+    // FM4 Recomp (alpha, 64 bpp resolve clear): X draw_util.cc:1212-1213 edram_base_offset_tiles, at 32 bpp (not doubled for a
+    // 64 bpp source): the clear's base offset (X render_target_cache.cc:1172-1183 halves the doubled colour offset back to it).
+    uint32_t edramBaseOffsetTiles = 0;
     bool copy = false;  // false: a clear-only resolve
     CopyCommand command = CopyCommand::Raw;
     SampleSelect sampleSelect = SampleSelect::k0;  // sanitized (X draw_util.cc:495-545)

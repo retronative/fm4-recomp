@@ -31,7 +31,8 @@ namespace runtime::video {
 // GpuGuard::Shutdown confirmed that no submission's completion is unknown (EdramHooks::shutdown).
 // FM4 Recomp (M7 GPU cost): a resolve clear the EDRAM unit has not applied yet. The unit hands the
 // pending clears of the acquired targets to the renderer, which records them (vkCmdClearAttachments) as the first commands of the
-// draw's render pass, before the draw; the unit applies them itself before any other read or write of the target.
+// draw's render pass, before the draw; the unit applies them itself before any other read or write of the target (FM4 Recomp,
+// FM4_CLEAR_FLUSH_OVERLAP=1: before any read of their tiles; a read of other tiles leaves them pending, edram_vk.cpp FlushClears).
 struct PendingClear
 {
     VkClearAttachment attachment{};  // colour attachment 0, or depth + stencil
@@ -143,6 +144,15 @@ struct EdramHooks
     bool (*resolveRoom)();
     // FM4 Recomp (FM4_DIAG_TRANSFERS, diagnostic): prints and clears the unit's tallies for swaps [first, last]; null when off.
     void (*diagTally)(uint64_t firstSwap, uint64_t lastSwap);
+    // FM4 Recomp (opt-in FM4_ASYNC_RETIRE=1, async_retire.h): the write-back split across the two threads. `handOff` (the command
+    // processor, when part `serial` is submitted) copies the read-back resolves recorded up to that part and not yet handed off into
+    // a batch for it; `writeBackHandedOff` (the completion worker, after that part's fence and the GPU read guard's completion)
+    // writes that batch into guest memory, in record order (false with `error`: the command processor stops naming it);
+    // `forget` (the command processor, after GpuGuard::Retire confirmed the part retired) drops the written resolves up to `serial`
+    // from the pending list and frees their staging (the worker never touches the pending list or the staging allocation).
+    void (*handOff)(uint64_t serial);
+    bool (*writeBackHandedOff)(uint64_t serial, std::string& error);
+    void (*forget)(uint64_t upToSerial);
 };
 
 class UploadRing;  // pipeline_key.h

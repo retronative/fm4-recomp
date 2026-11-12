@@ -346,7 +346,7 @@
 //     Analysis: p0 is data-dependent, so each predicate set adds a pass dimension (its p0 is
 //     free; correlations between sets are not modelled, so passes over-approximate the paths
 //     and every check stays sound). A predicate set inside a loop (one value per iteration) is
-//     refused.
+//     accepted (FM4 Recomp): its dimension covers every iteration's value, as for the dynamic loops below.
 //   Register state: the VS gets r0 = (vertex index, 0, 0, 0) as floats [X] for the index (the
 //     rest INFERRED); reading any other never-written temp component in a VS is refused. A PS
 //     gets r0..r(n-1) = interpolators 0..n-1, n = 1 + the highest register it reads before
@@ -810,8 +810,6 @@ bool Translator::Alu(const uint32_t w[3], uint32_t slot)
 // as a pass dimension (Emit) or takes this pass's p0 value (Analyze).
 bool Translator::PredicateSet(const AluInstruction& a, const std::string& where, std::string& operand)
 {
-    if (inLoop_)
-        return Fail("predicate set inside a loop" + where);
     if (inPredExec_)
         return Fail("predicate set inside a predicated exec" + where);
     if (execPredClean_)
@@ -824,8 +822,10 @@ bool Translator::PredicateSet(const AluInstruction& a, const std::string& where,
 // The predicate-set walk shared by the scalar PRED_SETs and the vector PRED_SET*_PUSHs (FM4 Recomp).
 bool Translator::PredicateSetBookkeeping(const std::string& where)
 {
-    if (inLoop_)
-        return Fail("predicate set inside a loop" + where);
+    // FM4 Recomp (alpha, Car Select; ps_1960469b232322b5 slot 35): a predicate set
+    // inside a constant loop is accepted, by the dynamic loops' argument (header, "Dynamic loops"): the body is walked once from the
+    // pre-loop state, later iterations see a superset of its registers, and the set's p0 is a free pass dimension, so every value p0
+    // takes in any iteration is analysed at a state no larger than the real one. The emitted `xe_p0 = ...` simply runs every iteration.
     if (inPredExec_)
         return Fail("predicate set inside a predicated exec" + where);
     if (execPredClean_)
@@ -2181,7 +2181,10 @@ bool Translator::Run(std::string& error)
             }
             continue;
         }
-        if (inLoop_ && op != CfOpcode::Exec)
+        // FM4 Recomp (alpha, Car Select; ps_1960469b232322b5): a predicated exec (opcode 5) inside a constant loop is accepted:
+        // it holds only ALU instructions predicated on its own condition (PredExec), so it is the predicated ALU instructions already
+        // accepted in a loop body, with one `if` per iteration; the walk-once argument covers it (header, "Dynamic loops").
+        if (inLoop_ && op != CfOpcode::Exec && op != CfOpcode::CondExecPred)
         {
             Fail(std::string(op == CfOpcode::ExecEnd ? "exec_end" : CfName(op)) + " (control-flow opcode " +
                  Num(uint32_t(op)) + ") inside a loop is not supported");

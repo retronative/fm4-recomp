@@ -59,8 +59,13 @@ public:
     GlslangCompiler(const GlslangCompiler&) = delete;
     GlslangCompiler& operator=(const GlslangCompiler&) = delete;
     bool Compile(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error) override;
+    // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): a compute shader with the same options (texture_vk.cpp's untile pipeline); the
+    // graphics-only rewrites (FM4_SHADER_NO_PRECISE and the diagnostics) never apply.
+    bool CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error);
 
 private:
+    bool CompileStage(int stage, bool pixel, bool rewrites, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings,
+                      std::string& error);
     bool initialized_ = false;
 };
 

@@ -62,6 +62,16 @@ struct VulkanDevice
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     void (*destroySurface)(VkInstance, VkSurfaceKHR) = nullptr;
     bool swapchain = false;
+    // FM4 Recomp (M7 CPU cost, FM4_PUSH_DESCRIPTORS=1): VK_KHR_push_descriptor enabled when asked and offered; its limit
+    // (VkPhysicalDevicePushDescriptorPropertiesKHR maxPushDescriptors) and vkCmdPushDescriptorSetKHR (renderer.cpp Draw).
+    bool pushDescriptors = false;
+    uint32_t maxPushDescriptors = 0;
+    PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
+    // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1): VK_EXT_external_memory_host enabled when asked and offered, its import alignment
+    // (VkPhysicalDeviceExternalMemoryHostPropertiesEXT) and vkGetMemoryHostPointerPropertiesEXT (guest_memory_vk.cpp).
+    bool externalMemoryHost = false;
+    VkDeviceSize minImportedHostPointerAlignment = 0;
+    PFN_vkGetMemoryHostPointerPropertiesEXT getMemoryHostPointerProperties = nullptr;
 };
 
 // Creates the instance (validation as asked), picks the MoltenVK device with a graphics queue,

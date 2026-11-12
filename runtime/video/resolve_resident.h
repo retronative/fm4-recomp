@@ -95,15 +95,32 @@ struct ResidentTextureShape
     uint32_t base = 0, width = 0, height = 0, pitch = 0, format = 0, endian = 0, levels = 0, dimension = 0, depth = 0;
     bool tiled = false, stacked = false, packedMips = false;
 };
+// FM4 Recomp (M7, resident resolves; opt-in FM4_RESOLVE_RESIDENT_COVER=1, texture_vk.cpp ResidentCover): `cover` widens the match
+// in two ways, both from the guest layout alone. (1) The resolve's pitch is compared aligned up to 32 texels: its write-back lays the
+// words out at that pitch (texture_untile.h TiledOffset2D and front_buffer.h TilesPerRow align it, Xenia texture_util.cc:446), so a
+// resolve with RB_COPY_DEST_PITCH 8 stores exactly where one with 32 does. (2) A rectangle that reaches past the texture's (level's)
+// texels but stays inside its padded storage (x < the pitch, y < its rows aligned to 32: texture_info.cpp MipStorageOf, Xenia
+// texture_util.cc:315-334, a level's stride aligned to 4 KB :342-344) is taken clipped: the texels past it are padding no fetch of
+// this texture (level) samples, and their bytes are its own storage, not another level's. FM4's 512x512 k_8_8 chain resolves 8x8
+// rectangles into its 4x4, 2x2 and 1x1 levels (0CF00000, 0CF01000, 0CF02000, the hand layout of levels
+// 7-9 under the mip address 0CED3000); without `cover` each refusal drops the image's residency and the chain's next draw waits.
+// `copy` (when matched): the texels of the rectangle inside the texture (level), from its corner; 0 x 0 when it lies wholly in
+// the padding (nothing to copy; the image keeps its texels).
+struct ResidentCopy
+{
+    uint32_t width = 0, height = 0;
+};
+constexpr uint32_t ResidentAlign32(uint32_t v) { return (v + 31u) & ~31u; }
 inline bool ResidentTextureMatches(const ResidentTextureShape& t, const ResidentResolve& r, std::string* why = nullptr, uint32_t* x = nullptr,
-                                   uint32_t* y = nullptr)
+                                   uint32_t* y = nullptr, bool cover = false, ResidentCopy* copy = nullptr)
 {
     uint32_t cornerX = 0, cornerY = 0;
+    const uint32_t resolvePitch = cover ? ResidentAlign32(r.destPitch) : r.destPitch;  // FM4 Recomp (M7, resident resolves): (1) above
     const char* reason = !r.converted                              ? "the resolve has no GPU words"
                          : t.dimension != 1 || t.depth != 1 || t.stacked ? "not a plain 2D texture"
                          : t.levels != 1 || t.packedMips           ? "more than one level"
                          : !t.tiled                                ? "linear"
-                         : t.pitch != r.destPitch || t.pitch == 0 || t.pitch % 32 != 0 ? "another pitch"
+                         : t.pitch != resolvePitch || t.pitch == 0 || t.pitch % 32 != 0 ? "another pitch"
                          : r.textureBase < t.base || (r.textureBase - t.base) % 4096 != 0 ? "another base"
                          : r.bytesLog2 != 2 && r.textureBase != t.base                    ? "another base"
                                                                                            : nullptr;
@@ -111,10 +128,19 @@ inline bool ResidentTextureMatches(const ResidentTextureShape& t, const Resident
     {
         const uint32_t macro = (r.textureBase - t.base) >> 12, tilesPerRow = t.pitch >> 5;
         cornerX = macro % tilesPerRow * 32, cornerY = macro / tilesPerRow * 32;
+        // FM4 Recomp (M7, resident resolves): (2) above: past the texels, inside the padded storage, only with `cover`.
+        const uint64_t left = uint64_t(cornerX) + r.x0, top = uint64_t(cornerY) + r.y0, right = left + r.width, bottom = top + r.height;
+        const bool past = right > t.width || bottom > t.height;
+        const bool padded = cover && right <= t.pitch && bottom <= ResidentAlign32(t.height);
         reason = t.endian != r.destEndian                ? "another endian"
                  : !ResidentFormatPair(r.destFormat, t.format) ? "a format whose texel is not the resolve's word"
-                 : uint64_t(cornerX) + r.x0 + r.width > t.width || uint64_t(cornerY) + r.y0 + r.height > t.height ? "the rectangle exceeds the texture"
-                                                                                                                  : nullptr;
+                 : past && !padded                             ? "the rectangle exceeds the texture"
+                                                               : nullptr;
+        if (reason == nullptr && copy != nullptr)
+        {
+            copy->width = right <= t.width ? r.width : left >= t.width ? 0 : uint32_t(t.width - left);
+            copy->height = bottom <= t.height ? r.height : top >= t.height ? 0 : uint32_t(t.height - top);
+        }
     }
     if (reason != nullptr && why != nullptr)
         *why = reason;
@@ -135,11 +161,12 @@ struct ResidentLevel
     uint32_t address = 0, width = 0, height = 0, pitch = 0;
     bool packed = false;
 };
+// FM4 Recomp (M7, resident resolves): `cover` and `copy` as ResidentTextureMatches, per level.
 inline int ResidentLevelFor(const ResidentTextureShape& t, const std::vector<ResidentLevel>& levels, const ResidentResolve& r, std::string* why = nullptr,
-                            uint32_t* x = nullptr, uint32_t* y = nullptr)
+                            uint32_t* x = nullptr, uint32_t* y = nullptr, bool cover = false, ResidentCopy* copy = nullptr)
 {
     if ((t.levels == 1 && !t.packedMips) || levels.empty())
-        return ResidentTextureMatches(t, r, why, x, y) ? 0 : -1;
+        return ResidentTextureMatches(t, r, why, x, y, cover, copy) ? 0 : -1;
     std::string first;
     for (size_t level = 0; level < levels.size(); level++)
     {
@@ -149,7 +176,7 @@ inline int ResidentLevelFor(const ResidentTextureShape& t, const std::vector<Res
         {
             ResidentTextureShape one = t;
             one.base = l.address, one.width = l.width, one.height = l.height, one.pitch = l.pitch, one.levels = 1, one.packedMips = false;
-            if (ResidentTextureMatches(one, r, &reason, x, y))
+            if (ResidentTextureMatches(one, r, &reason, x, y, cover, copy))
                 return int(level);
         }
         if (level == 0)
@@ -158,6 +185,21 @@ inline int ResidentLevelFor(const ResidentTextureShape& t, const std::vector<Res
     if (why != nullptr)
         *why = "no level takes it (level 0: " + first + ")";
     return -1;
+}
+
+// FM4 Recomp (M7, resident resolves): whether an image that is not resident is in step after the resolve because the resolve replaces
+// every texel it samples (level 0 of a single-level texture, the corner at 0,0, the copied extent the whole texture;
+// FM4's bloom chain). As before (`cover` false) only when no earlier resolve of the open submission is pending over
+// the image. With `cover` also when one is: the write-backs land in record order (edram_vk.cpp Retired: "overlapping destinations end
+// as the last resolve wrote them"), so once this resolve's has landed the texture's texels in guest memory are its words whatever the
+// earlier ones wrote; until then the image is resident and its draws bind it, never guest memory. FM4's 32x32 k_2_10_10_10 at the bloom
+// chain's shared base is resolved after the 64x32 one of the same submission (INFERRED from a race's consumer tally:
+// one wait every race frame). Its other in-step paths (a hash or a clean watch) still need no earlier pending resolve.
+inline bool ResidentCoversInStep(int level, uint32_t levelCount, uint32_t x, uint32_t y, const ResidentCopy& copy, uint32_t width, uint32_t height,
+                                 bool noEarlierPending, bool cover)
+{
+    const bool covers = level == 0 && levelCount == 1 && x == 0 && y == 0 && copy.width == width && copy.height == height;
+    return covers && (noEarlierPending || cover);
 }
 
 }  // namespace runtime::video

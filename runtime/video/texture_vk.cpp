@@ -15,6 +15,10 @@
 #include "texture_dump.h"
 #include "texture_upload.h"
 #include "resolve_resident.h"
+#include "texture_untile_gpu.h"
+#include "guest_memory_vk.h"
+#include "gpu_read_guard.h"
+#include "shader_cache.h"
 #include "kernel/virtual_memory.h"
 #include "guest_memory.h"
 #include <algorithm>
@@ -227,6 +231,20 @@ struct Unit
     const uint8_t* guestBase = nullptr;
     uint32_t residentImages = 0;
     uint64_t adoptedSince = 0, residentBindsSince = 0, residentDroppedSince = 0;
+    // FM4 Recomp (M7): the swap's CPU texture staging (FillStaging calls, staged bytes, wall time), always counted.
+    uint64_t fillsSince = 0, fillBytesSince = 0, fillNsSince = 0;
+    // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): the untile pipeline (created at Initialize, destroyed at Shutdown) and the swap's counts.
+    struct GpuUntile
+    {
+        bool on = false;
+        const GuestMemoryGpu* guest = nullptr;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        uint64_t storageAlign = 0, maxRange = 0;
+        uint32_t maxGroupsX = 0;
+    } untile;
+    uint64_t gpuLoadsSince = 0, gpuLoadBytesSince = 0, gpuFallbacksSince = 0;
 };
 std::optional<Unit> unit;
 
@@ -370,6 +388,82 @@ void Barrier(VkCommandBuffer c, VkImage image, uint32_t levels, VkImageLayout fr
     vkCmdPipelineBarrier(c, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+// FM4 Recomp (M7, opt-in FM4_TEXTURE_GPU_UNTILE=1; ReCarbon renderer.cpp:3255-3257, :4335-4352):
+// a load texture_untile_gpu.h can plan is untiled by a compute dispatch from the imported guest
+// memory (guest_memory_vk.h) into the same ring bytes FillStaging would write, then copied as before. The GPU reads guest memory when
+// the part executes, so every range it reads is first given to the guest-memory guard (GuardGuestRead below): a later store is held
+// until the part completes. Everything else (and the whole unit when off) stages on the CPU as before.
+bool GpuUntileAsked()
+{
+    static const bool asked = [] { const char* v = std::getenv("FM4_TEXTURE_GPU_UNTILE"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return asked;
+}
+bool GpuUntileOn() { return unit && unit->untile.on; }
+
+// The adapter: the texture unit's one call into the guest-memory draft's guard (gpu_read_guard.h); its final API is wired here.
+// FM4 Recomp (M7, shared guest memory; wired at merge): the vertex path's order (renderer.cpp, gpu_read_guard.h G1): the read is noted
+// with the part first, then the range is protected (WatchGuestRange). A range outside physical memory, unaligned, or with a pending
+// resolve write-back over its host pages is refused (the CPU path). A refusal after the note leaves it noted: a later store to those
+// pages waits for this part for nothing, which is safe.
+bool GuardGuestRead(void*, uint32_t physical, uint32_t bytes, uint64_t serial)
+{
+    GpuReadGuard* const guard = GuestMemoryGpuGuard();
+    if (guard == nullptr)
+        return false;
+    GuardFacts f{true, physical, bytes, runtime::kPhysicalSize, true, false};
+    if (ChooseGuardPath(f) != GuardPath::Direct)
+        return false;
+    const uint64_t hostFirst = physical & ~uint64_t(runtime::kWatchHostPage - 1);
+    const uint64_t hostEnd = (uint64_t(physical) + bytes + runtime::kWatchHostPage - 1) & ~uint64_t(runtime::kWatchHostPage - 1);
+    if (GuestWritesOverlap(uint32_t(hostFirst), uint32_t(hostEnd - hostFirst)))
+        return false;
+    if (guard->Hot(physical, bytes))  // FM4 Recomp (M7, FM4_GUARD_HOT): a page stores waited for: the CPU path, nothing noted
+        return false;
+    (void)guard->NoteReadThen(physical, bytes, serial, [] { return false; });
+    uint64_t sequence = 0;
+    return WatchGuestRange(physical, bytes, sequence);
+}
+
+// Records the planned levels' dispatches into `c`, then the compute-write -> transfer-read barrier over the staging. The bindings are
+// computed first: a level that cannot be bound records nothing (false: the caller stages on the CPU into the same placement).
+bool RecordGpuUntile(const TextureBindContext& c, std::vector<GpuUntileLevel>& levels, uint64_t offset, uint64_t stagingBytes)
+{
+    const Unit::GpuUntile& u = unit->untile;
+    std::vector<GpuUntileBinding> bindings(levels.size());
+    for (size_t i = 0; i < levels.size(); i++)
+        if (!GpuUntileBind(levels[i], offset + levels[i].levelOffset, u.guest->bytes, c.allocator->Capacity(), u.storageAlign, u.maxRange, bindings[i]))
+            return false;
+    OutsideRenderPass(c.commands);  // FM4 Recomp (FM4_PASS_MERGE): a dispatch is recorded outside a render pass
+    vkCmdBindPipeline(c.commands, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeline);
+    for (size_t i = 0; i < levels.size(); i++)
+    {
+        const VkDescriptorBufferInfo buffers[2] = {{u.guest->buffer, bindings[i].guestOffset, bindings[i].guestRange},
+                                                   {c.ring, bindings[i].ringOffset, bindings[i].ringRange}};
+        VkWriteDescriptorSet writes[2] = {};
+        for (uint32_t b = 0; b < 2; b++)
+        {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstBinding = b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].pBufferInfo = &buffers[b];
+        }
+        unit->dev.cmdPushDescriptorSet(c.commands, VK_PIPELINE_BIND_POINT_COMPUTE, u.layout, 0, 2, writes);
+        vkCmdPushConstants(c.commands, u.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuUntilePush), &levels[i].push);
+        vkCmdDispatch(c.commands, levels[i].groups, 1, 1);
+    }
+    VkBufferMemoryBarrier written{};
+    written.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    written.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    written.srcQueueFamilyIndex = written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    written.buffer = c.ring;
+    written.offset = offset;
+    written.size = GpuUntileStagingBytes(stagingBytes);
+    vkCmdPipelineBarrier(c.commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &written, 0, nullptr);
+    return true;
+}
+
 // Guest memory -> the slot's ring -> the image. An image an earlier draw of this (or an earlier) submission
 // sampled is overwritten only behind a barrier from the shader stages (write after read, same queue).
 bool Upload(const TextureBindContext& c, const uint32_t words[6], const TextureDescription& d, const TextureBinding& binding, const LoadPlan& plan,
@@ -382,18 +476,37 @@ bool Upload(const TextureBindContext& c, const uint32_t words[6], const TextureD
                 std::to_string(unit->copyAlignment);
         return false;
     }
+    // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): the path is chosen before the placement (a GPU load writes whole dwords).
+    std::vector<GpuUntileLevel> levels;
+    GpuLoadChoice choice;
+    if (GpuUntileOn())
+    {
+        std::string why;
+        const bool planned = PlanGpuUntile(d, plan, unit->untile.maxGroupsX, levels, why);
+        choice = ChooseTextureLoad(true, unit->model.ReadsPending(words), planned, d, currentPartSerial, GuardGuestRead, nullptr);
+    }
     uint64_t offset = 0;
-    if (!PlaceInRing(*c.allocator, plan.stagingBytes, alignment, offset))
+    if (!PlaceInRing(*c.allocator, choice.gpu ? GpuUntileStagingBytes(plan.stagingBytes) : plan.stagingBytes, alignment, offset))
     {
         error = "the slot's upload ring (" + std::to_string(c.allocator->Used()) + " of " + std::to_string(c.allocator->Capacity()) +
                 " bytes used) cannot hold the " + std::to_string(plan.stagingBytes) + " staging bytes of the texture at " + Hex(d.base.physical) +
                 " (every bind reloads, texture_upload.h kTextureValidity)";
         return false;
     }
-    if (!FillStaging(d, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset, error))
-        return false;
-    MaybeDumpTexture(words, d, binding, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset);  // FM4_DUMP_TEXTURE (texture_dump.h)
-    DiagTextureUpload(d, c.ringMapped + offset, plan.stagingBytes);  // FM4_DIAG_TEXTURE_UPLOADS (diagnostic, diag_texture_uploads.h): nothing unless set
+    if (choice.gpu && RecordGpuUntile(c, levels, offset, plan.stagingBytes))
+        unit->gpuLoadsSince++, unit->gpuLoadBytesSince += plan.stagingBytes;
+    else
+    {
+        unit->gpuFallbacksSince += GpuUntileOn() ? 1 : 0;
+        const auto fillStart = std::chrono::steady_clock::now();
+        const bool filled = FillStaging(d, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset, error);
+        unit->fillsSince++, unit->fillBytesSince += plan.stagingBytes;
+        unit->fillNsSince += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fillStart).count());
+        if (!filled)
+            return false;
+        MaybeDumpTexture(words, d, binding, plan, GuestBytes, const_cast<uint8_t*>(c.base), c.ringMapped + offset);  // FM4_DUMP_TEXTURE (texture_dump.h)
+        DiagTextureUpload(d, c.ringMapped + offset, plan.stagingBytes);  // FM4_DIAG_TEXTURE_UPLOADS (diagnostic, diag_texture_uploads.h): nothing unless set
+    }
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     Barrier(c.commands, image.image, d.levelCount, image.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, image.initialized ? shaders : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -698,11 +811,27 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     return sampler != VK_NULL_HANDLE;
 }
 
+// FM4 Recomp (M7, opt-in FM4_TEXTURE_PREPARE_ONCE=1): StagingBytes and
+// ReadsPendingWrite ask Prepare with the slot's own anisotropy, as Bind does, so the three share one memo entry instead of preparing
+// each texture twice a draw. Anisotropy only reaches the sampler (texture_info.cpp:391), never the entry or the plan
+// (test_texture_vk.cpp TestPrepareAnisotropy).
+uint32_t PrepareAniso(const TextureSlot& t)
+{
+    static const bool once = [] {
+        const char* v = std::getenv("FM4_TEXTURE_PREPARE_ONCE");
+        const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (on)
+            std::fprintf(stderr, "[texture] prepare once on (FM4_TEXTURE_PREPARE_ONCE=1): staging and pending checks share Bind's prepared texture\n");
+        return on;
+    }();
+    return once ? t.anisoFilter : 7u;
+}
+
 uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
 {
     if (!unit || t.null)
         return 0;
-    const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, 7, t.fetchDimension};
+    const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, PrepareAniso(t), t.fetchDimension};
     const PreparedTexture& p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, ResolveResident());
     if (p.entry == nullptr)
         return 0;
@@ -710,7 +839,8 @@ uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
     if (it != unit->images.end() && it->second.resident)
         return 0;  // FM4 Recomp (FM4_RESOLVE_RESIDENT): bound without an upload
     const uint64_t alignment = StagingAlignment(1u << p.entry->description.log2BytesPerBlock, unit->copyAlignment);
-    const uint64_t full = p.plan.stagingBytes + alignment;  // the worst-case padding PlaceInRing can add
+    // The worst-case padding PlaceInRing can add; FM4_TEXTURE_GPU_UNTILE: a GPU load's staging rounded up to a dword.
+    const uint64_t full = (GpuUntileOn() ? GpuUntileStagingBytes(p.plan.stagingBytes) : p.plan.stagingBytes) + alignment;
     if (!TextureReuse() || !p.load || base == nullptr || it == unit->images.end() || !it->second.initialized)
         return full;
     HostImage& image = it->second;
@@ -736,7 +866,7 @@ bool ReadsPendingWrite(const TextureSlot& t)
     if (!ResolveResident())
         return true;
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): an image that holds the resolves' words reads nothing pending.
-    const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, 7, t.fetchDimension};
+    const ShaderFetch shader{t.magFilter, t.minFilter, t.mipFilter, PrepareAniso(t), t.fetchDimension};
     const PreparedTexture& p = unit->model.Prepare(t.words, shader, t.gamma, unit->features, true);
     const auto it = p.entry == nullptr ? unit->images.end() : unit->images.find(p.entry->key);
     return it == unit->images.end() || !it->second.resident;
@@ -764,10 +894,28 @@ bool ResidentMips()
     return on;
 }
 
+// FM4 Recomp (M7, resident resolves; opt-in FM4_RESOLVE_RESIDENT_COVER=1, needs FM4_RESOLVE_RESIDENT=1):
+// a resolve is taken at its pitch aligned to 32 texels, clipped to a texture (level) it reaches past inside the padded storage, and a
+// resolve that replaces every texel of a single-level texture makes it in step even over an earlier pending resolve
+// (resolve_resident.h ResidentTextureMatches `cover`, ResidentCoversInStep). The GPU work is unchanged: the same copy and barriers.
+bool ResidentCover()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_RESOLVE_RESIDENT_COVER");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[texture] resident cover on (FM4_RESOLVE_RESIDENT_COVER=1): aligned resolve pitches, rectangles clipped to padded levels, "
+                                 "covering resolves in step over earlier pending ones\n");
+        return enabled;
+    }();
+    return on;
+}
+
 uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
 {
     if (!unit || r.extentLength == 0)
         return 0;
+    const bool cover = ResidentCover();  // FM4 Recomp (M7, resident resolves)
     uint32_t adopted = 0;
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     for (auto& [key, image] : unit->images)
@@ -783,7 +931,9 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
         std::vector<ResidentLevel> levels;
         for (const MipLevel& l : ResidentMips() ? d.levels : std::vector<MipLevel>{})
             levels.push_back({l.address, l.widthTexels, l.heightTexels, l.pitchBlocks * (d.info.blockWidth != 0 ? d.info.blockWidth : 1), l.packed});
-        const int level = image.initialized && d.layers == 1 ? ResidentLevelFor(shape, levels, r, &why, &x, &y) : -1;
+        // FM4 Recomp (M7, resident resolves): `extent` is what lands inside the level (r.width x r.height unless `cover` clipped it).
+        ResidentCopy extent{r.width, r.height};
+        const int level = image.initialized && d.layers == 1 ? ResidentLevelFor(shape, levels, r, &why, &x, &y, cover, &extent) : -1;
         bool take = level >= 0 && words != VK_NULL_HANDLE;
         if (take && !image.resident)
         {
@@ -796,8 +946,8 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
             // FM4 Recomp (M7 waits): a resolve that covers the whole single-level texture replaces every texel, so the image is in
             // step by construction whatever it held (FM4's bloom chain resolves 160x96, 64x32 and 32x32 textures at one base in turn:
             // each lands over the previous one's bytes, so no hash or watch could call the image clean).
-            const bool covers = level == 0 && d.levelCount == 1 && x == 0 && y == 0 && r.width == d.width && r.height == d.height;
-            bool inStep = covers && noEarlierPending;
+            // FM4 Recomp (M7, resident resolves): with `cover` also over an earlier pending resolve (resolve_resident.h ResidentCoversInStep).
+            bool inStep = ResidentCoversInStep(level, d.levelCount, x, y, extent, d.width, d.height, noEarlierPending, cover);
             if (!inStep && TextureReuse() && unit->guestBase != nullptr && noEarlierPending)
             {
                 if (image.hashed)
@@ -822,16 +972,22 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
                 image.resident = false, unit->residentImages--, unit->residentDroppedSince++;
             continue;
         }
-        Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, shaders, 0,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-        VkImageCopy copy{};
-        copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(level), 0, 1};
-        copy.dstOffset = {int32_t(x), int32_t(y), 0};
-        copy.extent = {r.width, r.height, 1};
-        vkCmdCopyImage(c, words, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_ACCESS_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
+        // FM4 Recomp (M7, resident resolves): a rectangle wholly in the level's padding copies nothing (a zero extent is not a valid
+        // VkImageCopy, VUID-VkImageCopy-extent-06668): the image keeps its texels, which the resolve does not change. Otherwise the
+        // clipped extent: src (0, 0) is the rectangle's corner in `words` and clipping only cuts its right and bottom.
+        if (extent.width != 0 && extent.height != 0)
+        {
+            Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, shaders, 0,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkImageCopy copy{};
+            copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, uint32_t(level), 0, 1};
+            copy.dstOffset = {int32_t(x), int32_t(y), 0};
+            copy.extent = {extent.width, extent.height, 1};
+            vkCmdCopyImage(c, words, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
+        }
         if (!image.resident)
             image.resident = true, unit->residentImages++;
         adopted++;
@@ -848,9 +1004,93 @@ uint64_t PendingWriteSerial(const TextureSlot& t)  // FM4_PARTIAL_RETIRE
 }
 const TextureHooks hooks{Bind, StagingBytes, ReadsPendingWrite, PendingWriteSerial, AdoptResolve};
 
+// FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): the untile pipeline, once, or one line naming why every load stays on the CPU. Objects that
+// fail half-way were never used by a command and are destroyed here.
+void InitializeGpuUntile(GlslangCompiler* compiler, const VkPhysicalDeviceLimits& limits)
+{
+    if (!GpuUntileAsked())
+        return;
+    Unit::GpuUntile& u = unit->untile;
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(unit->dev.gpu, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> family(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(unit->dev.gpu, &families, family.data());
+    const GuestMemoryGpu* guest = GuestMemoryGpuView();
+    const char* why = guest == nullptr || guest->buffer == VK_NULL_HANDLE ? "no guest memory view (FM4_GUEST_MEMORY_GPU=1 and its import)"
+                      : !unit->dev.pushDescriptors || unit->dev.cmdPushDescriptorSet == nullptr || unit->dev.maxPushDescriptors < 2
+                          ? "no push descriptors (FM4_PUSH_DESCRIPTORS=1 and VK_KHR_push_descriptor)"
+                      : unit->dev.queueFamily >= families || !(family[unit->dev.queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT) ? "the queue has no compute"
+                      : std::getenv("FM4_DUMP_TEXTURE") != nullptr || DiagTextureUploadsEnabled()
+                          ? "FM4_DUMP_TEXTURE / FM4_DIAG_TEXTURE_UPLOADS read the staged bytes on the CPU"
+                      : compiler == nullptr ? "no shader compiler"
+                                            : nullptr;
+    std::string error, warnings;
+    std::vector<uint32_t> spirv;
+    if (why == nullptr && !compiler->CompileCompute(UntileGpuGlsl(), spirv, warnings, error))
+        why = "the untile shader did not compile";
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (why == nullptr)
+    {
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        for (uint32_t b = 0; b < 2; b++)
+            bindings[b] = {b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo set{};
+        set.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        set.bindingCount = 2;
+        set.pBindings = bindings;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(GpuUntilePush)};
+        VkPipelineLayoutCreateInfo layout{};
+        layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &u.setLayout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        VkShaderModuleCreateInfo shader{};
+        shader.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shader.codeSize = spirv.size() * 4;
+        shader.pCode = spirv.data();
+        VkComputePipelineCreateInfo pipeline{};
+        pipeline.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline.stage.pName = "main";
+        if (Failed(vkCreateDescriptorSetLayout(unit->dev.device, &set, nullptr, &u.setLayout), "vkCreateDescriptorSetLayout (untile)", error) ||
+            Failed(vkCreatePipelineLayout(unit->dev.device, &layout, nullptr, &u.layout), "vkCreatePipelineLayout (untile)", error) ||
+            Failed(vkCreateShaderModule(unit->dev.device, &shader, nullptr, &module), "vkCreateShaderModule (untile)", error))
+            why = "a Vulkan object could not be created";
+        else
+        {
+            pipeline.stage.module = module;
+            pipeline.layout = u.layout;
+            if (Failed(vkCreateComputePipelines(unit->dev.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &u.pipeline), "vkCreateComputePipelines (untile)", error))
+                why = "the compute pipeline could not be created";
+        }
+        vkDestroyShaderModule(unit->dev.device, module, nullptr);  // null-safe; not needed once the pipeline exists
+    }
+    if (why != nullptr)
+    {
+        vkDestroyPipeline(unit->dev.device, u.pipeline, nullptr);  // null-safe; never used by a command
+        vkDestroyPipelineLayout(unit->dev.device, u.layout, nullptr);
+        vkDestroyDescriptorSetLayout(unit->dev.device, u.setLayout, nullptr);
+        u = Unit::GpuUntile{};
+        std::fprintf(stderr, "[texture] FM4_TEXTURE_GPU_UNTILE=1 ignored: %s%s%s; every texture is staged on the CPU\n", why, error.empty() ? "" : ": ",
+                     error.c_str());
+        return;
+    }
+    u.guest = guest;
+    u.storageAlign = limits.minStorageBufferOffsetAlignment;
+    u.maxRange = limits.maxStorageBufferRange;
+    u.maxGroupsX = limits.maxComputeWorkGroupCount[0];
+    u.on = true;
+    std::fprintf(stderr, "[texture] GPU untile on (FM4_TEXTURE_GPU_UNTILE=1): 2D tiled and linear loads without conversion are untiled by a compute "
+                         "dispatch from guest memory (%llu MB view) when the guard takes their ranges; the rest are staged on the CPU\n",
+                 (unsigned long long)(guest->bytes >> 20));
+}
+
 }  // namespace
 
-const TextureHooks* InitializeTextureUnit(const VulkanDevice& device)
+const TextureHooks* InitializeTextureUnit(const VulkanDevice& device, GlslangCompiler* compiler)
 {
     unit.emplace();
     unit->dev = device;
@@ -869,6 +1109,7 @@ const TextureHooks* InitializeTextureUnit(const VulkanDevice& device)
         runtime::SetWatchObservers(WatchAccessChanged, WatchHostWrite);
         runtime::SetGuestWriteFaultHook(WatchFault);
     }
+    InitializeGpuUntile(compiler, properties.limits);  // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE)
     return &hooks;
 }
 
@@ -895,6 +1136,10 @@ void ShutdownTextureUnit()
         vkDestroyImage(unit->dev.device, unit->nullImages[i].image, nullptr);
         vkFreeMemory(unit->dev.device, unit->nullImages[i].memory, nullptr);
     }
+    // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): null-safe; every submission that dispatched it is confirmed complete (above).
+    vkDestroyPipeline(unit->dev.device, unit->untile.pipeline, nullptr);
+    vkDestroyPipelineLayout(unit->dev.device, unit->untile.layout, nullptr);
+    vkDestroyDescriptorSetLayout(unit->dev.device, unit->untile.setLayout, nullptr);
     unit.reset();
 }
 
@@ -951,6 +1196,17 @@ std::string TextureUnitSummary()
                   hashNsSince / 1e6);
     summary += text;
     hashCallsSince = hashBytesSince = hashNsSince = 0;
+    // FM4 Recomp (M7): the CPU texture staging (FillStaging) of the swap, and with FM4_TEXTURE_GPU_UNTILE the GPU-untiled loads.
+    std::snprintf(text, sizeof text, "; CPU staging: %llu fill(s), %.2f MB, %.2f ms", (unsigned long long)unit->fillsSince, unit->fillBytesSince / 1048576.0,
+                  unit->fillNsSince / 1e6);
+    summary += text;
+    if (GpuUntileOn())
+    {
+        std::snprintf(text, sizeof text, "; GPU untile: %llu load(s), %.2f MB, %llu staged on the CPU", (unsigned long long)unit->gpuLoadsSince,
+                      unit->gpuLoadBytesSince / 1048576.0, (unsigned long long)unit->gpuFallbacksSince);
+        summary += text;
+    }
+    unit->fillsSince = unit->fillBytesSince = unit->fillNsSince = unit->gpuLoadsSince = unit->gpuLoadBytesSince = unit->gpuFallbacksSince = 0;
     if (ResolveResident())  // FM4 Recomp: the resident resolves of the swap (resolve_resident.h)
     {
         std::snprintf(text, sizeof text, "; resident: %llu image write(s), %llu bind(s), %llu dropped", (unsigned long long)unit->adoptedSince,

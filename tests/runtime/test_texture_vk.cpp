@@ -585,6 +585,62 @@ const uint32_t kDepthTex[6] = {1u << 31 | 0x0A024802u, 0x1C421097u, 0x0059E4FFu,
 // A linear k_24_8_FLOAT 5x1, pitch 32 texels, endian 8in32, at 0x00100000, point sampled.
 const uint32_t kDepthSmall[6] = {2u | kClampEdgeXYZ | 1u << 22, 23u | 2u << 6 | kSmallBase, 4u, kSwizzleXYZW | kMipBaseMap | 1u, 0, kDim2D};
 
+// FM4 Recomp (alpha): a Car Select playtest, slot 0: fetch 86024156 1C42105D 002FE2FF
+// 01280D11 000001C3 1C661218. Hand decode (xenos.h:1206-1307): 1C42105D: format 0x1D = 29 (k_16_16_16_16_EXPAND), endian (0x5D >> 6) & 3
+// = 1 (8in16), base 1C421000; 002FE2FF: width (0x2FF) + 1 = 768, height ((0x2FE2FF >> 13) & 0x1FFF) + 1 = 0x17F + 1 = 384. Host (Xenia
+// vulkan_texture_cache.cc:243-247): R16G16B16A16_SFLOAT, RGBA, the 64bpb load (8 bytes copied after the endian swap).
+const uint32_t kExpandTex[6] = {1u << 31 | 0x06024156u, 0x1C42105Du, 0x002FE2FFu, 0x01280D11u, 0x000001C3u, 0x1C661218u};
+// A linear k_16_16_16_16_EXPAND 2x1, pitch 32 texels, endian 8in16, at 0x00100000.
+const uint32_t kExpandSmall[6] = {2u | kClampEdgeXYZ | 1u << 22, 29u | 1u << 6 | kSmallBase, 1u, kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+
+void TestExpand64()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const PreparedTexture p = m.Prepare(kExpandTex, ShaderFetch{}, false, kFull);
+    Expect(p.entry != nullptr && p.error.empty() && p.entry->description.host.vkFormat == vk::kFormatR16G16B16A16Sfloat &&
+               p.entry->description.width == 768 && p.entry->description.height == 384 && p.entry->description.base.physical == 0x1C421000u,
+           "Car Select texture: k_16_16_16_16_EXPAND (29) 768x384 at 1C421000 prepares as R16G16B16A16_SFLOAT");
+    // Guest halves big-endian (half 1.0 = 3C00, 2.0 = 4000, -2.0 = C000, 0.5 = 3800); 8in16 exchanges each halfword's bytes.
+    const uint8_t guest[16] = {0x3C, 0x00, 0x40, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x38, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x40, 0x00};
+    const uint8_t want[16] = {0x00, 0x3C, 0x00, 0x40, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x38, 0x00, 0x3C, 0x00, 0x00, 0x00, 0x40};
+    FakeGuest g{kSmallBase, std::vector<uint8_t>(512, 0)};
+    std::memcpy(g.bytes.data(), guest, 16);
+    const PreparedTexture s = m.Prepare(kExpandSmall, ShaderFetch{}, false, kFull);
+    std::vector<uint8_t> out(s.entry != nullptr ? s.plan.stagingBytes : 0, 0xEE);
+    std::string error;
+    const bool filled = s.entry != nullptr && s.plan.stagingBytes >= 16 && FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    Expect(filled && std::memcmp(out.data(), want, 16) == 0, "k_16_16_16_16_EXPAND 8in16 staging: each halfword's bytes exchanged, nothing converted");
+    uint32_t asFloat[6];
+    std::memcpy(asFloat, kExpandSmall, sizeof asFloat);
+    asFloat[1] = 32u | 1u << 6 | kSmallBase;  // k_16_16_16_16_FLOAT: the same load
+    const PreparedTexture f = m.Prepare(asFloat, ShaderFetch{}, false, kFull);
+    Expect(f.entry != nullptr && f.error.empty(), "k_16_16_16_16_FLOAT (32) is in the observed set too");
+    asFloat[1] = 26u | 1u << 6 | kSmallBase;  // k_16_16_16_16: no host format
+    Expect(m.Prepare(asFloat, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: k_16_16_16_16 (26) still refused");
+}
+
+// FM4 Recomp (M7, FM4_TEXTURE_PREPARE_ONCE): the property it relies on: a fetch's anisotropy reaches only the sampler (texture_info.cpp
+// :391), so Prepare with 7 (the constant's) and with an instruction's own value gives the same entry key, staging bytes and levels;
+// only sampler.maxAnisotropy-related fields may differ. Checked on the observed constants of this file.
+void TestPrepareAnisotropy()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    const TextureDeviceFeatures aniso16{true, true, true, 16.0f};  // the test Mac's device: samplerAnisotropy offered, 16x
+    bool same = true;
+    for (const uint32_t* fetch : {kDxt1Small, kK8Small, kDxt1Mips, kDepthTex, kExpandTex})
+        for (uint32_t aniso : {0u, 3u, 5u})
+        {
+            const PreparedTexture a = m.Prepare(fetch, ShaderFetch{3, 3, 3, 7, 1}, false, aniso16);
+            const PreparedTexture b = m.Prepare(fetch, ShaderFetch{3, 3, 3, aniso, 1}, false, aniso16);
+            same = same && (a.entry != nullptr) == (b.entry != nullptr) && (a.entry == nullptr || a.entry->key == b.entry->key) &&
+                   a.plan.stagingBytes == b.plan.stagingBytes && a.plan.levelOffsets == b.plan.levelOffsets && a.plan.levelBytes == b.plan.levelBytes;
+        }
+    Expect(same, "prepare: anisotropy 7 and 0/3/5 give the same entry, staging bytes and levels (only the sampler differs)");
+    // Without the device feature an anisotropy above 1 is refused for Bind too (the same Prepare): the flag changes no outcome.
+    Expect(m.Prepare(kK8Small, ShaderFetch{3, 3, 3, 3, 1}, false, kFull).entry == nullptr,
+           "CONTROL-PAIR: without samplerAnisotropy the slot's anisotropy 3 is refused, as Bind's own Prepare would be");
+}
+
 void TestDepthFloat()
 {
     TextureUnitModel m(TextureValidity::ReloadEveryBind);
@@ -1231,6 +1287,125 @@ void TestResidentResolve()
     Expect(log.OverlapsEarlier(0x1BB71000u, 1) && !log.OverlapsEarlier(0x1C000000u, 1), "resident: two marks: only the first counts as earlier");
 }
 
+// FM4 Recomp (M7, resident resolves; FM4_RESOLVE_RESIDENT_COVER): resolve_resident.h `cover` and ResidentCoversInStep. Expected
+// values are hand-computed: Xenia xenia-canary 67f16c4e315f src/xenia/gpu/texture_util.cc:443-458 GetTiledOffset2D, transcribed
+// below as the reference (the pitch aligned to 32 at :446), and the mip layout of :310-344 (levels 1.. under the mip address,
+// pitch and rows aligned to 32 blocks, each level's stride aligned to 4 KB), never this code's output. Synthetic addresses.
+uint32_t XeniaTiledOffset2D(uint32_t x, uint32_t y, uint32_t pitch, uint32_t log2)
+{
+    pitch = (pitch + 31) & ~31u;                                                    // :446 xe::align(pitch, 32)
+    const uint32_t macro = ((x >> 5) + (y >> 5) * (pitch >> 5)) << (log2 + 7);      // :448
+    const uint32_t micro = ((x & 7) + ((y & 0xE) << 2)) << log2;                    // :450
+    const uint32_t offset = macro + ((micro & ~0xFu) << 1) + (micro & 0xF) + ((y & 1) << 4);  // :452
+    return ((offset & ~0x1FFu) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) + (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+void TestResidentCover()
+{
+    std::string why;
+    // (1) A 512x512 k_8_8 (format 10, 16 bpp, 8in16) with all 10 levels, unpacked, as FM4's chain (base
+    // 0CE53000, mip address 0CED3000, levels 2-6 at +20000, +28000, +2A000, +2B000, +2C000 as logged). Hand layout at 2 bytes a texel:
+    // level 1 256x256 = 0x20000; level 2 128x128 = 0x8000; level 3 64x64 = 0x2000; levels 4-9 each pitch 32 x 32 rows x 2 = 0x800,
+    // aligned to 0x1000. So level 7 (4x4) is at mip + 0x2D000, level 8 (2x2) + 0x2E000, level 9 (1x1) + 0x2F000 (FM4: 0CF00000,
+    // 0CF01000, 0CF02000, the bases of its three 8x8 resolves).
+    const uint32_t base = 0x10000000u, mip = base + 0x80000u;  // 512 x 512 x 2 = 0x80000: the mip address right after level 0
+    const uint32_t offsets[10] = {0, 0, 0x20000, 0x28000, 0x2A000, 0x2B000, 0x2C000, 0x2D000, 0x2E000, 0x2F000};
+    std::vector<ResidentLevel> levels;
+    for (uint32_t k = 0; k < 10; k++)
+    {
+        const uint32_t size = 512u >> k;
+        levels.push_back({k == 0 ? base : mip + offsets[k], size, size, size < 32 ? 32u : size, false});
+    }
+    const ResidentTextureShape chain{base, 512, 512, 512, 10, 1, 10, 1, 1, true, false, false};
+    const auto tail = [&](uint32_t level, uint32_t pitch, uint32_t w, uint32_t h) {
+        ResidentResolve r{true, mip + offsets[level], 0x1000, mip + offsets[level], 10, pitch, 1, 0, 0, w, h};
+        r.bytesLog2 = 1;
+        return r;
+    };
+    Expect(ResidentLevelFor(chain, levels, tail(7, 32, 8, 8), &why) == -1 && why == "no level takes it (level 0: another pitch)",
+           "CONTROL: cover off: an 8x8 resolve into the 4x4 level 7 is refused (scenario256's reason, level 0's)");
+    ResidentCopy copy;
+    uint32_t x = 9, y = 9;
+    Expect(ResidentLevelFor(chain, levels, tail(7, 32, 8, 8), &why, &x, &y, true, &copy) == 7 && x == 0 && y == 0 && copy.width == 4 && copy.height == 4,
+           "cover: an 8x8 resolve at level 7's base goes to level 7, clipped to 4x4 at texel 0,0");
+    Expect(ResidentLevelFor(chain, levels, tail(8, 32, 8, 8), &why, &x, &y, true, &copy) == 8 && copy.width == 2 && copy.height == 2,
+           "cover: level 8 (2x2) takes 2x2 of the 8x8 rectangle");
+    Expect(ResidentLevelFor(chain, levels, tail(9, 32, 8, 8), &why, &x, &y, true, &copy) == 9 && copy.width == 1 && copy.height == 1,
+           "cover: level 9 (1x1) takes 1x1 of the 8x8 rectangle");
+    Expect(ResidentLevelFor(chain, levels, tail(7, 8, 8, 8), &why, &x, &y, true, &copy) == 7 && copy.width == 4,
+           "cover: RB_COPY_DEST_PITCH 8 is pitch 32 once aligned (texture_util.cc:446): level 7");
+    Expect(ResidentLevelFor(chain, levels, tail(7, 8, 8, 8), &why) == -1, "CONTROL: cover off: pitch 8 is another pitch");
+    Expect(ResidentLevelFor(chain, levels, tail(7, 40, 8, 8), &why, &x, &y, true, &copy) == -1,
+           "CONTROL: cover: pitch 40 aligns to 64, not level 7's 32");
+    Expect(ResidentLevelFor(chain, levels, tail(7, 32, 40, 8), &why, &x, &y, true, &copy) == -1,
+           "CONTROL: cover: a 40-wide rectangle passes level 7's pitch (32) and is refused");
+    copy = {};
+    Expect(ResidentLevelFor(chain, levels, ResidentResolve{true, base, 0x40000, base, 10, 512, 1, 0, 0, 512, 256, 1}, &why, &x, &y, true, &copy) == 0 &&
+               copy.width == 512 && copy.height == 256,
+           "cover: the 512x256 band at the base still goes to level 0 unclipped");
+    // The clip's guest side at 16 bpp: the 8x8 resolve's halfwords land inside level 7's 4 KB stride, and the 4x4 texels a fetch of
+    // level 7 reads (pitch 32) are the rectangle's top-left 4x4, which the clipped copy takes from the words' corner.
+    std::vector<uint16_t> level7(0x1000 / 2, 0);
+    bool inside = true;
+    for (uint32_t ty = 0; ty < 8; ty++)
+        for (uint32_t tx = 0; tx < 8; tx++)
+        {
+            const uint32_t at = XeniaTiledOffset2D(tx, ty, 8, 1);  // RB_COPY_DEST_PITCH 8, aligned to 32 inside
+            inside = inside && at + 2 <= 0x1000;
+            if (at + 2 <= 0x1000)
+                level7[at / 2] = uint16_t(0x100 * ty + tx + 1);
+        }
+    bool topLeft = inside;
+    for (uint32_t ty = 0; ty < 4; ty++)
+        for (uint32_t tx = 0; tx < 4; tx++)
+            topLeft = topLeft && level7[XeniaTiledOffset2D(tx, ty, 32, 1) / 2] == uint16_t(0x100 * ty + tx + 1);
+    Expect(topLeft, "cover: the 8x8 halfwords stay in level 7's 4 KB and its 4x4 texels are the rectangle's top-left 4x4");
+    Expect(XeniaTiledOffset2D(32, 0, 32, 2) >= 0x1000, "CONTROL: at 32 bpp, x 32 at pitch 32 is past a 4 KB 32x32 level (why x + w <= pitch)");
+    // Rows: a single-level 64x32 texture (pitch 64) takes a 32x32 rectangle; one 40 rows high passes its rows aligned to 32.
+    const ResidentTextureShape wide{base, 64, 32, 64, 54, 2, 1, 1, 1, true, false, false};
+    Expect(ResidentTextureMatches(wide, ResidentResolve{true, base, 0x2000, base, 7, 64, 2, 0, 0, 32, 32}, &why, &x, &y, true, &copy) && copy.width == 32 &&
+               copy.height == 32, "cover: a 32x32 rectangle inside a 64x32 texture is copied whole");
+    Expect(!ResidentTextureMatches(wide, ResidentResolve{true, base, 0x4000, base, 7, 64, 2, 0, 0, 32, 40}, &why, &x, &y, true, &copy) &&
+               why == "the rectangle exceeds the texture",
+           "CONTROL: cover: 40 rows pass the 64x32 texture's 32 aligned rows (the pitch, 64, is no row bound)");
+
+    // (2) A covering resolve over an earlier pending one (FM4's bloom chain: 64x32 then 32x32 at one base, k_2_10_10_10 read as 54).
+    // Guest memory after both write-backs in record order, read as the 32x32 texture (pitch 32), is the 32x32 resolve's words.
+    std::vector<uint32_t> guest(0x2000 / 4, 0);
+    for (uint32_t ty = 0; ty < 32; ty++)
+        for (uint32_t tx = 0; tx < 64; tx++)
+            guest[XeniaTiledOffset2D(tx, ty, 64, 2) / 4] = 0xA0000000u | (ty << 8) | tx;  // the 64x32 resolve (pitch 64)
+    std::vector<uint32_t> partial = guest;
+    for (uint32_t ty = 0; ty < 32; ty++)
+        for (uint32_t tx = 0; tx < 32; tx++)
+            guest[XeniaTiledOffset2D(tx, ty, 32, 2) / 4] = 0xB0000000u | (ty << 8) | tx;  // then the 32x32 one (pitch 32)
+    for (uint32_t ty = 0; ty < 16; ty++)
+        for (uint32_t tx = 0; tx < 32; tx++)
+            partial[XeniaTiledOffset2D(tx, ty, 32, 2) / 4] = 0xB0000000u | (ty << 8) | tx;  // CONTROL: a 32x16 one instead
+    bool covered = true, partialCovered = true;
+    for (uint32_t ty = 0; ty < 32; ty++)
+        for (uint32_t tx = 0; tx < 32; tx++)
+        {
+            covered = covered && guest[XeniaTiledOffset2D(tx, ty, 32, 2) / 4] == (0xB0000000u | (ty << 8) | tx);
+            partialCovered = partialCovered && partial[XeniaTiledOffset2D(tx, ty, 32, 2) / 4] == (0xB0000000u | (ty << 8) | tx);
+        }
+    Expect(covered, "cover: after the 64x32 then the 32x32 write-back the 32x32 texture's texels are all the last resolve's words");
+    Expect(!partialCovered, "CONTROL: after a 32x16 last write-back rows 16-31 still hold the 64x32 resolve's words");
+    GuestWriteLog log;
+    log.Mark(base, 0x2000);  // the 64x32 resolve's extent (two 4 KB tiles)
+    log.Mark(base, 0x1000);  // the 32x32 one's
+    const bool noEarlier = !log.OverlapsEarlier(base, 0x1000);
+    const ResidentTextureShape bloom{base, 32, 32, 32, 54, 2, 1, 1, 1, true, false, false};
+    copy = {};
+    Expect(!noEarlier && ResidentTextureMatches(bloom, ResidentResolve{true, base, 0x1000, base, 7, 32, 2, 0, 0, 32, 32}, &why, &x, &y, true, &copy) &&
+               copy.width == 32 && copy.height == 32,
+           "cover: the 32x32 resolve matches the 32x32 texture whole, with the 64x32 one pending before it");
+    Expect(!ResidentCoversInStep(0, 1, 0, 0, copy, 32, 32, noEarlier, false), "CONTROL: cover off: an earlier pending resolve keeps it out of step (scenario256)");
+    Expect(ResidentCoversInStep(0, 1, 0, 0, copy, 32, 32, noEarlier, true), "cover: the covering resolve is in step over the earlier pending one");
+    Expect(!ResidentCoversInStep(0, 1, 0, 0, ResidentCopy{32, 16}, 32, 32, noEarlier, true), "CONTROL: cover: a 32x16 resolve does not cover the 32x32 texture");
+    Expect(!ResidentCoversInStep(7, 10, 0, 0, ResidentCopy{4, 4}, 4, 4, noEarlier, true), "CONTROL: cover: a mip level never makes the image in step alone");
+    Expect(ResidentCoversInStep(0, 1, 0, 0, copy, 32, 32, true, false), "cover off: with nothing pending before it, covering is in step (as before)");
+}
+
 // FM4 Recomp (FM4_WRITE_WATCH): with a protecting backend the cache's own bookkeeping protects nothing (a run stopped
 // at draw 3843 when Loaded protected through it), arming goes through the second watch, and GPU writes move both.
 struct CountingBackend final : WatchBackend
@@ -1301,6 +1476,9 @@ int main()
     TestReservedStagingBytes();
     TestCube();
     TestResidentResolve();
+    TestResidentCover();  // FM4 Recomp (M7, resident resolves)
+    TestExpand64();  // FM4 Recomp (alpha)
+    TestPrepareAnisotropy();  // FM4 Recomp (M7, FM4_TEXTURE_PREPARE_ONCE)
     TestProtectingWatch();
     TestGuestWriteLogSerials();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);

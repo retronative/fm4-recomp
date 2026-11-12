@@ -11,6 +11,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -26,17 +28,33 @@ std::atomic<uint32_t> callback{0}, userData{0};
 std::atomic<uint64_t> vblanks{0}, delivered{0};
 bool started = false;
 
+// FM4 Recomp (diagnostic, FM4_DIAG_INTERRUPTS=1): how long each queued interrupt waits before its callback starts and how long the
+// guest callback runs, by source, summed and reported every 300 PM4 interrupts. FM4's callback acknowledges a PM4 interrupt
+// itself (it clears its CPU's bit in the word the command stream's WAIT_REG_MEM polls), so these are the guest side of a drain.
+bool DiagInterrupts()
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_DIAG_INTERRUPTS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+}
+uint64_t NowNs() { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+struct InterruptTally { uint64_t n = 0, queueNs = 0, runNs = 0, maxRunNs = 0, maxQueueNs = 0; };
+InterruptTally tally[2];
+std::deque<uint64_t> queuedAt;  // FM4_DIAG_INTERRUPTS: when each pending entry was queued (under interruptLock)
+
 // The service thread: runs each queued interrupt's callback(source, user data), in order.
 void ServeInterrupts(uint8_t* base, PPCContext& initial)
 {
     for (;;)
     {
         uint32_t source;
+        uint64_t queued = 0;
         {
             std::unique_lock guard(interruptLock);
             interruptWake.wait(guard, [] { return !pending.empty(); });
             source = pending.front();
+            queued = DiagInterrupts() && !queuedAt.empty() ? queuedAt.front() : 0;
         }
+        const uint64_t begun = DiagInterrupts() ? NowNs() : 0;
         if (const uint32_t routine = callback.load())
         {
             PPCContext ctx = initial;
@@ -46,6 +64,22 @@ void ServeInterrupts(uint8_t* base, PPCContext& initial)
         {
             std::lock_guard guard(interruptLock);
             pending.pop_front();
+            if (DiagInterrupts() && !queuedAt.empty())
+            {
+                queuedAt.pop_front();
+                InterruptTally& t = tally[source == 0 ? 0 : 1];
+                const uint64_t run = NowNs() - begun, wait = queued != 0 && begun > queued ? begun - queued : 0;
+                t.n++, t.runNs += run, t.queueNs += wait, t.maxRunNs = std::max(t.maxRunNs, run), t.maxQueueNs = std::max(t.maxQueueNs, wait);
+                if (source != 0 && tally[1].n % 300 == 0)
+                {
+                    std::fprintf(stderr, "[interrupts] PM4: %llu, queue %.3f ms mean (max %.3f), callback %.3f ms mean (max %.3f); vblank: %llu, queue %.3f, "
+                                         "callback %.3f ms mean (max %.3f)\n", (unsigned long long)tally[1].n, tally[1].queueNs / 1e6 / tally[1].n,
+                                 tally[1].maxQueueNs / 1e6, tally[1].runNs / 1e6 / tally[1].n, tally[1].maxRunNs / 1e6, (unsigned long long)tally[0].n,
+                                 tally[0].n ? tally[0].queueNs / 1e6 / tally[0].n : 0.0, tally[0].n ? tally[0].runNs / 1e6 / tally[0].n : 0.0,
+                                 tally[0].maxRunNs / 1e6);
+                    tally[0] = tally[1] = {};
+                }
+            }
             delivered++;
         }
         interruptDone.notify_all();
@@ -72,20 +106,33 @@ void SetInterruptCallback(uint8_t* base, uint32_t routine, uint32_t data)
             vblanks++;
             std::lock_guard g(interruptLock);
             if (std::find(pending.begin(), pending.end(), 0u) == pending.end())
+            {
                 pending.push_back(0);
+                if (DiagInterrupts())
+                    queuedAt.push_back(NowNs());
+            }
             interruptWake.notify_one();
         }
     }).detach();
 }
 
-void RequestInterrupt(uint32_t source, bool wait)
+void RequestInterrupt(uint32_t source, bool wait, void (*poll)())
 {
     std::unique_lock guard(interruptLock);
     pending.push_back(source);
+    if (DiagInterrupts())
+        queuedAt.push_back(NowNs());
     const uint64_t target = delivered + pending.size();
     interruptWake.notify_one();
-    if (wait)
+    if (wait && poll == nullptr)
         interruptDone.wait(guard, [&] { return delivered >= target; });
+    else if (wait)  // FM4 Recomp (FM4_GUEST_MEMORY_GPU): runtime/video/gpu_read_guard.h G5
+        while (!interruptDone.wait_for(guard, std::chrono::microseconds(50), [&] { return delivered >= target; }))
+        {
+            guard.unlock();
+            poll();
+            guard.lock();
+        }
 }
 
 uint64_t VblankCount() { return vblanks.load(); }

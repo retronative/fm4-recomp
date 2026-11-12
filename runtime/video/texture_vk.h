@@ -15,9 +15,11 @@
 
 namespace runtime::video {
 
+class GlslangCompiler;
+
 // At renderer Initialize, after the device exists: logs the features the unit depends on and returns the
-// hooks to register (SetTextureHooks).
-const TextureHooks* InitializeTextureUnit(const VulkanDevice& device);
+// hooks to register (SetTextureHooks). FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): `compiler` builds the untile pipeline (used only here).
+const TextureHooks* InitializeTextureUnit(const VulkanDevice& device, GlslangCompiler* compiler);
 // At renderer Shutdown, only after GpuGuard::Shutdown kept nothing (every submission confirmed complete) and
 // before DestroyVulkanDevice: destroys the views, samplers, images and their memory.
 void ShutdownTextureUnit();

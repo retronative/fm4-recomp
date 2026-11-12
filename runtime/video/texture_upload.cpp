@@ -73,7 +73,7 @@ PreparedTexture TextureUnitModel::PrepareUncached(const uint32_t fetch[6], const
     };
     if (!ObservedFormat(d.fetch.format))
     {
-        p.error = where() + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (2, 6, 10, 18, 20, 23, 25, 36, 50, 51, 53, 54) this unit was checked for";
+        p.error = where() + ": format " + std::to_string(d.fetch.format) + " is mapped (texture_info.cpp) but not in the observed set (texture_upload.h ObservedFormat) this unit was checked for";
         return p;
     }
     // Every level the description holds (texture_info.cpp, Xenia's level range texture_util.cc:60-92 and layout :200-438,

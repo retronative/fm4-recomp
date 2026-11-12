@@ -157,7 +157,10 @@ bool HostFormatFor(uint32_t format, HostFormat& out)
         return true;
     // FM4 Recomp (alpha, 64 bpp resolve): k_16_16_16_16_FLOAT :258-262: R16G16B16A16_SFLOAT for both signednesses
     // (unsigned_signed_compatible), RGBA, kLoadShaderIndex64bpb (a plain 8-byte copy after the endian swap). FM4 resolves its
-    // post-race 16_16_16_16 target into it (the local capture alpha (not distributed), draw 4909852).
+    // post-race 16_16_16_16 target into it.
+    // FM4 Recomp (alpha, Car Select): k_16_16_16_16_EXPAND (29) :243-247 is loaded exactly as k_16_16_16_16_FLOAT: the same
+    // host format, swizzle and 64bpb load (FM4 samples one after its post-race 64 bpp resolve).
+    case 29:
     case 32: out = {vk::kFormatR16G16B16A16Sfloat, kSwizzleRGBA, false, true, true}; return true;
     case 25:  // k_16_16 :220-225: R16G16_UNORM, signed R16G16_SNORM, RGGG; the number-format bit ignored (Xenia never reads it)
         out = {vk::kFormatR16G16Unorm, kSwizzleRGGG, false, false, true, false, vk::kFormatR16G16Snorm, false};

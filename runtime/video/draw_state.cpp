@@ -50,11 +50,13 @@ struct Decoder
             return Refuse("draw opcode " + Hex(in.opcode) + " is not DRAW_INDX (22) or DRAW_INDX_2 (36)");
         d.opcode = in.opcode;
         d.vizQueryToken = in.vizQueryToken;
-        if (d.vizQueryToken != 0)  // a conditional draw on a visibility query (X :988-992)
-            return Refuse("DRAW_INDX with a viz-query token " + Hex(d.vizQueryToken) + ": conditional draws are not modelled");
+        // FM4 Recomp (alpha): a draw conditional on a visibility query (token: id bits 0-5, use bit 8; X :988-992) is drawn,
+        // as Xenia, which ignores the condition: every query reads visible (command_processor.cpp VIZ_QUERY), so the condition holds.
+        // FM4 Recomp (alpha, Car Select: PA_SC_VIZ_QUERY 000000F9): as Xenia (pm4_command_processor_implement.h:1074-1075),
+        // a draw with viz_query_ena (bit 0) and kill_pix_post_hi_z (bit 7; X registers.h:474-484) only feeds the visibility test and is
+        // dropped (classified NoWrite below; VIZ_QUERY reports every query visible, command_processor.cpp); with bit 7 clear it is drawn.
         const uint32_t vizQuery = Reg(xr::kPaScVizQuery);
-        if (vizQuery & 1)  // viz_query_ena (X registers.h:479; Xenia drops the draw when kill_pix_post_hi_z is also set, pm4:1074-1075)
-            return Refuse("PA_SC_VIZ_QUERY " + Hex(vizQuery) + ": visibility queries are not modelled");
+        vizQueryKill_ = (vizQuery & 1) && (vizQuery & 0x80);
         const uint32_t path = Reg(xr::kVgtOutputPathCntl) & 3;
         if (path == 1)  // kTessellationEnable (X xenos.h:876-880; registers.h:362-369)
             return Refuse("VGT_OUTPUT_PATH_CNTL path_select 1: tessellation is not modelled");
@@ -123,8 +125,11 @@ struct Decoder
                                                        (back >> 16) & 0xFF}
                                   : s.front;
     }
+    bool vizQueryKill_ = false;  // FM4 Recomp (alpha): Packet
     bool WritesNothing() const
     {
+        if (vizQueryKill_)
+            return true;
         const DepthStencil& s = d.depthStencil;
         return d.colorWriteMask == 0 && !(s.zEnable && s.zWriteEnable) && !s.stencilEnable;
     }

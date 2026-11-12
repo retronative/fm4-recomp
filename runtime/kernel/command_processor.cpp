@@ -4,6 +4,7 @@
 // The headless command processor (command_processor.h). Line references are to Xenia 67f16c4
 // src/xenia/gpu/pm4_command_processor_implement.h unless named otherwise.
 #include "command_processor.h"
+#include "deferred_store_parts.h"
 #include "graphics.h"
 #include "cp_trace.h"
 #include "imports.h"
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <pthread.h>
 #include <thread>
 #include <vector>
 
@@ -70,6 +72,21 @@ struct Reader
 
 std::atomic<uint32_t> ringStart{0}, ringWords{0}, readIndex{0}, writeBack{0}, stopAtSwap{1};
 const RendererHooks* renderer = nullptr;  // set once by main before the ring starts
+std::atomic<uintptr_t> cpThread{0};       // FM4 Recomp (FM4_GUEST_MEMORY_GPU): the ring thread's pthread_self
+std::atomic<uintptr_t> completionThread{0};  // FM4 Recomp (FM4_ASYNC_RETIRE): the renderer's completion worker's pthread_self
+void (*reapRetired)() = nullptr;             // FM4 Recomp (FM4_ASYNC_RETIRE): SetReapHook; null otherwise
+void BeforeCpWrite(uint32_t physical, uint32_t bytes)
+{
+    if (renderer && renderer->beforeCpWrite)
+        renderer->beforeCpWrite(physical & 0x1FFFFFFFu, bytes);
+}
+void HonourGpuReadGuard()
+{
+    if (renderer && renderer->honourGpuReadGuard)
+        renderer->honourGpuReadGuard();
+    if (reapRetired)  // FM4 Recomp (FM4_ASYNC_RETIRE): at the same points (no command buffer handle is live at any of them)
+        reapRetired();
+}
 std::mutex stateLock;
 CpState ringState;
 
@@ -103,6 +120,7 @@ uint32_t LoadGpu(const uint8_t* base, uint32_t address)
 
 void StoreGpu(uint8_t* base, uint32_t address, uint32_t value)
 {
+    BeforeCpWrite(address & ~3u, 4);
     const uint32_t raw = GpuSwap(value, address & 3);
     std::memcpy(base + PhysicalToGuest(address & ~3u), &raw, 4);
 }
@@ -114,6 +132,7 @@ void StoreGpu(uint8_t* base, uint32_t address, uint32_t value)
 struct DeferredStore { uint32_t address, value; bool interrupt = false; };  // interrupt: `value` is the CPU mask
 std::vector<DeferredStore> deferredStores;
 uint8_t* deferredBase = nullptr;
+StorePartition storeParts;  // FM4 Recomp (FM4_ASYNC_RETIRE; deferred_store_parts.h): the submission part each queued entry follows
 std::atomic<uint64_t> cpIdleNs{0}, selfWaits{0}, immediateWaits{0}, memWaits{0}, syncedWaits{0}, memWaitNs{0}, immediateInterrupts{0}, graceSyncs{0};
 // FM4 Recomp (FM4_DIAG_MEMWAIT=1, diagnostic): each memory WAIT_REG_MEM that is not satisfied at once, on every 50th swap (at
 // most 4,000 lines): its word, reference, the value before and after the sync, what was pending, and where the time went.
@@ -184,15 +203,15 @@ uint64_t NowNs()
 void RaiseInterrupts(uint32_t mask)
 {
     for (int n = 0; n < 6; n++)
-        if (mask & (1u << n))
-            RequestInterrupt(1, true);
+        if (mask & (1u << n))  // FM4_GUEST_MEMORY_GPU: the callback may store to a page a GPU read guards
+            RequestInterrupt(1, true, renderer && renderer->honourGpuReadGuard ? HonourGpuReadGuard : nullptr);
 }
 
 void CpStore(uint8_t* base, uint32_t address, uint32_t value)
 {
     if (!deferredStores.empty() || (renderer && renderer->deferStore && renderer->deferStore(address & ~3u)))
     {
-        deferredStores.push_back({address, value}), deferredBase = base;
+        deferredStores.push_back({address, value}), deferredBase = base, storeParts.Queued();
         return;
     }
     StoreGpu(base, address, value);
@@ -235,7 +254,49 @@ void CpWriteRegister(uint8_t* base, uint32_t index, uint32_t value)
         OnGammaRampRegisterWritten(base, index, value, LutWriter::CommandProcessor);
     if (index >= reg::kScratchReg0 && index < reg::kScratchReg0 + 8 &&
         (ReadRegister(base, reg::kScratchUmsk) >> (index - reg::kScratchReg0) & 1))
+        BeforeCpWrite(ReadRegister(base, reg::kScratchAddr) + 4 * (index - reg::kScratchReg0), 4),
         Store32(base, PhysicalToGuest(ReadRegister(base, reg::kScratchAddr) + 4 * (index - reg::kScratchReg0)), value);
+}
+
+// FM4 Recomp (M7 CP cost, opt-in FM4_BULK_REGISTERS=1; reference/perf/draw_cost.md R2): a run of consecutive registers
+// from the ring (type 0, SET_CONSTANT, SET_CONSTANT2) is one copy when no register in it has a side effect in CpWriteRegister
+// (COHER_STATUS_HOST, WAIT_UNTIL, the 8 scratch registers, the gamma ramp's DC_LUT_* state) and it does not wrap the ring;
+// otherwise it is written word by word as before. Both the ring and the register file are big-endian guest memory, so the copy
+// is byte for byte what Load32 then Store32 per word writes. Adapts SpeedBreaker 312ce69 runtime/gpu/command_processor.cpp:281-307
+// (BulkSafe, WriteRegistersBulk; GPL-3.0, technique only: it swaps into a host-order array, which FM4 does not have).
+int bulkRegistersOverride = -1;  // SetBulkRegisters (tests)
+bool BulkRegisters()
+{
+    if (bulkRegistersOverride >= 0)
+        return bulkRegistersOverride == 1;
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_BULK_REGISTERS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] bulk register runs on (FM4_BULK_REGISTERS=1): a run of plain registers is one copy\n");
+        return enabled;
+    }();
+    return on;
+}
+// Whether [index, index + count) is inside the register file and holds no register with a side effect.
+bool PlainRegisterRun(uint32_t index, uint32_t count)
+{
+    auto holds = [&](uint32_t first, uint32_t last) { return first < index + count && index <= last; };  // [first, last] meets the run
+    return index < kRegisterCount && count <= kRegisterCount - index && !holds(reg::kCoherStatusHost, reg::kCoherStatusHost) &&
+           !holds(reg::kWaitUntil, reg::kWaitUntil) && !holds(reg::kScratchReg0, reg::kScratchReg0 + 7) &&
+           !holds(gamma::reg::kRwIndex, gamma::reg::k30Color);
+}
+// `count` words from the reader to the registers from `index` on (one register when `one`).
+void WriteRegisterRun(uint8_t* base, Reader& r, uint32_t index, uint32_t count, bool one)
+{
+    if (!one && count > 1 && BulkRegisters() && PlainRegisterRun(index, count) && r.position % r.size + count <= r.size)
+    {
+        std::memcpy(base + RegisterAddress(index), r.base + r.start + 4 * (r.position % r.size), 4ull * count);
+        r.position += count, r.left -= count;
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        CpWriteRegister(base, one ? index : index + i, r.Next());
 }
 
 void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32_t words, CpState& state)
@@ -248,6 +309,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         state.lastHeaders[state.lastCount++ % 16] = packet;
         state.packets++;
         packetsSeen++;
+        HonourGpuReadGuard();  // FM4_GUEST_MEMORY_GPU (nothing otherwise): between packets
         if (packet == 0 || packet == 0x0BADF00D || type == 2)  // skipped (:274-312)
             continue;
         if (type == 1)  // two registers (:357-368)
@@ -266,8 +328,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         {
             const uint32_t index = packet & 0x7FFF;
             const bool one = (packet >> 15) & 1;
-            for (uint32_t i = 0; i < count; i++)
-                CpWriteRegister(base, one ? index : index + i, r.Next());
+            WriteRegisterRun(base, r, index, count, one);
             continue;
         }
         const uint32_t opcode = (packet >> 8) & 0x7F;
@@ -369,7 +430,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             }
             if (renderer && renderer->workOpen && (!deferredStores.empty() || renderer->workOpen()))
             {
-                deferredStores.push_back({0, mask, true}), deferredBase = base;
+                deferredStores.push_back({0, mask, true}), deferredBase = base, storeParts.Queued();
                 break;
             }
             SyncBefore(opcode);
@@ -473,6 +534,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 if (Matches(value & mask, ref, info))
                     break;
                 polls++;
+                HonourGpuReadGuard();  // FM4_GUEST_MEMORY_GPU: the guest thread this waits for may wait for a GPU read
                 if (!synced && NowNs() - waitStart > kCpuWordGraceNs)
                 {
                     synced = true, graceSyncs++;
@@ -565,6 +627,23 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             }
             break;
         }
+        case kVizQuery:  // (:1318-1350)
+        {
+            // FM4 Recomp (Car Select: packet C0002300): a visibility query's begin (VIZQUERY_START, 7) or end
+            // (VIZQUERY_END, 8) as VGT_EVENT_INITIATOR; at the end the query reads visible, bit `id` of PA_SC_VIZ_QUERY_STATUS_0 / _1, as
+            // Xenia (pm4_command_processor_implement.h:1318-1350 fakes "visible": no host occlusion query). One data word.
+            if (count != 1)
+                Stop(StopCode::Unimplemented, "GPU: VIZ_QUERY with %u words is not modelled", count);
+            const uint32_t word = next(), id = word & 0x3F;
+            const bool end = (word & 0x100) != 0;
+            WriteRegister(base, reg::kVgtEventInitiator, end ? 8u : 7u);
+            if (end)
+            {
+                const uint32_t status = id < 32 ? reg::kPaScVizQueryStatus0 : reg::kPaScVizQueryStatus1;
+                WriteRegister(base, status, Register(base, status) | 1u << (id & 31));
+            }
+            break;
+        }
         case kEventWrite:  // (:864-879)
             // FM4 Recomp: no sync point. The packet only sets VGT_EVENT_INITIATOR (no guest memory store, no interrupt), so the guest
             // CPU cannot learn from it that earlier GPU work finished. FM4 issues one after nearly every resolve (every
@@ -588,8 +667,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             const uint32_t bases[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
             if (type > 4)
                 Stop(StopCode::Unimplemented, "GPU: SET_CONSTANT of type %u", type);
-            for (uint32_t index = bases[type] + (offsetType & 0x7FF); remaining; index++)
-                CpWriteRegister(base, index, next());
+            WriteRegisterRun(base, r, bases[type] + (offsetType & 0x7FF), remaining, false), remaining = 0;
             break;
         }
         case kLoadAluConstant:  // {physical address, offset | type << 16, size in words}: from memory (:1181-1232)
@@ -658,8 +736,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         }
         case kSetConstant2:  // (:1170-1179)
         {
-            for (uint32_t index = next() & 0xFFFF; remaining; index++)
-                CpWriteRegister(base, index, next());
+            const uint32_t index = next() & 0xFFFF;
+            WriteRegisterRun(base, r, index, remaining, false), remaining = 0;
             break;
         }
         case kSetBinMaskLo: state.binMask = (state.binMask & 0xFFFFFFFF00000000ull) | next(); break;  // (:511-546)
@@ -683,6 +761,7 @@ void ApplyDeferredStores()
     // Taken first: an interrupt's guest callback may run on the interrupt thread while this thread goes on.
     const std::vector<DeferredStore> queued = std::move(deferredStores);
     deferredStores.clear();
+    storeParts.TakenAll();
     for (const DeferredStore& d : queued)
         if (!d.interrupt)
             StoreGpu(deferredBase, d.address, d.value);
@@ -690,6 +769,13 @@ void ApplyDeferredStores()
             RaiseInterrupts(d.value);
 }
 bool DeferredStoresPending() { return !deferredStores.empty(); }
+void MarkDeferredStoresPart(uint64_t serial) { storeParts.Submitted(serial); }
+size_t ApplyDeferredStoresThrough(uint64_t serial, bool (*canStore)(uint32_t physical))
+{
+    return ApplyStoresThrough(deferredStores, storeParts, serial, [&](const DeferredStore& d) { return canStore == nullptr || canStore(d.address & 0x1FFFFFFCu); },
+                              [](const DeferredStore& d) { StoreGpu(deferredBase, d.address, d.value); });
+}
+void SetReapHook(void (*reap)()) { reapRetired = reap; }
 uint64_t CpIdleNs() { return cpIdleNs.load(); }
 uint64_t SelfWaits() { return selfWaits.load(); }
 uint64_t ImmediateWaits() { return immediateWaits.load(); }
@@ -700,7 +786,19 @@ uint64_t ImmediateInterrupts() { return immediateInterrupts.load(); }
 uint64_t GraceSyncs() { return graceSyncs.load(); }
 void SetImmediateInterrupts(bool on) { immediateInterruptsOverride = on ? 1 : 0; }
 void SetDeferEvents(bool on) { deferEventsOverride = on ? 1 : 0; }
+void SetBulkRegisters(bool on) { bulkRegistersOverride = on ? 1 : 0; }
 void SetRendererHooks(const RendererHooks* hooks) { renderer = hooks; }
+bool OnCommandProcessorThread()
+{
+    const uintptr_t t = cpThread.load(std::memory_order_acquire);
+    return t != 0 && pthread_equal(reinterpret_cast<pthread_t>(t), pthread_self());
+}
+void SetCompletionWorkerThread() { completionThread.store(reinterpret_cast<uintptr_t>(pthread_self()), std::memory_order_release); }
+bool OnCompletionWorkerThread()
+{
+    const uintptr_t t = completionThread.load(std::memory_order_acquire);
+    return t != 0 && pthread_equal(reinterpret_cast<pthread_t>(t), pthread_self());
+}
 
 void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
 {
@@ -713,11 +811,22 @@ void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
     ringStart = PhysicalToGuest(physical);
     std::thread([base] {
         pthread_setname_np("fm4 gpu cp");  // FM4 Recomp: thread_cpu.h roles
+        cpThread.store(reinterpret_cast<uintptr_t>(pthread_self()), std::memory_order_release);
         for (;;)
         {
             const uint32_t size = ringWords.load(), write = ReadRegister(base, reg::kCpRbWptr) % size, read = readIndex.load();
             if (write == read)
             {
+                if (renderer && renderer->honourGpuReadGuard)  // FM4_GUEST_MEMORY_GPU: idle, a guest thread may wait for a GPU read
+                {
+                    std::lock_guard guard(stateLock);
+                    renderer->honourGpuReadGuard();
+                }
+                if (reapRetired)  // FM4 Recomp (FM4_ASYNC_RETIRE): idle, the parts the worker retired land their stores
+                {
+                    std::lock_guard guard(stateLock);
+                    reapRetired();
+                }
                 if (!deferredStores.empty() && renderer && renderer->ringIdle)
                 {
                     std::lock_guard guard(stateLock);
@@ -735,7 +844,14 @@ void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
             }
             readIndex = write;
             if (const uint32_t back = writeBack.load())
-                Store32(base, PhysicalToGuest(back), write);  // big-endian (command_processor.cc ExecutePrimaryBuffer)
+            {
+                if (renderer && renderer->beforeCpWrite)  // FM4 Recomp (FM4_GUEST_MEMORY_GPU): it may flush the renderer
+                {
+                    std::lock_guard guard(stateLock);
+                    BeforeCpWrite(back, 4);
+                }
+                Store32(base, PhysicalToGuest(back), write);
+            }  // big-endian (command_processor.cc ExecutePrimaryBuffer)
         }
     }).detach();
 }

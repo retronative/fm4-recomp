@@ -6,6 +6,8 @@
 // FM4 Recomp changes: M3: MapPhysicalMemory from ForzaRecomp guest_memory.cpp (macOS branch only);
 // ForzaRecomp's later OnTrap filter (symbol name) is not taken: our trap stop stays for every trap.
 // M4 unit 7: OnFault asks the write-watch hook first (SetGuestWriteFaultHook; texture_NOTES.md §5 step 1).
+// M7 (FM4_GUEST_MEMORY_GPU): the GPU read guard's wait before the write-watch hook (SetGpuReadFaultHook), and a dedicated host view
+// of physical memory for the GPU import (MapPhysicalHostView).
 #include "guest_memory.h"
 #include "stops.h"
 #include <atomic>
@@ -23,6 +25,11 @@ namespace {
 uint8_t* guestBase = nullptr;
 DescribeAddress describeAddress = nullptr;
 std::atomic<WriteFaultHook> writeFaultHook{nullptr};
+std::atomic<const GpuReadFaultHooks*> gpuReadFaultHooks{nullptr};
+// FM4 Recomp (FM4_GUEST_MEMORY_GPU=1): the physical memory's Mach entry, kept for MapPhysicalHostView (deallocated as before when
+// the option is off).
+mach_port_t physicalEntry = MACH_PORT_NULL;
+uint32_t physicalEntrySize = 0;
 
 void OnFault(int signal, siginfo_t* info, void* context)
 {
@@ -34,7 +41,15 @@ void OnFault(int signal, siginfo_t* info, void* context)
         return;
     }
     const auto guest = uint32_t(address - start);
-    if (const WriteFaultHook hook = writeFaultHook.load(std::memory_order_acquire); hook != nullptr && hook(guest))
+    // FM4_GUEST_MEMORY_GPU: enter returns once no unretired GPU read uses the page (or stops the run), holding the guard's gate
+    // until the write watch has made the page writable and recorded the write (runtime/video/gpu_read_guard.h G8).
+    const GpuReadFaultHooks* gpu = gpuReadFaultHooks.load(std::memory_order_acquire);
+    const bool gated = gpu != nullptr && gpu->enter(guest);
+    const WriteFaultHook hook = writeFaultHook.load(std::memory_order_acquire);
+    const bool handled = hook != nullptr && hook(guest);
+    if (gated)
+        gpu->leave();
+    if (handled)
         return;  // a watched page, writable again: the store re-runs
     const char* what = describeAddress ? describeAddress(guest) : nullptr;
     // The host pc and lr (arm64 x30) and the executable's load address: `atos -o <binary> -l <image> <pc> <lr>` on the
@@ -81,7 +96,26 @@ void MapPhysicalMemory(uint8_t* base, const uint32_t* views, size_t count, uint3
                    VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_COPY) != KERN_SUCCESS)
             Stop(StopCode::Setup, "cannot map the guest physical memory at %08X", views[i]);
     }
-    mach_port_deallocate(mach_task_self(), entry);  // the mappings keep it alive
+    // FM4 Recomp (FM4_GUEST_MEMORY_GPU=1): kept for the GPU's host view (MapPhysicalHostView); otherwise the mappings keep the
+    // memory alive as before.
+    const char* gpu = std::getenv("FM4_GUEST_MEMORY_GPU");
+    if (physicalEntry != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), physicalEntry), physicalEntry = MACH_PORT_NULL;
+    if (gpu != nullptr && gpu[0] == '1' && gpu[1] == '\0')
+        physicalEntry = entry, physicalEntrySize = size;
+    else
+        mach_port_deallocate(mach_task_self(), entry);
+}
+
+uint8_t* MapPhysicalHostView()
+{
+    if (physicalEntry == MACH_PORT_NULL)
+        return nullptr;
+    vm_address_t address = 0;
+    if (vm_map(mach_task_self(), &address, physicalEntrySize, 0, VM_FLAGS_ANYWHERE, physicalEntry, 0, FALSE, VM_PROT_READ | VM_PROT_WRITE,
+               VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS)
+        return nullptr;
+    return reinterpret_cast<uint8_t*>(address);
 }
 
 void CommitGuestMemory(uint8_t* base, uint64_t guest, uint64_t size)
@@ -109,6 +143,7 @@ void InstallGuestFaultHandler(uint8_t* base, DescribeAddress describe)
 }
 
 void SetGuestWriteFaultHook(WriteFaultHook hook) { writeFaultHook.store(hook, std::memory_order_release); }
+void SetGpuReadFaultHooks(const GpuReadFaultHooks* hooks) { gpuReadFaultHooks.store(hooks, std::memory_order_release); }
 
 void ProtectGuestMemoryReadOnly(uint8_t* base, uint64_t guest, uint64_t size)
 {

@@ -37,6 +37,20 @@ bool Readable(uint32_t protect) { return !(protect & page::kNoAccess) && protect
 uint8_t* membaseAll = nullptr;
 std::atomic<uint8_t> physicalWritable[kPhysicalSize / kWatchHostPage];
 std::atomic<PhysicalRangeObserver> accessObserver{nullptr}, hostWriteObserver{nullptr};
+// FM4 Recomp (FM4_GUEST_MEMORY_GPU=1; runtime/video/gpu_read_guard.h): whether an unretired GPU read uses a range (lock-free), and the
+// bounded wait for those reads (never called with the heap lock held: the command processor takes it before it can retire).
+std::atomic<PhysicalRangeObserver> gpuReadWait{nullptr};
+std::atomic<GpuReadBusy> gpuReadBusy{nullptr};
+bool GpuReadsPending(uint32_t physical, uint32_t size)
+{
+    const GpuReadBusy busy = gpuReadBusy.load(std::memory_order_acquire);
+    return busy != nullptr && size != 0 && busy(physical, size);
+}
+void WaitGpuReads(uint32_t physical, uint32_t size)
+{
+    if (const PhysicalRangeObserver wait = gpuReadWait.load(std::memory_order_acquire); wait != nullptr && size != 0)
+        wait(physical, size);
+}
 
 void AccessChanged(uint32_t physical, uint32_t size)
 {
@@ -92,12 +106,15 @@ void Heap::SetHostAccess(uint32_t first, uint32_t count)
             if (!(access & PROT_WRITE))
                 physicalWritable[physical / kWatchHostPage].store(0, std::memory_order_release);
         }
-        if (mprotect(membase_ + h, host, access) != 0)
+        // FM4 Recomp (FM4_GUEST_MEMORY_GPU): a host page an unretired GPU read uses stays read-only, so the next store faults and
+        // waits (gpu_read_guard.h G2); the heap still means it writable (physicalWritable), so the fault is the guard's.
+        const int hostAccess = shared && GpuReadsPending(physical, uint32_t(host)) ? access & ~PROT_WRITE : access;
+        if (mprotect(membase_ + h, host, hostAccess) != 0)
             Stop(StopCode::Setup, "cannot set guest page access at %08llX", (unsigned long long)h);
         // Physical memory is seen through every view: the same access at the same offset of the
         // other view (each frame belongs to one view's allocation, so no other page decides it).
         for (const uint32_t view : {0xA0000000u, 0xC0000000u})
-            if (kind_ == Kind::SharedPhysical && view != base_ && mprotect(membase_ + view + (h - base_), host, access) != 0)
+            if (kind_ == Kind::SharedPhysical && view != base_ && mprotect(membase_ + view + (h - base_), host, hostAccess) != 0)
                 Stop(StopCode::Setup, "cannot set guest page access at %08llX", (unsigned long long)(view + (h - base_)));
         if (shared && (access & PROT_WRITE))
             physicalWritable[physical / kWatchHostPage].store(1, std::memory_order_release);
@@ -174,7 +191,15 @@ uint32_t Heap::Alloc(uint32_t size, uint32_t alignment, uint32_t type, uint32_t 
 
 bool Heap::Release(uint32_t address, uint32_t* releasedSize)
 {
-    std::lock_guard guard(lock);
+    std::unique_lock guard(lock);
+    // FM4 Recomp (FM4_GUEST_MEMORY_GPU): Zero rewrites the allocation's bytes; the GPU reads of them are waited for without the heap
+    // lock (the command processor takes it before it can retire), then the allocation is looked up again.
+    for (uint32_t span; kind_ == Kind::SharedPhysical && (span = AllocationBytes(address)) != 0 && GpuReadsPending(address - base_, span);)
+    {
+        guard.unlock();
+        WaitGpuReads(address - base_, span);
+        guard.lock();
+    }
     if (!Contains(address))
         return false;
     const uint32_t index = (address - base_) / pageSize_;
@@ -193,9 +218,15 @@ bool Heap::Release(uint32_t address, uint32_t* releasedSize)
 
 bool Heap::Decommit(uint32_t address, uint32_t size)
 {
-    std::lock_guard guard(lock);
+    std::unique_lock guard(lock);
     if (!Contains(address) || size == 0 || size - 1 > base_ + this->size() - 1 - address)  // past the heap (or wrapping): nothing is freed
         return false;
+    while (kind_ == Kind::SharedPhysical && GpuReadsPending(address - base_, size))  // FM4 Recomp (FM4_GUEST_MEMORY_GPU): as Release
+    {
+        guard.unlock();
+        WaitGpuReads(address - base_, size);
+        guard.lock();
+    }
     const uint32_t first = (address - base_) / pageSize_;
     const uint32_t count = (address + size - 1 - base_) / pageSize_ - first + 1;
     if (first + count > pages_.size())
@@ -208,6 +239,15 @@ bool Heap::Decommit(uint32_t address, uint32_t size)
         pages_[i].state = mem::kReserve;
     SetHostAccess(first, count);
     return true;
+}
+
+uint32_t Heap::AllocationBytes(uint32_t address) const
+{
+    if (!Contains(address))
+        return 0;
+    const uint32_t index = (address - base_) / pageSize_;
+    const Page& p = pages_[index];
+    return p.state != 0 && p.allocationBase == index ? p.allocationPages * pageSize_ : 0;
 }
 
 bool Heap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32_t* oldProtect)
@@ -380,8 +420,19 @@ void SetWatchObservers(PhysicalRangeObserver accessChanged, PhysicalRangeObserve
     hostWriteObserver.store(hostWrite, std::memory_order_release);
 }
 
+void SetGpuReadGuard(GpuReadBusy busy, PhysicalRangeObserver wait)
+{
+    gpuReadBusy.store(busy, std::memory_order_release);
+    gpuReadWait.store(wait, std::memory_order_release);
+}
+
 void BeforeHostWrite(const uint8_t* host, uint32_t size)
 {
+    // FM4 Recomp (FM4_GUEST_MEMORY_GPU): a system call's write cannot fault, so the GPU reads of the range are waited for first
+    // (the caller holds no heap lock: file_system.cpp calls this before pread).
+    if (membaseAll != nullptr && size != 0 && host >= membaseAll && uint64_t(host - membaseAll) + size <= (1ull << 32))
+        if (const uint32_t guest = uint32_t(host - membaseAll); guest >= 0xA0000000u && guest < 0xE0000000u)
+            WaitGpuReads(guest & (kPhysicalSize - 1), size);
     const PhysicalRangeObserver o = hostWriteObserver.load(std::memory_order_acquire);
     if (o == nullptr || membaseAll == nullptr || size == 0 || host < membaseAll || uint64_t(host - membaseAll) + size > (1ull << 32))
         return;

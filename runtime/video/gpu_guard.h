@@ -123,6 +123,14 @@ public:
         return {true, false, {}};
     }
 
+    // FM4 Recomp (M7, FM4_SUBMIT_IF_IDLE): whether the slot's submission is done, without waiting or retiring anything (the
+    // backend's FenceStatus: VK_SUCCESS; the asynchronous submitter answers VK_NOT_READY until its worker has submitted the slot).
+    bool Finished(uint32_t slot)
+    {
+        return slot < Slots && lifetimes_[slot].Current() == gpu::SubmissionLifetime<Resource>::State::InFlight && backend_.FenceStatus(slot) == 0;
+    }
+    bool Idle(uint32_t slot) const { return slot < Slots && lifetimes_[slot].Current() == gpu::SubmissionLifetime<Resource>::State::Idle; }
+
     // The slot's submission: a bounded wait, then its held resources are destroyed (confirmed) or
     // kept for good (stranded: GPU_STOP is written, nothing further is submitted).
     Verdict Retire(uint32_t slot)

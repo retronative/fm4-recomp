@@ -7,6 +7,7 @@
 // 67f16c4e315f (src/xenia/gpu/: pm4_command_processor_implement.h,
 // command_processor.cc, xenos.h); design: reference/gpu/gpu_path.md.
 #pragma once
+#include <cstddef>
 #include <cstdint>
 
 namespace runtime::gpu {
@@ -60,11 +61,35 @@ struct RendererHooks
     // FM4 Recomp (FM4_DEFER_FENCES): true while the renderer has recorded work not yet submitted; an INTERRUPT then waits in the
     // deferred queue (raised at the retire, after the stores before it; ReCarbon command_processor.cpp:480-496). Nullable.
     bool (*workOpen)();
+    // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1; runtime/video/gpu_read_guard.h G5): a guest thread waits for GPU reads of a page it
+    // writes; the renderer submits and retires up to the part it needs. Called between packets, in every WAIT_REG_MEM poll and
+    // when the ring is idle (no command buffer handle is live at any of them). Nullable.
+    void (*honourGpuReadGuard)();
+    // FM4 Recomp (FM4_GUEST_MEMORY_GPU=1): before this thread stores to guest physical memory (a stream store, a scratch register's
+    // write-back, the read pointer's write-back), so that a store over a range unretired GPU work reads flushes and waits here,
+    // outside the signal handler. Nullable.
+    void (*beforeCpWrite)(uint32_t physical, uint32_t bytes);
 };
+// FM4 Recomp (FM4_GUEST_MEMORY_GPU): whether the calling thread is the command processor's (async-signal-safe: pthread_self).
+bool OnCommandProcessorThread();
+// FM4 Recomp (FM4_ASYNC_RETIRE): the renderer's completion worker registers itself (runtime/video/async_retire.h); a store of its
+// resolve write-backs that a later GPU part still reads stops at once, as the command processor's does (guest_memory_vk.cpp).
+void SetCompletionWorkerThread();
+bool OnCompletionWorkerThread();
 // FM4 Recomp (FM4_DEFER_FENCES): the queued stores in packet order, into guest memory (the renderer, after the submission that
 // was open when they were queued is confirmed complete and its resolve write-backs landed). Command-processor thread.
 void ApplyDeferredStores();
 bool DeferredStoresPending();
+// FM4 Recomp (opt-in FM4_ASYNC_RETIRE=1; deferred_store_parts.h P1-P5): at each part's submission the entries queued since the
+// previous one become that part's; once the renderer has retired parts up to `serial` (fence, write-backs), their stores land
+// from the front of the queue, stopping at the first interrupt (raised by the full drain, ApplyDeferredStores, after every prior
+// part), at the first entry of a later or unsubmitted part, and at the first store `canStore(physical)` refuses (null: none
+// refused). Returns the stores applied. Command-processor thread, never while a command buffer handle is live.
+void MarkDeferredStoresPart(uint64_t serial);
+size_t ApplyDeferredStoresThrough(uint64_t serial, bool (*canStore)(uint32_t physical));
+// FM4 Recomp (FM4_ASYNC_RETIRE): called between packets, in every WAIT_REG_MEM poll and when the ring is idle, where
+// honourGpuReadGuard is (the renderer reaps the parts its completion worker retired). Null (the default) changes nothing.
+void SetReapHook(void (*reap)());
 // FM4 Recomp (diagnostic): nanoseconds the command processor spent with nothing to execute (the ring drained), since start.
 uint64_t CpIdleNs();
 // FM4 Recomp (FM4_DEFER_FENCES): WAIT_REG_MEM packets a queued store of the stream satisfied without a flush, since start.
@@ -83,6 +108,8 @@ uint64_t GraceSyncs();
 void SetImmediateInterrupts(bool on);
 // Overrides FM4_DEFER_EVENTS (tests).
 void SetDeferEvents(bool on);
+// Tests: FM4_BULK_REGISTERS on or off (command_processor.cpp WriteRegisterRun).
+void SetBulkRegisters(bool on);
 void SetRendererHooks(const RendererHooks* hooks);
 
 // The run stops (11) at swap number `n` (fm4recomp --stop-at-swap n, required; M3's evidence is n = 1).

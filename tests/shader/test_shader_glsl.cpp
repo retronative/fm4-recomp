@@ -2463,7 +2463,45 @@ void TestPredicate()
         LoopOpts lo;
         lo.last.vop = 0, lo.last.vdest = 1, lo.last.vmask = 0xF, lo.last.s1 = T(2), lo.last.s2 = T(1);
         lo.last.sop = 27, lo.last.s3 = T(0);
-        CHECK(Refuses(LoopPs(lo), true, "predicate set inside a loop"));
+        // FM4 Recomp (alpha): accepted; the set runs in the body every iteration (`xe_p0 = ...` inside the `for`).
+        ShaderTranslation lt;
+        CHECK(Translate(LoopPs(lo), true, lt) && Compiles(lt.glsl, true));
+        const size_t loopAt = lt.glsl.find("for (uint "), setAt = lt.glsl.find("xe_p0 = ", loopAt == std::string::npos ? 0 : loopAt);
+        CHECK(loopAt != std::string::npos && setAt != std::string::npos && lt.glsl.rfind("for (uint ", setAt) == loopAt);
+        CONTROL(Refuses(LoopPs(lo), true, ""));  // no refusal of any kind
+        // A predicated ALU in the body still needs a set before it (here none before the loop, the set after it in the body).
+        LoopOpts lr;
+        lr.last.vop = 0, lr.last.vdest = 1, lr.last.vmask = 0xF, lr.last.s1 = T(2), lr.last.s2 = T(1), lr.last.s3 = T(0), lr.last.pred = true;
+        CHECK(Refuses(LoopPs(lr), true, "before any predicate-setting op"));
+    }
+    {
+        // FM4 Recomp (alpha): a predicated exec inside a constant loop. exec{MAXv r1 = r0, c0; p0 set from
+        // r0.x (PRED_SET, sop 27)}; loop_start(skip 4, constant 31); pexec(p0 == 1){(p0) MAXv r2 = r1, r1}; loop_end; alloc colour;
+        // exec_end export r1. Accepted, the `if (xe_p0)` inside the `for`.
+        const auto build = [](bool execCondition) {
+            std::vector<uint32_t> q;
+            PackCf(q, ExecCf(3, 2, 0), LoopStartCf(4, 31));
+            PackCf(q, PredExecCf(5, 1, execCondition), LoopEndCf(2, 31));
+            PackCf(q, AllocCf(2), ExecCf(6, 1, 0, true));
+            Alu a;
+            a.vop = 0, a.vdest = 1, a.vmask = 0xF, a.s1 = T(0), a.s2 = C(0), a.s3 = T(0);
+            Put(q, a);
+            Alu set;
+            set.vop = 0, set.vdest = 1, set.vmask = 0xF, set.s1 = T(1), set.s2 = T(1), set.sop = 27, set.s3 = T(0);
+            Put(q, set);
+            Alu body;
+            body.vop = 0, body.vdest = 2, body.vmask = 0xF, body.s1 = T(1), body.s2 = T(1), body.s3 = T(0), body.pred = true, body.predCond = true;
+            Put(q, body);
+            Alu e;
+            e.vop = 1, e.exp = true, e.vdest = 0, e.vmask = 0xF, e.s1 = T(1), e.s2 = C(3, "zzzz"), e.s3 = T(0);
+            Put(q, e);
+            return q;
+        };
+        ShaderTranslation pt;
+        CHECK(Translate(build(true), true, pt) && Compiles(pt.glsl, true));
+        const size_t forAt = pt.glsl.find("for (uint "), ifAt = pt.glsl.find("if (xe_p0)", forAt == std::string::npos ? 0 : forAt);
+        CHECK(forAt != std::string::npos && ifAt != std::string::npos && pt.glsl.rfind("for (uint ", ifAt) == forAt);
+        CHECK(Refuses(build(false), true, "opposite condition"));  // the exec's condition differs from its instruction's
     }
     o = {}, o.then = PredExecCf(9, 1, true), o.then.w1 |= 1u << 11;
     CHECK(Refuses(PredVs(o), false, "predicated exec with word 1 bit 11 (address mode)"));

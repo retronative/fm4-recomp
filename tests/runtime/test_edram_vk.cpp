@@ -1025,6 +1025,11 @@ void TestFloat32()
     // Clears (X :5417-5421): the raw word as uint32[0].
     uint32_t u[4] = {9, 9, 9, 9};
     CHECK(DecodeColorClearUint(0x3F800000u, 14, u) && u[0] == 0x3F800000u && u[1] == 0 && u[3] == 0);
+    // FM4 Recomp (alpha, 64 bpp resolve clear): storage 5, X render_target_cache.cc:1202-1205 + vulkan_render_target_cache.cc:5405-5415:
+    // clear = 0x22221111 | 0x44443333 << 32; uint32[j] = (clear >> 16j) & 0xFFFF = 0x1111, 0x2222, 0x3333, 0x4444.
+    CHECK(DecodeColorClearUint64(0x22221111u, 0x44443333u, 5, u) && u[0] == 0x1111u && u[1] == 0x2222u && u[2] == 0x3333u && u[3] == 0x4444u);
+    CONTROL(DecodeColorClearUint64(0x22221111u, 0x44443333u, 4, u));  // 16_16 is 32 bpp: DecodeColorClearUint
+    CONTROL(DecodeColorClearUint(0x22221111u, 5, u));  // storage 5 needs RB_COLOR_CLEAR_LO
     float fc[4];
     CONTROL(DecodeColorClear(0x3F800000u, 14, fc));  // storage 14 never clears through floats
     CONTROL(DecodeColorClearUint(0u, 3, u));
@@ -2026,6 +2031,135 @@ void TestPushPendingClear()
           depth[0].attachment.aspectMask == VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT));
 }
 
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP): a pixel rectangle of a key as the EDRAM tiles it touches (edram.h RectTiles,
+// RangeTiles). Tile sizes by hand from X render_target_cache.cc:355-359 (80x16 samples; a 4x pixel 2x2 samples, a 2x pixel 1x2,
+// a 64 bpp tile half as many pixels wide): 1x 80x16 pixels, 2x 80x8, 4x 40x8, 1x 64 bpp 40x16. Tile = base + row * pitch + column,
+// modulo 2048; pitch 16 tiles (32 for the 64 bpp key: Key::PitchTiles doubles it).
+void TestRectTiles()
+{
+    using edram::RectTiles;
+    using edram::RangeTiles;
+    using edram::TileSet;
+    const auto only = [](const TileSet& s, std::initializer_list<uint32_t> tiles) {
+        TileSet want;
+        for (uint32_t t : tiles)
+            want.set(t);
+        return s == want;
+    };
+    // 4x (kAc, 40x8 pixels a tile): the first tile, the pixel right of it, a 2x2 straddling four tiles (cols 0-1, rows 0-1).
+    CHECK(only(RectTiles(kAc, {0, 0, 40, 8}), {0}));
+    CHECK(only(RectTiles(kAc, {40, 0, 1, 1}), {1}));
+    CHECK(only(RectTiles(kAc, {39, 7, 2, 2}), {0, 1, 16, 17}));
+    // 1x (kBc2, 80x16): pixel row 16 is tile row 1; a full-width 16-row band is tiles 0-15 and nothing of row 1.
+    CHECK(only(RectTiles(kBc2, {0, 16, 1, 1}), {16}));
+    CHECK(RectTiles(kBc2, {0, 0, 1280, 16}).count() == 16 && !RectTiles(kBc2, {0, 0, 1280, 16}).test(16));
+    // The same EDRAM through two layouts: the 4x key's first 8 rows (640 wide) are the 1x key's first 16 rows (1280 wide).
+    CHECK(RectTiles(kAc, {0, 0, 640, 8}) == RectTiles(kBc2, {0, 0, 1280, 16}));
+    // 2x (80x8): pixel row 8 is tile row 1 (tile 16), where 1x puts it in row 0 (tile 0): sample count changes the mapping.
+    const Key k2x = Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8);
+    CHECK(only(RectTiles(k2x, {0, 8, 1, 1}), {16}));
+    CHECK(only(RectTiles(k2x, {0, 7, 1, 1}), {0}));
+    CHECK(only(RectTiles(kBc2, {0, 8, 1, 1}), {0}));
+    // 64 bpp (40x16, pitch 32): x 40 is column 1, row 1 starts at tile 32, x 1279 is column 31.
+    const Key k64 = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16);
+    CHECK(only(RectTiles(k64, {40, 0, 1, 1}), {1}));
+    CHECK(only(RectTiles(k64, {0, 16, 1, 1}), {32}));
+    CHECK(only(RectTiles(k64, {1279, 0, 1, 1}), {31}));
+    // A base: the depth key at 720 starts at tile 720; a key at 2040 wraps into 0-7 (the 11-bit period).
+    CHECK(only(RectTiles(kAd, {0, 0, 40, 8}), {720}));
+    const TileSet wrapped = RectTiles(Key::Color(2040, 16, Msaa::X1, ColorFormat::k8_8_8_8), {0, 0, 1280, 16});
+    CHECK(wrapped.count() == 16 && wrapped.test(2040) && wrapped.test(2047) && wrapped.test(0) && wrapped.test(7));
+    CONTROL(wrapped.test(8) || wrapped.test(2039));
+    // Columns clamp to the pitch: x 1200-1399 of a 1280-wide image is column 15 only, never row 1's tiles 16-17.
+    CHECK(only(RectTiles(kBc2, {1200, 0, 200, 16}), {15}));
+    // An empty rectangle touches nothing; a key without a pitch, everything (never "none" for a real clear).
+    CHECK(RectTiles(kBc2, {0, 0, 0, 16}).none() && RectTiles(kBc2, {0, 0, 16, 0}).none());
+    CHECK(RectTiles(Key{}, {0, 0, 1, 1}).all());
+    // RangeTiles: [16, 17) is tile 16 alone (adjacent tiles 15 and 17 are not in it); an empty range; the last 8 tiles.
+    CHECK(only(RangeTiles(16, 17), {16}));
+    CHECK(RangeTiles(5, 5).none() && RangeTiles(7, 3).none());
+    CHECK(RangeTiles(2040, 2048).count() == 8 && RangeTiles(2040, 2048).test(2047));
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP): which pending clears a read flushes (edram_vk_plan.h SelectClearFlush; SpeedBreaker
+// 312ce69 renderer.cpp:2749-2780's newest-first rule). Rectangles drawn by hand on the 1x key kBc2 (tile = row * 16 + column, 80x16
+// pixels a tile) unless named; the expected indices are read off those drawings.
+void TestSelectClearFlush()
+{
+    using Indices = std::vector<size_t>;
+    const auto clear = [](int32_t x, int32_t y, uint32_t w, uint32_t h) {
+        PendingClear pc;
+        pc.attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, pc.rect = {{x, y}, {w, h}};
+        return pc;
+    };
+    // Row 0 (tiles 0-15), row 2 (tiles 32-47), row 1 column 0 (tile 16). A read of tile 16 needs only the newest; tile 15 (row 0's
+    // last) is adjacent to the read, not in it.
+    const std::vector<PendingClear> rows = {clear(0, 0, 1280, 16), clear(0, 32, 1280, 16), clear(0, 16, 80, 16)};
+    edram::TileSet read = edram::RangeTiles(16, 17);
+    CHECK(SelectClearFlush(kBc2, rows, &read) == Indices{2});
+    // The control: without the flag (no read set) every clear, in order (today's FlushClears).
+    CHECK(SelectClearFlush(kBc2, rows, nullptr) == (Indices{0, 1, 2}));
+    // No pending clear on the tiles read: nothing (no flush pass).
+    read = edram::RangeTiles(100, 110);
+    CHECK(SelectClearFlush(kBc2, rows, &read).empty());
+    // The kept clears (0 and 1, in order) are flushed by their own readers later: tiles 32-47 take index 1 of the kept list
+    // (row 2), then tiles 0-1 take row 0.
+    const std::vector<PendingClear> kept = {rows[0], rows[1]};
+    read = edram::RangeTiles(32, 48);
+    CHECK(SelectClearFlush(kBc2, kept, &read) == Indices{1});
+    read = edram::RangeTiles(0, 2);
+    CHECK(SelectClearFlush(kBc2, kept, &read) == Indices{0});
+    // A kept clear stays ahead of a later push (PushPendingClear appends; row 4 column 0 contains neither): a read of the new
+    // clear's tile 64 takes the new one alone, the kept ones stay.
+    std::vector<PendingClear> later = kept;
+    PushPendingClear(later, clear(0, 64, 80, 16));
+    read = edram::RangeTiles(64, 65);
+    CHECK(later.size() == 3 && SelectClearFlush(kBc2, later, &read) == Indices{2});
+
+    // The chain: a0 tiles 0-1 (x 0-159), a1 tiles 1-2 (x 80-239), a2 tile 2 (x 160-239), a3 tile 8 (x 640-719). A read of tile 2
+    // takes a2 and a1 (both on it); a0 is not on tile 2 but lies under a1 (pixels 80-159): kept, it would land after a1 and undo it,
+    // so it is taken too. a3 stays. Read-only overlap would have given {1, 2}.
+    const std::vector<PendingClear> chain = {clear(0, 0, 160, 16), clear(80, 0, 160, 16), clear(160, 0, 80, 16), clear(640, 0, 80, 16)};
+    read = edram::RangeTiles(2, 3);
+    CHECK(SelectClearFlush(kBc2, chain, &read) == (Indices{0, 1, 2}));
+    CONTROL(SelectClearFlush(kBc2, chain, &read) == (Indices{1, 2}));
+    // Only newer clears pull in older ones: a read of tile 0 takes a0 alone (a1 is newer, so it lands after a0 anyway, as in guest
+    // order).
+    read = edram::RangeTiles(0, 1);
+    CHECK(SelectClearFlush(kBc2, chain, &read) == Indices{0});
+    // Tile overlap is coarser than pixel overlap: b0 x 0-39 (tile 0) and b1 x 40-119 (tiles 0-1) share no pixel but tile 0; a read
+    // of tile 1 takes b1, and b0 with it (conservative, never wrong: readers copy whole tiles).
+    const std::vector<PendingClear> coarse = {clear(0, 0, 40, 16), clear(40, 0, 80, 16)};
+    read = edram::RangeTiles(1, 2);
+    CHECK(SelectClearFlush(kBc2, coarse, &read) == (Indices{0, 1}));
+
+    // Across layouts: a 4x target (kAc, 40x8 a tile) with d0 = its first 8 rows (tiles 0-15) and d1 = rows 8-15 column 0 (tile 16).
+    // A 1x destination's transfer of tiles [16, 17) (its pixels 0-79 x 16-31) reads d1 only. In host pixels the 1x rectangle
+    // (y 16-31) overlaps neither d0 (y 0-7) nor d1 (y 8-15): a pixel test would flush nothing and lose d1.
+    const std::vector<PendingClear> ms = {clear(0, 0, 640, 8), clear(0, 8, 40, 8)};
+    read = edram::RangeTiles(16, 17);
+    CHECK(SelectClearFlush(kAc, ms, &read) == Indices{1});
+    // A 2x target (80x8 a tile): y 8-15 is tile 16 (1x would put it in tile 0).
+    const std::vector<PendingClear> ms2 = {clear(0, 8, 80, 8)};
+    CHECK(SelectClearFlush(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), ms2, &read) == Indices{0});
+    read = edram::RangeTiles(0, 1);
+    CHECK(SelectClearFlush(Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8), ms2, &read).empty());
+    // A 64 bpp target (40x16 a tile): x 40-79 is tile 1.
+    const std::vector<PendingClear> wide = {clear(40, 0, 40, 16)};
+    const Key k64 = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16);
+    read = edram::RangeTiles(1, 2);
+    CHECK(SelectClearFlush(k64, wide, &read) == Indices{0});
+    read = edram::RangeTiles(0, 1);
+    CHECK(SelectClearFlush(k64, wide, &read).empty());
+    // A resolve's read (RectTiles of its copy rectangle in the source's layout): a 4x source's 640x8 band at y 8 is tiles 16-31,
+    // which takes d1 (tile 16) and not d0 (tiles 0-15).
+    const edram::TileSet copy = edram::RectTiles(kAc, {0, 8, 640, 8});
+    CHECK(SelectClearFlush(kAc, ms, &copy) == Indices{1});
+    // PendingClearRect: a negative offset is cut at 0; nothing left is empty.
+    CHECK(PendingClearRect({{-8, 4}, {16, 4}}) == (edram::Rect{0, 4, 8, 4}));
+    CHECK(PendingClearRect({{-16, 0}, {16, 4}}).width == 0);
+}
+
 void TestTiledRuns()
 {
     bool runs = true;
@@ -2367,6 +2501,8 @@ int main()
     TestUnitPassArea();
     TestMergePendingClear();
     TestPushPendingClear();
+    TestRectTiles();         // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP)
+    TestSelectClearFlush();  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP)
     TestClearValueOwnership();
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;

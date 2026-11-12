@@ -29,6 +29,7 @@
 #include "kernel/graphics.h"
 #include "kernel/command_processor.h"
 #include "video/renderer.h"
+#include "video/guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked (FM4_GUEST_MEMORY_GPU)
 #include "video/window_sdl.h"
 #include "kernel/imports.h"
 #include "kernel/input_live.h"
@@ -296,12 +297,17 @@ int main(int argc, char** argv)
                                                    runtime::video::DeferFences() ? runtime::video::DeferStore : nullptr,
                                                    runtime::video::DeferFences() ? runtime::video::RingIdle : nullptr,
                                                    runtime::video::DeferFences() ? runtime::video::PendingAt : nullptr,
-                                                   runtime::video::DeferFences() ? runtime::video::WorkOpen : nullptr};
+                                                   runtime::video::DeferFences() ? runtime::video::WorkOpen : nullptr,
+                                                   // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1): the GPU read guard's hooks only when asked
+                                                   runtime::video::GuestMemoryGpuAsked() ? runtime::video::HonourGpuReadGuard : nullptr,
+                                                   runtime::video::GuestMemoryGpuAsked() ? runtime::video::BeforeCpWrite : nullptr};
     if (runtime::video::Initialize(video))
     {
         if (video.mode == runtime::video::Mode::SelfCheck)
             runtime::video::RunSelfCheck();  // never returns: stops 12 when every check passed
         runtime::gpu::SetRendererHooks(&hooks);
+        if (runtime::video::AsyncRetireOn())  // FM4 Recomp (FM4_ASYNC_RETIRE): nothing is called between packets otherwise
+            runtime::gpu::SetReapHook(runtime::video::ReapRetired);
     }
 
     // The translated code nests host calls deeply: run it on a large host stack.

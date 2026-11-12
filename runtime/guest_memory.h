@@ -42,6 +42,23 @@ void ProtectGuestMemoryReadOnly(uint8_t* base, uint64_t guest, uint64_t size);
 using WriteFaultHook = bool (*)(uint32_t guest);
 void SetGuestWriteFaultHook(WriteFaultHook hook);
 
+// FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1; runtime/video/gpu_read_guard.h G8): `enter` runs first for every fault inside the guest
+// range, on the faulting thread inside the signal handler: it returns once no unretired GPU read uses the faulting host page (the
+// page stays protected while it waits), or stops the run (bounded). True: it holds the guard's gate, and `leave` follows the
+// write-fault hook (the page writable again, the write recorded). Atomics, mprotect and nanosleep only. Null (the default): nothing.
+struct GpuReadFaultHooks
+{
+    bool (*enter)(uint32_t guest);
+    void (*leave)();
+};
+void SetGpuReadFaultHooks(const GpuReadFaultHooks* hooks);
+// FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1): one more mapping of the physical memory (MapPhysicalMemory's shared object), read-write
+// anywhere in the host address space and never protected, for the GPU import (runtime/video/guest_memory_vk.h): the heaps' and the
+// write watch's protections on the guest views do not apply to it. Physical address p is at byte p. Never unmapped (the GPU may
+// read it until the device is destroyed; the process ends after). Null when the option was off at MapPhysicalMemory or vm_map
+// failed.
+uint8_t* MapPhysicalHostView();
+
 inline void StoreBigEndian32(uint8_t* base, uint32_t guest, uint32_t value)
 {
     const uint32_t swapped = __builtin_bswap32(value);

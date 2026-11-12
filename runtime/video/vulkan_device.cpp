@@ -4,10 +4,12 @@
 //
 #define VK_ENABLE_BETA_EXTENSIONS  // VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h)
 #include "vulkan_device.h"
+#include "guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked
 #include "stops.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -62,6 +64,14 @@ VKAPI_ATTR VkBool32 VKAPI_CALL OnValidationMessage(VkDebugUtilsMessageSeverityFl
                  data && data->pMessageIdName ? data->pMessageIdName : "-", data && data->pMessage ? data->pMessage : "-");
     Stop(StopCode::Setup, "vulkan: the validation layer reported a %s (see the line above)",
          (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) ? "error" : "warning");
+}
+
+// FM4 Recomp (M7 CPU cost): opt-in FM4_PUSH_DESCRIPTORS=1 (descriptor set allocation, update and
+// pool reset were 33 % of the windowed command thread, mostly the validation layer's per-call work).
+bool PushDescriptorsAsked()
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_PUSH_DESCRIPTORS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
 }
 
 VkDebugUtilsMessengerCreateInfoEXT MessengerInfo()
@@ -201,6 +211,30 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
         swapchainOffered |= !std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         if (!std::strcmp(e.extensionName, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME))  // FM4_TRANSFER_STENCIL_EXPORT (vulkan_device.h)
             enabled.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME), d.stencilExport = true;
+        if (!std::strcmp(e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) && PushDescriptorsAsked())  // FM4_PUSH_DESCRIPTORS
+            enabled.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME), d.pushDescriptors = true;
+        if (!std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && GuestMemoryGpuAsked())  // FM4_GUEST_MEMORY_GPU
+            enabled.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME), d.externalMemoryHost = true;
+    }
+    if (d.externalMemoryHost)
+    {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{};
+        host.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 props{};
+        props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props.pNext = &host;
+        vkGetPhysicalDeviceProperties2(d.gpu, &props);
+        d.minImportedHostPointerAlignment = host.minImportedHostPointerAlignment;
+    }
+    if (d.pushDescriptors)
+    {
+        VkPhysicalDevicePushDescriptorPropertiesKHR push{};
+        push.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR;
+        VkPhysicalDeviceProperties2 props{};
+        props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props.pNext = &push;
+        vkGetPhysicalDeviceProperties2(d.gpu, &props);
+        d.maxPushDescriptors = push.maxPushDescriptors;
     }
     if (d.surface != VK_NULL_HANDLE)  // window mode only; offscreen modes keep their device unchanged
     {
@@ -256,6 +290,18 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
     deviceInfo.pNext = portabilityOffered ? &enabledPortability : nullptr;
     Check(vkCreateDevice(d.gpu, &deviceInfo, nullptr, &d.device), "vkCreateDevice");
     vkGetDeviceQueue(d.device, d.queueFamily, 0, &d.queue);
+    if (d.pushDescriptors)  // FM4_PUSH_DESCRIPTORS: the extension's command (not exported by the loader)
+    {
+        d.cmdPushDescriptorSet = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(d.device, "vkCmdPushDescriptorSetKHR"));
+        if (d.cmdPushDescriptorSet == nullptr)
+            Stop(StopCode::Setup, "vulkan: VK_KHR_push_descriptor is enabled but vkCmdPushDescriptorSetKHR is not available");
+        std::fprintf(stderr, "[gpu] push descriptors on (FM4_PUSH_DESCRIPTORS=1): VK_KHR_push_descriptor, at most %u descriptors a set\n", d.maxPushDescriptors);
+    }
+    else if (PushDescriptorsAsked())
+        std::fprintf(stderr, "[gpu] FM4_PUSH_DESCRIPTORS=1 ignored: the device does not offer VK_KHR_push_descriptor\n");
+    if (d.externalMemoryHost)  // FM4_GUEST_MEMORY_GPU: the extension's command (guest_memory_vk.cpp checks it)
+        d.getMemoryHostPointerProperties =
+            reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(vkGetDeviceProcAddr(d.device, "vkGetMemoryHostPointerPropertiesEXT"));
     // The formats the first screens need, as the device reports them:
     // S sampled, C colour attachment, D depth/stencil attachment, B blit destination, T transfer destination (optimal tiling).
     std::fprintf(stderr, "[gpu] features: textureCompressionBC %s, depthClamp %s, independentBlend %s, imageViewFormatSwizzle %s, samplerAnisotropy %s, "

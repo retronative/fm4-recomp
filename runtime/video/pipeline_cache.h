@@ -31,6 +31,9 @@ struct PipelineDeviceFeatures
     bool constantAlphaColorBlendFactors = true;   // VkPhysicalDevicePortabilitySubsetFeaturesKHR; false refuses colour factors 14, 15
     bool independentBlend = false;                // unused while colour 0 is the only target
     bool dynamicBuffers = false;                  // FM4 Recomp (FM4_DESCRIPTOR_CACHE): bindings 0-5 as *_DYNAMIC descriptors
+    // FM4 Recomp (FM4_PUSH_DESCRIPTORS): VK_KHR_push_descriptor's maxPushDescriptors, 0 when off (never with dynamicBuffers): a layout
+    // whose bindings fit is created with VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR (Layouts::push); larger ones keep sets.
+    uint32_t pushDescriptorLimit = 0;
 };
 
 // The host formats of the Xenos render target formats pipeline_key.h ColorFormatMapped accepts.
@@ -59,6 +62,7 @@ public:
     {
         VkDescriptorSetLayout set = VK_NULL_HANDLE;
         VkPipelineLayout pipeline = VK_NULL_HANDLE;
+        bool push = false;  // FM4 Recomp (FM4_PUSH_DESCRIPTORS): a push-descriptor set layout (vkCmdPushDescriptorSetKHR, no set allocated)
     };
     KeyResult LayoutFor(uint64_t layoutKey, Layouts& out);
 

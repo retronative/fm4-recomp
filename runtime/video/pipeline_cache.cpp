@@ -145,6 +145,10 @@ KeyResult PipelineCache::LayoutFor(uint64_t layoutKey, Layouts& out)
     setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     setInfo.bindingCount = uint32_t(bindings.size());
     setInfo.pBindings = bindings.data();
+    // FM4 Recomp (FM4_PUSH_DESCRIPTORS): every binding is one descriptor, so the set's descriptor count is its binding count
+    // (VUID-VkDescriptorSetLayoutCreateInfo-flags-00281: at most maxPushDescriptors); dynamic buffers are never pushed (-00280).
+    if (features_.pushDescriptorLimit != 0 && !features_.dynamicBuffers && bindings.size() <= features_.pushDescriptorLimit)
+        setInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, l.push = true;
     if (const VkResult r = vkCreateDescriptorSetLayout(device_, &setInfo, nullptr, &l.set); r != VK_SUCCESS)
         return Refuse(VkError("vkCreateDescriptorSetLayout", r));
     VkPipelineLayoutCreateInfo layoutInfo{};

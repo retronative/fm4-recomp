@@ -346,6 +346,40 @@ size_t PushPendingClear(std::vector<PendingClear>& pending, const PendingClear& 
     return dropped;
 }
 
+edram::Rect PendingClearRect(const VkRect2D& r)
+{
+    const int64_t x0 = std::max<int64_t>(0, r.offset.x), y0 = std::max<int64_t>(0, r.offset.y);
+    const int64_t x1 = int64_t(r.offset.x) + r.extent.width, y1 = int64_t(r.offset.y) + r.extent.height;
+    if (x1 <= x0 || y1 <= y0)
+        return {};
+    return {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
+}
+
+std::vector<size_t> SelectClearFlush(Key key, const std::vector<PendingClear>& pending, const edram::TileSet* read)
+{
+    std::vector<size_t> taken;
+    if (read == nullptr)
+    {
+        for (size_t i = 0; i < pending.size(); i++)
+            taken.push_back(i);
+        return taken;
+    }
+    // FM4 Recomp: SpeedBreaker's `run` (the read, then each clear taken) as one tile set; newest first, so it holds every newer
+    // clear taken when an older one is tested (an older clear kept under a newer taken one would land after it and undo it).
+    edram::TileSet run = *read;
+    for (size_t i = pending.size(); i-- > 0;)
+    {
+        const edram::TileSet tiles = edram::RectTiles(key, PendingClearRect(pending[i].rect));
+        if ((tiles & run).any())
+        {
+            taken.push_back(i);
+            run |= tiles;
+        }
+    }
+    std::reverse(taken.begin(), taken.end());
+    return taken;
+}
+
 uint32_t Depth32To20e4(float depth)
 {
     uint32_t u;
@@ -511,6 +545,16 @@ bool DecodeColorClearUint(uint32_t value, uint32_t storage, uint32_t rgba[4])
     if (storage != uint32_t(ColorFormat::k32_Float))
         return false;
     rgba[0] = value, rgba[1] = rgba[2] = rgba[3] = 0;  // X vulkan_render_target_cache.cc:5417-5421: uint32[0] = the clear word
+    return true;
+}
+
+bool DecodeColorClearUint64(uint32_t value, uint32_t valueLo, uint32_t storage, uint32_t rgba[4])  // FM4 Recomp (alpha, 64 bpp resolve clear)
+{
+    if (storage != uint32_t(ColorFormat::k16_16_16_16))
+        return false;
+    const uint64_t clear = uint64_t(value) | uint64_t(valueLo) << 32;
+    for (uint32_t j = 0; j < 4; j++)
+        rgba[j] = uint32_t(clear >> (j * 16)) & 0xFFFF;
     return true;
 }
 

@@ -4300,6 +4300,50 @@ int main(int, char** argv)
         Expect(ReadRegister(base, 0x4005) == 0x3F800000 && ReadRegister(base, 0x4006) == 0x40000000 && ReadRegister(base, 0x4802) == 0x12345678 &&
                    ExitCodeOf([&] { CpState c; Execute(base, page + 0x4A0, 4, 0, 4, c); }) == int(StopCode::Unimplemented),
                "PM4 LOAD_ALU_CONSTANT: ALU and fetch constants from memory (big-endian) at their register bases; type 5 stops (7)");
+        // FM4_BULK_REGISTERS (command_processor.cpp WriteRegisterRun), off then on, the same expectations (by hand, from the packet
+        // formats above): a type-0 run of 40 registers 4100.. = A0000000 + i; a run 576..579 over SCRATCH_REG0 (UMSK bit 0,
+        // ADDR +0x20) still stores 579's neighbour 578 = BEEF to +0x20; a run A30..A32 over COHER_STATUS_HOST still sets its bit
+        // 31 (0 -> 80000000); SET_CONSTANT (2D) ALU offset 0x150, 3 words -> 4150..4152 = 7, 8, 9; SET_CONSTANT2 (55) index 2100,
+        // 2 words -> 2100, 2101 = 0x51, 0x52; a type-0 run of 3 that wraps an 8-word ring (header at word 6) -> 4130..4132 = 111,
+        // 222, 333 in ring order; a one-register run (bit 15) of 3 on 4140 leaves the last word, 0xC3.
+        for (const bool bulk : {false, true})
+        {
+            SetBulkRegisters(bulk);
+            std::vector<uint32_t> words = {(39u << 16) | 0x4100};
+            for (uint32_t i = 0; i < 40; i++)
+                words.push_back(0xA0000000u + i);
+            for (uint32_t w : {0x000001DCu, 1u, 0x000001DDu, phys + 0x20,       // SCRATCH_UMSK = 1, SCRATCH_ADDR = +0x20
+                               (3u << 16) | 0x576, 1u, 2u, 0xBEEFu, 4u,             // 576..579
+                               (2u << 16) | 0xA30, 5u, 0u, 6u,                      // A30..A32
+                               0xC0032D00u, 0x150u, 7u, 8u, 9u,                     // SET_CONSTANT ALU 0x150
+                               0xC0025500u, 0x2100u, 0x51u, 0x52u,                  // SET_CONSTANT2 2100
+                               (2u << 16) | (1u << 15) | 0x4140, 0xC1u, 0xC2u, 0xC3u})  // one register, 3 times
+                words.push_back(w);
+            Store32(base, page + 0x20, 0);
+            for (uint32_t i = 0; i < words.size(); i++)
+                Store32(base, page + 0x900 + 4 * i, words[i]);
+            for (uint32_t r = 0x4100; r < 0x4153; r++)
+                WriteRegister(base, r, 0);
+            WriteRegister(base, reg::kCoherStatusHost, 0);
+            CpState bulkState;
+            Execute(base, page + 0x900, uint32_t(words.size()), 0, uint32_t(words.size()), bulkState);
+            put(0x800, {0x222, 0x333, 0, 0, 0, 0, (2u << 16) | 0x4130, 0x111});  // an 8-word ring: header at 6, values 7, 0, 1
+            CpState wrapState;
+            Execute(base, page + 0x800, 8, 6, 4, wrapState);
+            bool run = true;
+            for (uint32_t i = 0; i < 40; i++)
+                run = run && ReadRegister(base, 0x4100 + i) == 0xA0000000u + i;
+            const bool sides = be32(page + 0x20) == 0xBEEF && ReadRegister(base, 0x579) == 4 && ReadRegister(base, reg::kCoherStatusHost) == 0x80000000u &&
+                               ReadRegister(base, 0xA30) == 5 && ReadRegister(base, 0xA32) == 6;
+            const bool constantsOk = ReadRegister(base, 0x4150) == 7 && ReadRegister(base, 0x4151) == 8 && ReadRegister(base, 0x4152) == 9 &&
+                                     ReadRegister(base, 0x2100) == 0x51 && ReadRegister(base, 0x2101) == 0x52;
+            const bool wrapOk = ReadRegister(base, 0x4130) == 0x111 && ReadRegister(base, 0x4131) == 0x222 && ReadRegister(base, 0x4132) == 0x333;
+            Expect(mapped && run && sides && constantsOk && wrapOk && ReadRegister(base, 0x4140) == 0xC3 && ReadRegister(base, 0x4141) == 0,
+                   bulk ? "PM4 bulk register runs on: a 40-register run; scratch and COHER side effects inside runs; SET_CONSTANT, SET_CONSTANT2; "
+                          "a ring-wrapping run in ring order; a one-register run keeps the last word"
+                        : "PM4 bulk register runs off (control): the same register file");
+        }
+        SetBulkRegisters(false);
         // EVENT_WRITE_EXT (opcode 5A; Xenia :915-949): initiator 3 -> VGT_EVENT_INITIATOR; extents at +0x600 (endian 1,
         // 8in16): 0000 0400 0000 0400 0000 0001 (8192 >> 3 = 0x400); endian 2 stops (7). Header C0015A00: 2 words.
         put(0x5C0, {0xC0015A00, 3, (phys + 0x600) | 1});
@@ -4332,6 +4376,27 @@ int main(int, char** argv)
         Expect(ExitCodeOf([&] { CpState c; Execute(base, page + 0x740, 2, 0, 2, c); }) == int(StopCode::Unimplemented),
                "PM4 EVENT_WRITE_ZPD with RB_SAMPLE_COUNT_ADDR 0 stops (7)");
         {
+            // FM4 Recomp (alpha): PM4 VIZ_QUERY (opcode 23, header C0002300, one word; Xenia
+            // pm4_command_processor_implement.h:1318-1350): word 0x05 begins query 5 (VGT_EVENT_INITIATOR 7, no status bit); 0x105 ends it
+            // (initiator 8, PA_SC_VIZ_QUERY_STATUS_0 bit 5 = 0x20: visible); 0x128 ends query 40 (STATUS_1 bit 8 = 0x100).
+            WriteRegister(base, reg::kPaScVizQueryStatus0, 0), WriteRegister(base, reg::kPaScVizQueryStatus1, 0);
+            put(0x7A0, {0xC0002300, 0x05});
+            CpState viz;
+            if (mapped)
+                Execute(base, page + 0x7A0, 2, 0, 2, viz);
+            Expect(mapped && ReadRegister(base, reg::kVgtEventInitiator) == 7 && ReadRegister(base, reg::kPaScVizQueryStatus0) == 0,
+                   "PM4 VIZ_QUERY begin: VGT_EVENT_INITIATOR 7 (VIZQUERY_START), no status bit");
+            put(0x7A0, {0xC0002300, 0x105, 0xC0002300, 0x128});
+            if (mapped)
+                Execute(base, page + 0x7A0, 4, 0, 4, viz);
+            Expect(ReadRegister(base, reg::kVgtEventInitiator) == 8 && ReadRegister(base, reg::kPaScVizQueryStatus0) == 0x20 &&
+                       ReadRegister(base, reg::kPaScVizQueryStatus1) == 0x100,
+                   "PM4 VIZ_QUERY end: initiator 8, query 5 visible in STATUS_0 bit 5, query 40 in STATUS_1 bit 8");
+            put(0x7A0, {0xC0012300, 0x105, 0});
+            Expect(ExitCodeOf([&] { CpState c; Execute(base, page + 0x7A0, 3, 0, 3, c); }) == int(StopCode::Unimplemented),
+                   "CONTROL: VIZ_QUERY with 2 words stops (7)");
+        }
+        {
             // FM4 Recomp: the renderer's sync hook (command_processor.h syncGuestWrites) runs before the packets that store to guest
             // memory or wait on it (MEM_WRITE 3D, EVENT_WRITE_SHD 58, WAIT_REG_MEM 3C on memory), not before a plain EVENT_WRITE 46,
             // which only sets VGT_EVENT_INITIATOR, nor before a WAIT_REG_MEM on a register (info bit 4 clear:
@@ -4339,7 +4404,7 @@ int main(int, char** argv)
             // polls phys + 8 (EVENT_WRITE_SHD stored BEEF there) for BEEF (info 0x13: memory, function 3 equal).
             static std::vector<uint32_t> synced;
             synced.clear();
-            static const RendererHooks counting{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); }, nullptr, nullptr, nullptr, nullptr};
+            static const RendererHooks counting{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); }, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
             put(0x780, {0xC0004600, 0x16, 0xC0013D00, phys | 2, 0x5A5A, 0xC0025800, 0x14, (phys + 8) | 2, 0xBEEF,
                         0xC0043C00, 3, 0x2003, 7, 0xFFFFFFFF, 0, 0xC0043C00, 0x13, (phys + 8) | 2, 0xBEEF, 0xFFFFFFFF, 0, 0xC0004600, 0x17});
             SetRendererHooks(&counting);
@@ -4359,7 +4424,7 @@ int main(int, char** argv)
             synced.clear();
             static bool accept = true;
             static const RendererHooks deferring{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
-                                                 [](uint32_t) { return accept; }, nullptr, nullptr, nullptr};
+                                                 [](uint32_t) { return accept; }, nullptr, nullptr, nullptr, nullptr, nullptr};
             put(0x7C0, {0xC0013D00, phys | 2, 0x1111, 0xC0013D00, phys | 2, 0x2222, 0xC0025800, 0x14, (phys + 8) | 2, 0xBEEF});
             Store32(base, page, 0x0BAD0BAD), Store32(base, page + 8, 0x0BAD0BAD);
             SetRendererHooks(&deferring);
@@ -4396,7 +4461,7 @@ int main(int, char** argv)
             // passes without a sync; CONTROL: the same wait with pendingAt reporting the word pending syncs first.
             static bool pendingHere = false;
             static const RendererHooks polling{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
-                                               [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return pendingHere; }, nullptr};
+                                               [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return pendingHere; }, nullptr, nullptr, nullptr};
             put(0x7C0, {0xC0043C00, 0x13, (phys + 0x14) | 2, 9, 0xFFFFFFFF, 0x10});
             synced.clear();
             const uint64_t immediateBefore = ImmediateWaits();
@@ -4416,7 +4481,7 @@ int main(int, char** argv)
             // before it, no sync; ApplyDeferredStores lands the store. CONTROL: no open work and an empty queue: it syncs as before.
             static bool open = true;
             static const RendererHooks interrupting{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
-                                                    [](uint32_t) { return open; }, nullptr, nullptr, [] { return open; }};
+                                                    [](uint32_t) { return open; }, nullptr, nullptr, [] { return open; }, nullptr, nullptr};
             Store32(base, page + 0x1C, 0);
             put(0x7C0, {0xC0013D00, (phys + 0x1C) | 2, 0x77, 0xC0005400, 0});
             synced.clear();
@@ -4443,7 +4508,7 @@ int main(int, char** argv)
             static const RendererHooks unblocking{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); },
                                                   [](uint32_t) { return open; },
                                                   [] { idles++; ApplyDeferredStores(); Store32(idleBase, idleWord, 0); },
-                                                  [](uint32_t, uint32_t) { return false; }, [] { return open; }};
+                                                  [](uint32_t, uint32_t) { return false; }, [] { return open; }, nullptr, nullptr};
             Store32(base, page + 0x20, 4);
             put(0x7C0, {0xC0005400, 0, 0xC0043C00, 0x13, (phys + 0x20) | 2, 0, 0xFFFFFFFF, 0x10});
             SetRendererHooks(&unblocking);
@@ -4491,7 +4556,7 @@ int main(int, char** argv)
             static uint32_t cpuWordAt = 0;
             cpuBase = base, cpuWordAt = page + 0x24;
             static const RendererHooks acknowledging{nullptr, nullptr, nullptr, [](uint32_t opcode) { synced.push_back(opcode); Store32(cpuBase, cpuWordAt, 0); },
-                                                     [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return false; }, [] { return true; }};
+                                                     [](uint32_t) { return true; }, nullptr, [](uint32_t, uint32_t) { return false; }, [] { return true; }, nullptr, nullptr};
             Store32(base, page + 0x24, 4);
             synced.clear();
             const uint64_t graceBefore = GraceSyncs(), memBefore = MemWaits();

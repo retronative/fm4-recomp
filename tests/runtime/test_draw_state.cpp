@@ -534,12 +534,22 @@ void TestRectClear()
     // draw_record.cpp XE_PS_INTERPOLATORS); more than 16 is refused.
     Expect(Decode(g, Vs({0}, {4}, {4}, 1), Ps(2)).kind == DrawKind::Draw, "a pixel shader reading 2 interpolators of a vertex shader exporting 1");
     CONTROL(Decode(g, Vs({0}, {4}, {4}, 1), Ps(17)), "the pixel shader reads 17 interpolators");
-    g = RectClear(), g[xr::kPaScVizQuery] = 1;
-    CONTROL(Decode(g, vs, ps), "PA_SC_VIZ_QUERY");
+    // FM4 Recomp (alpha): PA_SC_VIZ_QUERY as Xenia (pm4_command_processor_implement.h:1074-1075). The
+    // logged value F9 = 1111 1001b: viz_query_ena (bit 0) 1, id (bits 1-6) 0x3C = 60, kill_pix_post_hi_z (bit 7) 1: the draw only feeds
+    // the test and is dropped (NoWrite). 0x79 (bit 7 clear, id 60): drawn as usual. 0x80 (kill without enable): drawn.
+    g = RectClear(), g[xr::kPaScVizQuery] = 0xF9;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::NoWrite, "PA_SC_VIZ_QUERY F9 (enabled, id 60, kill after hi-z): the draw is dropped (NoWrite)");
+    g = RectClear(), g[xr::kPaScVizQuery] = 0x79;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw, "PA_SC_VIZ_QUERY 79 (enabled, no kill): drawn");
+    g = RectClear(), g[xr::kPaScVizQuery] = 0x80;
+    Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "CONTROL: kill_pix_post_hi_z without viz_query_ena: drawn");
     g = RectClear(), g[xr::kVgtOutputPathCntl] = 1;
     CONTROL(Decode(g, vs, ps), "tessellation");
     g = RectClear();
-    CONTROL(Decode(g, vs, ps, 0x22, 0x101), "viz-query token");
+    // FM4 Recomp (alpha): a draw conditional on query 1 (token 0x101: id 1, use) is drawn (every query reads visible, as Xenia).
+    Expect(Decode(g, vs, ps, 0x22, 0x101).kind == DrawKind::Draw, "DRAW_INDX with viz-query token 101: drawn (the query reads visible)");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00000088;  // 0 indices
     CONTROL(Decode(g, vs, ps), "0 indices");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030085;  // triangle fan

@@ -64,6 +64,7 @@ private:
     void SetHostAccess(uint32_t first, uint32_t count);
     void Zero(uint32_t first, uint32_t count);
     bool Claim(uint32_t first, uint32_t count, bool take);  // physical frames of pages [first, first + count)
+    uint32_t AllocationBytes(uint32_t address) const;  // FM4 Recomp: the bytes Release would free at `address` (0: none); heap lock held
     uint8_t* membase_;
     uint32_t base_, pageSize_;
     Kind kind_;
@@ -92,6 +93,12 @@ bool WatchUnprotect(uint32_t physical, uint32_t size);
 // (Zero); `hostWrite` before host code writes guest memory through a system call (BeforeHostWrite), which cannot fault.
 using PhysicalRangeObserver = void (*)(uint32_t physical, uint32_t size);
 void SetWatchObservers(PhysicalRangeObserver accessChanged, PhysicalRangeObserver hostWrite);
+// FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1; runtime/video/gpu_read_guard.h): `busy` (lock-free): an unretired GPU read uses a host page of
+// [physical, physical + size); `wait`: returns once none does (bounded; stops otherwise). The heaps keep such host pages read-only
+// (SetHostAccess), wait before a release or decommit zeroes them (outside the heap lock), and BeforeHostWrite waits before a
+// system call writes them. Null (the default): nothing changes.
+using GpuReadBusy = bool (*)(uint32_t physical, uint32_t size);
+void SetGpuReadGuard(GpuReadBusy busy, PhysicalRangeObserver wait);
 // Before a system call writes `size` bytes at host address `host` (pread into a guest buffer): the watched pages it covers are
 // made writable and counted as written. Nothing for memory outside the shared physical views.
 void BeforeHostWrite(const uint8_t* host, uint32_t size);

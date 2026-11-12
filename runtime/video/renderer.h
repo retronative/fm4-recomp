@@ -98,6 +98,16 @@ bool DeferFences();
 bool DeferStore(uint32_t physical);
 void RingIdle();
 bool PendingAt(uint32_t physical, uint32_t bytes);
+// FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1; gpu_read_guard.h G5; command_processor.h honourGpuReadGuard / beforeCpWrite):
+// HonourGpuReadGuard submits and retires up to the part a waiting store needs; BeforeCpWrite does the same inline before the
+// command processor itself stores over a range that unretired GPU work reads. Both nothing while the import is off.
+void HonourGpuReadGuard();
+void BeforeCpWrite(uint32_t physical, uint32_t bytes);
+// FM4 Recomp (opt-in FM4_ASYNC_RETIRE=1, async_retire.h; command_processor.h SetReapHook): whether the completion worker runs (after
+// Initialize), and the reap the command processor calls between packets: the parts the worker retired are retired here without
+// waiting, then their deferred stores land in queue order (never an interrupt; never a store a later part's read guards).
+bool AsyncRetireOn();
+void ReapRetired();
 bool WorkOpen();  // FM4_DEFER_FENCES: the slot holds recorded work not yet submitted  // a GPU write or deferred store over the range waits for the open slot  // opcode: the PM4 type-3 packet (counted per packet in the swap timing line)
 
 // Window mode, main thread only (window_sdl.cpp RunWindowLoop; defined in window_present.cpp). Waits up to `waitNs` for

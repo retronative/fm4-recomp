@@ -56,6 +56,16 @@ size_t MergePendingClear(std::vector<VkRect2D>& rects, VkRect2D add);
 // the older clears whose rectangles lie wholly inside add's are dropped with their values, the rest keep their order and values.
 // Returns how many were dropped. The resolve clears (edram_vk.cpp Clear) and the clear-class draws (AcquireTargets) both go through it.
 size_t PushPendingClear(std::vector<PendingClear>& pending, const PendingClear& add);
+// FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP; after SpeedBreaker 312ce69 runtime/gpu/renderer.cpp:2749-2780 FlushPendingClears,
+// GPL-3.0, adapted to EDRAM tiles): which of the pending clears of `key`'s target (oldest first) must land before a read of the
+// tiles `read`. Newest first, a clear is taken when its tiles (edram::RectTiles of its rectangle in key's layout) meet `read` or the
+// tiles of a clear already taken (a newer clear it must land under), and its tiles join that set; the rest stay pending, in order,
+// for the next pass on the target (each later reader runs this again). Returns the indices taken, ascending (the recording order).
+// `read` == nullptr: every index (FlushClears without the flag, today's flush of all of them). Tile overlap is coarser than pixel
+// overlap (two pixel-disjoint clears in one tile are taken together): conservative, since every reader copies whole tiles.
+std::vector<size_t> SelectClearFlush(edram::Key key, const std::vector<PendingClear>& pending, const edram::TileSet* read);
+// The clear's VkRect2D as a rectangle of its host image (a negative offset is cut at 0; nothing left: an empty rectangle).
+edram::Rect PendingClearRect(const VkRect2D& r);
 
 // ---- Ownership transfers (render_targets_vk.h plan 4) ----------------------------------------------------------
 
@@ -228,6 +238,10 @@ bool DecodeColorClear(uint32_t value, uint32_t storage, float rgba[4]);
 // vulkan_render_target_cache.cc:5417-5421 "Using uint for proper denormal and NaN handling"); storage 4 (16_16) the raw
 // halves, uint32[j] = (value >> 16j) & 0xFFFF (X :5393-5404, so a 0x8000 half survives); false for every other storage.
 bool DecodeColorClearUint(uint32_t value, uint32_t storage, uint32_t rgba[4]);
+// FM4 Recomp (alpha, 64 bpp resolve clear): storage 5 (16_16_16_16) through its R16G16B16A16_UINT transfer view: X
+// render_target_cache.cc:1202-1205 clear value = RB_COLOR_CLEAR | RB_COLOR_CLEAR_LO << 32, vulkan_render_target_cache.cc:5405-5415
+// uint32[j] = (clear_value >> 16j) & 0xFFFF. False for every other storage.
+bool DecodeColorClearUint64(uint32_t value, uint32_t valueLo, uint32_t storage, uint32_t rgba[4]);
 // X :5346-5363 without X's [0, 2) -> [0, 1) halving of 20e4 depth: unit 8's viewport does not halve (FoldViewport,
 // draw_state.h) and edram::PrepareResolve refuses a 20e4 clear above 1.0 instead.
 // kD24S8: X xenos.h:432-438 UNorm24To32((v >> 8) & 0xFFFFFF); kD24FS8: X xenos.cc:150-166 Float20e4To32; the

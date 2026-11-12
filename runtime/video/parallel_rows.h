@@ -4,7 +4,8 @@
 // FM4 Recomp (M7): ParallelRows runs fn(first, last) over the rows [0, rows) in chunks on a small persistent pool, the calling
 // thread taking part; it returns when every row is done. The resolve read-backs (edram_vk_plan.cpp) convert each pixel to its own
 // tiled address, so rows are independent and the result is the serial one byte for byte. Below kParallelMinWork units of work
-// (rows * work per row) it runs on the caller only. One caller at a time (the command-processor thread). The race profile:
+// (rows * work per row) it runs on the caller only. One caller at a time: Run serializes its callers (FM4 Recomp, FM4_ASYNC_RETIRE:
+// the completion worker's resolve write-backs and the command processor's texture untiling may both call it). The race profile:
 // ResolveConvertToGuest was 13% of that thread.
 #pragma once
 #include <pthread.h>
@@ -32,6 +33,7 @@ public:
 
     void Run(uint32_t rows, const std::function<void(uint32_t, uint32_t)>& fn)
     {
+        std::lock_guard caller(caller_);  // one job at a time (uncontended with one calling thread)
         {
             std::lock_guard guard(lock_);
             job_ = &fn, rows_ = rows, chunk_ = std::max<uint32_t>(1, rows / ((kParallelWorkers + 1) * 4));
@@ -76,7 +78,7 @@ private:
         }
     }
 
-    std::mutex lock_;
+    std::mutex caller_, lock_;
     std::condition_variable wake_, done_;
     const std::function<void(uint32_t, uint32_t)>* job_ = nullptr;
     uint32_t rows_ = 0, chunk_ = 1, active_ = 0;

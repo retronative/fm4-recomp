@@ -32,6 +32,24 @@ bool Lists(const CachedShader& shader, uint32_t slot)
 
 }  // namespace
 
+PipelineKey SubsetMergeKey(const PipelineKey& colorOnly, uint8_t depthFormat)
+{
+    PipelineKey k = colorOnly;
+    k.depthUsed = 1, k.depthFormat = depthFormat, k.depthWrite = 0, k.depthFunc = 7, k.depthBias = 0, k.stencilEnable = 0;
+    std::memset(k.stencilFront, 0, sizeof k.stencilFront), std::memset(k.stencilBack, 0, sizeof k.stencilBack);
+    return k;
+}
+
+PipelineKey SubsetMergeKeyDepthOnly(const PipelineKey& depthOnly, uint8_t colorFormat)
+{
+    PipelineKey k = depthOnly;
+    k.colorUsed = 1;
+    k.color[0] = PipelineKeyColor{};
+    k.color[0].format = colorFormat, k.color[0].writeMask = 0;
+    k.color[0].srcColor = 1, k.color[0].dstColor = 0, k.color[0].colorOp = 0, k.color[0].srcAlpha = 1, k.color[0].dstAlpha = 0, k.color[0].alphaOp = 0;
+    return k;
+}
+
 KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, uint64_t vsVariant, uint64_t psVariant, PipelineKey& out)
 {
     if (d.kind != DrawKind::Draw && d.kind != DrawKind::DepthOnly)
@@ -131,8 +149,14 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
                     mask += std::string((t.biasedMask >> i) & 1 ? "true" : "false") + (i < 3 ? ", " : ")");
                 defines->Add(name + "_BIASED " + mask);
             }
-            if (t.expAdjust != 0)
-                defines->Add(name + "_SCALE ldexp(1.0, " + std::to_string(t.expAdjust) + ")");
+            // FM4 Recomp (the rectangular car shadow): a signed-integer 16_16 fetch (number format 1, every
+            // sign 1: draw_state.cpp accepts no other 16_16) holds each channel as the int16 itself times 2^exp_adjust, not normalized
+            // (the consumer side of the resolve's copy_dest_number 3 packing, edram_vk_plan.cpp PackFixed16; ForzaRecomp render.cpp:620-626,
+            // INFERRED there too). The view is R16G16_SNORM (int16 / 32767), so 32767 restores the integer exactly for -32767..32767
+            // (-32768 reads -32767), and filtering commutes with the scale. FM4's car-shadow mask (1C1E3000).
+            const bool int16Scale = t.format == 25 && t.numFormat == 1;
+            if (t.expAdjust != 0 || int16Scale)
+                defines->Add(name + "_SCALE " + std::string(int16Scale ? "32767.0 * " : "") + "ldexp(1.0, " + std::to_string(t.expAdjust) + ")");
             if (t.lodBias != 0)
                 defines->Add(name + "_LOD_BIAS " + FloatLiteral(float(t.lodBias) / 32.0f));
         }
@@ -172,6 +196,41 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
     else
         psDefines.Add("XE_NO_COLOR_OUTPUT");  // no colour attachment (the key's colorUsed is 0): the output is not declared
     return Accept();
+}
+
+// FM4 Recomp (M7 CPU cost, FM4_VARIANT_MEMO; draw_record.h): every input VariantsFromDrawState reads above, raw (a value it ignores
+// only makes the memo miss more, never hit wrongly). The shader objects stand for what it reads of the pair (interpolator counts, the
+// texture slots each lists: a translation's, fixed for the object) and for the variants ShaderCache::Variant returns (per shader).
+// Of the draw: hostPrimitive, the kind, the primitive type (PrimitivePolygonal), the renderer's XE_FETCH_UNCHECKED decision
+// (renderer.cpp adds that define after this function), the alpha test (ref as its bits: equal bits print one FloatLiteral),
+// param_gen and its position, alpha to mask, the sample count, the colour mask, the target's colour format and exp bias, and each
+// texture slot's slot, gamma, biasedMask, format, numFormat, expAdjust and lodBias.
+bool VariantMemoKeyFor(const DrawState& d, const CachedShader& vs, const CachedShader& ps, bool fetchUnchecked, VariantMemoKey& out)
+{
+    if (d.textureSlots.size() > VariantMemoKey::kMaxTextures)
+        return false;
+    uint32_t n = 0;
+    const auto put = [&](uint32_t v) { out.words[n++] = v; };
+    const auto put64 = [&](uint64_t v) { put(uint32_t(v)), put(uint32_t(v >> 32)); };
+    put64(uint64_t(reinterpret_cast<uintptr_t>(&vs)));
+    put64(uint64_t(reinterpret_cast<uintptr_t>(&ps)));
+    put(uint32_t(d.kind)), put(uint32_t(d.hostPrimitive)), put(d.primitiveType), put(fetchUnchecked ? 1u : 0u);
+    uint32_t refBits = 0;
+    std::memcpy(&refBits, &d.alphaTest.ref, sizeof refBits);
+    put(d.alphaTest.enabled ? 1u : 0u), put(d.alphaTest.func);
+    put(refBits);
+    put(d.program.paramGen ? 1u : 0u), put(d.program.paramGenPos);
+    put(d.alphaToMask), put(d.target.samples), put(d.colorWriteMask), put(d.target.colorFormat);
+    put(uint32_t(d.target.colorExpBias));
+    put(uint32_t(d.textureSlots.size()));
+    for (const TextureSlot& t : d.textureSlots)
+    {
+        put(t.slot);
+        put(t.gamma ? 1u : 0u), put(t.biasedMask), put(t.format), put(t.numFormat), put(uint32_t(t.expAdjust));
+        put(uint32_t(t.lodBias));
+    }
+    out.count = n;
+    return true;
 }
 
 uint32_t SwapIndex(uint32_t raw, bool is32Bit, uint32_t endian)

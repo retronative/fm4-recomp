@@ -2077,10 +2077,11 @@ void TestResolve64Decode()
     CHECK(refused(o, "64 bpp source (storage 5) at 2x"));
     o = r, o.surfaceInfo = 320 | 2u << 16;  // 4x (pitch tiles (640 + 79) / 80 = 8)
     CHECK(refused(o, "64 bpp source (storage 5) at 4x"));
+    // FM4 Recomp (alpha, 64 bpp resolve clear): a clear in the same resolve is accepted (TestResolve64Clear).
     o = r, o.copyControl |= 1u << 8;  // copy_color_clear_enable
-    CHECK(refused(o, "that also clears (colour 1, depth 0)"));
+    CHECK(DecodeResolve(o).ok);
     o = r, o.copyControl |= 1u << 9;  // copy_depth_clear_enable
-    CHECK(refused(o, "that also clears (colour 0, depth 1)"));
+    CHECK(DecodeResolve(o).ok);
     // CONTROL: a 32 bpp source into 32 stays refused by the 32 bpp destination list, and storage 5 into 6 by the 64 bpp one.
     o = r, o.colorInfo[0] = 0;
     CHECK(refused(o, "texture format 32 is not supported in M4"));
@@ -2088,6 +2089,44 @@ void TestResolve64Decode()
     o = r, o.copyDestInfo = 1 | 6u << 7;
     CHECK(refused(o, "into texture format 6"));
     CONTROL(DecodeResolve(o).ok);
+}
+
+// FM4 Recomp (alpha, 64 bpp resolve clear): a Car Select stop (a resolve from the storage-5 source that also
+// clears colour). Hand-computed from X render_target_cache.cc:1160-1293 and draw_util.cc:1202-1256 (67f16c4). The source key 1402000
+// (pitch 4 tiles at 32 bpp, 1x); the rectangle from y0 = 16 (vertex 15.5 + the half pixel) to 64, x 0-320:
+// - edram_base_offset_tiles (:1212-1213) = (16 / 16) * 4 + 0 = 4; the colour base_tiles (:1253) = 0 + (4 << 1) = 8, so the copy span
+//   starts at tile 8 (8 tiles a row, rows 1-3: tiles 8-31).
+// - the clear (:1177-1183): pitch (4 << 1) >> 1 = 4, base offset (8 - 0) >> 1 = 4: rows 4 / 4 = 1, so y = 1 * 16 = 16, x = 0;
+//   width min(320, 320) = 320, height min(48, 8192 - 16) = 48: the rectangle (0, 16, 320, 48). Using the span's base offset (8)
+//   instead would put it at y = 32.
+// - tiles (:1252-1266): start (16 / 16) * 4 + 0 = 4, length (63 / 16) * 4 + 319 / 80 + 1 - 4 = 12 + 3 + 1 - 4 = 12; doubled for 64
+//   bpp (:1281-1289): start 8, length (4 + 12) * 2 - 8 = 24: tiles 8-31, the span's. Without the doubling the clear would claim
+//   tiles 4-15, so tiles 4-7 would leave the 32 bpp key below.
+// - the value (:1202-1205, vulkan_render_target_cache.cc:5405-5415): RB_COLOR_CLEAR 0x22221111 | RB_COLOR_CLEAR_LO 0x44443333 << 32
+//   -> uint32[j] = 0x1111, 0x2222, 0x3333, 0x4444 (test_edram_vk.cpp).
+void TestResolve64Clear()
+{
+    const Key k32 = Key::Color(0, 4, Msaa::X1, ColorFormat::k8_8_8_8);
+    Ownership o;
+    std::vector<Transfer> claimed;
+    std::string why;
+    CHECK(o.Change(k32, 0, 64, claimed, why));
+    ResolveRegisters r = Resolve64();
+    const float v[6] = {-0.5f, 15.5f, 319.5f, 15.5f, 319.5f, 63.5f};
+    for (int k = 0; k < 6; k++)
+        r.vertexWords[k] = GuestFloat(v[k]);
+    r.copyControl |= 1u << 8;
+    r.colorClear = 0x22221111u, r.colorClearLo = 0x44443333u;
+    const ResolveInfo i = DecodeResolve(r);
+    CHECK(i.ok && i.y0 == 16 && i.y1 == 64 && i.edramBaseOffsetTiles == 4 && i.spanBase == 8 && i.spanPitch == 8 && i.spanRows == 3);
+    const ResolvePlan p = PrepareResolve(o, i);
+    CHECK(p.ok && p.copy && p.hasColorClear && !p.hasDepthClear && p.colorClear.target == i.source);
+    CHECK(p.colorClear.rect == (Rect{0, 16, 320, 48}));
+    CONTROL(p.colorClear.rect == (Rect{0, 32, 320, 32}));  // the span's base offset (8) taken as the clear's
+    CHECK(p.colorClear.value == 0x22221111u && p.colorClear.valueLo == 0x44443333u);
+    CHECK(o.At(8) == i.source && o.At(31) == i.source);
+    CHECK(o.At(4) == k32 && o.At(7) == k32 && o.At(32) == k32);  // the clear claims the doubled range 8-31 only
+    CONTROL(o.At(4) == i.source);  // the 32 bpp range 4-15
 }
 
 int main(int argc, char** argv)
@@ -2118,6 +2157,7 @@ int main(int argc, char** argv)
     TestClearValueOwnership();
     TestOwnership64();  // FM4 Recomp (alpha, RT format 5)
     TestResolve64Decode();  // FM4 Recomp (alpha, 64 bpp resolve)
+    TestResolve64Clear();  // FM4 Recomp (alpha, 64 bpp resolve clear)
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

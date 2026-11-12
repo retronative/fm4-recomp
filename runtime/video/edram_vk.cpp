@@ -18,6 +18,8 @@
 #include "kernel/virtual_memory.h"
 #include <cstdio>
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -901,7 +903,8 @@ struct Target
     VkPipelineStageFlags stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
     VkAccessFlags access = 0;
     // FM4 Recomp (M7 GPU cost): resolve clears not applied yet (render_hooks.h PendingClear), oldest first; applied by the next pass
-    // that touches the target (a draw pass, a transfer pass into it) or flushed before any read of it (FlushClears).
+    // that touches the target (a draw pass, a transfer pass into it) or flushed before any read of it (FlushClears; with
+    // FM4_CLEAR_FLUSH_OVERLAP=1 before any read of their tiles: the others stay pending for the next pass or the next read).
     std::vector<PendingClear> pendingClears;
     VkImageLayout RestLayout() const { return depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; }
     VkImageAspectFlags Aspects() const { return depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT; }
@@ -965,6 +968,7 @@ struct Unit
     edram::Ownership ownership;
     std::vector<Pending> pending;
     VkDeviceSize stagingUsed = 0;
+    size_t handedOff = 0;  // FM4 Recomp (FM4_ASYNC_RETIRE): pending[0, handedOff) are in a completion-worker batch (HandOff)
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): the converted words (kResolveResident) and the last recorded resolve (lastResolve).
     VkShaderModule resident1x = VK_NULL_HANDLE, residentMs = VK_NULL_HANDLE;
     VkShaderModule residentDepth1x = VK_NULL_HANDLE, residentDepthMs = VK_NULL_HANDLE;  // FM4_RESOLVE_RESIDENT_DEPTH
@@ -982,6 +986,9 @@ struct Unit
     uint64_t draws64 = 0;  // FM4 Recomp (alpha, RT format 5): draws bound to a 64 bpp colour key (AcquireTargets)
     uint64_t deferredClears = 0;  // FM4 Recomp (M7 GPU cost): resolve clears kept pending for the next pass (Clear)
     uint64_t deferredClearDraws = 0;  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): clear-class draws kept as pending clears instead of drawn (AcquireTargets)
+    // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP): FlushClears calls that found pending clears, the flush passes they recorded, the
+    // clears flushed and the clears kept pending past a read (none of their tiles read).
+    uint64_t flushCalls = 0, flushPasses = 0, flushedClears = 0, keptClears = 0;
     // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): transfers recorded as a clear of the destination (edram.h Transfer::value) and
     // their tiles; tiles recorded as constants (Ownership::SetClearValue); clears whose values could not be recorded (ClearRequestWord refused).
     uint64_t valueTransfers = 0, valueTiles = 0, clearValueTilesRecorded = 0, clearValuesRefused = 0;
@@ -1494,12 +1501,61 @@ void DiagTally(uint64_t firstSwap, uint64_t lastSwap)
     diagCauseTally.clear();
 }
 
+// FM4 Recomp (M7 GPU cost; opt-in FM4_CLEAR_FLUSH_OVERLAP=1, after SpeedBreaker 312ce69 runtime/gpu/renderer.cpp:2550-2558
+// NFSMW_CLEAR_FLUSH_RECT and :2749-2780 FlushPendingClears, GPL-3.0): with it, FlushClears flushes only the pending clears a read
+// of the given tiles needs (edram_vk_plan.h SelectClearFlush: those whose tiles the read touches and the older ones under them);
+// the rest stay pending for the target's next pass or its next read, which flushes them in turn. Off: every pending clear (today).
+bool ClearFlushOverlap()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_CLEAR_FLUSH_OVERLAP");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[edram] clear flush by overlap on (FM4_CLEAR_FLUSH_OVERLAP=1): a read of a target (transfer source, resolve copy) "
+                                 "flushes only the pending clears on the tiles it reads and the older ones under them\n");
+        return enabled;
+    }();
+    return on;
+}
+
 // FM4 Recomp (M7 GPU cost): the pending clears of `t` recorded in their own pass over the cleared rows (the former Clear() pass),
 // before a read of the target that no pass of ours precedes (a transfer source, a resolve copy). No-op without pending clears.
-bool FlushClears(VkCommandBuffer c, Target& t, std::string& error)
+// FM4 Recomp (FM4_CLEAR_FLUSH_OVERLAP): `read`, the EDRAM tiles the read touches (nullptr: all pending clears, as without the flag;
+// callers pass it only with the flag): only SelectClearFlush's clears are recorded, in their order; the others stay in
+// t.pendingClears in theirs. None selected: no pass.
+bool FlushClears(VkCommandBuffer c, Target& t, std::string& error, const edram::TileSet* read = nullptr)
 {
     if (t.pendingClears.empty())
         return true;
+    std::vector<PendingClear> kept;  // FM4_CLEAR_FLUSH_OVERLAP: what stays pending after this flush
+    if (read != nullptr)
+    {
+        unit->flushCalls++;
+        const std::vector<size_t> taken = SelectClearFlush(t.key, t.pendingClears, read);
+        if (taken.size() != t.pendingClears.size())
+        {
+            std::vector<PendingClear> flush;
+            size_t next = 0;
+            for (size_t i = 0; i < t.pendingClears.size(); i++)
+                if (next < taken.size() && taken[next] == i)
+                    flush.push_back(t.pendingClears[i]), next++;
+                else
+                    kept.push_back(t.pendingClears[i]);
+            unit->keptClears += kept.size();
+            if (DiagTransfersLevel() >= 2)  // FM4_DIAG_TRANSFERS=2 (diagnostic): clears kept past a read, by key and cause
+            {
+                auto& k = diagCauseTally["pending clears of " + DiagKeyName(t.key) + " kept past a read [" + diagCause + "]"];
+                k.first++, k.second += kept.size();
+            }
+            t.pendingClears.swap(flush);  // the clears to record now; `kept` goes back below
+            if (t.pendingClears.empty())
+            {
+                t.pendingClears.swap(kept);
+                return true;
+            }
+        }
+        unit->flushPasses++, unit->flushedClears += t.pendingClears.size();
+    }
     if (DiagTransfersLevel() >= 2)  // FM4_DIAG_TRANSFERS=2 (diagnostic): a flush pass, by key and cause (count, rectangles)
     {
         auto& f = diagCauseTally["flush of the pending clears of " + DiagKeyName(t.key) + " [" + diagCause + "]"];
@@ -1528,6 +1584,7 @@ bool FlushClears(VkCommandBuffer c, Target& t, std::string& error)
     vkCmdEndRenderPass(c);
     UnitPassEnd(c);
     t.pendingClears.clear();
+    t.pendingClears.swap(kept);  // FM4_CLEAR_FLUSH_OVERLAP: the clears not flushed, in order (empty without the flag)
     return true;
 }
 
@@ -1671,9 +1728,29 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
     // The sources are read: their pending clears first (FlushClears); then sampled by the fragment shader: out of their rest layout
     // before the pass, back after it. The destination's pending clears are the first commands of this pass (in guest order they
     // precede the transfer), so its render area covers them too.
-    for (const Item& it : items)
-        if (!FlushClears(c, *it.source, error))
-            return false;
+    // FM4 Recomp (FM4_CLEAR_FLUSH_OVERLAP): each source is flushed once, for the union of the tiles its transfers read (a transfer's
+    // [startTiles, endTiles) are EDRAM tiles, the same in every key's layout; the shader reads the source only in them).
+    if (ClearFlushOverlap())
+    {
+        std::vector<std::pair<Target*, edram::TileSet>> reads;
+        for (const Item& it : items)
+        {
+            auto r = std::find_if(reads.begin(), reads.end(), [&](const auto& p) { return p.first == it.source; });
+            if (r == reads.end())
+            {
+                reads.emplace_back(it.source, edram::TileSet{});
+                r = reads.end() - 1;
+            }
+            r->second |= edram::RangeTiles(it.t->startTiles, it.t->endTiles);
+        }
+        for (auto& [source, tiles] : reads)
+            if (!FlushClears(c, *source, error, &tiles))
+                return false;
+    }
+    else
+        for (const Item& it : items)
+            if (!FlushClears(c, *it.source, error))
+                return false;
     for (const PendingClear& pc : dest.pendingClears)
         area.push_back(pc.rect);
     for (const Item& it : items)
@@ -1906,10 +1983,11 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
 
 // The clear of `rect` on `t` (X vulkan_render_target_cache.cc:5340-5431). FM4 Recomp (M7 GPU cost):
 // not recorded here but kept pending on the target (render_hooks.h PendingClear); the next pass that touches `t` records
-// it first (the renderer's draw pass through AcquireTargets, a transfer pass into t), or FlushClears before a read of t. Older
+// it first (the renderer's draw pass through AcquireTargets, a transfer pass into t), or FlushClears before a read of t (with
+// FM4_CLEAR_FLUSH_OVERLAP=1: before a read of its tiles). Older
 // pending clears wholly inside this rectangle are dropped (edram_vk_plan.h MergePendingClear). Before this, every resolve clear
 // opened its own full-target render pass (~21 a race frame).
-bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value, std::string& error)
+bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value, uint32_t valueLo, std::string& error)
 {
     (void)c;
     if (rect.x + rect.width > t.width || rect.y + rect.height > t.height)
@@ -1925,7 +2003,9 @@ bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value
         pc.attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         pc.attachment.colorAttachment = 0;
         // Storage 14 and 4: the raw bits through the transfer view (X :5393-5404, :5417-5421); the others as floats (X :5366-5395).
-        if (UintStorage(t) ? !DecodeColorClearUint(value, t.key.Format(), pc.attachment.clearValue.color.uint32)
+        // FM4 Recomp (alpha, 64 bpp resolve clear): storage 5 takes RB_COLOR_CLEAR_LO too (DecodeColorClearUint64).
+        if (t.key.Is64bpp() ? !(UintStorage(t) && DecodeColorClearUint64(value, valueLo, t.key.Format(), pc.attachment.clearValue.color.uint32))
+            : UintStorage(t) ? !DecodeColorClearUint(value, t.key.Format(), pc.attachment.clearValue.color.uint32)
                            : !DecodeColorClear(value, t.key.Format(), pc.attachment.clearValue.color.float32))
             return Fail(error, "resolve colour clear of storage format " + std::to_string(t.key.Format()));
     }
@@ -2152,7 +2232,13 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
     {
         Target* source = GetTarget(c, plan.copySource, error);
         diagCause = "resolve copy";  // FM4_DIAG_TRANSFERS=2 (diagnostic label only)
-        const bool moved = source != nullptr && ExecuteTransfers(c, *source, plan.copyTransfers, error) && FlushClears(c, *source, error);
+        // FM4 Recomp (FM4_CLEAR_FLUSH_OVERLAP): the copy reads only plan.copyRect of the source (the read-back copy, RecordDump,
+        // RecordResident and the resident copy below all take `r`), so only the clears on its tiles must land first.
+        edram::TileSet copyTiles;
+        if (source != nullptr && ClearFlushOverlap())
+            copyTiles = edram::RectTiles(source->key, plan.copyRect);
+        const bool moved = source != nullptr && ExecuteTransfers(c, *source, plan.copyTransfers, error) &&
+                           FlushClears(c, *source, error, ClearFlushOverlap() ? &copyTiles : nullptr);
         diagCause = "bind";
         if (!moved)
             return false;
@@ -2277,7 +2363,7 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         diagCause = "resolve clear";  // FM4_DIAG_TRANSFERS=2 (diagnostic label only)
         const bool moved = t != nullptr && ExecuteTransfers(c, *t, clear->transfers, error);
         diagCause = "bind";
-        if (!moved || !Clear(c, *t, clear->rect, clear->value, error))
+        if (!moved || !Clear(c, *t, clear->rect, clear->value, clear->valueLo, error))
             return false;
         DiagConsume(clear->target, "resolve clear");  // FM4_DIAG_TRANSFERS=2
     }
@@ -2395,6 +2481,71 @@ bool Retired(uint64_t upToSerial, std::string& error)
     return true;
 }
 
+// FM4 Recomp (opt-in FM4_ASYNC_RETIRE=1; render_hooks.h handOff / writeBackHandedOff / forget; runtime/video/async_retire.h): the
+// same write-back as Retired, split so that the completion worker writes a part's resolves while the command processor goes on
+// recording. The worker sees only its batch (copies of the entries, the staging and guest base pointers, which live until Shutdown,
+// after the worker is joined); the pending list and the staging allocation stay the command processor's. A staging range is reused
+// only after `forget`, which runs after GpuGuard::Retire confirmed the worker finished that part.
+struct HandOffBatch
+{
+    uint64_t serial = 0;
+    const uint8_t* staging = nullptr;
+    uint8_t* guestBase = nullptr;
+    std::vector<Pending> entries;
+};
+std::mutex handOffLock;
+std::deque<HandOffBatch> handOffBatches;  // under handOffLock, in serial order
+
+void HandOff(uint64_t serial)
+{
+    HandOffBatch b{serial, static_cast<const uint8_t*>(unit->stagingMapped), unit->guestBase, {}};
+    while (unit->handedOff < unit->pending.size() && unit->pending[unit->handedOff].serial <= serial)
+        b.entries.push_back(unit->pending[unit->handedOff++]);
+    if (b.entries.empty())
+        return;
+    std::lock_guard<std::mutex> lock(handOffLock);
+    handOffBatches.push_back(std::move(b));
+}
+
+bool WriteBackHandedOff(uint64_t serial, std::string& error)
+{
+    HandOffBatch b;
+    {
+        std::lock_guard<std::mutex> lock(handOffLock);
+        if (handOffBatches.empty() || handOffBatches.front().serial > serial)
+            return true;  // the part recorded no read-back resolve
+        b = std::move(handOffBatches.front());
+        handOffBatches.pop_front();
+    }
+    for (const Pending& p : b.entries)  // record order, as Retired
+    {
+        uint32_t guest = 0;
+        if (!GuestRange(p.info.destExtentStart, p.info.destExtentLength, guest, error))
+            return Fail(error, "resolve destination: " + error);
+        if (ResolveHostWrite())
+            GuestRangeHostWrite(p.info.destExtentStart, p.info.destExtentLength);  // atomics and mprotect (texture_cache.h BeforeHostWrite)
+        const uint32_t* words = reinterpret_cast<const uint32_t*>(b.staging + p.offset);
+        const bool ok = p.gpuWords ? ResolveWordsToGuest(p.info, p.storage, words, b.guestBase + guest, p.info.destExtentLength, error)
+                        : p.depth  ? ResolveDepthToGuest(p.info, words, b.guestBase + guest, p.info.destExtentLength, error)
+                        : p.fast   ? ResolveToGuest(p.info, p.storage, words, b.guestBase + guest, p.info.destExtentLength, error)
+                                   : ResolveConvertToGuest(p.info, p.storage, words, b.guestBase + guest, p.info.destExtentLength, error);
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+void Forget(uint64_t upToSerial)
+{
+    size_t written = 0;
+    while (written < unit->handedOff && unit->pending[written].serial <= upToSerial)
+        written++;
+    unit->pending.erase(unit->pending.begin(), unit->pending.begin() + long(written));
+    unit->handedOff -= written;
+    if (unit->pending.empty())
+        unit->stagingUsed = 0;
+}
+
 bool LastResolve(ResidentResolve& out, VkImage& words)
 {
     if (!unit->lastValid)
@@ -2414,6 +2565,10 @@ void Shutdown()
     std::fprintf(stderr, "[edram] shutdown: %zu host target(s), %llu transfer(s) in %llu draw(s), %llu resolve(s), %llu deferred clear(s), %llu clear draw(s) deferred\n",
                  unit->targets.size(), (unsigned long long)unit->transfers, (unsigned long long)unit->transferDraws, (unsigned long long)unit->resolves,
                  (unsigned long long)unit->deferredClears, (unsigned long long)unit->deferredClearDraws);  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the last
+    if (ClearFlushOverlap())  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP)
+        std::fprintf(stderr, "[edram] clear flush by overlap: %llu flush(es) with pending clears, %llu flush pass(es), %llu clear(s) flushed, %llu kept past a read\n",
+                     (unsigned long long)unit->flushCalls, (unsigned long long)unit->flushPasses, (unsigned long long)unit->flushedClears,
+                     (unsigned long long)unit->keptClears);
     if (ClearValueOwnership())  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP)
         std::fprintf(stderr, "[edram] clear-value ownership: %llu value transfer(s) of %llu tile(s) (clears, no copy); %llu tile(s) recorded as constants, %llu clear(s) not recordable\n",
                      (unsigned long long)unit->valueTransfers, (unsigned long long)unit->valueTiles, (unsigned long long)unit->clearValueTilesRecorded,
@@ -2473,7 +2628,8 @@ void Shutdown()
     unit.reset();
 }
 
-const EdramHooks kHooks{AcquireTargets, Resolve, Retired, Shutdown, LastResolve, ResolveRoom, DiagTransfers() ? &DiagTally : nullptr};  // FM4_DIAG_TRANSFERS
+const EdramHooks kHooks{AcquireTargets, Resolve, Retired, Shutdown, LastResolve, ResolveRoom, DiagTransfers() ? &DiagTally : nullptr,  // FM4_DIAG_TRANSFERS
+                        HandOff, WriteBackHandedOff, Forget};  // FM4 Recomp (FM4_ASYNC_RETIRE)
 
 bool Module(SpirvCompiler& compiler, bool pixel, const std::string& glsl, VkShaderModule& out, std::string& error)
 {

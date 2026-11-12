@@ -49,19 +49,19 @@ A skips the long welcome video before the first race. Retail FM4 cannot skip it;
 | Scene | Frame rate |
 |---|---|
 | Menus | about 20 fps |
-| Race, in a window | about 15 fps (median frame 65 ms) |
+| Race, in a window | about 29 fps (median frame 35 ms; 90 % of frames under 50 ms) |
 
-The window always runs with the Vulkan validation layer (a GPU safeguard, below), which costs about two thirds of the
-renderer's CPU time. Without the window and the layer the same race runs at about 29 fps. Making the window fast is the
-next work item.
+Normal play runs without the Vulkan validation layer (it is in Debug mode, below), which cost about two thirds of the
+renderer's CPU time.
 
 ## GPU safeguards (always on)
 
-- One session at a time, under a hard deadline, in its own process group.
-- The Vulkan validation layer is on and is proven live before each session by a deliberate, query-only misuse it must report.
+- One session at a time, under a hard deadline, in its own process group, with the game's own GPU fence timeouts.
 - After each session the system log and crash reports are searched for a GPU hang or restart. On any evidence `play.sh`
-  writes `GPU_STOP` (in the data folder above) and refuses to start again until you read it and delete it yourself. Please send that file and the
-  session's `logs/` folder to the developers.
+  writes `GPU_STOP` (in the data folder above) and refuses to start again until you read it and delete it yourself. Please send
+  that file and the session's `logs/` folder to the developers.
+- **Debug mode** (the launcher's checkbox, or `./play.sh --debug`): the Vulkan validation layer and Metal API validation, proven
+  live first by a deliberate misuse they must report; the game stops at the first validation message. Much slower; for reports.
 
 ## Known issues
 

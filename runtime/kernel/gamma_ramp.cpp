@@ -100,14 +100,19 @@ void ApplyPwlToFrame(uint32_t* pixels, size_t count, const PwlEntry (&pwl)[128][
     // channel value's result, already shifted into place, in three 1024-entry tables built from ApplyPwl10 itself (3 x 1024
     // evaluations instead of 3 a pixel); the per-pixel result is the same expression, so the frame is bit-identical.
     uint32_t lut[3][1024];
-    for (uint32_t c = 0; c < 3; c++)
-        for (uint32_t v = 0; v < 1024; v++)
-            lut[c][v] = ApplyPwl10(v, pwl[v >> 3][c]) << (10 * c);
+    BuildPwlLut(pwl, lut);
     for (size_t i = 0; i < count; i++)
     {
         const uint32_t p = pixels[i];
         pixels[i] = (3u << 30) | lut[0][p & 0x3FF] | lut[1][(p >> 10) & 0x3FF] | lut[2][(p >> 20) & 0x3FF];
     }
+}
+
+void BuildPwlLut(const PwlEntry (&pwl)[128][3], uint32_t (&lut)[3][1024])
+{
+    for (uint32_t c = 0; c < 3; c++)
+        for (uint32_t v = 0; v < 1024; v++)
+            lut[c][v] = ApplyPwl10(v, pwl[v >> 3][c]) << (10 * c);
 }
 
 uint64_t PwlDigest(const PwlEntry (&pwl)[128][3])

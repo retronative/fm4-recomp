@@ -22,6 +22,7 @@ constexpr uint32_t RegisterAddress(uint32_t index) { return kRegisterBase + 4 * 
 // Register indices (Xenia register_table.inc).
 namespace reg { constexpr uint32_t kCpRbWptr = 0x1C5, kScratchUmsk = 0x1DC, kScratchAddr = 0x1DD, kScratchReg0 = 0x578, kWaitUntil = 0x5C8,
                                    kWritebackBase = 0xA04, kCoherStatusHost = 0xA31, kVgtEventInitiator = 0x21F9,
+                                   kPaScVizQueryStatus0 = 0x0C44, kPaScVizQueryStatus1 = 0x0C45,  // FM4 Recomp (alpha): X register_table.inc:100-102
                                    kRbSampleCountAddr = 0x2325,  // FM4 Recomp: X register_table.inc:615
                                    kVgtDmaBase = 0x21FA, kVgtDmaSize = 0x21FB, kVgtDrawInitiator = 0x21FC,
                                    kShaderConstantFetch00 = 0x4800; }
@@ -62,8 +63,9 @@ Engines& EngineState();
 // queued twice. Source 1 comes from a PM4 INTERRUPT packet. The first registration starts the thread and the
 // timer; a later one replaces the callback.
 void SetInterruptCallback(uint8_t* base, uint32_t callback, uint32_t userData);
-// Queues an interrupt; with `wait`, returns after the callback has run.
-void RequestInterrupt(uint32_t source, bool wait);
+// Queues an interrupt; with `wait`, returns after the callback has run. FM4 Recomp (FM4_GUEST_MEMORY_GPU): with `poll`, the wait
+// calls it every 50 us without the interrupt lock (the callback may store to a page whose GPU read the caller must retire).
+void RequestInterrupt(uint32_t source, bool wait, void (*poll)() = nullptr);
 uint64_t VblankCount();
 uint64_t InterruptsDelivered();
 

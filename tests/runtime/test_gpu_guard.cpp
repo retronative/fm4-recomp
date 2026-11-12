@@ -527,8 +527,26 @@ void TestAsyncSubmit()
         Expect(!bool(g.Retire(2)), "async control: slot 2 is not confirmed (stranded or no longer awaited)");
     }
 }
+// FM4 Recomp (M7, FM4_SUBMIT_IF_IDLE): Finished asks the backend's fence status without waiting or retiring: true only for a slot in
+// flight whose status is VK_SUCCESS (0); an idle slot is not Finished (Idle is), and nothing is destroyed or waited for.
+void TestFinishedWithoutWaiting()
+{
+    Fake fake;
+    gpu::SubmissionGate gate;
+    Guard g(fake, gate, Path("stop_finished"), k2s);
+    Expect(g.Idle(0) && !g.Finished(0) && fake.statuses == 0, "idle slot: Idle, not Finished, no fence asked");
+    Expect(g.Hold(0, 'a') && g.Submit(0).ok, "slot 0 submitted");
+    fake.statusResult = 1;  // VK_NOT_READY
+    Expect(!g.Idle(0) && !g.Finished(0) && fake.statuses == 1, "in flight, not ready: not Finished (one status query)");
+    fake.statusResult = 0;
+    Expect(g.Finished(0) && fake.waits == 0 && fake.destroyed.empty() && g.SlotState(0) == State::InFlight,
+           "in flight, signalled: Finished, nothing waited for, destroyed or retired");
+    Expect(!g.Finished(2), "CONTROL: no slot 2 (2 slots)");
+}
+
 int main(int argc, char** argv)
 {
+    TestFinishedWithoutWaiting();  // FM4 Recomp (M7, FM4_SUBMIT_IF_IDLE)
     if (argc != 2)
     {
         std::fprintf(stderr, "usage: %s <work dir>\n", argv[0]);

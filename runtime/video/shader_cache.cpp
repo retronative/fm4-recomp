@@ -134,14 +134,25 @@ GlslangCompiler::~GlslangCompiler()
 
 bool GlslangCompiler::Compile(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error)
 {
+    return CompileStage(pixel ? EShLangFragment : EShLangVertex, pixel, true, glsl, spirv, warnings, error);
+}
+
+bool GlslangCompiler::CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error)
+{
+    return CompileStage(EShLangCompute, false, false, glsl, spirv, warnings, error);
+}
+
+bool GlslangCompiler::CompileStage(int stageIndex, bool pixel, bool rewrites, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings,
+                                   std::string& error)
+{
     spirv.clear();
     warnings.clear();
     if (!initialized_)
         return error = "glslang::InitializeProcess failed", false;
-    const EShLanguage stage = pixel ? EShLangFragment : EShLangVertex;
+    const EShLanguage stage = EShLanguage(stageIndex);
     const EShMessages messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules);
     glslang::TShader shader(stage);
-    const bool rewrite = NoPrecise() || DiagVsNoAtomics() || DiagFastMul();  // FM4_SHADER_NO_PRECISE; the diagnostics above
+    const bool rewrite = rewrites && (NoPrecise() || DiagVsNoAtomics() || DiagFastMul());  // FM4_SHADER_NO_PRECISE; the diagnostics above
     const std::string text = rewrite ? DiagRewrite(NoPrecise() ? WithoutPrecise(glsl) : glsl, pixel) : std::string();
     const char* source = rewrite ? text.c_str() : glsl.c_str();
     shader.setStrings(&source, 1);

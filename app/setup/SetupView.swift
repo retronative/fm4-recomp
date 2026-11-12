@@ -34,6 +34,7 @@ final class SetupModel: ObservableObject {
   @Published var lastSession = ""
   @Published var gpuStop: String?
   @Published var minutes = 120
+  @Published var debugValidation = false  // play.sh --debug: Vulkan and Metal API validation (slower)
   private var process: Process?
 
   init(paths: Paths, preview: Bool = false) {
@@ -92,7 +93,7 @@ final class SetupModel: ObservableObject {
     guard gpuStop == nil, !playing else { return }
     playing = true
     lastSession = "Starting the game…"
-    process = runKitScript(paths, "play.sh", ["\(minutes)"], line: { text in
+    process = runKitScript(paths, "play.sh", ["\(minutes)"] + (debugValidation ? ["--debug"] : []), line: { text in
       Task { @MainActor in if text.hasPrefix("play:") { self.lastSession = String(text.dropFirst(6)) } }
     }, done: { _ in
       Task { @MainActor in
@@ -452,6 +453,8 @@ struct LauncherPage: View {
         }
         .labelsHidden().frame(width: 170).disabled(model.playing)
       }
+      Toggle("Debug mode: full GPU validation (much slower)", isOn: $model.debugValidation)
+        .toggleStyle(.checkbox).font(.system(size: 12)).foregroundStyle(Theme.secondary).disabled(model.playing)
       if !model.lastSession.isEmpty {
         Text(model.lastSession).font(.system(size: 12)).foregroundStyle(Theme.secondary).lineLimit(2).multilineTextAlignment(.center)
       }
@@ -464,7 +467,7 @@ struct LauncherPage: View {
           }
           VStack(alignment: .leading, spacing: 5) {
             Text("GPU safeguards").font(.system(size: 12.5, weight: .semibold))
-            Text("Validation layer always on, a hard session limit, and a hang check after every session. Close the game window to end early.")
+            Text("A hard session limit, the game's GPU timeouts, and a hang check after every session. Close the game window to end early.")
               .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
           }
         }

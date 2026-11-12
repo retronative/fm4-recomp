@@ -13,7 +13,9 @@
 #include "pipeline_key.h"
 #include "shader_cache.h"
 #include <cstdint>
+#include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace runtime::video {
@@ -35,6 +37,16 @@ constexpr NoWriteDraws kNoWriteDraws = NoWriteDraws::Skip;
 // target (1, 2 or 4: the EDRAM unit's images carry the sample count, pipeline_cache.cpp), the depth
 // attachment is present when the depth test or the stencil test is on (a test without a write still
 // needs it), colour 0 when the draw writes colour (DrawKind::Draw with a non-zero mask).
+// FM4 Recomp (M7 GPU cost, FM4_SUBSET_MERGE; renderer.cpp SubsetMerge): the key of a colour-only draw (depthUsed 0) recorded in an
+// open colour + depth pass whose key had `depthFormat`: the same key with that depth attachment declared and neither tested,
+// written, stencilled nor biased (depthFunc 7 = always, which PipelineCache reads as "no depth test" when nothing is written).
+// Render-pass compatible with the open pass when the colour formats and samples are equal (pipeline_cache.cpp RenderPass key).
+PipelineKey SubsetMergeKey(const PipelineKey& colorOnly, uint8_t depthFormat);
+// The same for a depth-only draw (colorUsed 0: DepthOnly, or a colour write mask of 0) in an open colour + depth pass whose key had
+// colour format `colorFormat`: the colour attachment declared with write mask 0 and no blend (1, 0, add / 1, 0, add), so nothing is
+// written to it; the depth/stencil state is the draw's. The pixel shader stays the depth-only variant (no colour output), valid with
+// a write mask of 0.
+PipelineKey SubsetMergeKeyDepthOnly(const PipelineKey& depthOnly, uint8_t colorFormat);
 KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, uint64_t vsVariant, uint64_t psVariant, PipelineKey& out);
 
 // FM4 Recomp: vkCmdSetDepthBias's constant and slope factors (clamp 0) for DrawState's polygon offset, as Xenia's host render
@@ -52,6 +64,71 @@ HostDepthBias DepthBiasFor(const DrawState& d);
 // format 1, XE_COLOR0_7E3 for 3, when colour is written.
 KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, const CachedShader& ps, ShaderVariantDefines& vsDefines,
                                 ShaderVariantDefines& psDefines);
+
+// FM4 Recomp (M7 CPU cost, opt-in FM4_VARIANT_MEMO): the variant memo. VariantsFromDrawState builds define text
+// every draw and ShaderCache::Variant hashes it (~6 % of the command-processor thread in a race, ~1 us a draw).
+// VariantMemoKeyFor writes every input VariantsFromDrawState reads (the fields listed in draw_record.cpp next to it), the shader
+// pair (its objects: the cache never erases a shader or a variant, shader_cache.h; the renderer clears the memo at Shutdown, which
+// destroys the cache) and the renderer's XE_FETCH_UNCHECKED decision
+// as flat words; equal keys therefore give equal defines and the same two variants. Adapted from SpeedBreaker's POD pipeline key
+// and its last-key memo (SpeedBreaker 312ce69, runtime/gpu/renderer.cpp:2839-2867, 3107-3120; GPL-3.0, as ours): there
+// the key is the pipeline's, here it is the variant selection FM4 spells as define text. A new input of VariantsFromDrawState
+// must be a new word here (tests/runtime/test_draw_record.cpp TestVariantMemo changes each input once).
+struct VariantMemoKey
+{
+    static constexpr uint32_t kMaxTextures = 32;
+    static constexpr uint32_t kHeaderWords = 19, kWordsPerTexture = 7;
+    static constexpr uint32_t kMaxWords = kHeaderWords + kWordsPerTexture * kMaxTextures;
+    uint32_t words[kMaxWords] = {};
+    uint32_t count = 0;
+    bool operator==(const VariantMemoKey& o) const { return count == o.count && std::memcmp(words, o.words, size_t(count) * 4) == 0; }
+};
+struct VariantMemoKeyHash
+{
+    size_t operator()(const VariantMemoKey& k) const  // FNV-1a-64 over the used words
+    {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t i = 0; i < k.count; i++)
+            h = (h ^ k.words[i]) * 0x100000001b3ull;
+        return size_t(h);
+    }
+};
+// False (no memo for this draw: the caller takes the full path) when the draw has more texture slots than the key holds.
+bool VariantMemoKeyFor(const DrawState& d, const CachedShader& vs, const CachedShader& ps, bool fetchUnchecked, VariantMemoKey& out);
+
+// The memo: a key -> the two variants the full path chose for it. Cleared whole when it would exceed `maxEntries` (the next draws
+// take the full path and refill it).
+class VariantMemo
+{
+public:
+    struct Entry
+    {
+        ShaderVariant* vs = nullptr;
+        ShaderVariant* ps = nullptr;
+    };
+    explicit VariantMemo(size_t maxEntries) : max_(maxEntries) {}
+    const Entry* Find(const VariantMemoKey& k) const
+    {
+        const auto it = map_.find(k);
+        return it == map_.end() ? nullptr : &it->second;
+    }
+    void Insert(const VariantMemoKey& k, ShaderVariant* vs, ShaderVariant* ps)
+    {
+        if (vs == nullptr || ps == nullptr)
+            return;
+        if (map_.size() >= max_)
+            map_.clear(), clears_++;
+        map_[k] = Entry{vs, ps};
+    }
+    void Clear() { map_.clear(); }
+    size_t Size() const { return map_.size(); }
+    uint64_t Clears() const { return clears_; }
+
+private:
+    std::unordered_map<VariantMemoKey, Entry, VariantMemoKeyHash> map_;
+    size_t max_;
+    uint64_t clears_ = 0;
+};
 
 // ---- Indices --------------------------------------------------------------------------------------------
 

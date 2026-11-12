@@ -3,15 +3,22 @@
 # Copyright (C) 2026 FM4 Recomp contributors
 #
 # FM4 Recomp alpha: plays the game in a window, with sound, a gamepad or the keyboard. Run ./setup.sh first (same FM4_RECOMP_HOME).
-#   ./play.sh [minutes]       (the session ends after this many minutes, default 120; closing the window ends it too)
-# GPU safeguards, the same as the developers' scripts/gpu_run.sh: one session at a time; the Vulkan validation layer is always on
-# (window mode requires it) and is proven live first by a deliberate, query-only misuse it must report; the session runs in its
-# own process group under a hard deadline; afterwards the system log and the crash reports are searched for a GPU hang or restart,
-# and on any evidence ./GPU_STOP is written: every later session refuses to start until you read it and delete it yourself.
+#   ./play.sh [minutes] [--debug]   (the session ends after this many minutes, default 120; closing the window ends it too)
+# Normal play: no Vulkan validation layer and no Metal API validation, which cost
+# about two thirds of the renderer's CPU time. --debug (or FM4_RECOMP_DEBUG=1) restores full validation: the pinned layer, proven
+# live first by a deliberate, query-only misuse it must report, Metal API validation, and a stop at the first validation message.
+# The GPU safeguards stay in both modes: one session at a time; the game's own fence timeouts and GPU_STOP checks; the session runs
+# in its own process group under a hard deadline; afterwards the system log and the crash reports are searched for a GPU hang or
+# restart, and on any evidence ./GPU_STOP is written: every later session refuses to start until you read it and delete it yourself.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MINUTES="${1:-120}"
-[[ "$MINUTES" =~ ^[1-9][0-9]*$ ]] || { echo "usage: ./play.sh [minutes]" >&2; exit 2; }
+MINUTES=120; DEBUG="${FM4_RECOMP_DEBUG:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --debug) DEBUG=1 ;;
+    *) [[ "$arg" =~ ^[1-9][0-9]*$ ]] || { echo "usage: ./play.sh [minutes] [--debug]" >&2; exit 2; }; MINUTES="$arg" ;;
+  esac
+done
 DEADLINE=$((MINUTES * 60))
 ROOT="${FM4_RECOMP_HOME:-$HERE}"  # the data, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
 DATA="$ROOT/data"
@@ -36,20 +43,29 @@ echo $$ > "$LOCK/pid"
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
 mkdir -p "$LOGS/captures" "$DATA/user-data" "$DATA/home"
 
-# The kit's own Vulkan: its loader, the MoltenVK driver and the validation layer, by their manifests (scripts/release/bundle_kit.sh);
-# nothing from Homebrew or the developer tools. VK_LOADER_DEBUG=layer logs the layer's insertion (the session's check below).
-LAYERS="$HERE/vulkan/explicit_layer.d"
+# The kit's own Vulkan: its loader and the MoltenVK driver, by their manifests (scripts/release/bundle_kit.sh); nothing from Homebrew or
+# the developer tools. VK_IMPLICIT_LAYER_PATH: the kit's empty folder, so no implicit layer installed elsewhere loads into the game.
 ICD="$HERE/vulkan/icd.d/MoltenVK_icd.json"
 LOADER="$HERE/lib/libvulkan.1.dylib"
-for f in "$LAYERS/VkLayer_khronos_validation.json" "$ICD" "$LOADER" "$HERE/lib/libVkLayer_khronos_validation.dylib" "$HERE/lib/libMoltenVK.dylib"; do
+for f in "$ICD" "$LOADER" "$HERE/lib/libMoltenVK.dylib"; do
   [ -e "$f" ] || { echo "play: $f is missing: this copy of FM4 Recomp is incomplete; download it again" >&2; exit 1; }
 done
 mkdir -p "$LOGS"
-# VK_IMPLICIT_LAYER_PATH: the kit's empty folder, so no implicit layer installed elsewhere on the Mac loads into the game.
-export VK_IMPLICIT_LAYER_PATH="$HERE/vulkan/implicit_layer.d" VK_LAYER_PATH="$LAYERS" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer MTL_DEBUG_LAYER=1 SDL_VULKAN_LIBRARY="$LOADER"
-perl -e 'alarm 30; exec { $ARGV[0] } @ARGV' "$HERE/bin/fm4_validation_control" > "$LOGS/validation_control.log" 2>&1 || true
-grep -q 'VUID-VkPhysicalDeviceProperties2-sType-sType' "$LOGS/validation_control.log" ||
-  { echo "play: the validation layer did not report its negative control: not starting (see $LOGS/validation_control.log)" >&2; exit 1; }
+unset VK_INSTANCE_LAYERS VK_LAYER_PATH VK_ADD_LAYER_PATH MTL_DEBUG_LAYER
+export VK_IMPLICIT_LAYER_PATH="$HERE/vulkan/implicit_layer.d" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer SDL_VULKAN_LIBRARY="$LOADER"
+VALIDATION=off
+if [ "$DEBUG" = 1 ]; then
+  LAYERS="$HERE/vulkan/explicit_layer.d"
+  for f in "$LAYERS/VkLayer_khronos_validation.json" "$HERE/lib/libVkLayer_khronos_validation.dylib"; do
+    [ -e "$f" ] || { echo "play: $f is missing: this copy of FM4 Recomp is incomplete; download it again" >&2; exit 1; }
+  done
+  export VK_LAYER_PATH="$LAYERS" MTL_DEBUG_LAYER=1
+  perl -e 'alarm 30; exec { $ARGV[0] } @ARGV' "$HERE/bin/fm4_validation_control" > "$LOGS/validation_control.log" 2>&1 || true
+  grep -q 'VUID-VkPhysicalDeviceProperties2-sType-sType' "$LOGS/validation_control.log" ||
+    { echo "play: the validation layer did not report its negative control: not starting (see $LOGS/validation_control.log)" >&2; exit 1; }
+  VALIDATION=on
+  echo "play: debug mode: Vulkan validation and Metal API validation on (slower)"
+fi
 
 # The alpha's settings (the developers' tested stack at this build): diagnostics off.
 export FM4_DEFER_FENCES=1 FM4_GPU_TIMESTAMPS=1 FM4_RING_MB=256 FM4_WRITE_WATCH=1 FM4_RESOLVE_RESIDENT=1 FM4_PASS_MERGE=1 FM4_VERTEX_REUSE=1 \
@@ -57,7 +73,8 @@ export FM4_DEFER_FENCES=1 FM4_GPU_TIMESTAMPS=1 FM4_RING_MB=256 FM4_WRITE_WATCH=1
   FM4_RESOLVE_RESIDENT_K88=1 FM4_SHADER_NO_PRECISE=1 FM4_TRANSFER_STENCIL_EXPORT=2 FM4_RESOLVE_HOST_WRITE=1 FM4_ASYNC_SUBMIT=1 FM4_WAIT_POLL_US=2000 \
   FM4_OVERWRITE_CLAIM=1 FM4_FETCH_UNCHECKED=2 FM4_RESOLVE_RESIDENT_DEPTH=1 FM4_SHADER_MEMO=1 FM4_RESOLVE_GPU_WORDS16=1 FM4_RESOLVE_RESIDENT_1616=1 \
   FM4_SPLIT_AT_PASS_END=1 FM4_CLEAR_DRAWS=1 FM4_CLEAR_VALUE_OWNERSHIP=1 FM4_RESOLVE_DEFER=1 FM4_INPUT_LIVE=1 \
-  FM4_SKIPPABLE_WELCOME_VIDEO=1  # A skips the long welcome video before the first race (not skippable in retail FM4)
+  FM4_SKIPPABLE_WELCOME_VIDEO=1 FM4_PUSH_DESCRIPTORS=1  # A skips the long welcome video before the first race (not skippable in retail FM4)
+export FM4_SHADER_DUMP="$LOGS/shaders"  # a refused shader's microcode (<ps|vs>_<hash>.bin) for the developers' offline replay (alpha)
 USER_HOME="$HOME"
 export HOME="$DATA/home"
 echo "play: starting (session limit $MINUTES min; logs in $LOGS)"
@@ -72,7 +89,7 @@ perl -e '
   my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
   "$DEADLINE" "$HERE/bin/fm4recomp" --image "$DATA/survey/image.bin" --xex "$DATA/files/default.xex" --disc "$DATA/files" \
   --disc-map "$DATA/survey/disc1_gdfx.tsv" --modules "$DATA/modules" --gpu-stop "$STOP_FLAG" --user-data "$DATA/user-data" --audio audible \
-  --renderer window --gpu-capture "$LOGS/captures" --vk-validation on --shader-classes branch,predicate,loop,dynloop \
+  --renderer window --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop \
   --stop-at-swap 100000000 --deadline "$DEADLINE" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
 echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
 sleep 2
@@ -87,8 +104,12 @@ if [ -n "$evidence" ]; then
   { echo "GPU_STOP written $(date '+%Y-%m-%d %H:%M:%S') by play.sh: GPU hang evidence after a session; delete this file yourself to play again."; echo "$evidence"; } > "$STOP_FLAG"
   echo "play: GPU HANG EVIDENCE: wrote $STOP_FLAG (please send it and $LOGS to the developers)" >&2; exit 3
 fi
-grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$LOGS/game.log" ||
-  echo "play: WARNING: the game did not load the validation layer (a GPU safeguard); please send $LOGS/game.log to the developers" >&2
+if [ "$VALIDATION" = on ]; then
+  grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$LOGS/game.log" ||
+    echo "play: WARNING: debug mode, but the game did not load the validation layer; please send $LOGS/game.log to the developers" >&2
+elif grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$LOGS/game.log"; then
+  echo "play: WARNING: a validation layer loaded in normal mode (something outside FM4 Recomp inserted it)" >&2
+fi
 if grep -E 'Validation (Error|Warning)|\[vulkan validation\]' "$LOGS/game.log" | head -5; then
   echo "play: the validation layer reported problems (above); please send $LOGS/game.log to the developers" >&2
 fi

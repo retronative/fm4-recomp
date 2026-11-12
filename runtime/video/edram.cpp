@@ -112,6 +112,35 @@ uint32_t RangeRectangles(uint32_t startTiles, uint32_t endTiles, Key dest, Rect 
     return n;
 }
 
+// ---- Tile sets (FM4 Recomp, M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP) ------------------------------------------------
+
+TileSet RectTiles(Key k, const Rect& r)
+{
+    TileSet tiles;
+    if (r.width == 0 || r.height == 0)
+        return tiles;
+    const uint32_t pitch = k.PitchTiles();
+    if (pitch == 0)
+        return tiles.set();
+    // As SetClearValue (X render_target_cache.cc:355-359): the tile size in this key's pixels, the rows and the clamped columns.
+    const uint32_t tileWidth = kTileWidthSamples >> (SamplesXLog2(k.MsaaMode()) + (k.Is64bpp() ? 1 : 0));
+    const uint32_t tileHeight = kTileHeightSamples >> SamplesYLog2(k.MsaaMode());
+    const uint32_t rowFirst = r.y / tileHeight, rowEnd = (r.y + r.height - 1) / tileHeight + 1;
+    const uint32_t colFirst = r.x / tileWidth, colEnd = std::min(pitch, (r.x + r.width - 1) / tileWidth + 1);
+    for (uint32_t row = rowFirst; row < rowEnd && !tiles.all(); row++)
+        for (uint32_t col = colFirst; col < colEnd; col++)
+            tiles.set((k.Base() + row * pitch + col) % kTileCount);
+    return tiles;
+}
+
+TileSet RangeTiles(uint32_t startTiles, uint32_t endTiles)
+{
+    TileSet tiles;
+    for (uint32_t t = startTiles; t < endTiles && t < kTileCount; t++)
+        tiles.set(t);
+    return tiles;
+}
+
 // ---- Ownership (X render_target_cache.cc:1539-1699) ------------------------------------------------------
 
 uint32_t Ownership::Count(Key k) const
@@ -764,9 +793,8 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
             if (info.destEndian > 1)
                 return refuse(shape + from + ": resolve destination endian " + std::to_string(info.destEndian) +
                               " on a 64 bpp destination is not supported (0 and 8in16 only)");
-            if (info.clearColor || info.clearDepth)
-                return refuse(shape + from + " that also clears (colour " + std::to_string(int(info.clearColor)) + ", depth " +
-                              std::to_string(int(info.clearDepth)) + ") is not supported yet (X render_target_cache.cc:1181-1186 64 bpp clear)");
+            // FM4 Recomp (alpha, 64 bpp resolve clear): a clear in the same resolve is
+            // planned by PrepareResolve (X render_target_cache.cc:1181-1186, :1283-1293) and decoded by DecodeColorClearUint64.
         }
         const bool rg16 = info.source.Format() == uint32_t(ColorFormat::k16_16);
         if (!is64 && (info.destFormat == 25 ? !rg16
@@ -846,6 +874,7 @@ ResolveInfo DecodeResolve(const ResolveRegisters& r)
     const uint32_t ty0 = (info.edramOffsetYDiv8 << yScale) / kTileHeightSamples;
     const uint32_t ty1 = (((info.edramOffsetYDiv8 + heightDiv8) << yScale) + kTileHeightSamples - 1) / kTileHeightSamples;
     info.spanBase = baseTiles + ty0 * info.spanPitch + tx0;
+    info.edramBaseOffsetTiles = offsetTiles;  // FM4 Recomp (alpha, 64 bpp resolve clear)
     info.spanRowLength = tx1 - tx0, info.spanRows = ty1 - ty0;
 
     info.colorClear = r.colorClear, info.colorClearLo = r.colorClearLo, info.depthClear = r.depthClear;  // :1283-1285
@@ -909,14 +938,14 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
         plan.ok = true;
         return plan;
     }
-    // FM4 Recomp (alpha, 64 bpp resolve): a clear in a resolve from a 64 bpp source is refused by DecodeResolve, so neither clear
-    // below sees one.
-    const uint32_t pitch32 = info.pitchTilesAt32bpp;  // :1168-1184 (the colour pitch >> 64 bpp; refused by DecodeResolve for 64 bpp)
+    const uint32_t pitch32 = info.pitchTilesAt32bpp;  // :1168-1184 (X's 64 bpp colour pitch, doubled at draw_util.cc:1248, halved back)
     const uint32_t sx = SamplesXLog2(info.msaa), sy = SamplesYLog2(info.msaa);
     const uint32_t pitchPixels = pitch32 * (kTileWidthSamples >> sx);  // :1211-1213
     const uint32_t rtHeight = RenderTargetHeight(pitch32, info.msaa);  // :1225-1226
-    // The span's base relative to the original base, at 32 bpp (:1172-1183): the first tile of the rectangle.
-    const uint32_t spanBaseOffset32 = info.spanBase - info.source.Base();
+    // The base offset at 32 bpp (:1172-1183): X's depth or colour base_tiles minus its original base, the colour one halved for a 64 bpp
+    // source (FM4 Recomp, alpha, 64 bpp resolve clear: edram_base_offset_tiles in both cases; for 32 bpp it equals the span's base
+    // offset used before, since a 32 bpp rectangle starts inside its first tile).
+    const uint32_t spanBaseOffset32 = info.edramBaseOffsetTiles;
     const uint32_t baseOffsetRows = spanBaseOffset32 / pitch32;  // :1227-1228
     Rect rect;
     rect.x = std::min((spanBaseOffset32 - baseOffsetRows * pitch32) * (kTileWidthSamples >> sx) + (info.edramOffsetXDiv8 << 3), pitchPixels);
@@ -931,12 +960,13 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
     // :1252-1266: the tiles the rectangle covers, whole rows between its first and last tile.
     const uint32_t start32 = ((rect.y << sy) / kTileHeightSamples) * pitch32 + (rect.x << sx) / kTileWidthSamples;
     const uint32_t length32 = (((rect.y + rect.height - 1) << sy) / kTileHeightSamples) * pitch32 + ((rect.x + rect.width - 1) << sx) / kTileWidthSamples + 1 - start32;
-    // :1267-1289: at most up to the base's next addressing period (64 bpp doubling refused by DecodeResolve).
+    // :1267-1289: at most up to the base's next addressing period; a 64 bpp colour clear's tiles doubled (:1281-1289).
+    const uint32_t color64 = info.source.Is64bpp() ? 1u : 0u;  // FM4 Recomp (alpha, 64 bpp resolve clear)
     uint32_t depthStart = 0, depthLength = 0, colorStart = 0, colorLength = 0;
     if (clearDepth)
         depthStart = std::min(start32, kTileCount), depthLength = std::min(start32 + length32, kTileCount) - depthStart;
     if (clearColor)
-        colorStart = std::min(start32, kTileCount), colorLength = std::min(start32 + length32, kTileCount) - colorStart;
+        colorStart = std::min(start32 << color64, kTileCount), colorLength = std::min((start32 + length32) << color64, kTileCount) - colorStart;
     const uint32_t depthBase = info.depthBase, colorBase = info.source.Base();
     if (depthLength && colorLength)  // :1290-1313: clear each only up to the other's start
     {
@@ -982,7 +1012,7 @@ ResolvePlan PrepareResolve(Ownership& ownership, const ResolveInfo& info)
             ownership = before;
             return refuse("resolve colour clear: " + why);
         }
-        ownership.MarkWritten(colorKey, start32, length32);  // FM4_TRANSFER_SKIP_UNWRITTEN: as the depth clear above
+        ownership.MarkWritten(colorKey, start32 << color64, length32 << color64);  // FM4_TRANSFER_SKIP_UNWRITTEN: as the depth clear above
         plan.hasColorClear = true;
     }
     plan.ok = true;

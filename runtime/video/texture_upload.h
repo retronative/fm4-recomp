@@ -169,7 +169,8 @@ private:
 constexpr bool ObservedFormat(uint32_t format)
 {
     return format == 2 || format == 6 || format == 10 || format == 18 || format == 20 || format == 23 || format == 25 || format == 36 || format == 49 ||
-           format == 50 || format == 51 || format == 53 || format == 54 || format == 59 || format == 19 || format == 52;
+           format == 50 || format == 51 || format == 53 || format == 54 || format == 59 || format == 19 || format == 52 ||
+           format == 29 || format == 32;  // FM4 Recomp (alpha, Car Select): k_16_16_16_16_EXPAND / _FLOAT, 8-byte blocks, no conversion
 }
 
 // VkComponentMapping {R, G, B, A}: what a view may use without imageViewFormatSwizzle (the portability
