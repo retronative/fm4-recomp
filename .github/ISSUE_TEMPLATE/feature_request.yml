@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement to FM4 Recomp.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Requests that bypass security checks or target online services won't be accepted. FM4 Recomp runs offline.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: What you're trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Your suggestion
+    validations:
+      required: false

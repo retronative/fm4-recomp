@@ -1,12 +1,14 @@
 # FM4 Recomp
 
-> [!IMPORTANT]
-> An unofficial, fan-made project in early development. It contains no game files: you need
-> your own legally obtained discs of *Forza Motorsport 4* (Xbox 360). Not affiliated with
-> Microsoft, Xbox Game Studios or Turn 10 Studios.
-
 A static recompilation of *Forza Motorsport 4* (Xbox 360, USA disc, title ID 4D530910) to native
-arm64 macOS, following the method of ReCarbon.
+arm64 macOS, built on [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
+
+> [!IMPORTANT]
+> FM4 Recomp is an unofficial fan project, not affiliated with, endorsed by or sponsored by
+> Microsoft, Xbox Game Studios or Turn 10 Studios. **No game files are included or distributed.**
+> You need your own legally obtained Xbox 360 copy of *Forza Motorsport 4*; please do not request
+> or share game files or disc images. What this repository and the macOS DMG contain:
+> [docs/LEGAL.md](docs/LEGAL.md).
 
 ## Status
 

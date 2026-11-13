@@ -66,6 +66,10 @@ std::string ModuleSurveyImage(const ModuleImage& image);  // <modules dir>/<name
 // A mapped module by its file name ("x.xex", "x", "game:\\x.xex"; any case), or by its loader entry.
 const LoadedModule* LoadedModuleByName(const char* name);
 const LoadedModule* LoadedModuleByLdr(uint32_t ldr);
+// FM4 Recomp: a module XexUnloadImage unloaded and XexLoadImage loads again (Xenia maps it afresh,
+// kernel_state.cc LoadUserModule): its writable pages are copied from `bytes` again (the read-only code is unchanged) and its
+// import slots filled again, so its data is as at the first load. Stops (9) if `bytes` is not its image.
+void RefreshModule(uint8_t* base, const LoadedModule& module, const std::vector<uint8_t>& bytes);
 // Whether `name` names the module file `fileName` (the directory ignored; with or without the
 // extension; any case): Xenia XModule::Matches.
 bool NamesModule(const char* name, const char* fileName);

@@ -3,6 +3,7 @@
 //
 // See draw_record.h.
 #include "draw_record.h"
+#include "host_samples.h"  // FM4 Recomp (FM4_HOST_MSAA_1X): HostSampleCount, HostMsaa1x
 
 #include <cmath>
 #include <algorithm>
@@ -59,7 +60,9 @@ KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const Cac
     k.vsHash = vs.hash, k.psHash = ps.hash, k.vsVariant = vsVariant, k.psVariant = psVariant;
     switch (d.hostPrimitive)
     {
-    case HostPrimitive::TriangleList: case HostPrimitive::RectList: case HostPrimitive::QuadList: k.topology = uint8_t(Topology::TriangleList); break;
+    case HostPrimitive::TriangleList: case HostPrimitive::RectList: case HostPrimitive::QuadList: case HostPrimitive::TriangleFan:
+        k.topology = uint8_t(Topology::TriangleList);
+        break;
     case HostPrimitive::TriangleStrip: k.topology = uint8_t(Topology::TriangleStrip); break;
     case HostPrimitive::LineList: k.topology = uint8_t(Topology::LineList); break;
     case HostPrimitive::PointNoWrite: return Refuse("a point list that writes nothing has no pipeline");
@@ -69,7 +72,9 @@ KeyResult KeyFromDrawState(const DrawState& d, const CachedShader& vs, const Cac
     k.depthClamp = d.viewport.clipDisabled;
     if (d.target.samples != 1 && d.target.samples != 2 && d.target.samples != 4)
         return Refuse("RB_SURFACE_INFO: " + Num(d.target.samples) + " samples");
-    k.samples = uint8_t(d.target.samples);
+    // FM4 Recomp (FM4_HOST_MSAA_1X=1): the host image's sample count (edram_vk.cpp GetTarget derives it the same way; renderer.cpp
+    // stops on a mismatch with HostTargets::samples), not the guest's: rasterizationSamples must equal the attachments'.
+    k.samples = uint8_t(HostSampleCount(d.target.samples, HostMsaa1x()));
     const DepthStencil& s = d.depthStencil;
     if (s.zEnable || s.stencilEnable)
     {
@@ -178,7 +183,9 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
     if (d.alphaToMask != 0)  // the offsets and the target's sample count (shader_glsl.cpp XE_ALPHA_TO_MASK)
     {
         psDefines.Add("XE_ALPHA_TO_MASK " + Num(d.alphaToMask & 0xFF) + "u");
-        psDefines.Add("XE_ALPHA_TO_MASK_SAMPLES " + Num(d.target.samples));
+        // FM4 Recomp (FM4_HOST_MSAA_1X=1): the host count (KeyFromDrawState's k.samples): a 1-sample target takes the 1x coverage
+        // rule and writes no gl_SampleMask (shader_glsl.cpp XE_ALPHA_TO_MASK).
+        psDefines.Add("XE_ALPHA_TO_MASK_SAMPLES " + Num(HostSampleCount(d.target.samples, HostMsaa1x())));
     }
     if (d.kind == DrawKind::Draw && d.colorWriteMask != 0)
     {
@@ -293,6 +300,17 @@ KeyResult BuildHostIndices(const DrawState& d, GuestIndexReader read, const void
                 out.indices.push_back(v[k]);
         }
         out.vertexCount = count / 4 * 6;
+        break;
+    case HostPrimitive::TriangleFan:
+        // FM4 Recomp (alpha): a fan as a triangle list in Xenia's order, (previous, current, first) for i = 2.. (ShiftGlue 72b7dd6f
+        // include/rex/graphics/primitive_processor.h:494-512 TriangleFanToList, BSD-style, Xenia-derived; a rotation of (first,
+        // previous, current), so the winding is the fan's). Fewer than 3 indices: no triangle (GetTriangleFanListIndexCount).
+        out.kind = HostIndices::Kind::Indexed;
+        out.indices.reserve(count > 2 ? (count - 2) * 3 : 0);
+        for (uint32_t i = 2; i < count; i++)
+            for (const uint32_t v : {guest(i - 1), guest(i), guest(0)})
+                out.indices.push_back(v);
+        out.vertexCount = count > 2 ? (count - 2) * 3 : 0;
         break;
     case HostPrimitive::TriangleList: case HostPrimitive::TriangleStrip: case HostPrimitive::LineList:
         if (identity)

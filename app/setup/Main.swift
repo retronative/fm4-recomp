@@ -8,9 +8,14 @@
 //     status                            needs-setup | ready
 //     prerequisites                     one line per check; exit 1 if any fails
 //     verify <iso>                      what the image is, or why not (exit 1)
-//     install <iso>                     runs the kit's setup.sh: its lines, its exit status
+//     install [--data <dir>] [--user-data <dir>] <iso>
+//                                       runs the kit's setup.sh: its lines (progress, result), its exit status (setup.sh's codes)
+//     verify-disc2 <iso>                the same for the optional Disc 2 (Content Install Disc)
+//     install-disc2 [--dest <dir>] <iso>  runs setup.sh --disc2 (after Disc 1; not-set-up 7 otherwise)
 //     play [minutes]                    runs the kit's play.sh (the GPU safeguards): its lines, its exit status
 //     render <dir>                      the window's pages as PNGs (previews)
+//   FM4 Recomp --disc-panel 2 [--frame <x,y,w,h>] [--message <text>] [--problem <text>]
+//                                     the Disc 2 setup panel the game opens over its "Insert Disc 2" screen (Panel.swift)
 // Paths: FM4_RECOMP_HOME (default ~/Library/Application Support/FM4 Recomp) and FM4_RECOMP_KIT (default the app's Resources/kit).
 
 import AppKit
@@ -21,6 +26,7 @@ enum Entry {
   static func main() {
     let args = Array(CommandLine.arguments.dropFirst())
     if args.first == "--setup" { exit(SetupCLI.run(Array(args.dropFirst()), paths: Paths.standard())) }
+    if args.first == "--disc-panel" { DiscPanel.run(Array(args.dropFirst())) }
     SetupApp.main()
   }
 }
@@ -56,11 +62,18 @@ enum SetupCLI {
       let check = verifyDisc(URL(fileURLWithPath: rest[0]))
       print(check.message)
       return check.ok ? 0 : 1
-    case ("install", 1):
-      let iso = URL(fileURLWithPath: rest[0])
-      let check = verifyDisc(iso)
-      guard check.ok else { print(check.message); return 1 }
-      return wait { done in runKitScript(paths, "setup.sh", [iso.path], line: { print($0); fflush(stdout) }, done: done) }
+    case ("install", 1), ("install", 3), ("install", 5):  // [--data <dir>] [--user-data <dir>] <iso>: setup.sh checks the options
+      let check = verifyDisc(URL(fileURLWithPath: rest[rest.count - 1]))
+      guard check.ok else { print(check.message); print("result wrong-disc"); return 3 }
+      return wait { done in runKitScript(paths, "setup.sh", rest, line: { print($0); fflush(stdout) }, done: done) }
+    case ("verify-disc2", 1):
+      let check = verifyDisc(URL(fileURLWithPath: rest[0]), .two)
+      print(check.message)
+      return check.ok ? 0 : 1
+    case ("install-disc2", 1), ("install-disc2", 3):  // [--dest <dir>] <iso>
+      let check = verifyDisc(URL(fileURLWithPath: rest[rest.count - 1]), .two)
+      guard check.ok else { print(check.message); print("result wrong-disc"); return 3 }
+      return wait { done in runKitScript(paths, "setup.sh", ["--disc2"] + rest, line: { print($0); fflush(stdout) }, done: done) }
     case ("play", 0), ("play", 1):
       guard state(paths) == .ready else { print("not set up yet: run --setup install <iso> first"); return 1 }
       return wait { done in runKitScript(paths, "play.sh", rest, line: { print($0); fflush(stdout) }, done: done) }
@@ -80,7 +93,7 @@ enum SetupCLI {
   }
 
   static func usage() -> Int32 {
-    print("usage: FM4 Recomp --setup status | prerequisites | verify <iso> | install <iso> | play [minutes] | render <dir>")
+    print("usage: FM4 Recomp --setup status | prerequisites | verify <iso> | install [--data <dir>] [--user-data <dir>] <iso> | verify-disc2 <iso> | install-disc2 [--dest <dir>] <iso> | play [minutes] | render <dir>")
     return 2
   }
 }
@@ -99,6 +112,18 @@ func renderPages(paths: Paths, to dir: URL) -> Int32 {
     let rep = NSBitmapImageRep(cgImage: image)
     let url = dir.appendingPathComponent("\(page.rawValue).png")
     do { try rep.representation(using: .png, properties: [:])!.write(to: url); print("wrote \(url.path)") } catch { failed = true }
+  }
+  // The in-game Disc 2 panel (Panel.swift): its first page and a failure.
+  model.panel = true
+  model.gameMessage = "Content Install Disc"
+  for page in [SetupModel.Page.disc2, .failed] {
+    model.showForPreview(page)
+    model.installingDisc2 = page == .failed
+    let renderer = ImageRenderer(content: RootView(model: model).environment(\.colorScheme, .dark))
+    renderer.scale = 2
+    guard let image = renderer.cgImage else { failed = true; continue }
+    let url = dir.appendingPathComponent("panel-\(page.rawValue).png")
+    do { try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: url); print("wrote \(url.path)") } catch { failed = true }
   }
   return failed ? 1 : 0
 }

@@ -12,6 +12,7 @@
 #include "edram.h"
 #include "edram_vk_plan.h"
 #include "front_buffer.h"  // TiledOffset (the serial reference scan)
+#include "host_samples.h"  // FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X): HostSampleCount (pure; the flag reader is not called)
 #include "render_targets_vk.h"
 #include "resolve_resident.h"  // FM4 Recomp (M7 CPU cost): the pure resident-pair answers (header-only; the flag readers are not called)
 #include "texture_untile.h"  // TiledOffset2D (the 16 bpp hand table's slip check, TestResolveWords16ToGuest)
@@ -1525,9 +1526,9 @@ void TestK16_16_16_16()
     CHECK(ClassifyTransfer(f32, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, f32, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(c5a, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, c5h, why) == TransferKind::Color);
     CONTROL(ClassifyTransfer(c5b, c5b, why) != TransferKind::Refused);  // a key as its own source
-    // Named stops: depth <-> 64 bpp, and the other 64 bpp formats.
+    // Named stops: depth -> 64 bpp, and the other 64 bpp formats. FM4 Recomp (alpha): 64 bpp -> depth is modelled.
     CHECK(ClassifyTransfer(kBd, c5b, why) == TransferKind::Refused && why.find("64 bpp") != std::string::npos);
-    CHECK(ClassifyTransfer(c5a, kAd, why) == TransferKind::Refused && why.find("64 bpp") != std::string::npos);
+    CHECK(ClassifyTransfer(c5a, kAd, why) == TransferKind::ColorToDepth && ClassifyTransfer(c5b, kBd, why) == TransferKind::ColorToDepth);
     CHECK(ClassifyTransfer(c5b, Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16_Float), why) == TransferKind::Refused);
 
     auto is = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
@@ -1580,6 +1581,23 @@ void TestK16_16_16_16()
     // the second texel is the first and no half is picked.
     m = MapTransferSource(1, 0, 3, kBc0, c0a);
     CHECK(is(m.first, 3, 1, 0) && is(m.second, 3, 1, 0) && m.half == 0 && is(MapEdramTexel(1, 0, 3, kBc0, c0a), 3, 1, 0));
+
+    // FM4 Recomp (alpha): 64 bpp colour -> depth, the logged pair: key 1402000 (base 0, 4 tiles a row at 32
+    // bpp, 8 at 64 bpp, 1x, storage 5) -> depth key 203800 (base 0, 7 tiles a row, 1x, kD24S8). From the EDRAM layout: a depth tile holds
+    // the colour tile's two 40-dword halves swapped (X :2916-2936), so depth dword column c is colour dword column c ^ 40 (c + 40 for
+    // c < 40, else c - 40); a 64 bpp 1x pixel x is colour dwords 2x (low half) and 2x + 1 (high).
+    //   depth (0, 0): colour dword 40 = 64 bpp pixel 20, low half.  depth (41, 0): colour dword 1 = pixel 0, high half.
+    //   depth (85, 16): EDRAM tile (16 / 16) * 7 + 85 / 80 = 8 = the 64 bpp key's row 1 (8 tiles a row), tile 0; dword 5 -> 45 = pixel
+    //   22, high half, pixel row 16.
+    const Key src64 = Key::Color(0, 4, Msaa::X1, ColorFormat::k16_16_16_16), dst = Key::Depth(0, 7, Msaa::X1, DepthFormat::D24S8);
+    CHECK(src64.packed == 0x1402000u && dst.packed == 0x203800u);
+    m = MapTransferSource(0, 0, 0, src64, dst);
+    CHECK(is(m.first, 20, 0, 0) && m.half == 0);
+    CONTROL(is(m.first, 40, 0, 0));  // the 32 bpp column swap (40 pixels) on a 64 bpp source
+    m = MapTransferSource(41, 0, 0, src64, dst);
+    CHECK(is(m.first, 0, 0, 0) && m.half == 1);
+    m = MapTransferSource(85, 16, 0, src64, dst);
+    CHECK(is(m.first, 22, 16, 0) && m.half == 1);
 
     // The words (X :3080-3102 the half's two components, :3545-3576 r | g << 16; :3352-3370 the four halves back).
     const uint32_t t4[4] = {0x1111u, 0x2222u, 0x3333u, 0x4444u};
@@ -2464,8 +2482,82 @@ void TestResolve64()
     CONTROL(ResolveWordsToGuest(info, 5, words.data(), shortDest.data(), uint32_t(shortDest.size()), why));  // GPU words: 32 or 16 bpp only
 }
 
+// FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X): the host sample count of a key's image and the source variant bits that follow it.
+// Expectations: the guest counts are Xenos msaa_samples 0/1/2 -> 1/2/4 samples (X xenos.h:288-292; draw_state.cpp 1 << msaa); with
+// the flag every image has 1 sample (an experiment). The variant bits are those Pipeline reads
+// (edram_vk.cpp: bit 0 sampler2DMS, bit 1 the transfer view, bit 3 a 64 bpp source): Vulkan requires a multisampled view to be read
+// as sampler2DMS and a 1-sample one as sampler2D (SPIR-V OpTypeImage MS operand vs the view's VkImage samples), so bit 0 is set
+// exactly when the IMAGE has more than one sample, whatever the guest's MSAA.
+void TestHostSamples()
+{
+    // Flag off (CONTROL of today's behaviour): the guest's count.
+    CHECK(HostSampleCount(1, false) == 1);
+    CHECK(HostSampleCount(2, false) == 2);
+    CHECK(HostSampleCount(4, false) == 4);
+    // Flag on: 1 for every key.
+    CHECK(HostSampleCount(1, true) == 1);
+    CHECK(HostSampleCount(2, true) == 1);
+    CHECK(HostSampleCount(4, true) == 1);
+    CONTROL(HostSampleCount(4, true) == 4);
+    // The variant bits by host samples (1 + 0 / 2 / 8, hand-composed).
+    CHECK(TransferSourceFlags(1, false, false) == 0u);
+    CHECK(TransferSourceFlags(2, false, false) == 1u);
+    CHECK(TransferSourceFlags(4, false, false) == 1u);
+    CHECK(TransferSourceFlags(4, true, false) == 3u);   // a 4x 16_16 / 32_FLOAT key today: usampler2DMS on its transfer view
+    CHECK(TransferSourceFlags(1, true, false) == 2u);   // the same key with the flag: usampler2D on its transfer view
+    CHECK(TransferSourceFlags(1, true, true) == 10u);   // a 1-sample 64 bpp source (always through its view)
+    CHECK(TransferSourceFlags(4, true, true) == 11u);
+    // FM4's keys (its host targets): a 4x 7e3 colour key (kA7) and a 4x depth key (kAd), each as its image is created.
+    const auto guestSamples = [](Key k) { return k.MsaaMode() == Msaa::X4 ? 4u : k.MsaaMode() == Msaa::X2 ? 2u : 1u; };
+    CHECK(TransferSourceFlags(HostSampleCount(guestSamples(kA7), false), false, false) == 1u);  // CONTROL of today: sampler2DMS
+    CHECK(TransferSourceFlags(HostSampleCount(guestSamples(kA7), true), false, false) == 0u);   // flag: sampler2D, texelFetch sample 0
+    CHECK(TransferSourceFlags(HostSampleCount(guestSamples(kAd), true), false, false) == 0u);
+    CHECK(TransferSourceFlags(HostSampleCount(guestSamples(kBc2), true), false, false) == 0u);  // a 1x key: 0 either way
+    CHECK(TransferSourceFlags(HostSampleCount(guestSamples(kBc2), false), false, false) == 0u);
+    CONTROL(TransferSourceFlags(HostSampleCount(guestSamples(kA7), true), false, false) == 1u);
+    // The guest model is unchanged: the key's pixel size does not depend on the flag (X render_target_cache.h:528-537; 4x: a tile
+    // is 40x8 pixels, so 16 tiles a row are 640 pixels).
+    CHECK(kAc.Width() == 640);
+    // With one host sample, the destination draw is the one with destination sample 0 (ExecuteTransfers' loop `s < dest.samples`),
+    // and the source texel it reads is MapTransferTexel(x, y, 0, ...) without its sample (hand-derived from X :2804-2898):
+    //   4x -> 1x: pixels to samples (X :2804-2818): (x >> 1, y >> 1), so the 2x2 block (2, 2)-(3, 3) reads source pixel (1, 1).
+    const auto px = [](SourceTexel t, uint32_t x, uint32_t y) { return t.x == x && t.y == y; };
+    CHECK(px(MapTransferTexel(2, 2, 0, Msaa::X4, Msaa::X1), 1, 1) && px(MapTransferTexel(3, 3, 0, Msaa::X4, Msaa::X1), 1, 1));
+    //   1x -> 4x: samples to pixels (X :2823-2828, :2857-2864) with sample 0: (2x, 2y), so 1x pixels (11, 6), (10, 7), (11, 7) are dropped.
+    CHECK(px(MapTransferTexel(5, 3, 0, Msaa::X1, Msaa::X4), 10, 6));
+    //   2x -> 1x (X :2868-2886): (x, y >> 1); 1x -> 2x (X :2887-2898) with destination sample 0 (guest sample 1, ^ 1 native): (x, 2y + 1).
+    CHECK(px(MapTransferTexel(7, 2, 0, Msaa::X2, Msaa::X1), 7, 1) && px(MapTransferTexel(7, 3, 0, Msaa::X2, Msaa::X1), 7, 1));
+    CHECK(px(MapTransferTexel(7, 3, 0, Msaa::X1, Msaa::X2), 7, 7));
+}
+
+// FM4 Recomp (FM4_RESOLVE_COMPUTE): edram_vk_plan.h ResolveComputeSource on a hand-written fragment shader holding the two texts it
+// replaces once each: the output declaration becomes an r32ui storage image at set 1 binding 0 plus a plain `uint xe_word`, main becomes
+// XeResolveMain(uvec2) reading its pixel from the argument (no gl_FragCoord left), the body in between is kept byte for byte, and a
+// compute main of 8x8 invocations stores xe_word at its pixel after a width/height bound. A missing or doubled text is refused.
+void TestResolveComputeSource()
+{
+    const std::string out_ = "layout(location = 0) out uint xe_word;";
+    const std::string entry = "void main()\n{\n    ivec2 p = ivec2(uvec2(gl_FragCoord.xy) + uvec2(xe_transfer.x0, xe_transfer.y0));";
+    const std::string body = "\n    xe_word = uint(p.x) * 3u + 7u;\n}\n";
+    const std::string fragment = "uint XeHelper() { return 1u; }\n" + out_ + "\n" + entry + body;
+    std::string compute, why;
+    CHECK(ResolveComputeSource(fragment, compute, why));
+    CHECK(compute.find("layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D xe_dest;\nuint xe_word;") != std::string::npos);
+    CHECK(compute.find("void XeResolveMain(uvec2 xe_pixel)\n{\n    ivec2 p = ivec2(xe_pixel + uvec2(xe_transfer.x0, xe_transfer.y0));" + body) != std::string::npos);
+    CHECK(compute.find("gl_FragCoord") == std::string::npos && compute.find("layout(location") == std::string::npos);
+    CHECK(compute.find("uint XeHelper() { return 1u; }\n") == 0);
+    CHECK(compute.find("layout(local_size_x = 8, local_size_y = 8) in;") != std::string::npos &&
+          compute.find("if (d.x >= xe_transfer.width || d.y >= xe_transfer.height)\n        return;\n    XeResolveMain(d);\n"
+                       "    imageStore(xe_dest, ivec2(d), uvec4(xe_word, 0u, 0u, 0u));") != std::string::npos);
+    CHECK(kResolveComputeGroup == 8);
+    CONTROL(ResolveComputeSource(entry + body, compute, why));                           // no output declaration
+    CONTROL(ResolveComputeSource(out_ + "\n" + out_ + "\n" + entry + body, compute, why));  // the output twice
+    CHECK(!ResolveComputeSource(out_ + "\nvoid main() {}\n", compute, why) && why.find("exactly one") != std::string::npos);
+}
+
 int main()
 {
+    TestResolveComputeSource();
     TestFormats();
     TestClassify();
     TestDepthToColor();
@@ -2504,6 +2596,7 @@ int main()
     TestRectTiles();         // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP)
     TestSelectClearFlush();  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_FLUSH_OVERLAP)
     TestClearValueOwnership();
+    TestHostSamples();  // FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X)
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

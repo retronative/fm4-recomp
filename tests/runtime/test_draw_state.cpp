@@ -552,8 +552,8 @@ void TestRectClear()
     Expect(Decode(g, vs, ps, 0x22, 0x101).kind == DrawKind::Draw, "DRAW_INDX with viz-query token 101: drawn (the query reads visible)");
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00000088;  // 0 indices
     CONTROL(Decode(g, vs, ps), "0 indices");
-    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030085;  // triangle fan
-    CONTROL(Decode(g, vs, ps), "triangle fan");
+    g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00030085;  // triangle fan (prim type 5): FM4 Recomp (alpha) a host triangle list
+    Expect(Decode(g, vs, ps).kind == DrawKind::Draw && Decode(g, vs, ps).hostPrimitive == HostPrimitive::TriangleFan, "a triangle fan is decoded (host list)");
     // FM4 Recomp: a line list (2), auto index (2 << 6), 4 indices: drawn as a host line list.
     g = RectClear(), g[xr::kVgtDrawInitiator] = 0x00040082;
     d = Decode(g, vs, ps);
@@ -768,7 +768,14 @@ void TestTextured()
     g = Textured(), word(g, 1, 1) = 0x1B60004A;  // format 10 (k_8_8, the k_8_8 resolve's destination), endian 1
     Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "texture format 10 (k_8_8) is modelled");
     g = Textured(), word(g, 1, 5) = 0x400;  // dimension 2 (3D) while the shader fetches 2D
-    CONTROL(Decode(g, vs, ps), "the shader fetches dimension 1");
+    // FM4 Recomp (alpha): as Xenia (vulkan_texture_cache.cc:587-609), a constant whose dimension does not fit the fetch
+    // binds the zero null image of the fetch's dimension: a null slot (unsigned, no conversions), the draw accepted.
+    {
+        const DrawState m = Decode(g, vs, ps);
+        Expect(m.kind == DrawKind::Draw && !m.textureSlots.empty() && m.textureSlots[0].null && m.textureSlots[0].fetchDimension == 1 &&
+                   m.textureSlots[0].sign[0] == 0 && !m.textureSlots[0].gamma,
+               "a 3D constant fetched as 2D: a null slot of the fetch's dimension (2D)");
+    }
     g = Textured(), word(g, 1, 1) = 0x1B600486;  // stacked
     CONTROL(Decode(g, vs, ps), "stacked");
     g = Textured(), word(g, 1, 0) = 0x02004C02;  // clamp_x 3 (mirror clamp to edge)
@@ -800,7 +807,7 @@ void TestTextured()
         Sample(vs2, 1, 1);  // the vertex shader fetches slot 1 as 2D, the pixel shader as 1D: one binding (Xenia's)
         Expect(Decode(h, vs2, ps1).kind == DrawKind::Draw, "slot 1 fetched as 2D (VS) and 1D (PS): accepted");
         word(h, 1, 5) = (word(h, 1, 5) & ~(3u << 9)) | (2u << 9);
-        CONTROL(Decode(h, vs1, ps1), "the shader fetches dimension 0");
+        Expect(Decode(h, vs1, ps1).kind == DrawKind::Draw && Decode(h, vs1, ps1).textureSlots[0].null, "a 1D fetch of a 3D constant: a null slot");
     }
     // Polygon offset on a triangle list: front pair unless front faces are culled, then the back pair; FM4's
     // PA_SU_SC_MODE_CNTL 00219802 (cull back, front and back enabled) with a zero front pair falls through to the back pair.

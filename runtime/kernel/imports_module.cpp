@@ -16,6 +16,7 @@
 #include "file_system.h"
 #include "loader.h"
 #include "module.h"
+#include <set>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -38,6 +39,7 @@ thread_local bool inEntry = false;  // a load from inside a DllMain stops
 // title normally (a run ends at a stop), so they are recorded and never called.
 std::mutex terminateLock;
 std::vector<std::pair<uint32_t, uint32_t>> terminateNotifications;
+std::set<uint32_t> unloadedModules;  // FM4 Recomp (alpha): loader entries XexUnloadImage took to load count 0
 
 // Loads a translated title module named `text` (Xenia KernelState::LoadUserModule, FinishLoadingUserModule
 // kernel_state.cc:452): the file comes from the disc and must be the one translated (size and CRC-32),
@@ -128,7 +130,7 @@ GUEST_IMPORT(XexGetModuleHandle, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:4
         ldr = runtime::SystemModule(base, text);
         if (ldr == 0)
         {
-            if (const runtime::LoadedModule* loaded = runtime::LoadedModuleByName(text))
+            if (const runtime::LoadedModule* loaded = runtime::LoadedModuleByName(text); loaded != nullptr && !unloadedModules.count(loaded->module.ldr))
                 ldr = loaded->module.ldr;
             else if (runtime::FindModuleImage(text) != nullptr)
             {
@@ -186,6 +188,35 @@ GUEST_IMPORT(XexLoadImage, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:94 XexL
     if (ldr == 0 && *text)
         if (const runtime::LoadedModule* loaded = runtime::LoadedModuleByName(text))
             ldr = loaded->module.ldr;
+    // FM4 Recomp (FM4 unloads XMediaFacade after a race and loads it again):
+    // Xenia maps a module unloaded by XexUnloadImage afresh (a new image, DllMain ATTACH again). The runtime keeps the translated
+    // module mapped and restores it: its writable pages and import slots as at the first load (loader.h RefreshModule), then DllMain
+    // (loader entry, DLL_PROCESS_ATTACH 1, 0) on this thread; its load count then goes from 0 to 1 below.
+    if (ldr != 0 && unloadedModules.count(ldr))
+    {
+        const runtime::LoadedModule* m = runtime::LoadedModuleByLdr(ldr);
+        if (inEntry)
+            Stop(StopCode::Unimplemented, "XexLoadImage(\"%s\") from inside a DllMain is not implemented", text);
+        const std::vector<uint8_t> bytes = ReadHostFile(runtime::ModuleSurveyImage(*m->image));
+        if (bytes.size() != m->image->size || runtime::Crc32(bytes.data(), bytes.size()) != m->image->imageCrc32)
+            Stop(StopCode::Setup, "%s is not the image %s was translated from", runtime::ModuleSurveyImage(*m->image).c_str(), m->image->name);
+        runtime::RefreshModule(base, *m, bytes);
+        if (m->image->entry != 0)
+        {
+            PPCFunc* dllMain = runtime::FindFunction(base, m->image->entry);
+            if (dllMain == nullptr)
+                Stop(StopCode::Setup, "the entry %08X of %s has no translated function", m->image->entry, m->image->name);
+            PPCContext call = ctx;
+            call.r3.u64 = ldr, call.r4.u64 = 1, call.r5.u64 = 0;
+            inEntry = true;
+            dllMain(call, base);
+            inEntry = false;
+            if (call.r3.u32 == 0)
+                Stop(StopCode::Unimplemented, "DllMain of %s returned FALSE on its reload", m->image->fileName);
+        }
+        unloadedModules.erase(ldr);
+        std::fprintf(stderr, "[runtime] reloaded %s (data restored; DllMain PROCESS_ATTACH)\n", m->image->fileName);
+    }
     if (ldr == 0)
     {
         if (!*text)
@@ -199,6 +230,43 @@ GUEST_IMPORT(XexLoadImage, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:94 XexL
     const uint32_t count = uint32_t(base[ldr + 0x40] << 8 | base[ldr + 0x41]) + 1;
     base[ldr + 0x40] = uint8_t(count >> 8), base[ldr + 0x41] = uint8_t(count);
     runtime::Store32(base, handle, ldr);
+    ctx.r3.u64 = 0;  // X_STATUS_SUCCESS
+}
+
+GUEST_IMPORT(XexUnloadImage, "REFERENCE_DERIVED: Xenia xboxkrnl_modules.cc:139 XexUnloadImage, kernel_state.cc UnloadUserModule")
+{
+    // FM4 Recomp (FM4 loads SpeechFacade while loading the menus and unloads it).
+    // (module): a system module is never unloaded (Xenia: kernel modules); a handle that is no module: STATUS_INVALID_HANDLE. A
+    // title module's load count (big-endian 16 bits at +0x40) goes down; at 0 its DllMain runs on this thread with (loader entry,
+    // DLL_PROCESS_DETACH 0, 0), as Xenia's UnloadUserModule, and the module counts as unloaded (XexGetModuleHandle: not found).
+    const uint32_t module = ctx.r3.u32;
+    if (runtime::SystemModuleName(module) != nullptr)
+        return (void)(ctx.r3.u64 = 0);
+    const runtime::LoadedModule* loaded = runtime::LoadedModuleByLdr(module);
+    if (loaded == nullptr || unloadedModules.count(module))
+        return (void)(ctx.r3.u64 = 0xC0000008);  // STATUS_INVALID_HANDLE
+    const uint32_t count = uint32_t(base[module + 0x40] << 8 | base[module + 0x41]);
+    if (count == 0)
+        Stop(StopCode::Unimplemented, "XexUnloadImage(%s) with load count 0", loaded->image->fileName);
+    base[module + 0x40] = uint8_t((count - 1) >> 8), base[module + 0x41] = uint8_t(count - 1);
+    if (count == 1)
+    {
+        if (inEntry)
+            Stop(StopCode::Unimplemented, "XexUnloadImage(%s) from inside a DllMain is not implemented", loaded->image->fileName);
+        if (loaded->image->entry != 0)
+        {
+            PPCFunc* dllMain = runtime::FindFunction(base, loaded->image->entry);
+            if (dllMain == nullptr)
+                Stop(StopCode::Setup, "the entry %08X of %s has no translated function", loaded->image->entry, loaded->image->name);
+            PPCContext call = ctx;
+            call.r3.u64 = module, call.r4.u64 = 0, call.r5.u64 = 0;
+            inEntry = true;
+            dllMain(call, base);
+            inEntry = false;
+        }
+        unloadedModules.insert(module);
+        std::fprintf(stderr, "[runtime] unloaded %s (DllMain PROCESS_DETACH); it stays mapped\n", loaded->image->fileName);
+    }
     ctx.r3.u64 = 0;  // X_STATUS_SUCCESS
 }
 

@@ -55,7 +55,12 @@ void Dispatch(EventAction action, const char* what, Close close, Resized resized
 const SurfaceRequest* OpenWindow();
 // The window's size in pixels now (SDL_GetWindowSizeInPixels; main thread).
 VkExtent2D WindowPixels();
-// Main thread, after the guest thread started. Never returns.
+// Main thread, after the guest thread started. Never returns. FM4 Recomp (Disc 2): each turn also pumps a pending disc
+// swap's dialogs (kernel/disc_swap.h PumpMainThread).
 [[noreturn]] void RunWindowLoop();
+// Main thread: the window's title.
+void SetWindowTitle(const char* title);
+// Main thread: the window's frame in points, top-left origin on the main display (the Disc setup panel opens over it).
+SDL_Rect WindowFrame();
 
 }  // namespace runtime::video::window

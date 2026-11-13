@@ -24,8 +24,28 @@
 namespace runtime {
 
 // The host directory holding the extracted disc and the disc map (path TAB sector TAB size TAB attributes, hex);
-// stops (9) unless the directory and the map are readable and well formed.
+// stops (9) unless the directory and the map are readable and well formed. MountDisc registers it as Disc 1 (the
+// launch disc, --disc) and puts it in the drive.
 void MountDisc(const std::string& root, const std::string& map);
+
+// FM4 Recomp (Disc 2): the title's other discs (FM4's execution info: disc 1 of 2, system flag
+// MULTIDISC_SWAP 0x8000, Xenia xex2_info.h:140). AddDisc registers disc `number` (FM4: Disc 2, --disc2, --disc2-map),
+// checked as MountDisc checks Disc 1, without putting it in the drive. InsertDisc puts a registered disc in the drive
+// (XamSwapDisc): from then on \Device\Cdrom0 (and game:\, d:\) serve that disc's tree and map. Handles and package
+// roots opened on a disc stay tied to it (DiscEntry::disc): reading one while another disc is in the drive stops (7)
+// (the console's behaviour for a removed disc is not modelled). InsertDisc of an unregistered disc stops (9).
+void AddDisc(uint32_t number, const std::string& root, const std::string& map);
+bool DiscRegistered(uint32_t number);
+uint32_t DiscInDrive();  // 0 before MountDisc
+void InsertDisc(uint32_t number);
+// The host path of a registered disc's root file `name` (matched in any case against its map), "" if the map has none.
+std::string DiscRootFile(uint32_t number, std::string_view name);
+size_t OpenFilesOnDisc(uint32_t number);  // open handles to entries of that disc (the swap's log line)
+// The content packages of the disc in the drive, in its GDFX tree order: the files
+// Content\0000000000000000\<title>\<type>\<name> (any case) with an 8-character title directory (hex, else a stop (7)),
+// the type as 8 hex digits and a 16-character name (Xenia xam_content_aggregate.cc:26-77 AddODDContentTest: rules "????????" and "????????????????").
+struct DiscContentItem { uint32_t titleId; std::string fileName; };
+std::vector<DiscContentItem> DiscContent(uint32_t contentType);
 
 std::string CanonicalGuestPath(std::string_view path);
 // Xenia xboxkrnl_io.cc:42 IsValidPath: printable ASCII without " + , ; < = > |, and without * ? unless `pattern`
@@ -53,6 +73,7 @@ struct DiscEntry
     int32_t packageFile = -1;
     std::string relative;  // a disc entry: its path under the disc root ('/'-separated, disc case; "" for the root)
     bool writable = false;  // in a writable content root (saved content, a host directory under the user data)
+    uint32_t disc = 0;      // the disc it is on (a disc entry, or a file of a package mounted from a disc); 0 elsewhere
 };
 uint32_t DiscAttributes(const DiscEntry& entry);
 uint64_t DiscAllocationSize(const DiscEntry& entry);
@@ -66,8 +87,9 @@ bool TitleUpdatePath(std::string_view device);
 // Content roots (XamContentOpenFile): a read-only STFS package mounted as "<root>:" (Xenia mounts content as a device
 // with a symbolic link "<root>:"; xam_content.cc). Paths "<root>:\..." resolve inside it, in any case; its root is a
 // directory, its directories 0x10 and files 0x81 (Xenia stfs_container_device.cc:122-124: directory; normal |
-// read-only). Mounting a root that exists, or unmounting one that does not, returns false.
-bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package);
+// read-only). Mounting a root that exists, or unmounting one that does not, returns false. `disc`: the disc the
+// package file is on (0: not on a disc); resolving inside the root while another disc is in the drive stops (7).
+bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package, uint32_t disc = 0);
 // A writable content root (XamContentCreateEx; Xenia content_manager.cc:35-49 mounts the item's directory as a writable
 // HostPathDevice linked as "<root>:"): paths resolve inside `hostDirectory` in any case; a symlink stops (9); directories
 // 0x10, files 0x80 (Xenia host_path_entry.cc:40-43). A root name already mounted (either kind) returns false.
@@ -122,7 +144,7 @@ uint64_t HostFileSize(const DiscEntry& entry);
 // fsync of a writable entry's host file (a failure stops (9)).
 void SyncHostFile(const DiscEntry& entry);
 // Reads up to `size` bytes at `offset` into `buffer`; returns the bytes read (0 at or past the end).
-// A failed host read stops (9): the extraction is damaged.
+// A failed host read stops (9): the extraction is damaged. An entry of a disc that is not in the drive stops (7).
 uint32_t ReadDiscFile(const DiscEntry& entry, uint64_t offset, uint8_t* buffer, uint32_t size);
 OpenFile* FindOpenFile(uint32_t body);                          // by the object body a handle names
 

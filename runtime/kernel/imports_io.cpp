@@ -289,10 +289,10 @@ GUEST_IMPORT(NtWriteFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:354-429 NtWri
     // (handle, event, APC routine, APC context, io status*, buffer*, length, offset*), completed at once as Xenia and as
     // NtReadFile here: a bad event or file handle INVALID_HANDLE with io status {status, 0}; the write at *offset, or at
     // the position without one (or -1); io status {0, bytes}, the event set, PENDING for an asynchronous file. A
-    // synchronous file's position becomes offset + bytes (NT; as NtReadFile). The quota (content.h, owner policy; Xenia
-    // has none): a write growing stored content past it fails with STATUS_DISK_FULL (C000007F), io status {status, 0},
-    // nothing written. A file outside a writable content root (the disc, a package), an APC, or an asynchronous write
-    // without an offset stops (7).
+    // synchronous file's position becomes offset + bytes (NT; as NtReadFile); an asynchronous file's advances by the bytes
+    // (Xenia XFile::Write, xfile.cc:236-246 at 67f16c4: no offset writes at position_). Free space (content.h ContentFreeBytes: the
+    // 20 GB device minus what is stored, bounded by the host volume minus its reserve; Xenia checks none): a write growing
+    // stored content past it fails with STATUS_DISK_FULL (C000007F), io status {status, 0}, nothing written. A file outside a writable content root (the disc, a package) or an APC stops (7).
     const uint32_t handle = ctx.r3.u32, event = ctx.r4.u32, apc = ctx.r5.u32, ioStatus = ctx.r7.u32;
     const uint32_t buffer = ctx.r8.u32, length = ctx.r9.u32, offsetAt = ctx.r10.u32;
     auto fail = [&](uint32_t status) {
@@ -317,27 +317,24 @@ GUEST_IMPORT(NtWriteFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:354-429 NtWri
         Stop(StopCode::Unimplemented, "NtWriteFile(%08X): %s is not a file in a writable content root (writing the disc or a package is not modelled)",
              handle, file->entry.host.c_str());
     uint64_t offset = file->position;
-    bool explicitOffset = false;
     if (offsetAt != 0)
     {
         const uint64_t given = uint64_t(runtime::Load32(base, offsetAt)) << 32 | runtime::Load32(base, offsetAt + 4);
         if (given != ~uint64_t(0))
-            offset = given, explicitOffset = true;
+            offset = given;
     }
-    if (!file->synchronous && !explicitOffset)
-        Stop(StopCode::Unimplemented, "NtWriteFile(%08X): an asynchronous write without an offset", handle);
     const uint64_t size = runtime::HostFileSize(file->entry), end = offset + length;
     const uint64_t growth = length != 0 && end > size ? end - size : 0;
-    if (growth != 0 && runtime::ContentBytesUsed() + growth > runtime::kContentQuota)
+    if (growth != 0 && growth > runtime::ContentFreeBytes())  // FM4 Recomp (Disc 2): the device's and the host's free space (content.h)
         return fail(0xC000007F);  // STATUS_DISK_FULL
     const uint32_t bytes = length != 0 ? runtime::WriteHostFile(file->entry, offset, base + buffer, length) : 0;
     file->entry.size = std::max(size, offset + bytes);
-    if (file->synchronous)
-        file->position = offset + bytes;
+    file->position = file->synchronous ? offset + bytes : file->position + bytes;
     if (ioStatus)
         runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, bytes);
     if (eventObject)
         runtime::SetEvent(base, eventObject->header);
+    runtime::SetEvent(base, object->header);  // the file object itself (Xenia XFile::Write, xfile.cc:305: its async event)
     ctx.r3.u64 = file->synchronous ? 0 : 0x103;  // STATUS_PENDING
 }
 
@@ -399,12 +396,12 @@ GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc
     // (handle, io status*, info*, length, class): FilePositionInformation (14) sets the position, FileEndOfFileInformation
     // (20) the file's length (a writable saved-content file: cut or zero-extended on the host), each from big-endian 64
     // bits. FileAllocationInformation (19): Xenia ignores it (:222-226, success); here so does an allocation at or above the
-    // file's size (space is taken on write, where the quota is checked), while one below it, which NT would cut the file
+    // file's size (space is taken on write, where free space is checked), while one below it, which NT would cut the file
     // to, stops (7). FileDispositionInformation (13, 1 byte): Xenia ignores it (:207-214); here, as NT, a writable
     // saved-content file is removed when this handle closes (NtClose) if the byte is non-zero (io status {0, 0}); a disc
     // file or a directory stops (7). Xenia's order: a length below the class's minimum (8) is INFO_LENGTH_MISMATCH, an unknown handle
-    // INVALID_HANDLE; then the io status {status, 8} and the status. Growing stored content past the quota (content.h)
-    // is STATUS_DISK_FULL with nothing changed, as NtWriteFile. The length of a disc file, and any other class, stop (7):
+    // INVALID_HANDLE; then the io status {status, 8} and the status. Growing stored content past the free space
+    // (content.h ContentFreeBytes) is STATUS_DISK_FULL with nothing changed, as NtWriteFile. The length of a disc file, and any other class, stop (7):
     // disposition (deletion) and allocation are not modelled until a run needs them.
     const uint32_t handle = ctx.r3.u32, ioStatus = ctx.r4.u32, info = ctx.r5.u32, length = ctx.r6.u32, infoClass = ctx.r7.u32;
     constexpr uint32_t kDisposition = 13, kPosition = 14, kAllocation = 19, kEndOfFile = 20;
@@ -441,7 +438,7 @@ GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc
         if (!file->entry.writable || file->entry.directory)
             Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): setting the length of a file outside a writable content root", handle);
         const uint64_t size = runtime::HostFileSize(file->entry);
-        if (value > size && runtime::ContentBytesUsed() + (value - size) > runtime::kContentQuota)
+        if (value > size && value - size > runtime::ContentFreeBytes())  // FM4 Recomp (Disc 2): the device's free space (content.h)
             status = 0xC000007F;  // STATUS_DISK_FULL
         else
             runtime::SetHostFileLength(file->entry, value), file->entry.size = value;
@@ -458,8 +455,10 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
     // asynchronous I/O returns PENDING unless the read hit the end (completing before returning is a valid
     // order for asynchronous I/O). The read is at *offset, or at the file position if there is no offset (or
     // it is -1); at or past the end: END_OF_FILE; a zero length succeeds with 0 bytes. A synchronous file's
-    // position becomes offset + bytes (NT's rule; Xenia adds the bytes to the old position). NT keeps no
-    // position for asynchronous files, so such a read without an offset stops (7); so does an APC.
+    // position becomes offset + bytes (NT's rule; Xenia adds the bytes to the old position). An asynchronous
+    // file keeps a position too, as Xenia's XFile::Read (xfile.cc:94-158 at 67f16c4: no offset reads at
+    // position_, which advances by the bytes read on success); FM4's Disc 2 install reads its packages that
+    // way. An APC stops (7).
     const uint32_t handle = ctx.r3.u32, event = ctx.r4.u32, apc = ctx.r5.u32, ioStatus = ctx.r7.u32;
     const uint32_t buffer = ctx.r8.u32, length = ctx.r9.u32, offsetAt = ctx.r10.u32;
     std::optional<runtime::KernelObject> eventObject;
@@ -476,15 +475,12 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
     if ((apc & ~1u) != 0)
         Stop(StopCode::Unimplemented, "NtReadFile(%08X): an APC routine (%08X) is not implemented", handle, apc);
     uint64_t offset = file->position;
-    bool explicitOffset = false;
     if (offsetAt != 0)
     {
         const uint64_t given = uint64_t(runtime::Load32(base, offsetAt)) << 32 | runtime::Load32(base, offsetAt + 4);
         if (given != ~uint64_t(0))
-            offset = given, explicitOffset = true;
+            offset = given;
     }
-    if (!file->synchronous && !explicitOffset)
-        Stop(StopCode::Unimplemented, "NtReadFile(%08X): an asynchronous read without an offset", handle);
     if (file->entry.writable && !file->entry.directory)
         file->entry.size = runtime::HostFileSize(file->entry);  // another handle may have written since
     uint32_t status = 0, bytes = 0;
@@ -496,11 +492,12 @@ GUEST_IMPORT(NtReadFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:184 NtReadFile
             bytes = runtime::ReadDiscFile(file->entry, offset, base + buffer, length);
         runtime::diag::ReadBytes(bytes);  // FM4_DIAG_WAITS (diagnostic)
     }
-    if (status == 0 && file->synchronous)
-        file->position = offset + bytes;
+    if (status == 0)
+        file->position = file->synchronous ? offset + bytes : file->position + bytes;
     if (ioStatus)
         runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, bytes);
     if (eventObject)
         runtime::SetEvent(base, eventObject->header);
+    runtime::SetEvent(base, object->header);  // the file object itself (Xenia XFile::Read, xfile.cc:185: its async event)
     ctx.r3.u64 = !file->synchronous && status == 0 ? 0x103 : status;  // STATUS_PENDING
 }

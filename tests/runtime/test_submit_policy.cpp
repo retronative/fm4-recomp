@@ -45,6 +45,13 @@ int main()
     Control(d.Split(), "control: 63 draws inside a pass, GPU idle: no split (4 x 16 = 64)");
     d = DecideSplit(64, 128, true, true, 16, empty);
     Expect(d.byIdle, "64 draws inside a pass, GPU idle: by idle");
+    // FM4_SUBMIT_IF_IDLE_IN_PASS: factor 1: 16 draws inside a pass, GPU idle: by idle; 15 not; factor 2: 31 not, 32 yes.
+    d = DecideSplit(16, 128, true, true, 16, empty, 1);
+    Expect(d.byIdle, "factor 1: 16 draws inside a pass, GPU idle: by idle");
+    d = DecideSplit(31, 128, true, true, 16, empty, 2);
+    Control(d.Split(), "control: factor 2: 31 draws inside a pass: no split (2 x 16 = 32)");
+    d = DecideSplit(32, 128, true, true, 16, empty, 2);
+    Expect(d.byIdle, "factor 2: 32 draws inside a pass, GPU idle: by idle");
     d = DecideSplit(100, 128, true, false, 0, empty);
     Control(d.Split(), "control: idle off (0): only by size");
     d = DecideSplit(1000, 0, true, false, 16, empty);

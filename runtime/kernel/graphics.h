@@ -67,6 +67,14 @@ void SetInterruptCallback(uint8_t* base, uint32_t callback, uint32_t userData);
 // calls it every 50 us without the interrupt lock (the callback may store to a page whose GPU read the caller must retire).
 void RequestInterrupt(uint32_t source, bool wait, void (*poll)() = nullptr);
 uint64_t VblankCount();
+// FM4 Recomp (opt-in FM4_UNLOCKED_FPS=1, unlocked frame rate): a variable-refresh
+// vblank. The command processor asks for the next vblank as soon as it waits on a word only the guest CPU can satisfy with the GPU
+// drained and nothing of ours queued (FM4's swap waiting for its vblank: FM4_DIAG_MEMWAIT, 08D4D006); the
+// vblank fires then, but never sooner than FM4_UNLOCKED_FPS_MIN_US (default 8333: 120 Hz) after the previous one, and the 60 Hz
+// timer restarts from it. Off (default): vblanks every 1/60 s only, as Xenia. A guest that counts vblanks for time would run faster.
+bool UnlockedFrameRate();
+void RequestEarlyVblank();
+uint64_t EarlyVblanks();  // the vblanks FM4_UNLOCKED_FPS fired before their 60 Hz deadline
 uint64_t InterruptsDelivered();
 
 }  // namespace runtime::gpu

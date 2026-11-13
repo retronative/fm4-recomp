@@ -19,7 +19,8 @@ namespace runtime::video {
 
 // The host images of a draw's render target, owned by the EDRAM unit (D-e, D-f: ownership map, GPU
 // transfers, resolves). Contract: `color` / `depth` are views of 2D images of `format` /
-// `depthFormat` with `samples` samples (= RenderTarget::samples), `width` x `height` pixels covering
+// `depthFormat` with `samples` samples (= RenderTarget::samples; FM4 Recomp: host_samples.h HostSampleCount of it, 1 with
+// FM4_HOST_MSAA_1X=1, = PipelineKey::samples), `width` x `height` pixels covering
 // at least the draw's scissor (RenderTarget::pitch x targetHeight), each in the attachment-optimal
 // layout (COLOR_ATTACHMENT_OPTIMAL / DEPTH_STENCIL_ATTACHMENT_OPTIMAL) when returned and left in it by
 // the render pass (pipeline_cache.cpp RenderPass: load, store, initial = final layout, external

@@ -5,6 +5,7 @@
 #include "loader.h"
 #include "guest_memory.h"
 #include "stops.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -156,6 +157,32 @@ const LoadedModule& MapModule(uint8_t* base, const ModuleImage& image, const std
     loaded[m] = LoadedModule{&image, module};
     loadedCount.store(m + 1);
     return loaded[m];
+}
+
+void RefreshModule(uint8_t* base, const LoadedModule& module, const std::vector<uint8_t>& bytes)
+{
+    std::lock_guard guard(loaderLock);
+    const ModuleImage& image = *module.image;
+    if (bytes.size() != image.size)
+        Stop(StopCode::Setup, "module %s: the image to reload is %zu bytes, not %X", image.name, bytes.size(), image.size);
+    const size_t page = size_t(getpagesize());
+    for (uint64_t at = image.base; at < uint64_t(image.base) + image.size; at += page)
+        if (PageWritable(uint32_t(at), page, image.sections, image.sectionCount))
+        {
+            const uint64_t n = std::min<uint64_t>(page, uint64_t(image.base) + image.size - at);
+            std::memcpy(base + at, bytes.data() + (at - image.base), n);
+        }
+    for (size_t i = 0; i < image.importCount; i++)
+    {
+        const ModuleImport& import = image.imports[i];
+        uint32_t value = import.thunk;
+        if (import.variable)
+        {
+            const char* name = std::strncmp(import.name, "__imp__", 7) == 0 ? import.name + 7 : import.name;
+            value = DataImportValue(name);
+        }
+        StoreBigEndian32(base, import.address, value);
+    }
 }
 
 const LoadedModule* LoadedModuleByName(const char* name)

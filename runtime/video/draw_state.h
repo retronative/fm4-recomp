@@ -98,6 +98,7 @@ enum class HostPrimitive : uint32_t
     QuadList,       // the host rewrites the indices as triangle lists
     PointNoWrite,   // a point list of a NoWrite draw: nothing to render
     LineList,       // FM4 Recomp: native (Xenia draws a guest line list as a host one, width 1)
+    TriangleFan,    // FM4 Recomp (alpha): the host rewrites the indices as a triangle list (Metal has no fans; draw_record.cpp)
 };
 
 enum class DrawKind : uint32_t

@@ -12,7 +12,8 @@
 # optionally, add-on .zip files (each holds one STFS package; it is unzipped, not unpacked).
 # The ISOs are only read. Output: <out>/disc1, <out>/disc2, <out>/dlc, <out>/disc{1,2}.log,
 # <out>/SHA256SUMS.
-# Disc 2's content packages (PIRS) and the add-on (LIVE) stay packed: no STFS tool is pinned yet.
+# Disc 2's content packages (PIRS) and the add-on (LIVE) stay packed: the game installs Disc 2's packages itself (copies them
+# into its storage, then mounts them); survey/stfs_extract.py reads a package's files with every block hash-checked.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 XISO="$ROOT/tools/extract-xiso/build/extract-xiso"

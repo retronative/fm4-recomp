@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in FM4 Recomp doesn't work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Never attach or link game files, disc images, executables, recompiled code
+        or a built binary.** Security problems go through the [security policy](https://github.com/retronative/fm4-recomp/security/policy), not an issue.
+  - type: input
+    id: version
+    attributes:
+      label: FM4 Recomp commit
+      description: The commit you built.
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS
+      description: The Mac model (for example MacBook Pro M3, 18 GB) and the macOS version.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you did
+      description: The steps that lead to the problem, including the screen or race where it happens.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Stop line and log
+      description: |
+        FM4 Recomp stops with a named reason when it meets something it does not implement. Paste that line
+        and the end of the log here, only if they contain no game files.
+      render: text
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Before submitting
+      options:
+        - label: This report contains no game files, disc images, executables or recompiled code.
+          required: true

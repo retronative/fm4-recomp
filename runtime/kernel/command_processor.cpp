@@ -535,6 +535,10 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                     break;
                 polls++;
                 HonourGpuReadGuard();  // FM4_GUEST_MEMORY_GPU: the guest thread this waits for may wait for a GPU read
+                // FM4_UNLOCKED_FPS (graphics.h): a memory word the guest CPU must write, the GPU drained, nothing of ours queued: the
+                // vblank it may be waiting for comes now (once a wait).
+                if (polls == 1 && (info & 0x10) && synced && deferredStores.empty() && UnlockedFrameRate())
+                    RequestEarlyVblank();
                 if (!synced && NowNs() - waitStart > kCpuWordGraceNs)
                 {
                     synced = true, graceSyncs++;

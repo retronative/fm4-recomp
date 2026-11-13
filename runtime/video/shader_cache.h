@@ -43,6 +43,13 @@ public:
     // `warnings` whatever the compiler reported on success (the census, glslangValidator exit 0,
     // accepts those).
     virtual bool Compile(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error) = 0;
+    // FM4 Recomp (M7, FM4_RESOLVE_COMPUTE): a compute module (the EDRAM unit's compute resolve); a compiler without compute refuses.
+    virtual bool CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error)
+    {
+        (void)glsl, (void)spirv, (void)warnings;
+        error = "this compiler has no compute stage";
+        return false;
+    }
 };
 
 // The glslang library (Homebrew glslang 16.6.0), with exactly the census's options
@@ -61,7 +68,7 @@ public:
     bool Compile(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error) override;
     // FM4 Recomp (M7, FM4_TEXTURE_GPU_UNTILE): a compute shader with the same options (texture_vk.cpp's untile pipeline); the
     // graphics-only rewrites (FM4_SHADER_NO_PRECISE and the diagnostics) never apply.
-    bool CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error);
+    bool CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error) override;
 
 private:
     bool CompileStage(int stage, bool pixel, bool rewrites, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings,

@@ -4,8 +4,9 @@
 #
 # Fills a self-contained kit (every runtime and setup dependency bundled, the app loads only its own
 # copies; no Homebrew, Xcode or developer tools on the player's Mac): bin/ (fm4recomp, the validation layer's negative control,
-# extract-xiso, xexsurvey, gdfx), lib/ (SDL3, the Vulkan loader, MoltenVK, the Vulkan validation layer, glslang, SPIRV-Tools),
-# vulkan/ (the MoltenVK driver and the validation layer manifests, by relative path), setup.sh, play.sh, README.md, licenses/.
+# extract-xiso, xexsurvey, gdfx, fm4recomp-setup: the launcher's setup app, the in-game Disc setup panel), lib/ (SDL3, the Vulkan loader, MoltenVK, the Vulkan validation layer, glslang, SPIRV-Tools),
+# vulkan/ (the MoltenVK driver and the validation layer manifests, by relative path), setup.sh, play.sh, locations.sh (their
+# shared storage-location helpers), README.md, licenses/.
 # Every bundled binary and library refers to the others by @rpath (bin: @executable_path/../lib, lib: @loader_path), is checked
 # to name no library outside the kit and macOS, and to need no macOS newer than the target; then ad hoc signed.
 #   scripts/release/bundle_kit.sh <kit dir> [<deps prefix>]
@@ -36,6 +37,10 @@ for entry in "${LIBS[@]}"; do
 done
 cp "$ROOT/build/native/runtime/fm4recomp" "$ROOT/build/native/tests/fm4_validation_control" "$ROOT/tools/extract-xiso/build/extract-xiso" \
    "$ROOT/tools/survey/xexsurvey" "$ROOT/tools/survey/gdfx" "$KIT/bin/"
+# The launcher's setup app, also the in-game Disc setup panel (fm4recomp --disc-setup, play.sh; FM4 Recomp --disc-panel): the
+# same sources as FM4 Recomp.app (scripts/release/make_app.sh), so the kit's panel is the launcher's own UI.
+/usr/bin/xcrun swiftc -O -swift-version 5 -target "arm64-apple-macos$TARGET" -parse-as-library -module-name FM4RecompSetup \
+  -file-prefix-map "$ROOT=fm4-recomp" "$ROOT"/app/setup/*.swift -o "$KIT/bin/fm4recomp-setup"
 chmod u+w "$KIT"/bin/*
 
 is_bundled() { local n; for n in "${NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
@@ -74,7 +79,7 @@ sed 's|"library_path": "[^"]*"|"library_path": "../../lib/libVkLayer_khronos_val
 grep -q '"api_version": "1.4.363"' "$KIT/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" ||
   { echo "bundle_kit: the validation layer is not the pinned 1.4.363" >&2; exit 1; }
 
-cp "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/README.md" "$KIT/"
+cp "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/README.md" "$KIT/"
 chmod +x "$KIT/setup.sh" "$KIT/play.sh"
 cp "$ROOT/COPYING" "$ROOT/NOTICE" "$ROOT/THIRD_PARTY_NOTICES.md" "$KIT/licenses/"
 cp -R "$ROOT/LICENSES" "$KIT/licenses/LICENSES"

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// FM4 Recomp.app's window: welcome -> your Mac -> your Disc 1 -> setting up -> the launcher (Play, with the GPU safeguards of
-// play.sh). Colours from the logo (assets/fm4-recomp-logo.svg): red #ff4429, asphalt #20242a, white.
+// FM4 Recomp.app's window: welcome -> your Mac -> your Disc 1 -> setting up -> your Disc 2 (optional: Skip, or set up; also
+// "Add Disc 2" in the launcher) -> the launcher (Play, with the GPU safeguards of play.sh). Colours from the logo (assets/fm4-recomp-logo.svg): red #ff4429, asphalt #20242a, white.
 
 import AppKit
 import SwiftUI
@@ -19,13 +19,21 @@ enum Theme {
 
 @MainActor
 final class SetupModel: ObservableObject {
-  enum Page: String, CaseIterable { case welcome, prerequisites, disc, installing, failed, launcher }
+  enum Page: String, CaseIterable { case welcome, prerequisites, disc, disc2, installing, failed, launcher }
 
   let paths: Paths
   @Published var page: Page
   @Published var checks: [Check] = []
   @Published var disc: URL?
   @Published var discCheck: DiscCheck?
+  @Published var disc2: URL?  // the optional Disc 2 (Content Install Disc), set up after Disc 1
+  @Published var disc2Check: DiscCheck?
+  @Published var installingDisc2 = false
+  @Published var hasDisc2 = false
+  // Where setup puts things (default: the recorded locations, else the internal ones); any of them may be on an external drive.
+  @Published var dataDir: URL
+  @Published var userDataDir: URL
+  @Published var disc2Dir: URL
   @Published var progress: Double = 0
   @Published var stage = ""
   @Published var log: [String] = []
@@ -35,32 +43,58 @@ final class SetupModel: ObservableObject {
   @Published var gpuStop: String?
   @Published var minutes = 120
   @Published var debugValidation = false  // play.sh --debug: Vulkan and Metal API validation (slower)
+  // The in-game Disc 2 panel (Panel.swift): set up, then end; "Back to the Game" ends it without the disc.
+  var panel = false
+  var gameMessage = ""
   private var process: Process?
 
   init(paths: Paths, preview: Bool = false) {
     self.paths = paths
+    let recorded = Locations.read(paths)
+    dataDir = recorded.dataRoot
+    userDataDir = recorded.userDataRoot
+    disc2Dir = recorded.disc2Root ?? recorded.dataRoot.appendingPathComponent("disc2")
     page = state(paths) == .ready && !preview ? .launcher : .welcome
     checks = prerequisites(paths)
+    hasDisc2 = disc2Ready(paths)
     refreshGpuStop()
   }
 
   var allChecksOK: Bool { checks.allSatisfy(\.ok) }
-  var free: UInt64 { freeSpace(at: paths.home) }
+
+  // nil when every destination volume has room (the same rule as locations.sh loc_need, which setup.sh applies again).
+  func shortfall(_ which: Disc) -> String? {
+    which == .one ? spaceShortfall([(dataDir, FileManager.default.fileExists(atPath: dataDir.appendingPathComponent("files").path) ? 0 : disc1DataBytes),
+                                     (userDataDir, 0)])
+      : spaceShortfall([(disc2Dir, disc2FilesBytes), (userDataDir, disc2ContentBytes)])
+  }
+
+  // A folder the player picked: setup's own folder inside it ("FM4 Recomp/<name>"), so a drive's top folder works too.
+  func place(_ picked: URL, _ name: String) -> URL {
+    picked.appendingPathComponent("FM4 Recomp", isDirectory: true).appendingPathComponent(name, isDirectory: true)
+  }
 
   func recheck() { checks = prerequisites(paths) }
 
-  func choose(_ url: URL) {
-    disc = url
-    discCheck = verifyDisc(url)
+  func choose(_ url: URL, _ which: Disc = .one) {
+    if which == .one {
+      disc = url
+      discCheck = verifyDisc(url)
+    } else {
+      disc2 = url
+      disc2Check = verifyDisc(url, .two)
+    }
   }
 
-  func startSetup() {
-    guard let disc else { return }
+  func startSetup(_ which: Disc = .one) {
+    guard let iso = which == .one ? disc : disc2 else { return }
+    installingDisc2 = which == .two
     page = .installing
     progress = 0
     stage = "Starting"
     log = []
-    process = runKitScript(paths, "setup.sh", [disc.path], line: { text in
+    let options = which == .one ? ["--data", dataDir.path, "--user-data", userDataDir.path] : ["--disc2", "--dest", disc2Dir.path]
+    process = runKitScript(paths, "setup.sh", options + [iso.path], line: { text in
       Task { @MainActor in self.consumeSetupLine(text) }
     }, done: { status in
       Task { @MainActor in self.setupFinished(status) }
@@ -68,9 +102,11 @@ final class SetupModel: ObservableObject {
   }
 
   private func consumeSetupLine(_ text: String) {
+    if panel { print(text); fflush(stdout) }  // the game logs the setup's lines and reads its result (disc_setup_sdl.cpp)
     if let (value, what) = parseProgress(text) {
       progress = value
       stage = what
+    } else if text.hasPrefix("result ") {  // setup.sh's machine-readable last line; its exit status says the same
     } else {
       log.append(text)
     }
@@ -78,15 +114,33 @@ final class SetupModel: ObservableObject {
 
   private func setupFinished(_ status: Int32) {
     process = nil
-    if status == 0 && state(paths) == .ready {
+    hasDisc2 = disc2Ready(paths)
+    if panel && status == 0 && hasDisc2 { leavePanel(0) }  // set up: the game mounts it and shows its next screen
+    if status == 0 && installingDisc2 && hasDisc2 {
       page = .launcher
+    } else if status == 0 && !installingDisc2 && state(paths) == .ready {
+      page = hasDisc2 ? .launcher : .disc2  // Disc 2 is optional: its page offers Skip
     } else {
-      failure = log.last(where: { $0.hasPrefix("setup:") }) ?? (status == 15 ? "Setup was cancelled." : "Setup stopped (status \(status)).")
+      failure = log.last(where: { $0.hasPrefix("setup:") }) ?? (status == 6 || status == 15 ? "Setup was cancelled." : "Setup stopped (status \(status)).")
       page = .failed
     }
   }
 
   func cancelSetup() { process?.terminate() }
+
+  // The panel never keeps the focus: after a file or folder dialog the game is active again (its keyboard and gamepad input).
+  func returnFocus() {
+    if panel { NSRunningApplication(processIdentifier: getppid())?.activate() }
+  }
+
+  // Ends the panel: 0 once Disc 2 is set up ("result ok", setup.sh's own line, came first), else "cancelled" (6): the game keeps
+  // waiting on its Disc 2 screen, whose Back returns to its menu.
+  func leavePanel(_ status: Int32) {
+    process?.terminate()
+    if status != 0 { print("result cancelled") }
+    fflush(stdout)
+    exit(status)
+  }
 
   func play() {
     refreshGpuStop()
@@ -119,6 +173,9 @@ final class SetupModel: ObservableObject {
     case .disc:
       disc = URL(fileURLWithPath: "/Volumes/Games/Forza Motorsport 4 (USA) (Disc 1) (Play Disc).iso")
       discCheck = DiscCheck(ok: true, message: "Xbox 360 game disc image (XGD3), 8.7 GB. Setup checks that it is Forza Motorsport 4 (USA) Disc 1.")
+    case .disc2:
+      disc2 = URL(fileURLWithPath: "/Volumes/Games/Forza Motorsport 4 (USA) (Disc 2) (Content Install Disc).iso")
+      disc2Check = DiscCheck(ok: true, message: "Forza Motorsport 4 Content Install Disc image (XGD3), 8.7 GB. Setup checks every file against this build.")
     case .installing:
       progress = 0.42
       stage = "Copying the game files from your disc"
@@ -143,7 +200,8 @@ struct RootView: View {
         switch model.page {
         case .welcome: WelcomePage(model: model)
         case .prerequisites: PrerequisitesPage(model: model)
-        case .disc: DiscPage(model: model)
+        case .disc: DiscPage(model: model, which: .one)
+        case .disc2: DiscPage(model: model, which: .two)
         case .installing: InstallingPage(model: model)
         case .failed: FailedPage(model: model)
         case .launcher: LauncherPage(model: model)
@@ -168,7 +226,7 @@ struct Header: View {
         Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
           .frame(height: model.page == .launcher ? 150 : 96)
       }
-      if model.page != .launcher { StepIndicator(page: model.page) }
+      if model.page != .launcher && !model.panel { StepIndicator(page: model.page, disc2: model.installingDisc2) }
     }
     .padding(.top, 34)
     .padding(.bottom, 18)
@@ -177,13 +235,15 @@ struct Header: View {
 
 struct StepIndicator: View {
   let page: SetupModel.Page
-  private let steps = ["Welcome", "Your Mac", "Your Disc 1", "Set up"]
+  let disc2: Bool  // installing or failing on Disc 2
+  private let steps = ["Welcome", "Your Mac", "Your Disc 1", "Set up", "Disc 2 (optional)"]
   private var current: Int {
     switch page {
     case .welcome: return 0
     case .prerequisites: return 1
     case .disc: return 2
-    default: return 3
+    case .disc2: return 4
+    default: return disc2 ? 4 : 3
     }
   }
 
@@ -250,7 +310,7 @@ struct WelcomePage: View {
       Card {
         Bullet(n: 1, text: "Check your Mac: Apple silicon and macOS 26 or later. Everything else is included.")
         Bullet(n: 2, text: "Choose your Disc 1 ISO. It is only read.")
-        Bullet(n: 3, text: "Setup copies the game files into your Library (about 8 GB) and checks every one against this build. Nothing leaves your Mac.")
+        Bullet(n: 3, text: "Setup copies the game files (about 8 GB) into your Library or a folder you choose, an external drive too, and checks every one against this build. Nothing leaves your Mac.")
       }
       HStack {
         Text("Alpha build: expect a low frame rate and known issues (Read Me).").font(.system(size: 12)).foregroundStyle(Theme.secondary)
@@ -305,53 +365,110 @@ struct PrerequisitesPage: View {
   }
 }
 
+// Disc 1 (required), or the optional Disc 2 (Content Install Disc) after Disc 1 is set up.
 struct DiscPage: View {
   @ObservedObject var model: SetupModel
+  let which: Disc
   @State private var targeted = false
+  private var chosen: URL? { which == .one ? model.disc : model.disc2 }
+  private var check: DiscCheck? { which == .one ? model.discCheck : model.disc2Check }
+  private var label: String { which == .one ? "Disc 1" : "Disc 2" }
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
-      Text("Your Disc 1").font(.system(size: 22, weight: .bold))
+      Text(which == .one ? "Your Disc 1" : model.panel ? "Your Disc 2" : "Your Disc 2 (optional)").font(.system(size: 22, weight: .bold))
+      if which == .two && model.panel {
+        Text("The game asks for Disc 2\(model.gameMessage.isEmpty ? "" : " (\u{201C}\(model.gameMessage)\u{201D})"). Drop your Disc 2 image here or choose it, and where its files go: FM4 Recomp checks and copies them, then the game shows its own Install screen (confirm with A). The game keeps running; its Back (B) returns to the menu.")
+          .font(.system(size: 12.5)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+      } else if which == .two {
+        Text("Disc 1 is set up and plays on its own. The Content Install Disc holds content the game installs when you choose to (about 3 GB copied now, 3 GB more when installed). Add it now, later from the launcher, or when the game asks.")
+          .font(.system(size: 12.5)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+      }
       VStack(spacing: 10) {
         Image(systemName: "opticaldisc").font(.system(size: 34)).foregroundStyle(Theme.red)
-        if let disc = model.disc {
+        if let disc = chosen {
           Text(disc.lastPathComponent).font(.system(size: 13, weight: .semibold)).multilineTextAlignment(.center).lineLimit(2)
-          if let check = model.discCheck {
+          if let check {
             Label(check.message, systemImage: check.ok ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
               .font(.system(size: 12)).foregroundStyle(check.ok ? Theme.good : Theme.red).multilineTextAlignment(.center)
           }
         } else {
-          Text("Drop your Forza Motorsport 4 (USA) Disc 1 ISO here").font(.system(size: 13.5, weight: .medium))
-          Text("The Play Disc, as an .iso image of your own disc").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+          Text("Drop your Forza Motorsport 4 (USA) \(label) ISO here").font(.system(size: 13.5, weight: .medium))
+          Text(which == .one ? "The Play Disc, as an .iso image of your own disc" : "The Content Install Disc, as an .iso image of your own disc")
+            .font(.system(size: 12)).foregroundStyle(Theme.secondary)
         }
-        SecondaryButton(title: model.disc == nil ? "Choose ISO…" : "Choose Another…") { pick() }
+        SecondaryButton(title: chosen == nil ? "Choose ISO…" : "Choose Another…") { pick() }
       }
-      .padding(22).frame(maxWidth: .infinity, minHeight: 190)
+      .padding(16).frame(maxWidth: .infinity, minHeight: which == .one ? 140 : 120)
       .background(RoundedRectangle(cornerRadius: 12).fill(targeted ? Theme.red.opacity(0.10) : Theme.card))
       .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
         .foregroundStyle(targeted ? Theme.red : Color.white.opacity(0.22)))
       .onDrop(of: [.fileURL], isTargeted: $targeted) { providers in
+        let target = which
         _ = providers.first?.loadObject(ofClass: URL.self) { url, _ in
-          if let url { Task { @MainActor in model.choose(url) } }
+          if let url { Task { @MainActor in model.choose(url, target) } }
         }
         return true
       }
-      let free = model.free
-      Text("Setup needs about 9 GB free in your Library: \(gigabytes(free)) free.")
-        .font(.system(size: 12)).foregroundStyle(free >= setupBytesNeeded ? Theme.secondary : Theme.red)
+      if which == .one {
+        LocationRow(title: "Game data (about 8 GB)", url: model.dataDir) { if let p = pickFolder() { model.dataDir = model.place(p, "data") } }
+        LocationRow(title: "Saves and installed Disc 2 content (about 3 GB)", url: model.userDataDir) {
+          if let p = pickFolder() { model.userDataDir = model.place(p, "user-data") }
+        }
+      } else {
+        LocationRow(title: "Disc 2 files (about 3.2 GB)", url: model.disc2Dir) { if let p = pickFolder() { model.disc2Dir = model.place(p, "disc2") } }
+        LocationRow(title: "Installed content, with your saves (about 3 GB)", url: model.userDataDir, change: nil)
+      }
+      let short = model.shortfall(which)
+      Text(short ?? "Enough free space at each location. Any folder may be on an external drive.")
+        .font(.system(size: 12)).foregroundStyle(short == nil ? Theme.secondary : Theme.red)
       HStack {
-        SecondaryButton(title: "Back") { model.page = .prerequisites }
+        if which == .one {
+          SecondaryButton(title: "Back") { model.page = .prerequisites }
+        } else {
+          SecondaryButton(title: model.panel ? "Back to the Game" : "Skip") { if model.panel { model.leavePanel(6) } else { model.page = .launcher } }
+        }
         Spacer()
-        PrimaryButton(title: "Set Up", enabled: model.discCheck?.ok == true && free >= setupBytesNeeded) { model.startSetup() }
+        PrimaryButton(title: which == .one ? "Set Up" : "Set Up Disc 2", enabled: check?.ok == true && short == nil) { model.startSetup(which) }
       }
     }
   }
 
+  private func pickFolder() -> URL? {
+    let panel = NSOpenPanel()
+    panel.title = "Choose where FM4 Recomp keeps this (setup makes an \"FM4 Recomp\" folder inside it)"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.canCreateDirectories = true
+    panel.allowsMultipleSelection = false
+    defer { model.returnFocus() }
+    return panel.runModal() == .OK ? panel.url : nil
+  }
+
   private func pick() {
     let panel = NSOpenPanel()
-    panel.title = "Choose your Forza Motorsport 4 Disc 1 ISO"
+    panel.title = "Choose your Forza Motorsport 4 \(label) ISO"
     panel.allowedContentTypes = [UTType(filenameExtension: "iso") ?? .diskImage]
     panel.allowsMultipleSelection = false
-    if panel.runModal() == .OK, let url = panel.url { model.choose(url) }
+    defer { model.returnFocus() }
+    if panel.runModal() == .OK, let url = panel.url { model.choose(url, which) }
+  }
+}
+
+// One storage location: what goes there, the folder (middle-truncated), and Change… (absent when it cannot be changed here).
+struct LocationRow: View {
+  let title: String
+  let url: URL
+  var change: (() -> Void)?
+  var body: some View {
+    HStack(spacing: 10) {
+      Image(systemName: "externaldrive").foregroundStyle(Theme.secondary)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(title).font(.system(size: 12, weight: .medium))
+        Text(url.path).font(.system(size: 11)).foregroundStyle(Theme.secondary).lineLimit(1).truncationMode(.middle)
+      }
+      Spacer()
+      if let change { SecondaryButton(title: "Change…", action: change) }
+    }
   }
 }
 
@@ -368,8 +485,9 @@ struct InstallingPage: View {
           Text("\(Int(model.progress * 100)) %").font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
         }
         ProgressBar(value: model.progress)
-        Text("Copying about 8 GB takes a few minutes. Every file is checked against this build.")
-          .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+        Text(model.installingDisc2 ? "Copying about 3 GB takes a few minutes. Every content package is checked against this build."
+             : "Copying about 8 GB takes a few minutes. Every file is checked against this build.")
+          .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
       }
       DisclosureGroup(isExpanded: $details) { LogView(lines: model.log) } label: {
         Text("Details").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
@@ -422,7 +540,9 @@ struct FailedPage: View {
       HStack {
         SecondaryButton(title: "Show Files") { NSWorkspace.shared.open(model.paths.home) }
         Spacer()
-        PrimaryButton(title: "Try Again") { model.page = .disc }
+        if model.panel { SecondaryButton(title: "Back to the Game") { model.leavePanel(6) } }
+        else if model.installingDisc2 { SecondaryButton(title: "Play Without Disc 2") { model.page = .launcher } }
+        PrimaryButton(title: "Try Again") { model.page = model.installingDisc2 ? .disc2 : .disc }
       }
     }
   }
@@ -475,6 +595,7 @@ struct LauncherPage: View {
       HStack {
         SecondaryButton(title: "Logs") { model.openLogs() }
         SecondaryButton(title: "Read Me & Known Issues") { NSWorkspace.shared.open(model.paths.readme) }
+        if !model.hasDisc2 && !model.playing { SecondaryButton(title: "Add Disc 2…") { model.page = .disc2 } }
         Spacer()
         Text("Alpha · your saves are kept in your Library").font(.system(size: 11)).foregroundStyle(Theme.secondary)
       }

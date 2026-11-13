@@ -28,6 +28,21 @@ std::atomic<uint32_t> callback{0}, userData{0};
 std::atomic<uint64_t> vblanks{0}, delivered{0};
 bool started = false;
 
+// FM4 Recomp (FM4_UNLOCKED_FPS, graphics.h): the early-vblank request, its minimum interval, and how many vblanks came early.
+std::mutex vblankLock;
+std::condition_variable vblankWake;
+bool earlyVblank = false;
+std::atomic<uint64_t> earlyVblanks{0};
+std::chrono::nanoseconds UnlockedMinInterval()
+{
+    static const std::chrono::nanoseconds interval = [] {
+        const char* v = std::getenv("FM4_UNLOCKED_FPS_MIN_US");
+        const unsigned long us = v != nullptr ? std::strtoul(v, nullptr, 10) : 8333;
+        return std::chrono::microseconds(us >= 1000 && us <= 16667 ? us : 8333);
+    }();
+    return interval;
+}
+
 // FM4 Recomp (diagnostic, FM4_DIAG_INTERRUPTS=1): how long each queued interrupt waits before its callback starts and how long the
 // guest callback runs, by source, summed and reported every 300 PM4 interrupts. FM4's callback acknowledges a PM4 interrupt
 // itself (it clears its CPU's bit in the word the command stream's WAIT_REG_MEM polls), so these are the guest side of a drain.
@@ -97,13 +112,30 @@ void SetInterruptCallback(uint8_t* base, uint32_t routine, uint32_t data)
     started = true;
     StartServiceThread(base, 2, [base](PPCContext& ctx) { ServeInterrupts(base, ctx); });
     std::thread([] {
+        using clock = std::chrono::steady_clock;
         constexpr auto period = std::chrono::nanoseconds(1000000000 / 60);
-        auto next = std::chrono::steady_clock::now() + period;
+        auto next = clock::now() + period, last = clock::now();
         for (;;)
         {
-            std::this_thread::sleep_until(next);
-            next += period;
+            if (!UnlockedFrameRate())
+                std::this_thread::sleep_until(next), next += period;
+            else  // FM4_UNLOCKED_FPS: the 60 Hz deadline, or an early request once the minimum interval since the last vblank passed
+            {
+                std::unique_lock g(vblankLock);
+                vblankWake.wait_until(g, next, [] { return earlyVblank; });
+                auto now = clock::now();
+                if (now < next && now < last + UnlockedMinInterval())
+                    vblankWake.wait_until(g, std::min(next, last + UnlockedMinInterval()), [] { return false; }), now = clock::now();
+                const bool early = now < next;
+                earlyVblank = false;
+                if (early)
+                    earlyVblanks++;
+                next = now + period, last = now;
+            }
             vblanks++;
+            if (UnlockedFrameRate() && vblanks % 600 == 0)
+                std::fprintf(stderr, "[vblank] %llu vblanks, %llu early (FM4_UNLOCKED_FPS)\n", (unsigned long long)vblanks.load(),
+                             (unsigned long long)earlyVblanks.load());
             std::lock_guard g(interruptLock);
             if (std::find(pending.begin(), pending.end(), 0u) == pending.end())
             {
@@ -136,6 +168,30 @@ void RequestInterrupt(uint32_t source, bool wait, void (*poll)())
 }
 
 uint64_t VblankCount() { return vblanks.load(); }
+
+bool UnlockedFrameRate()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_UNLOCKED_FPS");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] unlocked frame rate on (FM4_UNLOCKED_FPS=1): a swap waiting for its vblank gets it at once, at most every %lld us\n",
+                         (long long)std::chrono::duration_cast<std::chrono::microseconds>(UnlockedMinInterval()).count());
+        return enabled;
+    }();
+    return on;
+}
+
+void RequestEarlyVblank()
+{
+    if (!UnlockedFrameRate())
+        return;
+    std::lock_guard g(vblankLock);
+    earlyVblank = true;
+    vblankWake.notify_one();
+}
+
+uint64_t EarlyVblanks() { return earlyVblanks.load(); }
 uint64_t InterruptsDelivered() { return delivered.load(); }
 
 void InitializeRegisters(uint8_t* base)

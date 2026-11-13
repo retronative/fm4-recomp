@@ -39,6 +39,9 @@ namespace runtime { uint32_t ArmedTimerCountForTests(); }  // kernel/imports_tim
 #include "kernel/objects.h"
 #include "kernel/threads.h"
 #include <atomic>
+#include <functional>
+#include <TinySHA1.hpp>
+#include "kernel/disc_swap.h"
 #include <pthread.h>
 #include <sys/mman.h>
 #include <chrono>
@@ -54,6 +57,7 @@ void PpcMmioStore32(uint8_t* base, uint32_t address, uint32_t value);
 #include "stops.h"
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
@@ -110,6 +114,22 @@ PPC_EXTERN_FUNC(PpcRuntime_restore_context);
 namespace {
 
 int failures = 0;
+
+// FM4 Recomp (Disc 2): a disc-setup host the tests drive (kernel/disc_swap.h Host): the panel's outcome scripted, calls recorded.
+struct FakeDiscHost final : runtime::disc::Host
+{
+    bool inlineResult = true;                        // false: keep `pending` for the test to call
+    runtime::disc::InstallResult result;
+    std::function<void(runtime::disc::InstallResult)> pending;
+    std::vector<std::string> problems;               // OpenPanel's `problem`, per opening
+    int closes = 0;
+    void OpenPanel(uint32_t, const std::string&, const std::string& problem, std::function<void(runtime::disc::InstallResult)> done) override
+    {
+        problems.push_back(problem);
+        if (inlineResult) done(result); else pending = std::move(done);
+    }
+    void ClosePanel() override { closes++; }
+};
 
 void Expect(bool ok, const char* name)
 {
@@ -1748,6 +1768,19 @@ int main(int, char** argv)
             be32At(0x2000 + 1 * 0x18 + 0x14, 2), be32At(0x2000 + 2 * 0x18 + 0x14, 0xFFFFFF), be32At(0x2000 + 3 * 0x18 + 0x14, 0xFFFFFF);
             for (size_t i = 0; i < 5000; i++) pkg[(i < 4096 ? 0x4000 + i : 0x5000 + i - 4096)] = char('a' + i % 26);
             pkg.replace(0x6000, 3, "xyz");
+            // FM4 Recomp (Disc 2): its SHA-1 hash tree (stfs.h; Velocity 1690428a StfsPackage.cpp HashBlock/Rehash facts):
+            // data block n (at 2000 + (n + 1) * 1000) hashed over all 0x1000 bytes into the level-0 entry
+            // at 2000 + n * 0x18; the level-0 table (2000..3000; 4 blocks: top level 0) hashed into the descriptor at 379 + 8.
+            auto sha1At = [&](size_t from, size_t to) {
+                sha1::SHA1 h;
+                h.processBytes(pkg.data() + from, 0x1000);
+                uint8_t digest[20];
+                h.finalize(digest);
+                pkg.replace(to, 20, reinterpret_cast<const char*>(digest), 20);
+            };
+            for (size_t n = 0; n < 4; n++)
+                sha1At(0x2000 + (n + 1) * 0x1000, 0x2000 + n * 0x18);
+            sha1At(0x2000, 0x379 + 8);
             std::ofstream(disc + "/Pkg.xmplr", std::ios::binary) << pkg;
         }
         // Its disc map (survey/gdfx.py's format: path, sector, size, attributes in hex): Media is a directory (0x90) of
@@ -2027,7 +2060,10 @@ int main(int, char** argv)
                "NtReadFile: 2 bytes at 4998, then END_OF_FILE {C0000011, 0}; zero length succeeds; no file INVALID_HANDLE");
         // Asynchronous (Xenia xboxkrnl_io.cc:184-262): a file opened without FILE_SYNCHRONOUS_IO_*, an event: the read
         // completes at once, io status {0, 4}, the event set, PENDING (0x103); at the end: END_OF_FILE, event set;
-        // no offset stops (7); an event handle that is no event INVALID_HANDLE; an APC stops (7).
+        // an event handle that is no event INVALID_HANDLE; an APC stops (7). The file keeps a position as Xenia's
+        // XFile::Read (xfile.cc:94-158 at 67f16c4): 0 at the open, + 4 after the read at 26 (Xenia adds the bytes
+        // whatever the offset), unchanged by END_OF_FILE; no offset reads at 4 -> 'E' (4 % 26), position 8; -1 at
+        // 8 -> 'I', position 12; each PENDING.
         const uint32_t asyncHandle = create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x40) == 0 ? be32(fileOut) : 0;
         const uint32_t eventHandle = CreateObject(ObjectType::Event, ArenaAlloc(base, 16), "");
         const uint32_t eventBody = LookupHandle(eventHandle)->header;
@@ -2036,9 +2072,23 @@ int main(int, char** argv)
                              be32(ioStatus + 4) == 4 && be32(eventBody + 4) == 1;
         Store32(base, eventBody + 4, 0);
         const bool atEnd = readFile(asyncHandle, 4, 5000, eventHandle) == 0xC0000011 && be32(eventBody + 4) == 1;
-        Expect(asyncHandle && pending && atEnd && readFile(openHandle, 4, 0, openHandle) == 0xC0000008 &&
-                   ExitCodeOf([&] { (void)readFile(asyncHandle, 4, -2); }) == int(StopCode::Unimplemented),
-               "NtReadFile asynchronous: completes at once, {0, 4}, event set, PENDING; END_OF_FILE at the end; a non-event INVALID_HANDLE; no offset stops (7)");
+        auto asyncPosition = [&] { return FindOpenFile(LookupHandle(asyncHandle)->header)->position; };
+        const bool afterExplicit = asyncPosition() == 4;
+        const bool noOffset = readFile(asyncHandle, 4, -2) == 0x103 && base[readBuffer] == 'E' && be32(ioStatus + 4) == 4 && asyncPosition() == 8 &&
+                              readFile(asyncHandle, 4, -1) == 0x103 && base[readBuffer] == 'I' && asyncPosition() == 12;
+        // The file object is itself waitable (Xenia xfile.cc:27-32, 185 at 67f16c4: an auto-reset event, not signalled at the
+        // open, set by each completed read): reset, not signalled (a zero wait times out); a read without an event sets it; one
+        // wait takes it and resets it (a second times out). FM4's ReadFile without an OVERLAPPED waits on the handle so.
+        const uint32_t fileHeader = LookupHandle(asyncHandle)->header;
+        const int64_t now = 0;
+        Store32(base, fileHeader + dispatch::kSignalState, 0);
+        const bool unsignalled = base[fileHeader] == dispatch::kSynchronizationEvent && !WaitForObject(base, fileHeader, &now, 0);
+        const bool fileSignalled = readFile(asyncHandle, 4, 0) == 0x103 && WaitForObject(base, fileHeader, &now, 0) &&
+                                   !WaitForObject(base, fileHeader, &now, 0);
+        Expect(unsignalled && fileSignalled, "file object: an auto-reset event (Xenia), not signalled until a read completes; one wait takes it");
+        Expect(asyncHandle && pending && atEnd && afterExplicit && noOffset && readFile(openHandle, 4, 0, openHandle) == 0xC0000008,
+               "NtReadFile asynchronous: completes at once, {0, 4}, event set, PENDING; END_OF_FILE at the end; a non-event INVALID_HANDLE; "
+               "without an offset at the file's position (Xenia), which advances by the bytes");
         PPCContext withApc{};
         withApc.r3.u32 = openHandle, withApc.r5.u32 = 0x40001000, withApc.r7.u32 = ioStatus, withApc.r8.u32 = readBuffer, withApc.r9.u32 = 4;
         Expect(ExitCodeOf([&] { imp("NtReadFile")(withApc, base); }) == int(StopCode::Unimplemented), "NtReadFile with an APC routine stops (7)");
@@ -2119,6 +2169,43 @@ int main(int, char** argv)
                        ExitCodeOf([&] { (void)load("game:\\Media\\Cars.bin"); }) == int(StopCode::Setup) &&
                        StderrOf([&] { (void)load("game:\\Media\\Cars.bin"); }).find("is not the file badcrc was translated from") != std::string::npos,
                    "XexLoadImage: not on the disc NO_SUCH_FILE, handle 0; an untranslated file stops (7); a file whose CRC differs stops (9)");
+            {
+                // FM4 Recomp (alpha): XexUnloadImage (Xenia xboxkrnl_modules.cc:139, kernel_state.cc UnloadUserModule). The
+                // module's load count is 2 here: the first unload leaves 1 and no DllMain; the second leaves 0 and runs DllMain(entry,
+                // DLL_PROCESS_DETACH 0, 0) once; then XexGetModuleHandle does not find it (0x490), a third unload is STATUS_INVALID_HANDLE,
+                // and a reload stops (7). A system module (xboxkrnl.exe) unloads as a no-op success.
+                auto unload = [&](uint32_t h) {
+                    PPCContext c{};
+                    c.r3.u32 = h;
+                    imp("XexUnloadImage")(c, base);
+                    return c.r3.u32;
+                };
+                const uint32_t callsBefore = dllMainCalls;
+                Expect(unload(ldr) == 0 && base[ldr + 0x41] == 1 && dllMainCalls == callsBefore, "XexUnloadImage: count 2 -> 1, no DllMain");
+                Expect(unload(ldr) == 0 && base[ldr + 0x41] == 0 && dllMainCalls == callsBefore + 1 && dllMainArgs[0] == ldr && dllMainArgs[1] == 0 &&
+                           dllMainArgs[2] == 0,
+                       "XexUnloadImage: count 1 -> 0, DllMain(loader entry, PROCESS_DETACH 0, 0) once");
+                PPCContext gone{};
+                gone.r3.u32 = guestString("mod.xex"), gone.r4.u32 = handleOut;
+                imp("XexGetModuleHandle")(gone, base);
+                Expect(gone.r3.u64 == 0x490 && be32(handleOut) == 0 && unload(ldr) == 0xC0000008,
+                       "an unloaded module: XexGetModuleHandle not found (0x490, 0); a further unload STATUS_INVALID_HANDLE");
+                // FM4 Recomp (alpha): a reload restores the module (Xenia maps it afresh): the writable image byte at
+                // 94000005 (i * 7 = 35, changed to 0x77 while unloaded) is 35 again, the function slot 94000100 holds its thunk again
+                // (cleared while unloaded), DllMain runs with (entry, PROCESS_ATTACH 1, 0), the count is 1 and the handle is found again.
+                base[0x94000005u] = 0x77;
+                Store32(base, 0x94000100u, 0);
+                const uint32_t callsUnloaded = dllMainCalls;
+                Expect(load("MOD") == 0 && be32(handleOut) == ldr && dllMainCalls == callsUnloaded + 1 && dllMainArgs[0] == ldr && dllMainArgs[1] == 1 &&
+                           base[ldr + 0x41] == 1 && base[0x94000005u] == uint8_t(35) && be32(0x94000100u) == 0x94010010u,
+                       "XexLoadImage after XexUnloadImage: data and import slots restored, DllMain(entry, PROCESS_ATTACH), load count 1");
+                PPCContext back{};
+                back.r3.u32 = guestString("mod.xex"), back.r4.u32 = handleOut;
+                imp("XexGetModuleHandle")(back, base);
+                Expect(back.r3.u64 == 0 && be32(handleOut) == ldr, "the reloaded module is found again by XexGetModuleHandle");
+                Expect(unload(ldr) == 0 && base[ldr + 0x41] == 0 && dllMainArgs[1] == 0, "CONTROL: it unloads again (DETACH)");
+                Expect(unload(0x12345678) == 0xC0000008, "XexUnloadImage of a handle that is no module: STATUS_INVALID_HANDLE");
+            }
             ModuleImage outside = images[0];
             outside.base = 0x70000000u;
             ModuleImage unaligned = images[0];
@@ -2190,11 +2277,13 @@ int main(int, char** argv)
         unlink((disc + "/Media/Extra.bin").c_str());
         // Saved content (kernel/content.h; Xenia xam_content.cc:72, xam_enum.cc:30): a fresh user-data directory has no saved
         // games: the enumerator (buffer size 5 x 0x134 = 0x604) gives ERROR_NO_MORE_FILES (0x12) and 0 items; a stored record
-        // (as a creation leaves it) is listed with its bytes; device 2 is E_INVALIDARG (buffer size 0); type 2 stops (7).
+        // (as a creation leaves it) is listed with its bytes; device 3 (neither the content device nor the disc's, 2) is
+        // E_INVALIDARG (buffer size 0); type 3 stops (7).
         {
             const std::string user = disc + "/../user-data";
             mkdir(user.c_str(), 0755);
-            unlink((user + "/content/1/00000001/save0001.xcontent").c_str());  // a failed run keeps its work folder
+            for (const char* kept : {"save0001", "created1", "created2"})  // a failed run keeps its work folder
+                unlink((user + "/content/1/00000001/" + kept + ".xcontent").c_str());
             MountUserData(user);
             const uint32_t sizeOut = ArenaAlloc(base, 4), enumOut = ArenaAlloc(base, 4), items = ArenaAlloc(base, 0x200), got = ArenaAlloc(base, 4);
             auto create = [&](uint32_t device, uint32_t type) {
@@ -2221,10 +2310,10 @@ int main(int, char** argv)
             // Marketplace content (type 2, Xenia xbox.h:357): the user-data store holds none: NO_MORE_FILES, 0 items; the saved
             // record above is not listed under it (per-type directories). Type 3 (publisher) still stops (7).
             const bool market = create(0, 2) == 0 && be32(sizeOut) == 0x604 && enumerate() == 0x12 && be32(got) == 0;
-            Expect(empty && listed && market && create(2, 1) == ((1u << 31) | (7u << 16) | 0x57) && be32(sizeOut) == 0 &&
+            Expect(empty && listed && market && create(3, 1) == ((1u << 31) | (7u << 16) | 0x57) && be32(sizeOut) == 0 &&
                        ExitCodeOf([&] { (void)create(0, 3); }) == int(StopCode::Unimplemented),
                    "saved content: empty at first (NO_MORE_FILES); a stored record is enumerated once; marketplace content (type 2) "
-                   "is the empty list; device 2 E_INVALIDARG; type 3 stops (7)");
+                   "is the empty list; device 3 E_INVALIDARG; type 3 stops (7)");
             // XamContentCreateEx(user, root, XCONTENT_DATA*, flags, disposition*, license*, cache, size, XOVERLAPPED* (stack
             // +0x54)) (Xenia xam_content.cc:124-243): FM4's OPEN_EXISTING (flags 0x813, & 0xF = 3) of a saved game that is not
             // stored: PATH_NOT_FOUND (3); with an XOVERLAPPED: IO_PENDING (0x3E5), completion {FUNCTION_FAILED 0x65B, length 0,
@@ -2249,20 +2338,21 @@ int main(int, char** argv)
                                      be32(ov + 0x18) == (1u << 31 | 0x70003) && be32(disposition) == 0;
             mkdir((typeDir + "/save0001").c_str(), 0755);
             const bool stops = ExitCodeOf([&] { (void)contentCreate("absent01", 0x812, false); }) == int(StopCode::Unimplemented) &&
-                               ExitCodeOf([&] { (void)contentCreate("absent01", 0x813, false, 2); }) == int(StopCode::Unimplemented) &&
+                               contentCreate("absent01", 0x813, false, 2) == 3 &&  // FM4 Recomp (Disc 2): an absent installed package: PATH_NOT_FOUND
                                ExitCodeOf([&] { (void)contentCreate("..", 0x813, false); }) == int(StopCode::Unimplemented) &&
                                ExitCodeOf([&] { (void)contentCreate("a/b", 0x813, false); }) == int(StopCode::Unimplemented);
             rmdir((typeDir + "/save0001").c_str());
             Expect(absentSync && absentAsync && stops,
                    "XamContentCreateEx(OPEN_EXISTING, absent saved game): PATH_NOT_FOUND, or IO_PENDING with {FUNCTION_FAILED, 0, 80070003}; "
-                   "CREATE_ALWAYS, type 2, \"..\" and \"a/b\" stop (7)");
+                   "an absent installed package (type 2) PATH_NOT_FOUND; CREATE_ALWAYS, \"..\" and \"a/b\" stop (7)");
             // CREATE_NEW (flags 0x811) of an absent item (Xenia content_manager.cc:215-239): with an XOVERLAPPED IO_PENDING and
             // {0, extended 0, length 1 (created)}; its directory and its record (the 0x134 bytes as passed) exist; "save:\\" is
             // a writable root directory (0x10) until XamContentClose. Again: ALREADY_EXISTS (0xB7). A root name already open:
             // ALREADY_EXISTS and nothing created.
             auto cleanItem = [&](const char* name) {
                 unlink((typeDir + "/" + name + ".xcontent").c_str());
-                rmdir((typeDir + "/" + name).c_str());
+                std::error_code ignored;  // a failed run keeps the item with its files
+                std::filesystem::remove_all(typeDir + "/" + name, ignored);
             };
             auto closeRoot = [&](const char* root) {
                 PPCContext c{};
@@ -2315,8 +2405,8 @@ int main(int, char** argv)
                    "missing file or parent NO_SUCH_FILE (5); a directory is created; OVERWRITE_IF empties (3)");
             // NtWriteFile(handle, event, APC, APC context, io status*, buffer*, length, offset*) (Xenia xboxkrnl_io.cc:354): on the
             // synchronous handle just opened: "hello" at the position (0) -> io {0, 5}; "XY" at offset 1 -> "hXYlo", position
-            // 1 + 2 = 3; "!" at the position -> "hXY!o". A write ending past the 512 MB quota (offset 0x2000_0000) DISK_FULL
-            // (C000007F), io {status, 0}, the file unchanged; a bad handle INVALID_HANDLE (C0000008); a disc file stops (7).
+            // 1 + 2 = 3; "!" at the position -> "hXY!o". A write ending past the 20 GB device (offset kContentCapacity: more than
+            // any free space, content.h) DISK_FULL (C000007F), io {status, 0}, the file unchanged; a bad handle INVALID_HANDLE (C0000008); a disc file stops (7).
             {
                 const uint32_t h = be32(fileOut), wbuf = ArenaAlloc(base, 8), woff = ArenaAlloc(base, 8);
                 auto write = [&](uint32_t handle, const char* text, int64_t offset) {
@@ -2335,8 +2425,24 @@ int main(int, char** argv)
                 const bool first = write(h, "hello", -1) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 5 && hostText() == "hello";
                 const bool atOffset = write(h, "XY", 1) == 0 && hostText() == "hXYlo";
                 const bool atPosition = write(h, "!", -1) == 0 && hostText() == "hXY!o";
-                const bool full = write(h, "z", 0x20000000) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 0 && hostText() == "hXY!o";
+                const bool full = write(h, "z", int64_t(kContentCapacity)) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 0 && hostText() == "hXY!o";
                 const bool badHandle = write(0x12345678, "z", -1) == 0xC0000008 && be32(ioStatus) == 0xC0000008;
+                // An asynchronous file (no FILE_SYNCHRONOUS_IO_*; Xenia XFile::Write, xfile.cc:236-246 at 67f16c4): "ab" and "cd"
+                // without an offset go to the position (0, then 2) -> "abcd", each PENDING (0x103) with io {0, 2}.
+                const bool asyncMade = ntCreate("save:\\Async", kReadWrite, 2, 0x40) == 0;
+                const uint32_t asyncWrite = be32(fileOut);
+                const bool asyncFirst = asyncMade && write(asyncWrite, "ab", -1) == 0x103 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 2;
+                const bool asyncSecond = asyncFirst && write(asyncWrite, "cd", -1) == 0x103;
+                std::ifstream asyncIn(itemDir + "/Async", std::ios::binary);
+                const bool asyncWritten = asyncSecond && std::string((std::istreambuf_iterator<char>(asyncIn)), std::istreambuf_iterator<char>()) == "abcd";
+                const int64_t noWait = 0;
+                const uint32_t writeHeader = asyncMade ? LookupHandle(asyncWrite)->header : 0;
+                Store32(base, writeHeader + dispatch::kSignalState, 0);
+                const bool writeSignals = asyncMade && write(asyncWrite, "e", -1) == 0x103 && WaitForObject(base, writeHeader, &noWait, 0) &&
+                                          !WaitForObject(base, writeHeader, &noWait, 0);
+                unlink((itemDir + "/Async").c_str());
+                Expect(asyncWritten && writeSignals, "NtWriteFile asynchronous: without an offset at the file's position (Xenia), \"ab\" then \"cd\" -> \"abcd\", PENDING; "
+                       "a completed write signals the file object (Xenia xfile.cc:305)");
                 const bool discOpened = ntCreate("game:\\Media\\Cars.bin", kReadAccess, 1, 0x60) == 0;
                 const uint32_t discHandle = be32(fileOut);
                 // NtFlushBuffersFile(handle, io status*) (Xenia xboxkrnl_io.cc:590): success, io {0, 0}, for the written file and
@@ -2353,10 +2459,10 @@ int main(int, char** argv)
                        "NtFlushBuffersFile: success with io {0, 0} for a written and a read-only file; a non-file handle stops (7)");
                 Expect(first && atOffset && atPosition && full && badHandle && discOpened &&
                            ExitCodeOf([&] { (void)write(discHandle, "z", 0); }) == int(StopCode::Unimplemented),
-                       "NtWriteFile: at the position, at an offset (the position follows), quota DISK_FULL with nothing written, "
+                       "NtWriteFile: at the position, at an offset (the position follows), past the free space DISK_FULL with nothing written, "
                        "bad handle INVALID_HANDLE, a disc file stops (7)");
                 // NtSetInformationFile FileEndOfFileInformation (20) (Xenia xboxkrnl_io_info.cc:227-231, XFile::SetLength): the
-                // file "hXY!o" set to 3 bytes -> "hXY", then to 6 -> "hXY" + 3 zeros, io {0, 8}; past the quota DISK_FULL with
+                // file "hXY!o" set to 3 bytes -> "hXY", then to 6 -> "hXY" + 3 zeros, io {0, 8}; past the free space DISK_FULL with
                 // io {C000007F, 8} and nothing changed; 7 bytes INFO_LENGTH_MISMATCH; a disc file stops (7).
                 const uint32_t eof = ArenaAlloc(base, 8);
                 auto setLength = [&](uint32_t handle, uint64_t length, uint32_t infoLength = 8) {
@@ -2369,7 +2475,7 @@ int main(int, char** argv)
                 };
                 const bool cut = setLength(h, 3) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 8 && hostText() == "hXY";
                 const bool grown = setLength(h, 6) == 0 && hostText() == std::string("hXY\0\0\0", 6);
-                const bool tooBig = setLength(h, 0x20000000) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 8 &&
+                const bool tooBig = setLength(h, kContentCapacity) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 8 &&
                                     hostText() == std::string("hXY\0\0\0", 6);
                 // FileAllocationInformation (19) (Xenia :222-226, ignored): 6 or 64 bytes on the 6-byte file: success {0, 8}, the
                 // file unchanged; 2 bytes (below its size; NT would cut it) stops (7).
@@ -2410,7 +2516,7 @@ int main(int, char** argv)
                        "0 bytes INFO_LENGTH_MISMATCH; a disc file stops (7)");
                 Expect(cut && grown && tooBig && setLength(h, 3, 7) == 0xC0000004 &&
                            ExitCodeOf([&] { (void)setLength(discHandle, 1); }) == int(StopCode::Unimplemented),
-                       "NtSetInformationFile(end of file): cut and zero-extended on the host, io {0, 8}; past the quota DISK_FULL, "
+                       "NtSetInformationFile(end of file): cut and zero-extended on the host, io {0, 8}; past the free space DISK_FULL, "
                        "unchanged; 7 bytes INFO_LENGTH_MISMATCH; a disc file stops (7)");
             }
             {
@@ -2458,23 +2564,26 @@ int main(int, char** argv)
                 Expect(opened && busy && reclosed, "XamContentCreateEx(OPEN_EXISTING, stored saved game): opened and mounted writable "
                                                    "(IO_PENDING, {0, length 2 open}, license 0; its files there); a busy root ALREADY_EXISTS");
             }
-            // XamContentGetDeviceData(id, data*) (Xenia xam_content_device.cc:113): device 1: {1, HDD 1, total 512 MB = 0x2000_0000,
-            // free = total - stored bytes, "Dummy HDD" UTF-16BE}; the stored record above (0x134 bytes) is counted; device 2
-            // DEVICE_NOT_CONNECTED (0x48F) with nothing written.
+            // XamContentGetDeviceData(id, data*) (Xenia xam_content_device.cc:113): device 1: {1, HDD 1, total 20 GB = 0x5_0000_0000
+            // (Xenia :33-40), free = ContentFreeBytes (at most total - stored bytes), "Dummy HDD" UTF-16BE}; the stored record above
+            // (0x134 bytes) is counted; device 3
+            // DEVICE_NOT_CONNECTED (0x48F) with nothing written; the disc's content device (2) stops (7), not modelled.
             {
                 const uint32_t deviceData = ArenaAlloc(base, 0x50);
                 for (uint32_t i = 0; i < 0x50; i += 4) Store32(base, deviceData + i, 0xAAAAAAAA);
                 auto deviceDataOf = [&](uint32_t id) { PPCContext c{}; c.r3.u32 = id, c.r4.u32 = deviceData; imp("XamContentGetDeviceData")(c, base); return c.r3.u32; };
-                const bool other = deviceDataOf(2) == 0x48F && be32(deviceData) == 0xAAAAAAAA;
+                const bool other = deviceDataOf(3) == 0x48F && be32(deviceData) == 0xAAAAAAAA &&
+                                   ExitCodeOf([&] { (void)deviceDataOf(2); }) == int(StopCode::Unimplemented);
                 const uint64_t used = ContentBytesUsed();
-                const bool ok = deviceDataOf(1) == 0 && be32(deviceData) == 1 && be32(deviceData + 4) == 1 && be64(deviceData + 8) == 0x20000000ull &&
-                                be64(deviceData + 16) == 0x20000000ull - used && used >= 0x134 && base[deviceData + 24] == 0 && base[deviceData + 25] == 'D' &&
+                const bool ok = deviceDataOf(1) == 0 && be32(deviceData) == 1 && be32(deviceData + 4) == 1 && be64(deviceData + 8) == 0x500000000ull &&
+                                be64(deviceData + 16) <= 0x500000000ull - used && be64(deviceData + 16) + (uint64_t(64) << 20) >= ContentFreeBytes() &&
+                                used >= 0x134 && base[deviceData + 24] == 0 && base[deviceData + 25] == 'D' &&
                                 base[deviceData + 24 + 2 * 8 + 1] == 'D' && be32(deviceData + 24 + 2 * 9) == 0 && be32(deviceData + 0x4C) == 0;
-                Expect(other && ok, "XamContentGetDeviceData: device 1 {1, HDD, 512 MB total, quota minus stored free, \"Dummy HDD\"}; device 2 DEVICE_NOT_CONNECTED");
+                Expect(other && ok, "XamContentGetDeviceData: device 1 {1, HDD, 20 GB total, free within the device and the host, \"Dummy HDD\"}; device 3 DEVICE_NOT_CONNECTED; device 2 stops (7)");
             }
-            // XamContentGetDeviceState(id, XOVERLAPPED*) (Xenia xam_content_device.cc:78-99): device 1 present, 0; device 2
+            // XamContentGetDeviceState(id, XOVERLAPPED*) (Xenia xam_content_device.cc:78-99): device 1 present, 0; device 3
             // DEVICE_NOT_CONNECTED (0x48F). With an XOVERLAPPED: ERROR_IO_PENDING (0x3E5), result 0 / extended 0 for device 1,
-            // result FUNCTION_FAILED (0x65B) / extended 0x48F for device 2, length 0.
+            // result FUNCTION_FAILED (0x65B) / extended 0x48F for device 3, length 0. The disc's content device (2) stops (7).
             {
                 const uint32_t ov = ArenaAlloc(base, 0x1C);
                 auto state = [&](uint32_t id, uint32_t overlapped) {
@@ -2484,10 +2593,10 @@ int main(int, char** argv)
                     imp("XamContentGetDeviceState")(c, base);
                     return c.r3.u32;
                 };
-                const bool sync = state(1, 0) == 0 && state(2, 0) == 0x48F;
+                const bool sync = state(1, 0) == 0 && state(3, 0) == 0x48F && ExitCodeOf([&] { (void)state(2, 0); }) == int(StopCode::Unimplemented);
                 const bool asyncOk = state(1, ov) == 0x3E5 && be32(ov) == 0 && be32(ov + 4) == 0 && be32(ov + 0x18) == 0;
-                const bool asyncNo = state(2, ov) == 0x3E5 && be32(ov) == 0x65B && be32(ov + 4) == 0 && be32(ov + 0x18) == 0x48F;
-                Expect(sync && asyncOk && asyncNo, "XamContentGetDeviceState: device 1 present (0), device 2 DEVICE_NOT_CONNECTED; with an "
+                const bool asyncNo = state(3, ov) == 0x3E5 && be32(ov) == 0x65B && be32(ov + 4) == 0 && be32(ov + 0x18) == 0x48F;
+                Expect(sync && asyncOk && asyncNo, "XamContentGetDeviceState: device 1 present (0), device 3 DEVICE_NOT_CONNECTED, device 2 stops; with an "
                                                    "XOVERLAPPED: IO_PENDING, completed {0, 0} or {FUNCTION_FAILED, extended 0x48F}, length 0");
             }
             {
@@ -2525,6 +2634,457 @@ int main(int, char** argv)
                    StderrOf([&] { (void)query("game:\\Link"); }).find("on the disc is a symlink or unreadable") != std::string::npos,
                "a symlink on the disc stops (9), named as a symlink");
         unlink((disc + "/Link").c_str());
+        {
+            // FM4 Recomp (Disc 2): XamSwapDisc(disc, KEVENT*, X_SWAPDISC_ERROR_MESSAGE* {title*, text*, button*})
+            // (Xenia xam_content.cc:433-487) over a synthetic Disc 2 beside Disc 1: default.xex (an XEX2 header, Xenia
+            // xex2_info.h:555-564: count 1 at +0x14, {00040006, 0x30} at +0x18; execution info at 0x30: media id 22222222,
+            // title id 4D530910 at +0xC, disc 2 of 2 at +0x12/+0x13), Media/Only2.txt ("two"), and under
+            // Content/0000000000000000: 4D53084D/00000002/4D53084D00000009 ("abc", another title), 4D530910/00000002/
+            // 4D53091000000001 (Pkg.xmplr's 0x7000 bytes) and 4D530910/00000002/README (not 16 characters: never listed; Xenia
+            // AddODDContentTest's "????????????????"). The executable: execution info (media id 11111111, title 4D530910, disc
+            // 1 of 2) and multidisc media ids at +0x60 {size 0x24, two 16-byte entries ending 11111111 and 22222222}.
+            const std::string disc2 = disc + "/../disc2", type2 = disc2 + "/Content/0000000000000000/4D530910/00000002",
+                              other2 = disc2 + "/Content/0000000000000000/4D53084D/00000002";
+            for (const std::string& d : {disc2, disc2 + "/Media", disc2 + "/Content", disc2 + "/Content/0000000000000000",
+                                         disc2 + "/Content/0000000000000000/4D53084D", other2, disc2 + "/Content/0000000000000000/4D530910", type2})
+                mkdir(d.c_str(), 0755);
+            unlink((UserDataRoot() + "/content/1/00000002/4D53091000000001").c_str());  // an installed copy a failed run kept (below)
+            {
+                // Pkg.xmplr's bytes as a marketplace package (FM4 Recomp, Disc 2): content type 2 at 0x344 and the display name
+                // "Car Pack" (UTF-16BE at 0x411), both header bytes outside the hash tree.
+                std::ifstream in(disc + "/Pkg.xmplr", std::ios::binary);
+                std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                bytes[0x344] = 0, bytes[0x345] = 0, bytes[0x346] = 0, bytes[0x347] = 2;
+                const char* name = "Car Pack";
+                for (size_t i = 0; i < std::strlen(name); i++)
+                    bytes[0x411 + 2 * i] = 0, bytes[0x411 + 2 * i + 1] = name[i];
+                std::ofstream(type2 + "/4D53091000000001", std::ios::binary) << bytes;
+            }
+            std::ofstream(type2 + "/README") << "readme";
+            std::ofstream(other2 + "/4D53084D00000009") << "abc";
+            std::ofstream(disc2 + "/Media/Only2.txt") << "two";
+            auto xexWith = [](uint32_t media, uint32_t title, uint8_t number) {
+                std::string x(0x48, '\0');
+                auto put = [&](size_t at, uint32_t v) { for (int i = 0; i < 4; i++) x[at + i] = char(v >> (24 - 8 * i)); };
+                x.replace(0, 4, "XEX2");
+                put(0x14, 1), put(0x18, 0x00040006), put(0x1C, 0x30), put(0x30, media), put(0x3C, title);
+                x[0x42] = char(number), x[0x43] = 2;
+                return x;
+            };
+            std::ofstream(disc2 + "/default.xex", std::ios::binary) << xexWith(0x22222222, 0x4D530910, 2);
+            const std::string disc2Map = disc + "/../disc2_map.tsv";
+            std::ofstream(disc2Map) << "default.xex\t10\t48\t80\nMedia\t11\t800\t90\nMedia/Only2.txt\t12\t3\t80\nContent\t13\t800\t90\n"
+                                       "Content/0000000000000000\t14\t800\t90\nContent/0000000000000000/4D53084D\t15\t800\t90\n"
+                                       "Content/0000000000000000/4D53084D/00000002\t16\t800\t90\n"
+                                       "Content/0000000000000000/4D53084D/00000002/4D53084D00000009\t17\t3\t80\n"
+                                       "Content/0000000000000000/4D530910\t18\t800\t90\nContent/0000000000000000/4D530910/00000002\t19\t800\t90\n"
+                                       "Content/0000000000000000/4D530910/00000002/4D53091000000001\t20\t7000\t80\n"
+                                       "Content/0000000000000000/4D530910/00000002/README\t30\t6\t80\n";
+            std::vector<uint8_t> exe(0x140, 0);
+            auto putExe = [&](uint32_t at, uint32_t v) { for (int i = 0; i < 4; i++) exe[at + i] = uint8_t(v >> (24 - 8 * i)); };
+            exe[0] = 'X', exe[1] = 'E', exe[2] = 'X', exe[3] = '2';
+            putExe(0x10, 0x100), putExe(0x104, 0x00F50000), putExe(0x14, 2), putExe(0x18, 0x00040006), putExe(0x1C, 0x40), putExe(0x20, 0x000406FF),
+                putExe(0x24, 0x60);
+            putExe(0x40, 0x11111111), putExe(0x4C, 0x4D530910), exe[0x52] = 1, exe[0x53] = 2;
+            putExe(0x60, 0x24), putExe(0x70, 0x11111111), putExe(0x80, 0x22222222);
+            SetExecutableModule(CreateModule(base, exe, 0x40000000, 0x40001000));
+
+            // The completion: a notification KEVENT (type 0, signal state +4); the message's text "Content Install Disc" (UTF-16BE).
+            const uint32_t swapEvent = ArenaAlloc(base, 16), semaphore = ArenaAlloc(base, 16), swapMessage = ArenaAlloc(base, 12),
+                           swapText = ArenaAlloc(base, 64);
+            base[swapEvent] = dispatch::kNotificationEvent, base[semaphore] = dispatch::kSemaphore;
+            const char* installText = "Content Install Disc";
+            for (size_t i = 0; i <= std::strlen(installText); i++)
+                base[swapText + 2 * i] = 0, base[swapText + 2 * i + 1] = uint8_t(installText[i]);
+            Store32(base, swapMessage, 0), Store32(base, swapMessage + 4, swapText), Store32(base, swapMessage + 8, 0);
+            auto swap = [&](uint32_t number, uint32_t event) {
+                Store32(base, swapEvent + dispatch::kSignalState, 0);
+                PPCContext c{};
+                c.r3.u32 = number, c.r4.u32 = event, c.r5.u32 = swapMessage;
+                imp("XamSwapDisc")(c, base);
+                return c.r3.u32;
+            };
+            const bool unset = StderrOf([&] { (void)swap(2, swapEvent); }).find("the game asks for Disc 2 (\"Content Install Disc\"); set it up") !=
+                                   std::string::npos &&
+                               ExitCodeOf([&] { (void)swap(2, swapEvent); }) == int(StopCode::Setup);
+            const bool badRequest = ExitCodeOf([&] { (void)swap(3, swapEvent); }) == int(StopCode::Unimplemented) &&
+                                    ExitCodeOf([&] { (void)swap(0, swapEvent); }) == int(StopCode::Unimplemented) &&
+                                    ExitCodeOf([&] { (void)swap(2, semaphore); }) == int(StopCode::Unimplemented) &&
+                                    ExitCodeOf([&] { (void)swap(2, swapEvent + 2); }) == int(StopCode::Unimplemented);
+            Expect(unset && badRequest, "XamSwapDisc: Disc 2 not set up stops (9) with the game's text and how to set it up; disc 3 or 0 (of 2), "
+                                        "or a completion that is no event, stops (7)");
+            // A disc not set up, set up from the game (kernel/disc_swap.h): the launcher's panel
+            // over the game, as a state machine on a fake host, then through XamSwapDisc / XamSwapCancel. Expected by the design
+            // (NOTES.md §9): nothing completes without a mounted disc; the game's cancel always sets the event; the panel opens on
+            // the main thread's Pump, never at the request; a panel left without the disc leaves the game waiting.
+            {
+                using runtime::disc::SwapService;
+                using State = SwapService::State;
+                int completed = 0, mounted = 0;
+                std::string mountProblem;
+                auto mount = [&](const runtime::disc::InstallResult&) { mounted++; return mountProblem; };
+                auto complete = [&] { completed++; };
+                const runtime::disc::InstallResult okResult{true, "/y/disc2", "/y/disc2.tsv", ""}, left{false, "", "", "cancelled"};
+                // 1. Left without the disc: Opening, then Open (one panel, no problem), then Waiting; the game's Back ends it.
+                FakeDiscHost h1;
+                h1.result = left;
+                SwapService s1(h1);
+                s1.Request(2, "Content Install Disc", mount, complete);
+                const bool opening = s1.Current() == State::Opening && h1.problems.empty();
+                s1.Pump();
+                const bool open = s1.Current() == State::Open && h1.problems == std::vector<std::string>{""};
+                s1.Pump();
+                const bool waiting = s1.Current() == State::Waiting && completed == 0 && mounted == 0;
+                s1.Pump();
+                const bool staysWaiting = s1.Current() == State::Waiting && h1.problems.size() == 1;
+                const bool cancelled = s1.Cancel() && s1.Current() == State::Idle && completed == 1 && h1.closes == 0 && !s1.Cancel();
+                // 2. Set up: mounted, then completed once.
+                FakeDiscHost h2;
+                h2.result = okResult;
+                SwapService s2(h2);
+                completed = mounted = 0;
+                s2.Request(2, "", mount, complete);
+                s2.Pump(), s2.Pump();
+                const bool succeeded = s2.Current() == State::Idle && mounted == 1 && completed == 1;
+                // 3. Set up, but the mount refuses it (identity): not completed; the panel again on the problem; then set up.
+                FakeDiscHost h3;
+                h3.result = okResult;
+                SwapService s3(h3);
+                completed = mounted = 0, mountProblem = "it is not Disc 2 of this game";
+                s3.Request(2, "", mount, complete);
+                s3.Pump(), s3.Pump();
+                const bool refused = s3.Current() == State::Opening && mounted == 1 && completed == 0;
+                mountProblem.clear();
+                s3.Pump(), s3.Pump();
+                const bool reopened = h3.problems == std::vector<std::string>{"", "Disc 2 was set up, but it is not Disc 2 of this game"} &&
+                                      s3.Current() == State::Idle && mounted == 2 && completed == 1;
+                // 4. The game cancels while the panel is open: closed, completed at once, its later result dropped unmounted.
+                FakeDiscHost h4;
+                h4.inlineResult = false;
+                SwapService s4(h4);
+                completed = mounted = 0;
+                s4.Request(2, "", mount, complete);
+                s4.Pump();
+                const bool cancelOpen = s4.Cancel() && h4.closes == 1 && completed == 1 && s4.Current() == State::Cancelling;
+                h4.pending(okResult);
+                s4.Pump();
+                const bool dropped = s4.Current() == State::Idle && mounted == 0 && completed == 1;
+                // 5. The game cancels before the panel opened: completed, no panel ever.
+                FakeDiscHost h5;
+                SwapService s5(h5);
+                completed = 0;
+                s5.Request(2, "", mount, complete);
+                const bool early = s5.Cancel() && completed == 1 && s5.Current() == State::Idle;
+                s5.Pump();
+                const bool noPanel = h5.problems.empty() && h5.closes == 0;
+                // 6. A second request while one is pending stops (7).
+                const bool second = ExitCodeOf([&] { s4.Request(2, "", mount, complete); s4.Request(2, "", mount, complete); }) == int(StopCode::Unimplemented);
+                Expect(opening && open && waiting && staysWaiting && cancelled && succeeded && refused && reopened && cancelOpen && dropped && early &&
+                           noPanel && second,
+                       "disc swap service: the panel opens at the next Pump; left without the disc Waiting (the game's cancel completes); set up "
+                       "completes once after the mount; a refused mount reopens the panel on the problem; a cancel closes the open panel, "
+                       "completes, drops its result; a cancel before it opened; two requests stop (7)");
+            }
+            {
+                // The data side's setup contract (setup.sh revision 2, locations.sh; NOTES.md §9.3), by hand: locations.conf
+                // key=value lines (comments, unknown keys and lines without '=' ignored; version 1; disc2_root and disc2_map at most
+                // once, both or neither, absolute); the result names and exit statuses ok 0 ... unsupported 8; a disagreement fails.
+                using runtime::disc::InterpretSetup;
+                using runtime::disc::ReadDisc2Location;
+                using runtime::disc::SetupRun;
+                const std::string conf = "# FM4 Recomp storage locations\nversion=1\ndata_root=/d\nfuture_key=x\nno equals here\n"
+                                         "disc2_root=/Volumes/Extreme SSD/disc2\ndisc2_map=/d/survey/disc2_gdfx.tsv\n";
+                std::string root, map, problem;
+                const bool read = ReadDisc2Location(conf, root, map, problem) && root == "/Volumes/Extreme SSD/disc2" && map == "/d/survey/disc2_gdfx.tsv";
+                const bool none = ReadDisc2Location("version=1\ndata_root=/d\n", root, map, problem) && root.empty() && map.empty();
+                const bool refused = !ReadDisc2Location(conf + "disc2_root=/x\n", root, map, problem) && problem.find("more than once") != std::string::npos &&
+                                     !ReadDisc2Location("disc2_root=/x\n", root, map, problem) && problem.find("only one") != std::string::npos &&
+                                     !ReadDisc2Location("disc2_root=x\ndisc2_map=/m\n", root, map, problem) &&
+                                     !ReadDisc2Location("version=2\ndisc2_root=/x\ndisc2_map=/m\n", root, map, problem);
+                const runtime::disc::InstallResult ok = InterpretSetup({0, "ok", "", conf});
+                const bool okRead = ok.ok && ok.root == "/Volumes/Extreme SSD/disc2" && ok.map == "/d/survey/disc2_gdfx.tsv";
+                const bool okWithoutRecord = !InterpretSetup({0, "ok", "", "version=1\n"}).ok;
+                auto says = [&](int status, const char* name, const char* words) {
+                    const runtime::disc::InstallResult r = InterpretSetup({status, name, "the detail", conf});
+                    return !r.ok && r.problem.find(words) != std::string::npos && r.problem.find("(the detail)") != std::string::npos;
+                };
+                const bool outcomes = says(3, "wrong-disc", "not Forza Motorsport 4 (USA) Disc 2") && says(4, "no-space", "not enough free space") &&
+                                      says(5, "extract-failed", "could not be extracted") && says(6, "cancelled", "stopped before it finished") &&
+                                      says(8, "unsupported", "cannot set up Disc 2 yet") && says(7, "not-set-up", "Disc 1 is not set up") &&
+                                      says(1, "failed", "the setup failed") && says(3, "", "not Forza Motorsport 4") &&
+                                      says(0, "wrong-disc", "but ended with status 0") && says(-1, "", "ended before it finished");
+                Expect(read && none && refused && okRead && okWithoutRecord && outcomes && runtime::disc::SetupResultName(8) == "unsupported" &&
+                           runtime::disc::SetupResultName(9).empty(),
+                       "disc setup contract: locations.conf read (comments, unknown keys, both-or-neither, once, absolute, version 1); each result "
+                       "name a message with the tool's detail; ok needs the record; name and status must agree");
+            }
+            {
+                // Through the imports: with a service, XamSwapDisc(2) for a Disc 2 not set up returns 0 with the event NOT set
+                // (pending); XamSwapCancel sets it, Disc 1 stays. Again, with the fake setup giving the synthetic Disc 2 (written
+                // below, as the panel's result): the event is set only on the Pump that mounts it, and Disc 2 is then in the drive.
+                FakeDiscHost host;
+                runtime::disc::SwapService service(host);
+                runtime::disc::SetService(&service);
+                const bool pending = swap(2, swapEvent) == 0 && be32(swapEvent + dispatch::kSignalState) == 0 && DiscInDrive() == 1;
+                PPCContext cancel{};
+                imp("XamSwapCancel")(cancel, base);
+                const bool cancelledSwap = cancel.r3.u32 == 0 && be32(swapEvent + dispatch::kSignalState) == 1 && DiscInDrive() == 1 &&
+                                           service.Current() == runtime::disc::SwapService::State::Idle;
+                host.result = {true, disc2, disc + "/../disc2_map.tsv", ""};
+                const bool again = swap(2, swapEvent) == 0 && be32(swapEvent + dispatch::kSignalState) == 0;
+                service.Pump();  // the panel opens (its result at once)
+                const bool notYet = be32(swapEvent + dispatch::kSignalState) == 0 && DiscInDrive() == 1;
+                service.Pump();  // its result: the identity check, AddDisc, InsertDisc, then the event
+                const bool setUp = be32(swapEvent + dispatch::kSignalState) == 1 && DiscInDrive() == 2 && DiscRegistered(2) && host.problems.size() == 1;
+                runtime::disc::SetService(nullptr);
+                const bool backToOne = swap(1, swapEvent) == 0 && DiscInDrive() == 1;  // the rest of this block starts from Disc 1
+                Expect(again && notYet && setUp && backToOne,
+                       "XamSwapDisc set up from the game: pending until the Pump that mounts the synthetic Disc 2, which sets the event");
+                Expect(pending && cancelledSwap, "XamSwapDisc with the setup service: pending (0, event not set); XamSwapCancel sets the event, Disc 1 stays");
+            }
+            // A handle and a package root opened on Disc 1, kept across the swaps.
+            const bool disc1Open = create("game:\\Media\\Cars.bin", kReadAccess, 1, 0x60) == 0;
+            const uint32_t disc1Handle = be32(fileOut);
+            const uint32_t keptRoot = guestString("keptroot"), keptPath = guestString("game:\\Pkg.xmplr"), keptStack = ArenaAlloc(base, 0x80);
+            PPCContext keep{};
+            keep.r1.u32 = keptStack, keep.r3.u32 = 0xFF, keep.r4.u32 = keptRoot, keep.r5.u32 = keptPath, keep.r6.u32 = 0x43;
+            imp("XamContentOpenFile")(keep, base);
+            AddDisc(2, disc2, disc2Map);
+            // The identity check, on a wrong Disc 2 (its own directory and map, each case in a child): a default.xex of disc 1,
+            // of another title, or with a media id the executable's multidisc list lacks (33333333) stops (9); Disc 1 stays.
+            // Before the real Disc 2 goes in, so a broken check fails here, in a child, rather than stopping the parent below.
+            const std::string bad = disc + "/../disc2bad", badMap = disc + "/../disc2bad_map.tsv";
+            mkdir(bad.c_str(), 0755);
+            std::ofstream(badMap) << "default.xex\t10\t48\t80\n";
+            auto badSwap = [&](uint32_t media, uint32_t title, uint8_t number) {
+                std::ofstream(bad + "/default.xex", std::ios::binary | std::ios::trunc) << xexWith(media, title, number);
+                return ExitCodeOf([&] { AddDisc(2, bad, badMap); (void)swap(2, swapEvent); });
+            };
+            Expect(badSwap(0x22222222, 0x4D530910, 1) == int(StopCode::Setup) && badSwap(0x22222222, 0x4D53084D, 2) == int(StopCode::Setup) &&
+                       badSwap(0x33333333, 0x4D530910, 2) == int(StopCode::Setup) && badSwap(0x22222222, 0x4D530910, 2) == 0 && DiscInDrive() == 1,
+                   "XamSwapDisc: a Disc 2 whose default.xex is disc 1, another title or an unlisted media id stops (9); the right one swaps (control)");
+            const bool same = swap(1, swapEvent) == 0 && be32(swapEvent + dispatch::kSignalState) == 1 && DiscInDrive() == 1;
+            const bool toTwo = swap(2, swapEvent) == 0 && be32(swapEvent + dispatch::kSignalState) == 1 && DiscInDrive() == 2;
+            const bool twoServed = query("game:\\Media\\Only2.txt") == 0 && be64(info + 40) == 3 && query("d:\\Media\\Cars.bin") == 0xC000000F &&
+                                   query("\\Device\\Cdrom0\\default.xex") == 0;
+            DiscEntry kept;
+            std::string keptDevice;
+            const bool oldStops = ExitCodeOf([&] { (void)readFile(disc1Handle, 4, 0); }) == int(StopCode::Unimplemented) &&
+                                  ExitCodeOf([&] { (void)ResolveGuestPath("keptroot:\\a.bin", kept, keptDevice); }) == int(StopCode::Unimplemented);
+            Expect(disc1Open && keep.r3.u32 == 0 && same && toTwo && twoServed && oldStops,
+                   "XamSwapDisc: the disc in the drive (1): event set, 0; Disc 2: event set, 0, then game:\\ and d:\\ serve Disc 2 (Only2.txt, 3 "
+                   "bytes; no Cars.bin); a Disc 1 handle or package root stops (7) while Disc 2 is in");
+
+            // XamContentCreateEnumerator(user, device 0, type 2, flags 0, 512, size*, handle*) then XamEnumerate(handle, 0x20,
+            // buffer, size, 0, XOVERLAPPED*), FM4's installer scan: IO_PENDING (0x3E5); the XOVERLAPPED {result 0, length 1,
+            // extended 0}; the record {device 2, type 2, display name "4D53091000000001" UTF-16BE, file name "4D53091000000001"}
+            // (this title only, README not listed). Again: {FUNCTION_FAILED 0x65B, length 0, extended 80070012}.
+            const uint32_t scanSize = ArenaAlloc(base, 4), scanHandle = ArenaAlloc(base, 4), scanBuffer = ArenaAlloc(base, 0x134 * 2),
+                           scanOverlapped = ArenaAlloc(base, 0x1C), scanGot = ArenaAlloc(base, 4);
+            auto scanCreate = [&](uint32_t device) {
+                PPCContext c{};
+                c.r3.u32 = 0, c.r4.u32 = device, c.r5.u32 = 2, c.r7.u32 = 512, c.r8.u32 = scanSize, c.r9.u32 = scanHandle;
+                imp("XamContentCreateEnumerator")(c, base);
+                return c.r3.u32;
+            };
+            auto scan = [&](uint32_t flags, uint32_t returned, uint32_t overlapped) {
+                std::memset(base + scanBuffer, 0xEE, 0x134 * 2), std::memset(base + scanOverlapped, 0xAA, 0x1C);
+                std::memset(base + scanOverlapped + 0x8, 0, 0x10);  // no event, no completion routine
+                PPCContext c{};
+                c.r3.u32 = be32(scanHandle), c.r4.u32 = flags, c.r5.u32 = scanBuffer, c.r6.u32 = 0x134 * 2, c.r7.u32 = returned, c.r8.u32 = overlapped;
+                imp("XamEnumerate")(c, base);
+                return c.r3.u32;
+            };
+            const bool listedOnce = scanCreate(0) == 0 && be32(scanSize) == 0x134 * 512 && scan(0x20, 0, scanOverlapped) == 0x3E5 &&
+                                    be32(scanOverlapped) == 0 && be32(scanOverlapped + 4) == 1 && be32(scanOverlapped + 0x18) == 0 &&
+                                    be32(scanBuffer) == 2 && be32(scanBuffer + 4) == 2 && base[scanBuffer + 8] == 0 && base[scanBuffer + 9] == '4' &&
+                                    base[scanBuffer + 8 + 2 * 15 + 1] == '1' && be32(scanBuffer + 8 + 2 * 16) == 0 &&
+                                    std::memcmp(base + scanBuffer + 0x108, "4D53091000000001", 17) == 0 && base[scanBuffer + 0x134] == 0xEE;
+            std::vector<uint8_t> record(base + scanBuffer, base + scanBuffer + 0x134);
+            const bool thenNone = scan(0x20, 0, scanOverlapped) == 0x3E5 && be32(scanOverlapped) == 0x65B && be32(scanOverlapped + 4) == 0 &&
+                                  be32(scanOverlapped + 0x18) == ((1u << 31) | (7u << 16) | 0x12);
+            const bool byDevice = scanCreate(2) == 0 && scan(0, scanGot, 0) == 0 && be32(scanGot) == 1 && scanCreate(1) == 0 &&
+                                  scan(0, scanGot, 0) == 0x12 && be32(scanGot) == 0;
+            const bool scanRefused = scanCreate(0) == 0 && ExitCodeOf([&] { (void)scan(0x10, 0, scanOverlapped); }) == int(StopCode::Unimplemented) &&
+                                     ExitCodeOf([&] { (void)scan(0x20, scanGot, scanOverlapped); }) == int(StopCode::Unimplemented) &&
+                                     ExitCodeOf([&] { (void)scan(0x20, 0, 0); }) == int(StopCode::Unimplemented);
+            Expect(listedOnce && thenNone && byDevice && scanRefused,
+                   "XamContentCreateEnumerator(0, type 2) on Disc 2: the disc's package {device 2, type 2, its name as display and file name}, "
+                   "this title only; XamEnumerate(0x20, XOVERLAPPED): IO_PENDING {0, 1, 0}, then {FUNCTION_FAILED, 0, 80070012}; device 2 lists "
+                   "it, device 1 not; flag 0x10, both or neither outputs stop (7)");
+
+            // XamContentAggregateCreateEnumerator(xuid, 0, type 2, 0, handle*) (Xenia :26-77): every title's, in GDFX order:
+            // 4D53084D00000009 (title 4D53084D at +0x134), then 4D53091000000001 (4D530910), then NO_MORE_FILES.
+            const uint32_t aggHandle3 = ArenaAlloc(base, 4), aggBuf3 = ArenaAlloc(base, 0x138), aggGot3 = ArenaAlloc(base, 4);
+            PPCContext agg3{};
+            agg3.r4.u32 = 0, agg3.r5.u32 = 2, agg3.r7.u32 = aggHandle3;
+            imp("XamContentAggregateCreateEnumerator")(agg3, base);
+            auto aggNext = [&] {
+                PPCContext c{};
+                c.r3.u32 = be32(aggHandle3), c.r5.u32 = aggBuf3, c.r6.u32 = 0x138, c.r7.u32 = aggGot3;
+                imp("XamEnumerate")(c, base);
+                return c.r3.u32;
+            };
+            const bool aggFirst = agg3.r3.u32 == 0 && aggNext() == 0 && std::memcmp(base + aggBuf3 + 0x108, "4D53084D00000009", 17) == 0 &&
+                                  be32(aggBuf3) == 2 && be32(aggBuf3 + 0x134) == 0x4D53084D;
+            const bool aggSecond = aggNext() == 0 && std::memcmp(base + aggBuf3 + 0x108, "4D53091000000001", 17) == 0 &&
+                                   be32(aggBuf3 + 0x134) == 0x4D530910 && aggNext() == 0x12;
+            Expect(aggFirst && aggSecond, "XamContentAggregateCreateEnumerator(0, type 2) on Disc 2: every title's package with its title id, "
+                                          "in GDFX order, then NO_MORE_FILES");
+
+            // XamContentResolve(user, XCONTENT_DATA*, buffer*, 260, 0, 0, 0) of the enumerated record: 0 and the path
+            // \Device\Cdrom0\Content\0000000000000000\4D530910\00000002\4D53091000000001 (74 characters + NUL), which
+            // NtCreateFile opens read-only (0x7000 bytes). A storage-device item with flag 1, a 74-byte buffer (one short), a package that
+            // is not on the disc, or flag 1 on the disc's item stop (7).
+            const uint32_t resolveData = ArenaAlloc(base, 0x134), resolveBuffer = ArenaAlloc(base, 260);
+            auto resolve = [&](uint32_t device, const char* name, uint32_t size, uint32_t flag) {
+                std::memcpy(base + resolveData, record.data(), record.size());
+                Store32(base, resolveData, device);
+                std::memset(base + resolveData + 0x108, 0, 42), std::memcpy(base + resolveData + 0x108, name, std::strlen(name));
+                std::memset(base + resolveBuffer, 0xEE, 260);
+                PPCContext c{};
+                c.r3.u32 = 0, c.r4.u32 = resolveData, c.r5.u32 = resolveBuffer, c.r6.u32 = size, c.r7.u32 = flag;
+                imp("XamContentResolve")(c, base);
+                return c.r3.u32;
+            };
+            const char* expected = "\\Device\\Cdrom0\\Content\\0000000000000000\\4D530910\\00000002\\4D53091000000001";
+            const bool resolved = resolve(2, "4D53091000000001", 260, 0) == 0 && std::strlen(expected) == 74 &&
+                                  std::memcmp(base + resolveBuffer, expected, 75) == 0 && base[resolveBuffer + 75] == 0xEE;
+            const std::string packagePath(reinterpret_cast<const char*>(base + resolveBuffer));
+            const bool openedPackage = create(packagePath.c_str(), kReadAccess, 1, 0x60) == 0 &&
+                                       FindOpenFile(LookupHandle(be32(fileOut))->header)->entry.size == 0x7000;
+            // FM4 Recomp (Disc 2, the copy-install policy): the storage device's flag 1 is the install destination in the save folder.
+            const bool installTarget = resolve(1, "4D53091000000001", 260, 1) == 0 &&
+                                       std::string(reinterpret_cast<const char*>(base + resolveBuffer)) == "$content1-00000002:\\4D53091000000001";
+            const bool resolveRefused = installTarget &&
+                                        ExitCodeOf([&] { (void)resolve(2, "4D53091000000001", 74, 0); }) == int(StopCode::Unimplemented) &&
+                                        ExitCodeOf([&] { (void)resolve(2, "4D53091000000002", 260, 0); }) == int(StopCode::Unimplemented) &&
+                                        ExitCodeOf([&] { (void)resolve(2, "4D53091000000001", 260, 1); }) == int(StopCode::Unimplemented);
+            Expect(resolved && openedPackage && resolveRefused,
+                   "XamContentResolve: the disc's package -> \\Device\\Cdrom0\\Content\\0000000000000000\\4D530910\\00000002\\<name> (opened: "
+                   "0x7000 bytes); the storage device's flag 1, a short buffer, a missing package or flag 1 stop (7)");
+
+            {
+                // FM4's install, as its copy job does it (NOTES.md §1.2): XamContentResolve(0xFF, {device 1, type 2, name}, buf,
+                // 260, 1) -> "$content1-00000002:\4D53091000000001"; NtCreateFile(0x40110000, OVERWRITE_IF 5, options 0x64);
+                // the package's bytes in writes. Half written: not stored (Package::Complete: 0x3800 of 0x7000 bytes), not
+                // listed, XamContentResolve flag 0 stops (7), XamContentCreateEx OPEN_EXISTING PATH_NOT_FOUND (3). Complete:
+                // listed by XamContentCreateEnumerator(1, type 2) as {device 1, type 2, display name "Car Pack" from header
+                // 0x411, the name}; XamContentCreateEx mounts it read-only ("dlc:\A.BIN" reads the hashed bytes); a license
+                // pointer gets 0 (as Xenia's default). The copy's source is the disc 2 package (type 2 at 0x344, this block's file).
+                std::string package;
+                {
+                    std::ifstream in(type2 + "/4D53091000000001", std::ios::binary);
+                    package.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+                }
+                const uint32_t installData = ArenaAlloc(base, 0x134), installPath = ArenaAlloc(base, 260), chunk = ArenaAlloc(base, 0x4000),
+                               installGot = ArenaAlloc(base, 4);
+                std::memset(base + installData, 0, 0x134);
+                Store32(base, installData, 1), Store32(base, installData + 4, 2);
+                std::memcpy(base + installData + 0x108, "4D53091000000001", 16);
+                auto resolveInstall = [&](uint32_t flag) {
+                    PPCContext c{};
+                    c.r3.u32 = 0xFF, c.r4.u32 = installData, c.r5.u32 = installPath, c.r6.u32 = 260, c.r7.u32 = flag;
+                    imp("XamContentResolve")(c, base);
+                    return c.r3.u32;
+                };
+                const bool destination = resolveInstall(1) == 0 &&
+                                         std::string(reinterpret_cast<const char*>(base + installPath)) == "$content1-00000002:\\4D53091000000001";
+                const bool created = create(reinterpret_cast<const char*>(base + installPath), 0x40110000, 5, 0x64) == 0;
+                const uint32_t target = be32(fileOut);
+                auto writeChunk = [&](size_t from, size_t n) {
+                    std::memcpy(base + chunk, package.data() + from, n);
+                    PPCContext c{};
+                    c.r3.u32 = target, c.r7.u32 = ioStatus, c.r8.u32 = chunk, c.r9.u32 = uint32_t(n);
+                    imp("NtWriteFile")(c, base);
+                    return c.r3.u32 == 0 && be32(ioStatus + 4) == n;
+                };
+                const std::string stored = UserDataRoot() + "/content/1/00000002/4D53091000000001";
+                auto listInstalled = [&] {
+                    const uint32_t sizeOut = ArenaAlloc(base, 4), handleOut = ArenaAlloc(base, 4), items = ArenaAlloc(base, 0x134 * 2);
+                    PPCContext c{};
+                    c.r3.u32 = 0, c.r4.u32 = 1, c.r5.u32 = 2, c.r7.u32 = 2, c.r8.u32 = sizeOut, c.r9.u32 = handleOut;
+                    imp("XamContentCreateEnumerator")(c, base);
+                    PPCContext e{};
+                    e.r3.u32 = be32(handleOut), e.r5.u32 = items, e.r6.u32 = 0x134 * 2, e.r7.u32 = installGot;
+                    imp("XamEnumerate")(e, base);
+                    return e.r3.u32 == 0 ? items : 0u;
+                };
+                const uint32_t rootName = guestString("dlc"), createStack = ArenaAlloc(base, 0x80);
+                auto openInstalled = [&](uint32_t license) {
+                    PPCContext c{};
+                    c.r1.u32 = createStack, c.r3.u32 = 0, c.r4.u32 = rootName, c.r5.u32 = installData, c.r6.u32 = 3, c.r8.u32 = license;
+                    Store32(base, createStack + 0x54, 0);  // no XOVERLAPPED
+                    imp("XamContentCreateEx")(c, base);
+                    return c.r3.u32;
+                };
+                std::string problem;
+                const bool half = writeChunk(0, 0x3800) && !stfs::Package::Complete(stored, 2, problem) && problem.find("incomplete") == 0 &&
+                                  listInstalled() == 0 && openInstalled(0) == 3 &&
+                                  ExitCodeOf([&] { (void)resolveInstall(0); }) == int(StopCode::Unimplemented);
+                const bool whole = writeChunk(0x3800, 0x3800) && stfs::Package::Complete(stored, 2, problem) && !stfs::Package::Complete(stored, 1, problem);
+                const uint32_t listed = listInstalled();
+                const bool record = listed != 0 && be32(installGot) == 1 && be32(listed) == 1 && be32(listed + 4) == 2 && base[listed + 9] == 'C' &&
+                                    base[listed + 8 + 2 * 7 + 1] == 'k' && std::memcmp(base + listed + 0x108, "4D53091000000001", 17) == 0;
+                const bool reopened = resolveInstall(0) == 0;
+                DiscEntry a;
+                std::string device;
+                uint8_t bytes[4] = {};
+                const bool mounted = openInstalled(0) == 0 && ResolveGuestPath("dlc:\\A.BIN", a, device) == Resolved::Found &&
+                                     ReadDiscFile(a, 4093, bytes, 4) == 4 && std::memcmp(bytes, "lmno", 4) == 0;
+                PPCContext closeDlc{};
+                closeDlc.r3.u32 = rootName;
+                imp("XamContentClose")(closeDlc, base);
+                const uint32_t mask = ArenaAlloc(base, 4);
+                Store32(base, mask, 0xAAAAAAAA);
+                const bool license = openInstalled(mask) == 0 && be32(mask) == 0;  // Xenia xam_content.cc:207-213, its cvar's default 0
+                closeDlc.r3.u32 = rootName;
+                imp("XamContentClose")(closeDlc, base);
+                Expect(destination && created && half && whole && record && reopened && mounted && closeDlc.r3.u32 == 0 && license,
+                       "installed package: resolved into the writable type directory, copied by NtWriteFile; half written not stored (not listed, "
+                       "PATH_NOT_FOUND, resolve flag 0 stops); complete: listed with its header's display name, mounted read-only and read; "
+                       "a license pointer gets 0 (Xenia's default)");
+                // Complete's length rule at its boundary: exactly the end of the last block is complete (above), one byte less is not.
+                const std::string shortPath = disc + "/../short.pkg";
+                std::ofstream(shortPath, std::ios::binary | std::ios::trunc) << package.substr(0, 0x7000 - 1);
+                Expect(!stfs::Package::Complete(shortPath, 2, problem) && problem.find("incomplete") == 0 && package.size() == 0x7000,
+                       "Package::Complete: one byte short of the last block is incomplete (the full length is: above)");
+                // The hash tree refuses damage (children: each stops (9)): a data byte of A.BIN, an unused byte of the level-0 table (past
+                // its four entries: only the table's own hash covers it).
+                auto damaged = [&](size_t at, const char* name) {
+                    std::string bad = package;
+                    bad[at] = char(bad[at] ^ 1);
+                    const std::string path = disc + "/../" + name;
+                    std::ofstream(path, std::ios::binary | std::ios::trunc) << bad;
+                    return ExitCodeOf([&] {
+                        const auto p = stfs::Package::Open(path);
+                        uint8_t out[16];
+                        (void)p->Read(0, 0, out, sizeof out);
+                    });
+                };
+                Expect(damaged(0x3000 + 0x1000 + 5, "baddata.pkg") == int(StopCode::Setup) && damaged(0x2000 + 0x100, "badtable.pkg") == int(StopCode::Setup) &&
+                           damaged(0x500, "badheader.pkg") == 0,
+                       "STFS hash tree: a changed data block or level-0 table stops (9); a header byte outside the tree reads (control)");
+            }
+            {
+                // Free space (content.h ContentFree, by hand): min(20 GiB - used, host - 2 GiB reserve), 0 when either is spent.
+                constexpr uint64_t G = uint64_t(1) << 30;
+                Expect(ContentFree(0, 100 * G) == 20 * G && ContentFree(5 * G, 100 * G) == 15 * G && ContentFree(0, 7 * G) == 5 * G &&
+                           ContentFree(0, 2 * G) == 0 && ContentFree(0, G) == 0 && ContentFree(21 * G, 100 * G) == 0 && ContentFree(19 * G, 4 * G) == G,
+                       "ContentFree: the device's 20 GiB minus stored, never above the host's available minus 2 GiB");
+            }
+            // Back to Disc 1: event set, 0; the Disc 1 handle reads again (byte 30 'E'), Only2.txt is gone, the root resolves.
+            const bool backToOne = swap(1, swapEvent) == 0 && be32(swapEvent + dispatch::kSignalState) == 1 && DiscInDrive() == 1 &&
+                                   readFile(disc1Handle, 1, 30) == 0 && base[readBuffer] == 'E' && query("game:\\Media\\Only2.txt") == 0xC000000F &&
+                                   ResolveGuestPath("keptroot:\\a.bin", kept, keptDevice) == Resolved::Found;
+            PPCContext closeKept{};
+            closeKept.r3.u32 = keptRoot;
+            imp("XamContentClose")(closeKept, base);
+            Expect(backToOne && closeKept.r3.u32 == 0, "XamSwapDisc(1): Disc 1 back in the drive; its handle and package root work again");
+            SetExecutableModule(m);  // the executable the later checks expect (this block installed a two-disc one)
+            unlink((UserDataRoot() + "/content/1/00000002/4D53091000000001").c_str());  // later checks expect no installed package
+
+        }
     }
     PPCContext gm{};
     gm.r4.u32 = handleOut;
@@ -2667,7 +3227,7 @@ int main(int, char** argv)
             // XamContentAggregateCreateEnumerator(xuid, device, type, 0, handle*) (Xenia xam_content_aggregate.cc:84-145), resolved
             // as xam ordinal 0x279 (Xenia xam_table.inc:430): with a stored saved game "agg01", every stored record
             // (ListContent) comes back once per XamEnumerate as 0x138 bytes = the record + this title's id (4D530910), then
-            // NO_MORE_FILES; a null handle pointer or device 2 E_INVALIDARG (80070057); type 3 stops (7).
+            // NO_MORE_FILES; a null handle pointer or device 3 E_INVALIDARG (80070057); type 3 stops (7).
             const SystemExport* aggregate = FindSystemExport("xam.xex", 0x279);
             ContentData agg{};
             agg[3] = 1, agg[7] = 1;
@@ -2693,7 +3253,7 @@ int main(int, char** argv)
             PPCContext last{};
             last.r3.u32 = be32(aggHandle), last.r5.u32 = aggBuf, last.r6.u32 = 0x138, last.r7.u32 = aggGot;
             imp("XamEnumerate")(last, base);
-            const bool invalid = createAgg(1, 1, 0) == ((1u << 31) | (7u << 16) | 0x57) && createAgg(2, 1, aggHandle) == ((1u << 31) | (7u << 16) | 0x57);
+            const bool invalid = createAgg(1, 1, 0) == ((1u << 31) | (7u << 16) | 0x57) && createAgg(3, 1, aggHandle) == ((1u << 31) | (7u << 16) | 0x57);
             // XamGetPrivateEnumStructureFromHandle (Xenia xam_enum.cc:107-124): its X_KENUMERATOR (open message +4 = 0x2000E,
             // "XEN\0" + handle at +0x18); a bad handle STATUS_INVALID_HANDLE. XamGetExecutionId (Xenia xam_info.cc:267-283):
             // the execution info (title id at +0xC). XAM app 0xFE message 0x2000E (Xenia apps/xam_app.cc:29-71) through
@@ -2735,7 +3295,7 @@ int main(int, char** argv)
             DeleteContent(agg);
             Expect(all && last.r3.u32 == 0x12 && invalid && ExitCodeOf([&] { (void)createAgg(1, 3, aggHandle); }) == int(StopCode::Unimplemented),
                    "XamContentAggregateCreateEnumerator (xam 0x279): stored records + title id, one per call, then NO_MORE_FILES; "
-                   "null handle or device 2 E_INVALIDARG; type 3 stops (7)");
+                   "null handle or device 3 E_INVALIDARG; type 3 stops (7)");
         }
         SetExecutableModule(res);
     }

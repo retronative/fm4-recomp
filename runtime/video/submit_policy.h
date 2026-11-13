@@ -7,7 +7,8 @@
 //     holds 4 x `split`.
 //   byIdle (FM4_SUBMIT_IF_IDLE=<idle>; SpeedBreaker 312ce69 runtime/gpu/renderer.cpp:10848-10859 SubmitIfIdle, technique adapted):
 //     not bySize, the part holds `idle` draws (4 x `idle` inside a render pass) and no submitted part still runs. `queueEmpty` is asked
-//     last, only when the draw counts allow a split (it queries fences).
+//     last, only when the draw counts allow a split (it queries fences). FM4 Recomp (M7, FM4_SUBMIT_IF_IDLE_IN_PASS=<1-8>, default 4):
+//     the in-pass factor `inPass` (x `idle`): a lower one starts the GPU sooner after a drain, at the cost of ending the open pass.
 #pragma once
 #include <cstdint>
 
@@ -20,13 +21,14 @@ struct SplitDecision
 };
 
 template <class QueueEmpty>
-SplitDecision DecideSplit(uint64_t draws, uint32_t split, bool splitAtPassEnd, bool inPass, uint32_t idle, QueueEmpty queueEmpty)
+SplitDecision DecideSplit(uint64_t draws, uint32_t split, bool splitAtPassEnd, bool inPass, uint32_t idle, QueueEmpty queueEmpty,
+                          uint32_t idleInPassFactor = 4)
 {
     SplitDecision d;
     if (split == 0)
         return d;
     d.bySize = draws >= split && !(splitAtPassEnd && inPass && draws < 4ull * split);
-    d.byIdle = !d.bySize && idle != 0 && draws >= idle && (!inPass || draws >= 4ull * idle) && queueEmpty();
+    d.byIdle = !d.bySize && idle != 0 && draws >= idle && (!inPass || draws >= uint64_t(idleInPassFactor) * idle) && queueEmpty();
     return d;
 }
 

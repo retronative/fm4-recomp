@@ -31,6 +31,8 @@
 #include "video/renderer.h"
 #include "video/guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked (FM4_GUEST_MEMORY_GPU)
 #include "video/window_sdl.h"
+#include "disc_setup_sdl.h"
+#include "kernel/disc_swap.h"
 #include "kernel/imports.h"
 #include "kernel/input_live.h"
 #include "kernel/loader.h"
@@ -45,6 +47,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <pthread.h>
 #include <string>
 #include <thread>
@@ -118,6 +121,9 @@ int main(int argc, char** argv)
     const char* xexPath = nullptr;
     const char* discPath = nullptr;
     const char* discMapPath = nullptr;
+    const char* disc2Path = nullptr;     // FM4 Recomp (Disc 2): optional, with its map (XamSwapDisc)
+    const char* disc2MapPath = nullptr;
+    const char* discSetupTool = nullptr;  // FM4 Recomp (Disc 2): the kit's setup tool, for a disc set up from the game (window only)
     const char* gpuStopPath = nullptr;
     const char* userDataPath = nullptr;
     const char* audioMode = nullptr;
@@ -136,6 +142,9 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--xex")) xexPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--disc")) discPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--disc-map")) discMapPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--disc2")) disc2Path = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--disc2-map")) disc2MapPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--disc-setup")) discSetupTool = argv[i + 1];
         else if (!std::strcmp(argv[i], "--gpu-stop")) gpuStopPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--user-data")) userDataPath = argv[i + 1];
         else if (!std::strcmp(argv[i], "--audio")) audioMode = argv[i + 1];
@@ -151,7 +160,11 @@ int main(int argc, char** argv)
     if (imagePath == nullptr || xexPath == nullptr || discPath == nullptr || discMapPath == nullptr || gpuStopPath == nullptr || userDataPath == nullptr || modulesPath == nullptr || audioMode == nullptr || rendererMode == nullptr || deadline <= 0 || stopAtSwap <= 0)
         Stop(StopCode::Setup, "usage: fm4recomp --image <image.bin> --xex <default.xex> --disc <extracted disc> --disc-map <disc1_gdfx.tsv> "
              "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present|window> --stop-at-swap <n> --deadline <seconds> (all required; "
-             "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off> --shader-classes <none|branch,predicate,loop>)");
+             "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off> --shader-classes <none|branch,predicate,loop>; "
+             "optional: --disc2 <extracted Disc 2> --disc2-map <disc2_gdfx.tsv>, both or neither; with --renderer window, --disc-setup <the kit's setup panel, bin/fm4recomp-setup> "
+             "sets up a disc the game asks for that is not given)");
+    if ((disc2Path == nullptr) != (disc2MapPath == nullptr))
+        Stop(StopCode::Setup, "--disc2 and --disc2-map go together (the extracted Disc 2 and its GDFX map)");
     // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
     // the same 48 kHz pacing, frame conversion and callbacks (kernel/audio.h).
     if (!std::strcmp(audioMode, "audible"))
@@ -201,6 +214,19 @@ int main(int argc, char** argv)
     }
     runtime::SetModuleImages(fm4::kModules, std::size(fm4::kModules), modulesPath);  // XexLoadImage (kernel/loader.h)
     runtime::MountDisc(discPath, discMapPath);
+    if (disc2Path != nullptr)
+        runtime::AddDisc(2, disc2Path, disc2MapPath);  // put in the drive when the game asks (XamSwapDisc, kernel/file_system.h)
+    if (discSetupTool != nullptr)
+    {
+        // A disc the game asks for and the launcher did not give is set up from the game (kernel/disc_swap.h): the launcher's
+        // setup panel over the game window, so only with --renderer window. Its setup tool records where it put the disc in
+        // $FM4_RECOMP_HOME/locations.conf (the data side's contract), which the host reads after it.
+        if (std::strcmp(rendererMode, "window"))
+            Stop(StopCode::Setup, "--disc-setup needs --renderer window (its panel opens over the game window)");
+        static const std::unique_ptr<runtime::disc::Host> discHost = runtime::disc::MakeSdlHost(discSetupTool);
+        static runtime::disc::SwapService discService(*discHost);
+        runtime::disc::SetService(&discService);
+    }
     runtime::MountUserData(userDataPath);  // saved content, writable and isolated (kernel/content.h)  // read-only: game:\ and d:\ (kernel/file_system.h)
     const auto image = ReadChecked(imagePath, fm4::kImageSize, fm4::kImageCrc32, true);
     const auto header = ReadChecked(xexPath, fm4::kHeaderSize, fm4::kHeaderCrc32, false);

@@ -4,6 +4,7 @@
 // The title's disc, read-only (file_system.h).
 #include "file_system.h"
 #include "arena.h"
+#include "dispatcher.h"
 #include "objects.h"
 #include "stops.h"
 #include "stfs.h"
@@ -13,6 +14,7 @@
 #include <mutex>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <climits>
 #include <cstdlib>
 #include <cstring>
@@ -28,9 +30,12 @@
 namespace runtime {
 namespace {
 
-std::string discRoot;  // realpath of the extracted disc
 struct MapEntry { uint32_t sector; uint64_t size; uint32_t attributes; size_t rank; };  // rank: the line (GDFX tree order)
-std::unordered_map<std::string, MapEntry> discMap;  // by path relative to the root, '/'-separated, disc case
+// One disc of the set: the realpath of its extraction and its map (by path relative to the root, '/'-separated, disc case).
+struct Disc { uint32_t number; std::string root; std::unordered_map<std::string, MapEntry> map; };
+std::mutex discLock;  // guards the set and the drive: XamSwapDisc changes the drive while other threads resolve paths
+std::map<uint32_t, std::shared_ptr<const Disc>> discs;
+std::shared_ptr<const Disc> drive;  // the disc in the drive (\Device\Cdrom0)
 constexpr std::string_view kCdrom = "\\Device\\Cdrom0";
 constexpr std::string_view kLinks[] = {"game:", "d:"};
 
@@ -59,14 +64,25 @@ std::vector<std::string_view> SplitPath(std::string_view path)
     return parts;
 }
 
-}  // namespace
-
-void MountDisc(const std::string& root, const std::string& map)
+// The disc in the drive, or a stop (9) before MountDisc.
+std::shared_ptr<const Disc> DriveDisc()
 {
+    std::lock_guard guard(discLock);
+    if (!drive)
+        Stop(StopCode::Setup, "no disc is mounted (--disc)");
+    return drive;
+}
+
+// Reads and checks a disc's extraction and map; the options named in its stops are Disc 1's --disc/--disc-map, else
+// --disc<n>/--disc<n>-map.
+std::shared_ptr<const Disc> LoadDisc(uint32_t number, const std::string& root, const std::string& map)
+{
+    const std::string option = number == 1 ? "--disc" : "--disc" + std::to_string(number);
+    auto disc = std::make_shared<Disc>();
+    disc->number = number;
     std::ifstream in(map);
     if (!in)
-        Stop(StopCode::Setup, "--disc-map %s cannot be read (survey/gdfx.py writes it)", map.c_str());
-    discMap.clear();
+        Stop(StopCode::Setup, "%s-map %s cannot be read (survey/gdfx.py writes it)", option.c_str(), map.c_str());
     std::string line;
     while (std::getline(in, line))
     {
@@ -74,19 +90,101 @@ void MountDisc(const std::string& root, const std::string& map)
         std::string path, sector, size, attributes;
         if (!std::getline(fields, path, '\t') || !std::getline(fields, sector, '\t') || !std::getline(fields, size, '\t') ||
             !std::getline(fields, attributes) || path.empty())
-            Stop(StopCode::Setup, "--disc-map %s: a malformed line: %.80s", map.c_str(), line.c_str());
-        const size_t rank = discMap.size();
-        if (!discMap.emplace(path, MapEntry{uint32_t(std::stoul(sector, nullptr, 16)), std::stoull(size, nullptr, 16),
-                                            uint32_t(std::stoul(attributes, nullptr, 16)), rank}).second)
-            Stop(StopCode::Setup, "--disc-map %s lists %s twice", map.c_str(), path.c_str());
+            Stop(StopCode::Setup, "%s-map %s: a malformed line: %.80s", option.c_str(), map.c_str(), line.c_str());
+        const size_t rank = disc->map.size();
+        if (!disc->map.emplace(path, MapEntry{uint32_t(std::stoul(sector, nullptr, 16)), std::stoull(size, nullptr, 16),
+                                              uint32_t(std::stoul(attributes, nullptr, 16)), rank}).second)
+            Stop(StopCode::Setup, "%s-map %s lists %s twice", option.c_str(), map.c_str(), path.c_str());
     }
-    if (discMap.empty())
-        Stop(StopCode::Setup, "--disc-map %s is empty", map.c_str());
+    if (disc->map.empty())
+        Stop(StopCode::Setup, "%s-map %s is empty", option.c_str(), map.c_str());
     char resolved[PATH_MAX];
     struct stat info;
     if (realpath(root.c_str(), resolved) == nullptr || stat(resolved, &info) != 0 || !S_ISDIR(info.st_mode))
-        Stop(StopCode::Setup, "--disc %s is not a directory (the extracted Disc 1, game/files)", root.c_str());
-    discRoot = resolved;
+        Stop(StopCode::Setup, "%s %s is not a directory (the extracted Disc %u%s)", option.c_str(), root.c_str(), number,
+             number == 1 ? ", game/files" : "");
+    disc->root = resolved;
+    return disc;
+}
+
+}  // namespace
+
+void MountDisc(const std::string& root, const std::string& map)
+{
+    auto disc = LoadDisc(1, root, map);
+    std::lock_guard guard(discLock);
+    discs[1] = disc;
+    drive = disc;
+}
+
+void AddDisc(uint32_t number, const std::string& root, const std::string& map)
+{
+    if (number < 2)
+        Stop(StopCode::Setup, "AddDisc(%u): Disc 1 is the launch disc (MountDisc)", number);
+    auto disc = LoadDisc(number, root, map);
+    std::lock_guard guard(discLock);
+    discs[number] = disc;
+}
+
+bool DiscRegistered(uint32_t number)
+{
+    std::lock_guard guard(discLock);
+    return discs.count(number) == 1;
+}
+
+uint32_t DiscInDrive()
+{
+    std::lock_guard guard(discLock);
+    return drive ? drive->number : 0;
+}
+
+void InsertDisc(uint32_t number)
+{
+    std::lock_guard guard(discLock);
+    const auto it = discs.find(number);
+    if (it == discs.end())
+        Stop(StopCode::Setup, "Disc %u is not set up (--disc%u, --disc%u-map)", number, number, number);
+    drive = it->second;
+}
+
+std::string DiscRootFile(uint32_t number, std::string_view name)
+{
+    std::shared_ptr<const Disc> disc;
+    {
+        std::lock_guard guard(discLock);
+        const auto it = discs.find(number);
+        if (it == discs.end())
+            return "";
+        disc = it->second;
+    }
+    for (const auto& [path, m] : disc->map)
+        if ((m.attributes & file_attribute::kDirectory) == 0 && EqualCase(path, name))
+            return disc->root + "/" + path;
+    return "";
+}
+
+std::vector<DiscContentItem> DiscContent(uint32_t contentType)
+{
+    const auto disc = DriveDisc();
+    char type[9];
+    std::snprintf(type, sizeof type, "%08X", contentType);
+    std::vector<std::pair<size_t, DiscContentItem>> ranked;
+    for (const auto& [path, m] : disc->map)
+    {
+        const std::vector<std::string_view> parts = SplitPath(path);
+        if (parts.size() != 5 || (m.attributes & file_attribute::kDirectory) != 0 || !EqualCase(parts[0], "Content") ||
+            parts[1] != "0000000000000000" || parts[2].size() != 8 || !EqualCase(parts[3], type) || parts[4].size() != 16)
+            continue;
+        const std::string title(parts[2]);
+        if (title.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+            Stop(StopCode::Unimplemented, "the disc's content directory %s is not a title id (8 hex digits)", path.c_str());
+        ranked.push_back({m.rank, {uint32_t(std::stoul(title, nullptr, 16)), std::string(parts[4])}});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<DiscContentItem> items;
+    for (auto& r : ranked)
+        items.push_back(std::move(r.second));
+    return items;
 }
 
 std::string CanonicalGuestPath(std::string_view path)
@@ -218,7 +316,8 @@ uint64_t DiscAllocationSize(const DiscEntry& entry)
 
 namespace {
 std::mutex rootsLock;
-std::map<std::string, std::shared_ptr<const stfs::Package>> contentRoots;  // by lower-case root name
+struct PackageRoot { std::shared_ptr<const stfs::Package> package; uint32_t disc; };  // disc: the package file's (0: none)
+std::map<std::string, PackageRoot> contentRoots;                             // by lower-case root name
 std::map<std::string, std::string> directoryRoots;                           // by lower-case root name: the host directory
 
 std::string Lower(std::string_view s)
@@ -229,10 +328,11 @@ std::string Lower(std::string_view s)
     return out;
 }
 
-DiscEntry PackageEntry(const std::shared_ptr<const stfs::Package>& package, int32_t at)
+DiscEntry PackageEntry(const std::shared_ptr<const stfs::Package>& package, int32_t at, uint32_t disc)
 {
     DiscEntry entry;
     entry.host = package->Host();
+    entry.disc = disc;
     entry.package = package;
     entry.packageFile = at;
     entry.directory = at < 0 || package->Files()[size_t(at)].directory;
@@ -299,6 +399,7 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
     if (colon == std::string::npos)
         return Resolved::OtherDevice;
     std::shared_ptr<const stfs::Package> package;
+    uint32_t packageDisc = 0;
     {
         std::lock_guard guard(rootsLock);
         if (const auto d = directoryRoots.find(Lower(std::string_view(device).substr(0, colon))); d != directoryRoots.end())
@@ -309,8 +410,11 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
         const auto it = contentRoots.find(Lower(std::string_view(device).substr(0, colon)));
         if (it == contentRoots.end())
             return Resolved::OtherDevice;
-        package = it->second;
+        package = it->second.package, packageDisc = it->second.disc;
     }
+    if (packageDisc != 0 && packageDisc != DiscInDrive())
+        Stop(StopCode::Unimplemented, "%s: the root is a package on Disc %u, and Disc %u is in the drive (not modelled)", device.c_str(),
+             packageDisc, DiscInDrive());
     int32_t at = -1;  // the package root
     for (const std::string_view part : SplitPath(std::string_view(device).substr(colon + 1)))
     {
@@ -324,15 +428,15 @@ Resolved ResolveContentPath(const std::string& device, DiscEntry& entry)
             return Resolved::NotFound;
         at = found;
     }
-    entry = PackageEntry(package, at);
+    entry = PackageEntry(package, at, packageDisc);
     return Resolved::Found;
 }
 }  // namespace
 
-bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package)
+bool MountContentRoot(const std::string& root, std::shared_ptr<const stfs::Package> package, uint32_t disc)
 {
     std::lock_guard guard(rootsLock);
-    return directoryRoots.count(Lower(root)) == 0 && contentRoots.emplace(Lower(root), std::move(package)).second;
+    return directoryRoots.count(Lower(root)) == 0 && contentRoots.emplace(Lower(root), PackageRoot{std::move(package), disc}).second;
 }
 
 bool MountDirectoryRoot(const std::string& root, const std::string& hostDirectory)
@@ -404,10 +508,9 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
     }
     if (device.compare(0, kCdrom.size(), kCdrom) != 0)
         return ResolveContentPath(device, entry);
-    if (discRoot.empty())
-        Stop(StopCode::Setup, "no disc is mounted (--disc)");
-
-    std::string host = discRoot, relative;
+    const auto disc = DriveDisc();
+    entry.disc = disc->number;
+    std::string host = disc->root, relative;
     bool directory = true;
     for (const std::string_view part : SplitPath(std::string_view(device).substr(kCdrom.size())))
     {
@@ -445,8 +548,8 @@ Resolved ResolveGuestPath(std::string_view path, DiscEntry& entry, std::string& 
         entry.size = 0, entry.sector = 0, entry.attributes = file_attribute::kDirectory;
         return Resolved::Found;
     }
-    const auto it = discMap.find(relative);
-    if (it == discMap.end() || ((it->second.attributes & file_attribute::kDirectory) != 0) != directory ||
+    const auto it = disc->map.find(relative);
+    if (it == disc->map.end() || ((it->second.attributes & file_attribute::kDirectory) != 0) != directory ||
         (!directory && it->second.size != entry.size))
         Stop(StopCode::Setup, "%s on the disc does not match the disc map (not listed, or another kind or size)", relative.c_str());
     entry.size = it->second.size;  // a directory: its directory data size (Xenia: the dirent length)
@@ -467,18 +570,23 @@ std::vector<DirectoryChild> ListDirectory(const DiscEntry& directory)
         const auto& files = directory.package->Files();
         for (size_t i = 0; i < files.size(); i++)
             if (files[i].parent == directory.packageFile)
-                children.push_back({files[i].name, PackageEntry(directory.package, int32_t(i))});
+                children.push_back({files[i].name, PackageEntry(directory.package, int32_t(i), directory.disc)});
         return children;
     }
+    const auto disc = DriveDisc();
+    if (directory.disc != disc->number)
+        Stop(StopCode::Unimplemented, "listing \\%s of Disc %u while Disc %u is in the drive is not modelled", directory.relative.c_str(),
+             directory.disc, disc->number);
     const std::string prefix = directory.relative.empty() ? "" : directory.relative + "/";
     std::vector<std::pair<size_t, DirectoryChild>> ranked;
-    for (const auto& [path, m] : discMap)
+    for (const auto& [path, m] : disc->map)
     {
         if (path.size() <= prefix.size() || path.compare(0, prefix.size(), prefix) != 0 || path.find('/', prefix.size()) != std::string::npos)
             continue;
         DiscEntry e;
-        e.host = discRoot + "/" + path;
+        e.host = disc->root + "/" + path;
         e.relative = path;
+        e.disc = disc->number;
         e.directory = (m.attributes & file_attribute::kDirectory) != 0;
         e.size = m.size;
         e.sector = m.sector;
@@ -577,7 +685,11 @@ uint64_t HostFileSize(const DiscEntry& entry)
 
 uint32_t OpenDiscFile(uint8_t* base, const DiscEntry& entry, bool synchronous)
 {
+    // The body is a waitable object, as Xenia's XFile (xfile.cc:27-32 at 67f16c4): an auto-reset event, not signalled, that
+    // each completed NtReadFile and NtWriteFile sets (FM4's ReadFile without an OVERLAPPED waits on the file handle after
+    // PENDING, sub_8275A968; a Disc 2 install waited there forever on a body that was no event).
     const uint32_t body = ArenaAlloc(base, 16);
+    std::memset(base + body, 0, 16), base[body] = dispatch::kSynchronizationEvent;  // signal state (+4) 0
     {
         std::lock_guard guard(filesLock);
         OpenFile file;
@@ -594,8 +706,23 @@ OpenFile* FindOpenFile(uint32_t body)
     return it == files.end() ? nullptr : &it->second;
 }
 
+size_t OpenFilesOnDisc(uint32_t number)
+{
+    std::lock_guard guard(filesLock);
+    size_t count = 0;
+    for (const auto& [body, file] : files)
+        count += file.entry.disc == number;
+    return count;
+}
+
 uint32_t ReadDiscFile(const DiscEntry& entry, uint64_t offset, uint8_t* buffer, uint32_t size)
 {
+    // FM4 Recomp (Disc 2): a handle opened on a disc that has been swapped out. What the console answers (an error, or a
+    // read of the new disc) is not known, so this stops; FM4 preloads its swap music (Media/audio/disc2music, 7 MB) from
+    // Disc 1, which suggests it reads nothing from Disc 1 while Disc 2 is in (HYPOTHESIS).
+    if (entry.disc != 0 && entry.disc != DiscInDrive())
+        Stop(StopCode::Unimplemented, "reading %s of Disc %u while Disc %u is in the drive is not modelled", entry.host.c_str(), entry.disc,
+             DiscInDrive());
     if (entry.package)
         return entry.packageFile < 0 ? 0 : entry.package->Read(uint32_t(entry.packageFile), offset, buffer, size);
     if (offset >= entry.size)

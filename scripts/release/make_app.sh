@@ -20,7 +20,7 @@ APP="$OUT/FM4 Recomp.app"
 KIT="$APP/Contents/Resources/kit"
 ART="$OUT/art"
 for f in "$ROOT/build/native/runtime/fm4recomp" "$ROOT/build/native/tests/fm4_validation_control" "$ROOT/tools/extract-xiso/build/extract-xiso" \
-         "$ROOT/tools/survey/xexsurvey" "$ROOT/tools/survey/gdfx" "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/README.md"; do
+         "$ROOT/tools/survey/xexsurvey" "$ROOT/tools/survey/gdfx" "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/README.md"; do
   [ -e "$f" ] || { echo "make_app: $f is missing (scripts/build.sh, scripts/setup_tools.sh)" >&2; exit 1; }
 done
 [ ! -e "$APP" ] || { echo "make_app: $APP exists (never overwritten)" >&2; exit 1; }
@@ -70,7 +70,7 @@ codesign --force -s - "$APP"
 codesign --verify --deep --strict "$APP"
 
 # Never a game file in the app.
-if find "$APP" -type f \( -iname '*.xex' -o -iname '*.iso' -o -name 'image.bin' -o -iname '*.xma' -o -iname '*.fxobj' -o -name 'disc1_gdfx.tsv' \) | grep -q .; then
+if find "$APP" -type f \( -iname '*.xex' -o -iname '*.iso' -o -name 'image.bin' -o -iname '*.xma' -o -iname '*.fxobj' -o -name 'disc[12]_gdfx.tsv' -o -name '4d530910*' \) | grep -q .; then
   echo "make_app: a game-derived file entered the app" >&2; exit 1
 fi
 for f in "$APP/Contents/MacOS/FM4Recomp" "$KIT"/bin/* "$KIT"/lib/*.dylib; do

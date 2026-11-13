@@ -13,6 +13,14 @@ and checks every file it derives against the SHA-256 this build was made for. Ot
 
 - An Apple-silicon Mac with macOS 26 or later.
 - Your own *Forza Motorsport 4* (USA) Disc 1 (Play Disc) as an ISO, and about 9 GB free disk space.
+- Optional: your Disc 2 (Content Install Disc) as an ISO: about 3.2 GB for its files, and about 3 GB more in the user-data
+  folder when the game installs its content. Disc 1 alone still plays. If you choose to install Disc 2 in the game before it
+  is set up, FM4 Recomp's Disc 2 panel opens over the game's "Insert Disc 2" screen: drop or choose your Disc 2 ISO and
+  where its files go, watch the progress (Cancel and Try Again are there), and the panel closes once Disc 2 is ready; the
+  game then shows its own "Install Additional Content" screen (confirm with A). The game keeps running meanwhile, and its
+  Back (B) returns to the menu.
+- Setup asks where to keep the game data, and where to keep your saves and installed content: your Library by default, or
+  any folder, an external SSD included (keep that drive connected to play). It checks the free space on each drive first.
 
 Nothing else: the app includes everything it runs (SDL 3, the Vulkan loader, MoltenVK, the Vulkan validation layer, glslang,
 SPIRV-Tools and the setup tools). No Homebrew, Xcode or developer tools are needed.
@@ -29,8 +37,9 @@ SPIRV-Tools and the setup tools). No Homebrew, Xcode or developer tools are need
 Your data, saves and session logs are kept in `~/Library/Application Support/FM4 Recomp` (`data/`, `data/user-data`,
 `logs/<date>/`). To remove FM4 Recomp, move the app to the Bin and delete that folder.
 
-**Without the app** (the `.tar.gz` package): `./setup.sh "<Disc 1 .iso>"` once, then `./play.sh [minutes]`; the data stays next to
-the scripts (or in `$FM4_RECOMP_HOME`).
+**Without the app** (the `.tar.gz` package): `./setup.sh [--data <dir>] [--user-data <dir>] "<Disc 1 .iso>"` once (optionally
+`./setup.sh --disc2 [--dest <dir>] "<Disc 2 .iso>"` after it), then `./play.sh [minutes]`; the data stays next to the scripts (or in
+`$FM4_RECOMP_HOME`) unless you choose other folders; `locations.conf` there records them.
 
 ## Controls
 

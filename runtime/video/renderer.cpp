@@ -384,6 +384,16 @@ bool DiagSubsetPasses()
     return on;
 }
 uint64_t subsetEnds[4] = {0, 0, 0, 0};  // subset, same, superset, other
+// FM4 Recomp (diagnostic, FM4_DIAG_VS_TALLY=1; profiles the vertex shaders of the main scene and shadow passes):
+// per (target kind, vertex shader) the draws and the vertices they submit (indices, or the auto-indexed count), and the vertex shader's
+// fetch slots and GLSL lines, reported every 300 swaps sorted by vertices: the geometry workload each shader carries.
+bool DiagVsTally()
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_DIAG_VS_TALLY"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+}
+struct VsTally { uint64_t draws = 0, vertices = 0; size_t fetchSlots = 0; };
+std::map<std::pair<std::string, uint64_t>, VsTally> vsTally;
 // FM4 Recomp (opt-in FM4_PASS_AREA=1): a draw render pass's render area is the full width and only the rows the draw can touch
 // (its scissor's bottom, rounded up to 32 and capped at the image), not the whole host target: the main scene's 1280x1024 2x
 // target is 720 rows on screen and costs ~44 ms of GPU a race frame over ~22 passes, each loading and storing both attachments
@@ -1507,6 +1517,19 @@ bool SplitAtPassEnd()
 // reloads its targets on a tiled GPU), so the GPU starts while the next part is recorded. Measured: retire fence
 // waits 14.4 ms against GPU busy 17.2 ms a race frame (the GPU ran mostly while the command processor waited). A split at a draw
 // entry is the existing safe point: fences, interrupts and write-backs keep their part's retire order.
+// FM4 Recomp (M7, opt-in FM4_SUBMIT_IF_IDLE_IN_PASS=<1-8>, default 4): submit_policy.h's in-pass factor for the idle split.
+uint32_t SubmitIfIdleInPass()
+{
+    static const uint32_t n = [] {
+        const char* v = std::getenv("FM4_SUBMIT_IF_IDLE_IN_PASS");
+        const unsigned long f = v != nullptr ? std::strtoul(v, nullptr, 10) : 4;
+        const uint32_t on = f >= 1 && f <= 8 ? uint32_t(f) : 4;
+        if (v != nullptr)
+            std::fprintf(stderr, "[gpu] FM4_SUBMIT_IF_IDLE_IN_PASS=%s: an idle split inside a render pass needs %u x the idle draws\n", v, on);
+        return on;
+    }();
+    return n;
+}
 uint32_t SubmitIfIdleDraws()
 {
     static const uint32_t n = [] {
@@ -1521,13 +1544,30 @@ uint32_t SubmitIfIdleDraws()
     }();
     return n;
 }
-// No submitted part still running: every slot but the one being recorded is idle or its fence is signalled (nothing retired here).
+// FM4 Recomp (M7, opt-in FM4_SUBMIT_IF_IDLE_DEPTH=<1-4>, default 1): the idle split's queue depth: it fires while fewer than this many
+// submitted parts still run (1: none, SpeedBreaker's SubmitIfIdle; 2: one, so the next part is already encoded and queued when the GPU
+// finishes the running one, SpeedBreaker's depth with eager writes, renderer.cpp:10848-10859).
+uint32_t SubmitIfIdleDepth()
+{
+    static const uint32_t n = [] {
+        const char* v = std::getenv("FM4_SUBMIT_IF_IDLE_DEPTH");
+        const unsigned long d = v != nullptr ? std::strtoul(v, nullptr, 10) : 1;
+        const uint32_t on = d >= 1 && d <= 4 ? uint32_t(d) : 1;
+        if (v != nullptr)
+            std::fprintf(stderr, "[gpu] FM4_SUBMIT_IF_IDLE_DEPTH=%s: an idle split while fewer than %u submitted part(s) run\n", v, on);
+        return on;
+    }();
+    return n;
+}
+// Fewer than SubmitIfIdleDepth() submitted parts still running: the slots but the one being recorded that are neither idle nor
+// signalled (nothing retired here). Depth 1: no submitted part still running.
 bool GpuQueueEmpty()
 {
+    uint32_t running = 0;
     for (uint32_t k = 0; k < kSlots; k++)
         if (k != recording && !guard->Idle(k) && !guard->Finished(k))
-            return false;
-    return true;
+            running++;
+    return running < SubmitIfIdleDepth();
 }
 void SplitSubmit()
 {
@@ -1535,7 +1575,7 @@ void SplitSubmit()
         return;
     // FM4_SPLIT_AT_PASS_END: at the next pass boundary; FM4_SUBMIT_IF_IDLE: earlier while the GPU has nothing (submit_policy.h)
     const SplitDecision decision = DecideSplit(drawsInBuffer, SplitDraws(), SplitAtPassEnd(), openPass.commands != VK_NULL_HANDLE, SubmitIfIdleDraws(),
-                                               [] { return GpuQueueEmpty(); });
+                                               [] { return GpuQueueEmpty(); }, SubmitIfIdleInPass());
     if (!decision.Split())
         return;
     const bool byIdle = decision.byIdle;
@@ -2504,6 +2544,22 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
             if (SubmitIfIdleDraws() != 0)  // FM4_SUBMIT_IF_IDLE
                 std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), " (%llu when the GPU was idle)", (unsigned long long)idleSplitsSinceSwap);
             splitsSinceSwap = idleSplitsSinceSwap = 0;
+        }
+        if (DiagVsTally() && swap % 300 == 0 && !vsTally.empty())  // FM4_DIAG_VS_TALLY (diagnostic): per swap over the last 300
+        {
+            std::vector<std::pair<uint64_t, std::pair<std::string, uint64_t>>> sorted;
+            for (const auto& [k, t] : vsTally)
+                sorted.push_back({t.vertices, k});
+            std::sort(sorted.rbegin(), sorted.rend());
+            std::fprintf(stderr, "[diag vs] swaps %llu-%llu, per swap, by vertices:", (unsigned long long)(swap - 299), (unsigned long long)swap);
+            for (size_t i = 0; i < sorted.size() && i < 25; i++)
+            {
+                const VsTally& t = vsTally[sorted[i].second];
+                std::fprintf(stderr, "%s %.0f vertices in %.1f draws vs_%016llx (%zu fetch slots) on %s", i ? ";" : "", t.vertices / 300.0, t.draws / 300.0,
+                             (unsigned long long)sorted[i].second.second, t.fetchSlots, sorted[i].second.first.c_str());
+            }
+            std::fprintf(stderr, "\n");
+            vsTally.clear();
         }
         if (DiagSubsetPasses() && swap % 300 == 0)  // FM4_DIAG_SUBSET_PASSES (diagnostic)
         {
@@ -3584,6 +3640,14 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     const uint32_t areaRows = PassArea() ? std::min(targets.height, (touchedBottom + 31) & ~31u) : targets.height;
     pass.renderArea.extent.height = areaRows;
     // FM4_SUBSET_MERGE: the colour-only draw's pipeline for the open colour + depth pass (above); the draw then stays in that pass.
+    if (DiagVsTally())  // FM4_DIAG_VS_TALLY (diagnostic)
+    {
+        char kind[96];
+        std::snprintf(kind, sizeof kind, "%ux%u x%u colour %d depth %d", targets.width, targets.height, targets.samples,
+                      key.colorUsed ? int(targets.format) : 0, key.depthUsed ? int(targets.depthFormat) : 0);
+        VsTally& t = vsTally[{kind, vs->hash}];
+        t.draws++, t.vertices += d.indices.count, t.fetchSlots = vs->t.vertexFetchSlots.size();
+    }
     bool subset = false;
     const bool colourOnly = key.colorUsed && !key.depthUsed, depthOnly = !key.colorUsed && key.depthUsed;
     if (SubsetMerge() && openPass.commands == c && openPass.pass != VK_NULL_HANDLE && openPass.color != VK_NULL_HANDLE && openPass.depth != VK_NULL_HANDLE &&

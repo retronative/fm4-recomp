@@ -17,7 +17,7 @@ OUT="$ROOT/build/tests/runtime"
 mkdir -p "$OUT"
 export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 perl -e 'alarm 300; exec @ARGV' "$LLVM/clang++" -std=c++20 -O1 -Wall -Wextra -Werror -isysroot "$SDKROOT" \
-  -I"$ROOT/tests/runtime" -I"$ROOT/runtime" -I"$ROOT/recomp" -I"$XR/XenonUtils" -I"$XR/thirdparty/simde" \
+  -I"$ROOT/tests/runtime" -I"$ROOT/runtime" -I"$ROOT/recomp" -I"$XR/XenonUtils" -I"$XR/thirdparty/simde" -I"$XR/thirdparty/TinySHA1" \
   -I"$ROOT/runtime/kernel" "$ROOT/tests/runtime/test_runtime.cpp" "$ROOT/runtime/stops.cpp" "$ROOT/runtime/guest_memory.cpp" \
   "$ROOT"/runtime/kernel/*.cpp -o "$OUT/test_runtime"
 status=0

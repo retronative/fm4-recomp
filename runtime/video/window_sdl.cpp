@@ -8,6 +8,7 @@
 #include "renderer.h"
 #include "stops.h"
 #include "kernel/input_live.h"
+#include "kernel/disc_swap.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <cstdio>
@@ -136,6 +137,19 @@ VkExtent2D WindowPixels()
     return {uint32_t(w < 0 ? 0 : w), uint32_t(h < 0 ? 0 : h)};
 }
 
+void SetWindowTitle(const char* title)
+{
+    SDL_SetWindowTitle(sdlWindow, title);
+}
+
+SDL_Rect WindowFrame()
+{
+    SDL_Rect r{};
+    SDL_GetWindowPosition(sdlWindow, &r.x, &r.y);
+    SDL_GetWindowSize(sdlWindow, &r.w, &r.h);
+    return r;
+}
+
 void RunWindowLoop()
 {
     for (;;)
@@ -147,6 +161,7 @@ void RunWindowLoop()
                      [](bool minimized) { WindowEvent(minimized ? EventAction::Minimized : EventAction::Restored, WindowPixels()); });
         if (runtime::input::LiveEnabled())
             PollLiveInput();
+        runtime::disc::PumpMainThread();  // FM4 Recomp (Disc 2): a pending swap's dialogs (they may wait for the player; frames are dropped meanwhile)
         PresentHandedOverFrame(kTakeWaitNs);  // bounded: at most kTakeWaitNs without a frame, then the bounded present
     }
 }

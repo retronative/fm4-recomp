@@ -12,6 +12,9 @@
 #   src/xenia/xbox.h: XContentType
 #   src/xenia/vfs/devices/xcontent_devices/stfs_container_device.{h,cc}: SetupContainer,
 #     Read, ReadEntry, BlockToOffset, BlockToHashBlockNumber, GetBlockHash
+# Directory entry timestamps (create at +0x38, modified at +0x3C, each a big-endian FAT date then time) as
+# ShiftGlue 72b7dd6f include/rex/filesystem/devices/stfs_xbox.h:168-195 (Xenia's StfsDirectoryEntry);
+# --json gives them raw as created_fat / modified_fat (date << 16 | time).
 # Written for FM4 Recomp from those definitions; no Xenia code is copied.
 import json
 import struct
@@ -104,6 +107,7 @@ class Package:
                 "read_only_format": bool(flags & 1), "root_active_index": bool(flags & 2),
                 "file_table_block_count": h[v + 3] | (h[v + 4] << 8),   # host (LE) uint16
                 "file_table_block_number": u24le(h[v + 5:v + 8]),
+                "top_hash_table_hash": h[v + 8:v + 0x1C].hex(),
                 "total_block_count": struct.unpack_from(">I", h, v + 0x1C)[0],
                 "free_block_count": struct.unpack_from(">I", h, v + 0x20)[0],
             }
@@ -160,6 +164,9 @@ class Stfs:
             self.tables[offset] = self._read(offset, BLOCK)
         return self.tables[offset]
 
+    def data_block(self, index):                                # one data block, unverified
+        return self._read(self.block_to_offset(index), BLOCK)
+
     def next_block(self, index):                                # GetBlockHash().level0_next_block
         secondary = BLOCK if self.root_active else 0
         levels = 0
@@ -180,7 +187,7 @@ class Stfs:
     def entries(self):                                          # Read / ReadEntry
         out, index = [], self.s["file_table_block_number"]
         for n in range(self.s["file_table_block_count"]):
-            block = self._read(self.block_to_offset(index), BLOCK)
+            block = self.data_block(index)
             for m in range(BLOCK // 0x40):
                 e = block[m * 0x40:(m + 1) * 0x40]
                 if e[0] == 0:
@@ -192,7 +199,9 @@ class Stfs:
                             "parent": None if parent == 0xFFFF else parent,
                             "length": struct.unpack_from(">I", e, 52)[0],
                             "allocated_blocks": u24le(e[44:47]),
-                            "start_block": u24le(e[47:50])})
+                            "start_block": u24le(e[47:50]),
+                            "created_fat": struct.unpack_from(">I", e, 56)[0],    # date << 16 | time
+                            "modified_fat": struct.unpack_from(">I", e, 60)[0]})
             if n + 1 == self.s["file_table_block_count"]:
                 break
             index = self.next_block(index)
@@ -210,19 +219,35 @@ def path_of(entries, e):
     while e["parent"] is not None:
         e = entries[e["parent"]]
         parts.append(e["name"])
+        if len(parts) > len(entries):
+            raise ValueError("directory entries form a cycle at %r" % e["name"])
     return "/".join(reversed(parts))
+
+
+def describe(info, entries):
+    """The file-table fields of the --json output (stfs_extract.py writes the same header.json)."""
+    files = [e for e in entries if not e["directory"]]
+    info["file_count"] = len(files)
+    info["directory_count"] = len(entries) - len(files)
+    info["files_total_bytes"] = sum(e["length"] for e in files)
+    info["files"] = [{"path": path_of(entries, e), "length": e["length"],
+                      "created_fat": e["created_fat"], "modified_fat": e["modified_fat"]} for e in files]
+    info["directories"] = [{"path": path_of(entries, e), "created_fat": e["created_fat"],
+                            "modified_fat": e["modified_fat"]} for e in entries if e["directory"]]
+    return info
+
+
+def write_json(info, out):
+    with open(out, "w") as f:
+        json.dump(info, f, indent=1, sort_keys=True)
+        f.write("\n")
 
 
 def inspect(path):
     with open(path, "rb") as f:
         info = Package(f).header()
         if info["volume_type"] == "STFS":
-            entries = Stfs(f, info).entries()
-            files = [e for e in entries if not e["directory"]]
-            info["file_count"] = len(files)
-            info["directory_count"] = len(entries) - len(files)
-            info["files_total_bytes"] = sum(e["length"] for e in files)
-            info["files"] = [{"path": path_of(entries, e), "length": e["length"]} for e in files]
+            describe(info, Stfs(f, info).entries())
     return info
 
 
@@ -252,9 +277,7 @@ def main(argv):
     info = inspect(args[0])
     sys.stdout.write(report(info, listing))
     if len(args) == 3:
-        with open(args[2], "w") as f:
-            json.dump(info, f, indent=1, sort_keys=True)
-            f.write("\n")
+        write_json(info, args[2])
     return 0
 
 

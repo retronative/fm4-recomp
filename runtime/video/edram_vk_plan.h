@@ -108,6 +108,14 @@ enum class TransferKind
 // another sample count (MapTransferSource); depth <-> storage 5 is refused by name (not modelled yet).
 TransferKind ClassifyTransfer(edram::Key source, edram::Key dest, std::string& why);
 
+// FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X): the source bits of an EDRAM unit pipeline (edram_vk.cpp Pipeline's `sourceFlags`) for a
+// source host image of `hostSamples` samples: bit 0 the multisampled variant (XE_SOURCE_MS: sampler2DMS / usampler2DMS) exactly when
+// the IMAGE has more than one sample (a sampler2DMS over a 1-sample view, or a sampler2D over a multisampled one, is invalid Vulkan;
+// with FM4_HOST_MSAA_1X a 4x key's image has one sample: bit 0 clear, the shader's texelFetch reads sample 0); bit 1 read through the
+// transfer view (`uintView`: storage 4, 14, 5); bit 3 a 64 bpp colour source (`colour64`: storage 5, never a depth key). Bit 2
+// (sample shading) is the caller's.
+uint32_t TransferSourceFlags(uint32_t hostSamples, bool uintView, bool colour64);
+
 // The guest's 32-bit depth/stencil word from the host's float depth and 8-bit stencil (X :3605-3617): kD24FS8 depth
 // through PreClampedDepthTo20e4 (X spirv_shader_translator_rb.cc:236-326) with X's defaults round_to_nearest_even =
 // depth_float24_round = false (render_target_cache.cc:46) and remap_from_0_to_0_5 = false (FM4 Recomp difference: X
@@ -273,6 +281,14 @@ bool ValueClear(edram::Key dest, uint32_t word, const edram::Rect& rect, Pending
 // the same clear. Values outside the format's range (NaN, negative, above 1 for a UNORM, above 31.875 for 7e3) are refused before
 // packing. False: the tiles are not recorded as constants and keep today's copy path.
 bool ClearRequestWord(const ClearRequest& request, edram::Key key, uint32_t& word);
+
+// FM4 Recomp (M7 GPU cost, opt-in FM4_RESOLVE_COMPUTE=1): the resident resolve's fragment shader
+// (edram_vk.cpp kResolveResident) as a compute shader with the same conversion, operation for operation: its colour output becomes a
+// word written to an r32ui storage image (set 1, binding 0) at the invocation's pixel, and gl_FragCoord the invocation's id; 8x8
+// invocations a group, those outside width x height write nothing. Each replaced text must occur exactly once in `fragment`, else false
+// with `why` naming it (the fragment shader changed: the compute path must be revisited, never drift).
+constexpr uint32_t kResolveComputeGroup = 8;
+bool ResolveComputeSource(const std::string& fragment, std::string& out, std::string& why);
 
 // ---- Resolve registers --------------------------------------------------------------------------------------------
 

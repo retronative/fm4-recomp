@@ -10,6 +10,8 @@
 #include "objects.h"
 #include "file_system.h"
 #include "overlapped.h"
+#include "dispatcher.h"
+#include "disc_swap.h"
 #include "stfs.h"
 #include <cstdio>
 #include <cstring>
@@ -26,17 +28,44 @@ struct Enumerator { std::vector<std::vector<uint8_t>> items; uint32_t itemSize; 
 std::mutex enumLock;
 std::map<uint32_t, Enumerator> enumerators;  // by object body
 
+uint32_t CurrentTitleId(const uint8_t* base);  // below
+
+// FM4 Recomp (Disc 2): the content packages of the disc in the drive (file_system.h DiscContent) as XCONTENT_DATA
+// records, Xenia's shape (xam_content_aggregate.cc:65-72 AddODDContentTest): device = the disc's (content.h
+// kDiscContentDeviceId), the type, display name = the file name (UTF-16BE), file name = the name on the disc; each with
+// the title id of its directory.
+std::vector<std::pair<uint32_t, runtime::ContentData>> DiscContentRecords(uint32_t type)
+{
+    std::vector<std::pair<uint32_t, runtime::ContentData>> records;
+    for (const runtime::DiscContentItem& item : runtime::DiscContent(type))
+    {
+        runtime::ContentData data{};
+        const uint32_t words[2] = {runtime::kDiscContentDeviceId, type};
+        for (int w = 0; w < 2; w++)
+            for (int i = 0; i < 4; i++)
+                data[4 * w + i] = uint8_t(words[w] >> (24 - 8 * i));
+        for (size_t i = 0; i < item.fileName.size(); i++)  // 16 characters (DiscContent), within both fields
+            data[8 + 2 * i + 1] = uint8_t(item.fileName[i]), data[0x108 + i] = uint8_t(item.fileName[i]);
+        records.push_back({item.titleId, data});
+    }
+    return records;
+}
+
 }  // namespace
 
 GUEST_IMPORT(XamContentCreateEnumerator, "REFERENCE_DERIVED: Xenia xam_content.cc:72 XamContentCreateEnumerator, xenumerator.cc")
 {
     // (user index, device id, content type, flags, items per call, buffer size*, handle*). FM4: (0xFE, 0 = any device,
-    // 1 = saved game, 0, 5, ...). A device other than 0 or the content device: E_INVALIDARG with buffer size 0 (Xenia).
-    // Only saved games and flags 0 are modelled; anything else stops (7). The enumerator holds what is stored now.
+    // 1 = saved game, 0, 5, ...). A device other than 0, the content device or the disc's: E_INVALIDARG with buffer size 0
+    // (Xenia :79-87). Only saved games and flags 0 are modelled; anything else stops (7). The enumerator holds what is
+    // stored now. FM4 Recomp (Disc 2): device 0 or the disc's (2) also lists the content packages of the disc
+    // in the drive for this title (DiscContentRecords). Xenia leaves the disc part a TODO (xam_content.cc:110-112); its
+    // aggregate enumerator lists them (xam_content_aggregate.cc:26-77). FM4's content installer depends on it: it
+    // enumerates (user, 0, type 2, 0, 512) after the swap to Disc 2 and opens every item it gets (XamContentResolve).
     using namespace runtime;
     const uint32_t userIndex = ctx.r3.u32, device = ctx.r4.u32, type = ctx.r5.u32, flags = ctx.r6.u32, perCall = ctx.r7.u32;
     const uint32_t sizeOut = ctx.r8.u32, handleOut = ctx.r9.u32;
-    if (device != 0 && device != kContentDeviceId)
+    if (device != 0 && device != kContentDeviceId && device != kDiscContentDeviceId)
     {
         if (sizeOut)
             Store32(base, sizeOut, 0);
@@ -59,8 +88,17 @@ GUEST_IMPORT(XamContentCreateEnumerator, "REFERENCE_DERIVED: Xenia xam_content.c
     {
         std::lock_guard guard(enumLock);
         std::vector<std::vector<uint8_t>> items;
-        for (const ContentData& item : ListContent(type))
-            items.emplace_back(item.begin(), item.end());
+        if (device != kDiscContentDeviceId)
+            for (const ContentData& item : ListContent(type))
+                items.emplace_back(item.begin(), item.end());
+        if (device != kContentDeviceId)
+        {
+            const auto disc = DiscContentRecords(type);  // the title id is read only when the disc has content
+            const uint32_t current = disc.empty() ? 0 : CurrentTitleId(base);
+            for (const auto& [title, item] : disc)
+                if (title == current)
+                    items.emplace_back(item.begin(), item.end());
+        }
         enumerators[body] = Enumerator{std::move(items), kContentDataSize, perCall, 0};
     }
     Store32(base, handleOut, CreateObject(ObjectType::Enumerator, body, ""));
@@ -69,39 +107,54 @@ GUEST_IMPORT(XamContentCreateEnumerator, "REFERENCE_DERIVED: Xenia xam_content.c
 
 GUEST_IMPORT(XamEnumerate, "REFERENCE_DERIVED: Xenia xam_enum.cc:30-86 xeXamEnumerate, xenumerator.cc:60 WriteItems")
 {
-    // (handle, flags, buffer*, buffer length, items returned*, overlapped*). Synchronous (items returned given): up to the
-    // enumerator's items per call, then ERROR_NO_MORE_FILES (0x12) with 0 items. A buffer too small for them stops (7)
-    // (Xenia does not check); flags other than 0 or the overlapped form stop (7).
+    // (handle, flags, buffer*, buffer length, items returned*, overlapped*). Up to the enumerator's items per call, then
+    // ERROR_NO_MORE_FILES (0x12) with 0 items; a null buffer ERROR_INVALID_PARAMETER. Synchronous (items returned given):
+    // the result, items returned = the count (0 on failure). FM4 Recomp (Disc 2): the overlapped form (no
+    // items returned), as Xenia's run (xam_enum.cc:38-57): extended error = HRESULT_FROM_WIN32(result) (xbox.h:113-116: 0
+    // stays 0), length = the count, result FUNCTION_FAILED (0x65B) when not 0; completed at once (overlapped.h), returns
+    // ERROR_IO_PENDING. FM4's content installer uses it (flags 0x20, overlapped; its XEnumerate wrapper refuses any other
+    // flag with ERROR_INVALID_PARAMETER). Xenia ignores flags (asserts 0), so 0x20 is handled as 0; the bit's meaning is
+    // UNRESOLVED. Other flags, both or neither of items returned and overlapped stop (7); so does a buffer too small for
+    // the items (Xenia does not check). A handle that is no enumerator: ERROR_INVALID_HANDLE, before the overlapped.
     using namespace runtime;
+    constexpr uint32_t kFunctionFailed = 0x65B;
     const uint32_t handle = ctx.r3.u32, flags = ctx.r4.u32, buffer = ctx.r5.u32, length = ctx.r6.u32, returned = ctx.r7.u32;
     const uint32_t overlapped = ctx.r8.u32;
-    if (flags != 0 || overlapped != 0 || returned == 0)
-        Stop(StopCode::Unimplemented, "XamEnumerate(%08X, flags %X, overlapped %08X): only the synchronous form is modelled", handle, flags, overlapped);
+    if ((flags & ~0x20u) != 0 || (returned == 0) == (overlapped == 0))
+        Stop(StopCode::Unimplemented, "XamEnumerate(%08X, flags %X, items returned %08X, overlapped %08X): not modelled", handle, flags,
+             returned, overlapped);
+    if (overlapped)
+        CheckOverlapped(ctx, base, overlapped, "XamEnumerate");
     const auto object = LookupHandle(handle);
-    std::lock_guard guard(enumLock);
-    const auto it = object && object->type == ObjectType::Enumerator ? enumerators.find(object->header) : enumerators.end();
-    if (it == enumerators.end())
-        return (void)(ctx.r3.u64 = kErrorInvalidHandle);
-    if (buffer == 0)
+    uint32_t result = 0, count = 0;
     {
-        Store32(base, returned, 0);
-        return (void)(ctx.r3.u64 = kErrorInvalidParameter);
+        std::lock_guard guard(enumLock);
+        const auto it = object && object->type == ObjectType::Enumerator ? enumerators.find(object->header) : enumerators.end();
+        if (it == enumerators.end())
+            return (void)(ctx.r3.u64 = kErrorInvalidHandle);
+        Enumerator& e = it->second;
+        count = uint32_t(std::min<size_t>(e.items.size() - e.next, e.perCall));
+        if (buffer == 0)
+            result = kErrorInvalidParameter, count = 0;
+        else if (count == 0)
+            result = kErrorNoMoreFiles;
+        else
+        {
+            if (uint64_t(count) * e.itemSize > length)
+                Stop(StopCode::Unimplemented, "XamEnumerate: %u items need %llu bytes, the buffer has %u", count,
+                     (unsigned long long)(uint64_t(count) * e.itemSize), length);
+            for (size_t i = 0; i < count; i++)
+                std::memcpy(base + buffer + i * e.itemSize, e.items[e.next + i].data(), e.itemSize);
+            e.next += count;
+        }
     }
-    Enumerator& e = it->second;
-    const size_t count = std::min<size_t>(e.items.size() - e.next, e.perCall);
-    if (count == 0)
+    if (!overlapped)
     {
-        Store32(base, returned, 0);
-        return (void)(ctx.r3.u64 = kErrorNoMoreFiles);
+        Store32(base, returned, result == 0 ? count : 0);
+        return (void)(ctx.r3.u64 = result);
     }
-    if (uint64_t(count) * e.itemSize > length)
-        Stop(StopCode::Unimplemented, "XamEnumerate: %zu items need %llu bytes, the buffer has %u", count,
-             (unsigned long long)(count * e.itemSize), length);
-    for (size_t i = 0; i < count; i++)
-        std::memcpy(base + buffer + i * e.itemSize, e.items[e.next + i].data(), e.itemSize);
-    e.next += count;
-    Store32(base, returned, uint32_t(count));
-    ctx.r3.u64 = 0;
+    const uint32_t extended = result == 0 ? 0 : (1u << 31 | 0x70000 | (result & 0xFFFF));  // HRESULT_FROM_WIN32
+    ctx.r3.u64 = FinishOverlapped(ctx, base, overlapped, result == 0 ? 0 : kFunctionFailed, extended, count, "XamEnumerate");
 }
 
 GUEST_IMPORT(XamContentOpenFile, "REFERENCE_DERIVED: XContent package mounting as Xenia content roots (xam_content.cc); Xenia stubs this call (:267-276, FILE_NOT_FOUND)")
@@ -132,11 +185,62 @@ GUEST_IMPORT(XamContentOpenFile, "REFERENCE_DERIVED: XContent package mounting a
     if (r == runtime::Resolved::NotFound)
         return (void)(ctx.r3.u64 = 2);
     const auto package = runtime::stfs::Package::Open(entry.host);
-    if (!runtime::MountContentRoot(rootName, package))
+    if (!runtime::MountContentRoot(rootName, package, entry.disc))
         Stop(StopCode::Unimplemented, "XamContentOpenFile: root \"%.32s\" is already mounted", rootName);
     std::fprintf(stderr, "[content] %s: mounted %s (%zu entries) read-only\n", rootName, text, package->Files().size());
     ctx.r3.u64 = 0;
 }
+
+namespace {
+
+// FM4 Recomp (Disc 2): XamContentCreateEx of an installed package (device 1, type 2: a Disc 2 package FM4's
+// installer copied, content.h). OPEN_EXISTING only: PATH_NOT_FOUND (3) unless it is stored complete (an interrupted copy
+// is not installed), else OpenPackageContent (read-only, its hash tree verified), disposition state 2; results and the
+// XOVERLAPPED as for saved games (Xenia xam_content.cc:124-243). The license mask: 0 after a successful open, as Xenia's
+// default (its license_mask cvar, :22-31, :207-213; chosen after FM4's installed Disc 2 packages showed
+// a first license entry FFFFFFFFFFFFFFFF, bits 0, flags 0). The console derives it from the package's license entries
+// (header 0x22C, UNRESOLVED); FM4 uses it for "purchased" (UPDATE ContentOffers ... IsPurchased=(LicenseMask & %u)=LicenseMask),
+// so offers without license bits count as purchased and none are invented. The first license entry is logged as evidence.
+// Another disposition stops (7).
+void OpenInstalledPackage(PPCContext& ctx, uint8_t* base, const runtime::ContentData& data, const std::string& root, uint32_t flags,
+                          uint32_t dispositionPtr, uint32_t licensePtr, uint32_t overlapped)
+{
+    const std::string fileName = runtime::ContentFileName(data);
+    if ((flags & 0xF) != 3)
+        Stop(StopCode::Unimplemented, "XamContentCreateEx(\"%s\", installed package \"%s\", flags %08X): only OPEN_EXISTING is modelled", root.c_str(),
+             fileName.c_str(), flags);
+    if (overlapped != 0)
+        runtime::CheckOverlapped(ctx, base, overlapped, "XamContentCreateEx");
+    const bool stored = runtime::PackageStored(data);
+    if (stored && licensePtr != 0)
+    {
+        uint8_t license[16] = {};
+        if (FILE* f = std::fopen(runtime::InstalledPackagePath(data).c_str(), "rb"))
+        {
+            if (std::fseek(f, 0x22C, SEEK_SET) != 0 || std::fread(license, 1, sizeof license, f) != sizeof license)
+                std::memset(license, 0, sizeof license);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[content] XamContentCreateEx(\"%s\", installed package \"%s\"): license mask 0 (Xenia's default; first license entry "
+                     "%02X%02X%02X%02X%02X%02X%02X%02X bits %02X%02X%02X%02X flags %02X%02X%02X%02X)\n", root.c_str(), fileName.c_str(), license[0],
+                     license[1], license[2], license[3], license[4], license[5], license[6], license[7], license[8], license[9], license[10], license[11],
+                     license[12], license[13], license[14], license[15]);
+    }
+    constexpr uint32_t kPathNotFound = 3, kFunctionFailed = 0x65B;
+    const uint32_t result = stored ? runtime::OpenPackageContent(data, root) : kPathNotFound, state = stored && result == 0 ? 2 : 0;
+    std::fprintf(stderr, "[content] XamContentCreateEx(\"%s\", installed package \"%s\", OPEN_EXISTING): %s (result %X)\n", root.c_str(),
+                 fileName.c_str(), result != 0 ? "not done" : "opened and mounted read-only", result);
+    if (licensePtr != 0 && result == 0)
+        runtime::Store32(base, licensePtr, 0);  // Xenia :207-213 (its license_mask cvar's default)
+    if (overlapped == 0)
+        return (void)(ctx.r3.u64 = result);
+    if (dispositionPtr != 0)
+        runtime::Store32(base, dispositionPtr, 0);
+    const uint32_t extended = result == 0 ? 0 : (1u << 31 | 0x70000 | (result & 0xFFFF));  // HRESULT_FROM_WIN32
+    ctx.r3.u64 = runtime::FinishOverlapped(ctx, base, overlapped, result == 0 ? 0 : kFunctionFailed, extended, state, "XamContentCreateEx");
+}
+
+}  // namespace
 
 GUEST_IMPORT(XamContentCreateEx, "REFERENCE_DERIVED: Xenia xam_content.cc:124-243 xeXamContentCreate, content_manager.cc:215-239 CreateContent; compatibility policy: save storage")
 {
@@ -154,6 +258,8 @@ GUEST_IMPORT(XamContentCreateEx, "REFERENCE_DERIVED: Xenia xam_content.cc:124-24
     std::memcpy(data.data(), base + dataPtr, data.size());
     const uint32_t device = runtime::Load32(base, dataPtr), type = runtime::Load32(base, dataPtr + 4), disposition = flags & 0xF;
     const std::string root(reinterpret_cast<const char*>(base + rootName), strnlen(reinterpret_cast<const char*>(base + rootName), 64));
+    if (device == runtime::kContentDeviceId && type == runtime::kContentTypeMarketplace)
+        return OpenInstalledPackage(ctx, base, data, root, flags, dispositionPtr, licensePtr, overlapped);
     if ((device != runtime::kContentDeviceId && device != 0) || type != runtime::kContentTypeSavedGame)
         Stop(StopCode::Unimplemented, "XamContentCreateEx(\"%s\", device %u, type %08X): only saved games on device 1 are modelled", root.c_str(), device, type);
     const std::string fileName = runtime::ContentFileName(data);
@@ -185,16 +291,20 @@ GUEST_IMPORT(XamContentCreateEx, "REFERENCE_DERIVED: Xenia xam_content.cc:124-24
     ctx.r3.u64 = runtime::FinishOverlapped(ctx, base, overlapped, result == 0 ? 0 : kFunctionFailed, extended, state, "XamContentCreateEx");
 }
 
-GUEST_IMPORT(XamContentGetDeviceData, "REFERENCE_DERIVED: Xenia xam_content_device.cc:101-129 (X_CONTENT_DEVICE_DATA, 0x50 bytes); compatibility policy: save storage (512 MB quota)")
+GUEST_IMPORT(XamContentGetDeviceData, "REFERENCE_DERIVED: Xenia xam_content_device.cc:101-129 (X_CONTENT_DEVICE_DATA, 0x50 bytes), :33-40 (20 GB); compatibility policy: free space bounded by the host")
 {
-    // (device id, X_CONTENT_DEVICE_DATA*): the only device (1): zeroed, then id, type HDD (1), total bytes = the quota,
-    // free bytes = the quota minus what is stored (content.h; not Xenia's invented 20 GB / 3 GB), and Xenia's name
-    // "Dummy HDD" (UTF-16 big-endian, at most 28 characters with the terminator). Any other id: DEVICE_NOT_CONNECTED
-    // (0x48F), nothing written.
+    // (device id, X_CONTENT_DEVICE_DATA*): the only device (1): zeroed, then id, type HDD (1), total bytes = Xenia's 20 GB
+    // (content.h kContentCapacity), free bytes = ContentFreeBytes (the capacity minus what is stored, never more than the
+    // host volume's available space minus its reserve; not Xenia's invented 3 GB), and Xenia's name "Dummy HDD" (UTF-16
+    // big-endian, at most 28 characters with the terminator). FM4 reads free bytes as 64 bits (ld at its call sites),
+    // so Xenia's warning about titles reading the low 32 bits does not apply to it. Any
+    // other id: DEVICE_NOT_CONNECTED (0x48F), nothing written.
     const uint32_t deviceId = ctx.r3.u32, data = ctx.r4.u32;
+    if (deviceId == runtime::kDiscContentDeviceId)  // FM4 Recomp (Disc 2): its size and name are not modelled (Xenia invents 7 GB)
+        Stop(StopCode::Unimplemented, "XamContentGetDeviceData(%u): the disc drive's content device is not modelled", deviceId);
     if (deviceId != runtime::kContentDeviceId)
         return (void)(ctx.r3.u64 = 0x48F);
-    const uint64_t used = runtime::ContentBytesUsed(), total = runtime::kContentQuota, free = used >= total ? 0 : total - used;
+    const uint64_t total = runtime::kContentCapacity, free = runtime::ContentFreeBytes();
     std::memset(base + data, 0, 0x50);
     runtime::Store32(base, data, runtime::kContentDeviceId);
     runtime::Store32(base, data + 4, runtime::kContentDeviceType);
@@ -212,6 +322,8 @@ GUEST_IMPORT(XamContentGetDeviceState, "REFERENCE_DERIVED: Xenia xam_content_dev
     // an XOVERLAPPED, FUNCTION_FAILED (0x65B) with extended error 0x48F (Xenia's CompleteOverlappedImmediateEx).
     constexpr uint32_t kDeviceNotConnected = 0x48F, kFunctionFailed = 0x65B;
     const uint32_t deviceId = ctx.r3.u32, overlapped = ctx.r4.u32;
+    if (deviceId == runtime::kDiscContentDeviceId)  // FM4 Recomp (Disc 2): present only with content? not modelled
+        Stop(StopCode::Unimplemented, "XamContentGetDeviceState(%u): the disc drive's content device is not modelled", deviceId);
     const bool present = deviceId == runtime::kContentDeviceId;
     if (!overlapped)
         return (void)(ctx.r3.u64 = present ? 0 : kDeviceNotConnected);
@@ -413,32 +525,33 @@ GUEST_IMPORT(XamContentAggregateCreateEnumerator, "REFERENCE_DERIVED: Xenia xam_
     // (device 0 or 1) the stored items of the current title and of its alternate title ids (FM4: 4D53084D, Forza
     // Motorsport 3); on the disc (device 0) game:\Content\0000000000000000. Here: the user-data store holds only content
     // made by this runtime for the current title, so its items carry the current title id and the alternate title has
-    // none; disc 1 has no Content directory, and one that exists stops (not modelled). X_KENUMERATOR as Xenia's
-    // Initialize(0xFF, 0xFE, 0x2000E, 0x20010, 0), then {"XEN\0", handle}. Saved games (1) and marketplace content (2)
-    // are modelled; another type stops (7).
+    // none. FM4 Recomp (Disc 2): on device 0 or the disc's (2), the disc's packages follow, every title's
+    // with its directory's title id (Xenia AddODDContentTest :26-77, DiscContentRecords); Disc 1 has none. X_KENUMERATOR
+    // as Xenia's Initialize(0xFF, 0xFE, 0x2000E, 0x20010, 0), then {"XEN\0", handle}. Saved games (1) and marketplace
+    // content (2) are modelled; another type stops (7).
     using namespace runtime;
     const uint32_t device = ctx.r4.u32, type = ctx.r5.u32, handleOut = ctx.r7.u32;
-    if (!handleOut || (device != 0 && device != kContentDeviceId))
+    if (!handleOut || (device != 0 && device != kContentDeviceId && device != kDiscContentDeviceId))
         return (void)(ctx.r3.u64 = kInvalidArg);
     if (type != kContentTypeSavedGame && type != kContentTypeMarketplace)
         Stop(StopCode::Unimplemented, "XamContentAggregateCreateEnumerator(device %u, type %X): not modelled", device, type);
-    if (device == 0)
-    {
-        DiscEntry odd;
-        std::string resolved;
-        if (ResolveGuestPath("game:\\Content\\0000000000000000", odd, resolved) == Resolved::Found)
-            Stop(StopCode::Unimplemented, "XamContentAggregateCreateEnumerator: disc content (game:\\Content) is not modelled");
-    }
     constexpr uint32_t kAggregateSize = kContentDataSize + 4;
-    const uint32_t titleId = CurrentTitleId(base);
-    std::vector<std::vector<uint8_t>> items;
-    for (const ContentData& item : ListContent(type))
-    {
+    auto aggregateRecord = [](const ContentData& item, uint32_t title) {
         std::vector<uint8_t> record(item.begin(), item.end());
         for (int i = 0; i < 4; i++)
-            record.push_back(uint8_t(titleId >> (24 - 8 * i)));
-        items.push_back(std::move(record));
+            record.push_back(uint8_t(title >> (24 - 8 * i)));
+        return record;
+    };
+    std::vector<std::vector<uint8_t>> items;
+    if (device != kDiscContentDeviceId)
+    {
+        const uint32_t titleId = CurrentTitleId(base);
+        for (const ContentData& item : ListContent(type))
+            items.push_back(aggregateRecord(item, titleId));
     }
+    if (device != kContentDeviceId)
+        for (const auto& [title, item] : DiscContentRecords(type))
+            items.push_back(aggregateRecord(item, title));
     const uint32_t body = ArenaAlloc(base, 0x20);
     const uint32_t words[6] = {0xFE, 0x2000E, 0x20010, 0xFF, 1, 0};
     for (int i = 0; i < 6; i++)
@@ -500,5 +613,197 @@ GUEST_IMPORT(XamGetPrivateEnumStructureFromHandle, "REFERENCE_DERIVED: Xenia xam
         return (void)(ctx.r3.u64 = status::kInvalidHandle);
     if (out)
         Store32(base, out, object->header);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(XamContentResolve, "HYPOTHESIS: a package's device path into the buffer, from FM4's callers; Xenia stubs it (xam_content.cc:54-67: the buffer goes to RtlInitAnsiString, 260 bytes, 0 = resolved)")
+{
+    // FM4 Recomp (Disc 2). (user index, XCONTENT_DATA*, buffer*, buffer size, flag, 0, 0). FM4's two callers (its
+    // XDK content-file library) pass flag 0 and then RtlInitAnsiString + NtOpenFile(GENERIC_READ, share read) on the
+    // buffer (the content installer reads the package's size, then copies it in 32 KB reads), or flag 1 and then
+    // NtCreateFile(OVERWRITE_IF) (the installed copy, written in 32 KB writes). The path's form is this runtime's (the guest
+    // only opens it). Modelled:
+    // - a package of the disc in the drive (device 2, content.h kDiscContentDeviceId, as XamContentCreateEnumerator lists
+    //   it), flag 0: \Device\Cdrom0\Content\0000000000000000\<title %08X>\<type %08X>\<file name>; it must be a file of the
+    //   disc in the drive;
+    // - an installed package (device 1, type 2), flag 1: "<InstallRoot>:\<file name>", the file in the writable type
+    //   directory <user-data>/content/1/00000002 (content.h InstallRoot); NtCreateFile creates or empties it there and
+    //   NtWriteFile fills it, against the device's free space (STATUS_DISK_FULL past it);
+    // - the same, flag 0: the same path, for a package stored complete (content.h PackageStored), as FM4's scan opens
+    //   every item it enumerates.
+    // Each returns 0; a buffer too small for the path and its NUL stops (7), as does anything else.
+    using namespace runtime;
+    const uint32_t user = ctx.r3.u32, dataPtr = ctx.r4.u32, buffer = ctx.r5.u32, size = ctx.r6.u32, flag = ctx.r7.u32;
+    ContentData data;
+    std::memcpy(data.data(), base + dataPtr, data.size());
+    const uint32_t device = Load32(base, dataPtr), type = Load32(base, dataPtr + 4);
+    const std::string name = ContentFileName(data);
+    if (flag > 1 || ctx.r8.u32 != 0 || ctx.r9.u32 != 0 || buffer == 0 ||
+        !((device == kDiscContentDeviceId && flag == 0) || (device == kContentDeviceId && type == kContentTypeMarketplace)))
+        Stop(StopCode::Unimplemented, "XamContentResolve(user %X, device %u, type %08X, \"%s\", flag %u, %08X, %08X): not modelled", user, device,
+             type, name.c_str(), flag, ctx.r8.u32, ctx.r9.u32);
+    char path[160];
+    if (device == kDiscContentDeviceId)
+    {
+        std::snprintf(path, sizeof path, "\\Device\\Cdrom0\\Content\\0000000000000000\\%08X\\%08X\\%s", CurrentTitleId(base), type, name.c_str());
+        DiscEntry entry;
+        std::string resolved;
+        if (ResolveGuestPath(path, entry, resolved) != Resolved::Found || entry.directory)
+            Stop(StopCode::Unimplemented, "XamContentResolve: %s is not a package of the disc in the drive (Disc %u)", path, DiscInDrive());
+    }
+    else
+    {
+        if (flag == 0 && !PackageStored(data))
+            Stop(StopCode::Unimplemented, "XamContentResolve(user %X, \"%s\", flag 0): the package is not installed complete (%s)", user, name.c_str(),
+                 InstalledPackagePath(data).c_str());
+        std::snprintf(path, sizeof path, "%s:\\%s", InstallRoot(type).c_str(), name.c_str());
+    }
+    const size_t length = std::strlen(path);
+    if (length + 1 > size)
+        Stop(StopCode::Unimplemented, "XamContentResolve: %s needs %zu bytes, the buffer has %u", path, length + 1, size);
+    std::memcpy(base + buffer, path, length + 1);
+    std::fprintf(stderr, "[content] XamContentResolve(user %X, %s \"%s\", type %08X, flag %u): %s\n", user,
+                 device == kDiscContentDeviceId ? "disc package" : "installed package", name.c_str(), type, flag, path);
+    ctx.r3.u64 = 0;
+}
+
+namespace {
+
+// A guest UTF-16BE string (at most 255 characters, NUL-terminated) as UTF-8, for the log; "" for a null pointer.
+std::string GuestText(const uint8_t* base, uint32_t at)
+{
+    std::string out;
+    for (uint32_t i = 0; at != 0 && i < 255; i++)
+    {
+        const uint32_t c = uint32_t(base[at + 2 * i]) << 8 | base[at + 2 * i + 1];
+        if (c == 0)
+            break;
+        if (c < 0x80)
+            out += char(c);
+        else if (c < 0x800)
+            out += char(0xC0 | c >> 6), out += char(0x80 | (c & 0x3F));
+        else
+            out += char(0xE0 | c >> 12), out += char(0x80 | ((c >> 6) & 0x3F)), out += char(0x80 | (c & 0x3F));
+    }
+    return out;
+}
+
+// Why the disc whose default.xex is the host file `xex` is not disc `number` of this title ("" if it is): its execution
+// info (plaintext header: Xenia xex2_info.h:555-564 xex2_header {magic "XEX2", ..., header count +0x14, {key, offset} from
+// +0x18}; :486-496 xex2_opt_execution_info, key 0x00040006 (:300): media id +0, title id +0xC, disc number +0x12) must
+// name the running title and disc `number`, and its media id must be in the executable's multidisc media ids
+// (0x000406FF: a size, then 16-byte entries; the media id is an entry's last 4 bytes: OBSERVED on FM4, 26FF1101 and
+// 0F5C87F9 for its two discs; Xenia leaves the header a TODO, user_module.cc:642).
+std::string DiscIdentityProblem(const uint8_t* base, const std::string& xex, uint32_t number)
+{
+    using runtime::Load32;
+    std::vector<uint8_t> header(0x10000);
+    FILE* f = xex.empty() ? nullptr : std::fopen(xex.c_str(), "rb");
+    if (f == nullptr)
+        return "the disc has no readable default.xex";
+    header.resize(std::fread(header.data(), 1, header.size(), f));
+    std::fclose(f);
+    auto be32 = [&](size_t at) {
+        return at + 4 <= header.size() ? uint32_t(header[at]) << 24 | uint32_t(header[at + 1]) << 16 | uint32_t(header[at + 2]) << 8 | header[at + 3] : 0u;
+    };
+    uint32_t info = 0;
+    for (uint32_t i = 0, count = be32(0x14); be32(0) == 0x58455832 && i < count && 0x18 + 8 * (i + 1) <= header.size(); i++)
+        if (be32(0x18 + 8 * i) == 0x00040006)
+            info = be32(0x18 + 8 * i + 4);
+    if (info == 0 || info + 0x18 > header.size())
+        return xex + " is not an XEX2 with execution info";
+    const uint32_t execution = runtime::XexHeaderField(base, runtime::ExecutableModule().header, 0x00040006);
+    const uint32_t mediaIds = runtime::XexHeaderField(base, runtime::ExecutableModule().header, 0x000406FF);
+    const uint32_t media = be32(info), title = be32(info + 0xC), disc = header[info + 0x12];
+    bool listed = false;
+    for (uint32_t at = 4; mediaIds != 0 && at + 16 <= Load32(base, mediaIds); at += 16)
+        listed = listed || Load32(base, mediaIds + at + 12) == media;
+    if (title == Load32(base, execution + 0xC) && disc == number && listed)
+        return "";
+    char problem[256];
+    std::snprintf(problem, sizeof problem, "it is not Disc %u of this game: its default.xex is title %08X, disc %u, media id %08X (%s the game's list of its "
+                  "discs); this game is %08X", number, title, disc, media, listed ? "in" : "not in", Load32(base, execution + 0xC));
+    return problem;
+}
+
+}  // namespace
+
+GUEST_IMPORT(XamSwapDisc, "REFERENCE_DERIVED: Xenia xam_content.cc:433-487 XamSwapDisc (X_SWAPDISC_ERROR_MESSAGE; the completion KEVENT set once the disc is mounted); disc identity from the XEX headers")
+{
+    // FM4 Recomp (Disc 2). (disc number, KEVENT* completion, X_SWAPDISC_ERROR_MESSAGE* {title*, text*, button*},
+    // UTF-16BE). FM4 (CSwapDisc::DiscSwapThreadFunc) creates the event, references it by handle (ObReferenceObjectByHandle
+    // with the event type: the KEVENT body), calls this and, on 0, waits for the event with no timeout. Xenia: a disc the
+    // title has (its check compares the executable's own disc number, not the request: not copied); the requested disc
+    // already in the drive: the event set, 0; otherwise the new disc mounted, then the event set, 0. Here: the request
+    // must be a disc of the title (1 to its execution info's disc count, +0x13; FM4: 2), else a stop (7).
+    // - The disc in the drive: the event set, 0.
+    // - A disc set up (--disc<n>, --disc<n>-map): it must be this title's (DiscIdentityProblem, else a stop (9)); it is put
+    //   in the drive (file_system.h InsertDisc: \Device\Cdrom0, game:\ and d:\ serve it; Xenia mounts the new disc at
+    //   \Device\LauncherData instead, leaving game:\ on the old disc, which FM4's installer paths contradict), and only
+    //   then the event is set, 0.
+    // - A disc not set up, with the player's window able to set it up (disc_swap.h, the window build with --disc-setup):
+    //   0 and the request stays pending, as on the console while its "insert the disc" screen is up; the window asks for
+    //   the disc's image and sets it up; the disc then goes into the drive (checked as above, a mismatch being a failure the
+    //   player can retry) and only then the event is set. The game's own Back on its Disc screen cancels (XamSwapCancel).
+    // - A disc not set up, no window to ask: a stop (9) telling the player how to set it up, with the game's text.
+    // Xenia releases the event's reference at completion; kernel objects are not reference counted here
+    // (ObDereferenceObject), so nothing is released. A completion that is not an event stops (7).
+    using namespace runtime;
+    const uint32_t disc = ctx.r3.u32, event = ctx.r4.u32, message = ctx.r5.u32;
+    const uint32_t execution = XexHeaderField(base, ExecutableModule().header, 0x00040006);
+    if (execution == 0)
+        Stop(StopCode::Setup, "XamSwapDisc: the executable has no execution info (disc count)");
+    const uint32_t discs = base[execution + 0x13];
+    if (disc == 0 || disc > discs)
+        Stop(StopCode::Unimplemented, "XamSwapDisc(%u): the title has discs 1 to %u", disc, discs);
+    if (event == 0 || event % 4 || base[event] > dispatch::kSynchronizationEvent)
+        Stop(StopCode::Unimplemented, "XamSwapDisc(%u, %08X): the completion is not an event object", disc, event);
+    const std::string text = message ? GuestText(base, Load32(base, message + 4)) : "";
+    const uint32_t previous = DiscInDrive();
+    const bool launchDisc = disc == base[execution + 0x12];  // the executable's own disc (fm4recomp checks --xex): not re-checked
+    if (disc != previous && !DiscRegistered(disc))
+    {
+        runtime::disc::SwapService* service = runtime::disc::Service();
+        if (service == nullptr)
+            Stop(StopCode::Setup, "XamSwapDisc: the game asks for Disc %u (\"%s\"); set it up: extract the owner's Disc %u (scripts/extract_game.sh) "
+                 "and pass --disc%u <its extracted root> --disc%u-map <its GDFX map, survey/gdfx.py>", disc, text.c_str(), disc, disc, disc);
+        service->Request(disc, text,
+                         [base, disc](const runtime::disc::InstallResult& r) {
+                             const std::string problem = DiscIdentityProblem(base, r.root + "/default.xex", disc);
+                             if (!problem.empty())
+                                 return problem;
+                             AddDisc(disc, r.root, r.map);  // the kit's own map; a malformed one stops (9)
+                             InsertDisc(disc);
+                             return std::string();
+                         },
+                         [base, event] { SetEvent(base, event); });
+        return (void)(ctx.r3.u64 = 0);  // pending: the event is set when the disc is in the drive, or when the game cancels
+    }
+    if (disc != previous)
+    {
+        if (!launchDisc)
+            if (const std::string problem = DiscIdentityProblem(base, DiscRootFile(disc, "default.xex"), disc); !problem.empty())
+                Stop(StopCode::Setup, "--disc%u: %s", disc, problem.c_str());
+        const size_t open = OpenFilesOnDisc(previous);
+        InsertDisc(disc);
+        std::fprintf(stderr, "[disc] XamSwapDisc(%u) \"%s\": Disc %u is in the drive (was Disc %u; %zu handle(s) still open on it)\n", disc,
+                     text.c_str(), disc, previous, open);
+    }
+    else
+        std::fprintf(stderr, "[disc] XamSwapDisc(%u) \"%s\": already in the drive\n", disc, text.c_str());
+    SetEvent(base, event);
+    ctx.r3.u64 = 0;
+}
+
+GUEST_IMPORT(XamSwapCancel, "HYPOTHESIS from FM4's code: ends a pending XamSwapDisc and sets its completion event (FM4's swap thread waits on it with no timeout); Xenia and ShiftGlue list the export only")
+{
+    // FM4 Recomp (Disc 2). (): FM4 calls it from its Disc screen's Back (CMultiDiscSwap) only while
+    // its swap state is 0 (pending), after setting that state to 2 (cancelled); its swap thread then wakes from the event
+    // and ends without setting "done". So a pending request (disc_swap.h, a disc being set up) ends here with its event set.
+    // With none pending (the swap completed at once, before the thread marked it done), there is nothing to end. FM4
+    // discards the result (VERIFIED in our translation); 0 is returned either way.
+    runtime::disc::SwapService* service = runtime::disc::Service();
+    const bool ended = service != nullptr && service->Cancel();
+    std::fprintf(stderr, "[disc] XamSwapCancel: %s\n", ended ? "the pending swap ended" : "no swap pending (it had completed)");
     ctx.r3.u64 = 0;
 }

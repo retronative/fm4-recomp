@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/retronative/fm4-recomp/security/policy
+    about: Security problems are reported privately, never in a public issue.
+  - name: Legal notice and what the repository contains
+    url: https://github.com/retronative/fm4-recomp/blob/main/docs/LEGAL.md
+    about: No game files are included or distributed; please don't ask for them.

@@ -94,9 +94,18 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     // FM4 Recomp (alpha, RT format 5): a 64 bpp colour key (storage 5) moves to and from colour keys only (kTransferColor64). Its
     // depth <-> colour transfers (X packs two depth samples into one 64 bpp sample, :3303-3333, and picks a 32 bpp half for a
     // depth destination, :3080-3102) are not modelled yet: refused by name, so the run that needs one says so.
-    if (source.IsDepth() != dest.IsDepth() && (source.Is64bpp() || dest.Is64bpp()))
-        return refuse(source.IsDepth() ? "depth -> colour into a 64 bpp key (storage 5) is not modelled yet (X :3303-3333)"
-                                       : "colour -> depth from a 64 bpp key (storage 5) is not modelled yet (X :3080-3102)");
+    // FM4 Recomp (alpha, Car Select): colour -> depth from a 64 bpp key is modelled (the half of the source sample by
+    // the destination pixel, X :2686-2777 and :3080-3102, then the column swap at the source's 64 bpp width, :2912-2936: MapTransferSource,
+    // TransferWordOf64); depth -> colour into one stays refused.
+    if (source.IsDepth() && dest.Is64bpp())
+        return refuse("depth -> colour into a 64 bpp key (storage 5) is not modelled yet (X :3303-3333)");
+    if (!source.IsDepth() && dest.IsDepth() && source.Is64bpp())
+    {
+        const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
+        if (uint32_t(sm) > 2 || uint32_t(dm) > 2)
+            return refuse("msaa_samples 3 is undefined");
+        return TransferKind::ColorToDepth;
+    }
     if (source.IsDepth() && !dest.IsDepth())  // X kDepthToColor (:4910-4913); edram_vk_plan.h for the accepted shape
     {
         // Any pitches: X splits the destination tile index by the destination's pitch (:2516-2577) and the source tile index
@@ -163,6 +172,12 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
     // FM4 Recomp (alpha, RT format 5): a 64 bpp side (storage 5) goes through its two 32-bit guest words (MapTransferSource,
     // TransferWordOf64 / TransferTexelOf64; X :2607-2777, :3005-3023, :3080-3102, :3114-3370), every MSAA pair as for 32 bpp.
     return TransferKind::Color;
+}
+
+// FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X): the three former inline copies (edram_vk.cpp ExecuteTransfers, RecordDump, RecordResident).
+uint32_t TransferSourceFlags(uint32_t hostSamples, bool uintView, bool colour64)
+{
+    return (hostSamples > 1 ? 1u : 0u) | (uintView ? 2u : 0u) | (colour64 ? 8u : 0u);
 }
 
 SourceTexel MapTransferTexel(uint32_t destX, uint32_t destY, uint32_t destSample, Msaa source, Msaa dest)
@@ -378,6 +393,32 @@ std::vector<size_t> SelectClearFlush(Key key, const std::vector<PendingClear>& p
     }
     std::reverse(taken.begin(), taken.end());
     return taken;
+}
+
+bool ResolveComputeSource(const std::string& fragment, std::string& out, std::string& why)
+{
+    static const char* const output = "layout(location = 0) out uint xe_word;";
+    static const char* const entry = "void main()\n{\n    ivec2 p = ivec2(uvec2(gl_FragCoord.xy) + uvec2(xe_transfer.x0, xe_transfer.y0));";
+    out = fragment;
+    for (const char* text : {output, entry})
+    {
+        const size_t at = out.find(text);
+        if (at == std::string::npos || out.find(text, at + 1) != std::string::npos)
+            return why = std::string("the resident resolve shader does not hold exactly one \"") + text + "\"", false;
+    }
+    out.replace(out.find(output), std::strlen(output), "layout(set = 1, binding = 0, r32ui) uniform writeonly uimage2D xe_dest;\nuint xe_word;");
+    out.replace(out.find(entry), std::strlen(entry),
+                "void XeResolveMain(uvec2 xe_pixel)\n{\n    ivec2 p = ivec2(xe_pixel + uvec2(xe_transfer.x0, xe_transfer.y0));");
+    out += "layout(local_size_x = 8, local_size_y = 8) in;\n"
+           "void main()\n"
+           "{\n"
+           "    uvec2 d = gl_GlobalInvocationID.xy;\n"
+           "    if (d.x >= xe_transfer.width || d.y >= xe_transfer.height)\n"
+           "        return;\n"
+           "    XeResolveMain(d);\n"
+           "    imageStore(xe_dest, ivec2(d), uvec4(xe_word, 0u, 0u, 0u));\n"
+           "}\n";
+    return true;
 }
 
 uint32_t Depth32To20e4(float depth)

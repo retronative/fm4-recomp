@@ -144,6 +144,7 @@ struct Decoder
         case 6: d.hostPrimitive = HostPrimitive::TriangleStrip; break;
         case 8: d.hostPrimitive = HostPrimitive::RectList; break;
         case 13: d.hostPrimitive = HostPrimitive::QuadList; break;
+        case 5: d.hostPrimitive = HostPrimitive::TriangleFan; break;  // FM4 Recomp (alpha)
         case 2: d.hostPrimitive = HostPrimitive::LineList; break;  // FM4 Recomp: X primitive_processor.cc passes a line list through
         case 1:
             if (!noWrite)  // point sprites: PA_SU_POINT_SIZE expansion (X primitive_processor.cc:379-385 kPointListAsTriangleStrip)
@@ -572,9 +573,21 @@ struct Decoder
             // fetches a 256x1 2D constant as 1D).
             const uint32_t needed = u.dimension <= 3 ? u.dimension : 0xFF;
             const bool linearOf2D = u.dimension == 0 && t.dimension == 1;
-            if (needed == 0xFF || (t.dimension != needed && !linearOf2D))
+            if (needed == 0xFF)
                 return Refuse(where() + "the shader fetches dimension " + Num(u.dimension) + " (1 2D, 2 3D, 3 cube) but the constant's dimension is " +
                               Num(t.dimension) + " (0 1D, 1 2D or stacked, 2 3D, 3 cube)");
+            // FM4 Recomp (alpha: a cube fetch of a 2D constant after Back): as Xenia, a constant whose
+            // dimension does not fit the fetch binds the zero null image of the fetch's dimension (vulkan_texture_cache.cc:587-609
+            // GetActiveBindingOrNullImageView, AreDimensionsCompatible), the same as an invalid constant above.
+            if (t.dimension != needed && !linearOf2D)
+            {
+                t.null = true, t.gamma = false;
+                for (uint32_t& s : t.sign)
+                    s = 0;
+                t.expAdjust = 0, t.lodBias = 0, t.anisoFilter = 0;
+                d.textureSlots.push_back(t);
+                continue;
+            }
             if (t.stacked)
                 return Refuse(where() + "a stacked (2D array) texture is not modelled");
             // A tiled 3D texture: the texture unit untiles it (texture_untile.h TiledOffset3D, Xenia texture_util.cc:461-487).

@@ -5,3 +5,4 @@ Code taken from other projects keeps its attribution in each file, and FM4 Recom
 | Component | Licence | Used in | Licence text |
 |---|---|---|---|
 | Xenia (xenia-canary 67f16c4e315f), Copyright (c) 2015, Ben Vanik | BSD-3-Clause | `runtime/kernel/imports_strings.cpp` (the xboxkrnl printf family, ported from `xboxkrnl_strings.cc`) | [LICENSES/Xenia-BSD-3-Clause.txt](LICENSES/Xenia-BSD-3-Clause.txt) |
+| TinySHA1, Copyright (c) 2012-22 Saurav Mohapatra (as modified for Xenia, in XenonRecomp's pinned `thirdparty/TinySHA1`) | ISC-style (permission notice in the header) | `runtime/kernel/stfs.cpp` (the STFS hash tree), `tests/runtime/test_runtime.cpp`; included from `tools/XenonRecomp`, not copied | `tools/XenonRecomp/thirdparty/TinySHA1/TinySHA1.hpp` (its header) |

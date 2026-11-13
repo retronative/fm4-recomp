@@ -20,14 +20,17 @@ for arg in "$@"; do
   esac
 done
 DEADLINE=$((MINUTES * 60))
-ROOT="${FM4_RECOMP_HOME:-$HERE}"  # the data, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
-DATA="$ROOT/data"
+ROOT="${FM4_RECOMP_HOME:-$HERE}"  # locations.conf, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
 STOP_FLAG="$ROOT/GPU_STOP"
 LOCK="$ROOT/.play.lock"
 LOGS="$ROOT/logs/$(date '+%Y-%m-%d_%H%M%S')"
-for f in "$DATA/survey/image.bin" "$DATA/files/default.xex" "$DATA/survey/disc1_gdfx.tsv"; do
-  [ -e "$f" ] || { echo "play: $f is missing: run ./setup.sh with your own Disc 1 image first" >&2; exit 1; }
-done
+# The game data, user data and (once set up) Disc 2 where setup.sh recorded them (locations.conf; an external drive must be connected).
+source "$HERE/locations.sh"
+loc_game_args "$ROOT" || { echo "play: not starting" >&2; exit 1; }
+DATA="$LOC_DATA_ROOT"
+# The game's in-game Disc 2 setup (the launcher's setup panel, bin/fm4recomp-setup) runs this kit's setup.sh --disc2 against the
+# same locations.conf.
+export FM4_RECOMP_HOME="$ROOT" FM4_RECOMP_KIT="$HERE"
 if [ -e "$STOP_FLAG" ]; then
   echo "play: refused: $STOP_FLAG exists (an earlier session showed GPU hang evidence). Read it, then delete it yourself:" >&2
   cat "$STOP_FLAG" >&2; exit 3
@@ -41,7 +44,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
-mkdir -p "$LOGS/captures" "$DATA/user-data" "$DATA/home"
+mkdir -p "$LOGS/captures" "$DATA/home"
 
 # The kit's own Vulkan: its loader and the MoltenVK driver, by their manifests (scripts/release/bundle_kit.sh); nothing from Homebrew or
 # the developer tools. VK_IMPLICIT_LAYER_PATH: the kit's empty folder, so no implicit layer installed elsewhere loads into the game.
@@ -74,6 +77,10 @@ export FM4_DEFER_FENCES=1 FM4_GPU_TIMESTAMPS=1 FM4_RING_MB=256 FM4_WRITE_WATCH=1
   FM4_OVERWRITE_CLAIM=1 FM4_FETCH_UNCHECKED=2 FM4_RESOLVE_RESIDENT_DEPTH=1 FM4_SHADER_MEMO=1 FM4_RESOLVE_GPU_WORDS16=1 FM4_RESOLVE_RESIDENT_1616=1 \
   FM4_SPLIT_AT_PASS_END=1 FM4_CLEAR_DRAWS=1 FM4_CLEAR_VALUE_OWNERSHIP=1 FM4_RESOLVE_DEFER=1 FM4_INPUT_LIVE=1 \
   FM4_SKIPPABLE_WELCOME_VIDEO=1 FM4_PUSH_DESCRIPTORS=1  # A skips the long welcome video before the first race (not skippable in retail FM4)
+# Stack v2: shared guest memory read by the
+# GPU, GPU present and texture untile, the vertex cache, submit-when-idle at 32 draws, bulk register runs, async retire.
+export FM4_VARIANT_MEMO=1 FM4_GPU_PRESENT=1 FM4_TEXTURE_PREPARE_ONCE=1 FM4_GUARD_HOT=1 FM4_GUEST_MEMORY_GPU=1 FM4_RESOLVE_RESIDENT_COVER=1 \
+  FM4_TEXTURE_GPU_UNTILE=1 FM4_VERTEX_CACHE_MB=256 FM4_SUBMIT_IF_IDLE=32 FM4_BULK_REGISTERS=1 FM4_ASYNC_RETIRE=1
 export FM4_SHADER_DUMP="$LOGS/shaders"  # a refused shader's microcode (<ps|vs>_<hash>.bin) for the developers' offline replay (alpha)
 USER_HOME="$HOME"
 export HOME="$DATA/home"
@@ -87,9 +94,9 @@ perl -e '
   $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[play] session limit: stopped\n"; exit 124 };
   alarm $deadline + 30; waitpid $pid, 0; alarm 0;
   my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-  "$DEADLINE" "$HERE/bin/fm4recomp" --image "$DATA/survey/image.bin" --xex "$DATA/files/default.xex" --disc "$DATA/files" \
-  --disc-map "$DATA/survey/disc1_gdfx.tsv" --modules "$DATA/modules" --gpu-stop "$STOP_FLAG" --user-data "$DATA/user-data" --audio audible \
+  "$DEADLINE" "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio audible \
   --renderer window --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop \
+  --disc-setup "$HERE/bin/fm4recomp-setup" \
   --stop-at-swap 100000000 --deadline "$DEADLINE" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
 echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
 sleep 2

@@ -455,6 +455,21 @@ void TestIndices()
                    std::find(lp.lines.begin(), lp.lines.end(), "XE_PARAM_GEN_POLYGONAL 0") != lp.lines.end(),
                "a line list's param_gen: XE_PARAM_GEN_LINE 1, not polygonal");
     }
+    {
+        // FM4 Recomp (alpha): an auto-indexed triangle fan of 5 as a list in Xenia's order (previous, current, first)
+        // (ShiftGlue primitive_processor.h:494-512): (1 2 0)(2 3 0)(3 4 0), 9 host vertices, high index 4; a fan of 2: no triangle.
+        DrawState f = Clear();
+        f.hostPrimitive = HostPrimitive::TriangleFan, f.indices.count = 5;
+        Expect(BuildHostIndices(f, nullptr, nullptr, h).ok && h.kind == HostIndices::Kind::Indexed &&
+                   h.indices == std::vector<uint32_t>{1, 2, 0, 2, 3, 0, 3, 4, 0} && h.vertexCount == 9 && h.highIndex == 4,
+               "an auto-indexed triangle fan of 5: (1 2 0)(2 3 0)(3 4 0), 9 host vertices, high 4");
+        f.indices.count = 2;
+        Expect(BuildHostIndices(f, nullptr, nullptr, h).ok && h.vertexCount == 0 && h.indices.empty(), "a fan of 2 indices: no triangle");
+        f.indices.count = 5, f.indexOffset = 10;
+        Expect(BuildHostIndices(f, nullptr, nullptr, h).ok && h.indices == std::vector<uint32_t>{11, 12, 10, 12, 13, 10, 13, 14, 10},
+               "a fan with index offset 10: the offset on every index");
+        Expect(KeyOf(f, Vs({0}), Ps()).topology == uint8_t(Topology::TriangleList), "a fan's pipeline topology is a triangle list");
+    }
     DrawState d = Clear();
     d.hostPrimitive = HostPrimitive::TriangleList, d.indices.count = 6;
     Expect(BuildHostIndices(d, nullptr, nullptr, h).ok && h.kind == HostIndices::Kind::Direct && h.vertexCount == 6 && h.indices.empty() && h.highIndex == 5,

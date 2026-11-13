@@ -53,6 +53,11 @@ out/
 xcuserdata/
 *.spv
 
+# Website dependencies and build output (.ssr is the prerender's temporary SSR bundle)
+.website/node_modules/
+.website/dist/
+.website/.ssr/
+
 # Third-party tool checkouts and builds
 /tools
 
@@ -83,7 +88,7 @@ __pycache__/
 # Local debugging log
 WORKLOG.local.md
 
-# Private local documents (owner decides later which become public)
+# Private local documents (not published)
 /reference/private/
 
 # Claude Code session state
@@ -98,8 +103,9 @@ WORKLOG.local.md
 # Retention markers for local temporary data (general/data-retention-and-cleanup.md)
 .retention.json
 
-# Local alpha packages (scripts/package_alpha.sh): the binary contains translated game code; never committed or published without the owner.
+# Local alpha packages (scripts/package_alpha.sh): the binary contains translated game code; never committed or published.
 /dist
+.website/private-patterns.local.json
 
 # Kept out of the public repository: it embeds data from the game's disc
 /tests/runtime/test_extent_wiring.cpp
