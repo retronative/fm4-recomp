@@ -19,6 +19,7 @@
 // Header only, std only: tests/runtime/test_gpu_guard.cpp drives it with a mock backend (CPU only).
 #pragma once
 #include "gpu_guard.h"
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -88,6 +89,9 @@ public:
         if (worker_.joinable())
             worker_.join();
     }
+    // Diagnostic hook (null by default): called on the worker after each real submit with the queue-lock wait and the
+    // submit's own duration, in ns. Set before the first Submit.
+    void SetTimingHook(std::function<void(uint32_t, uint64_t, uint64_t)> hook) { timingHook_ = std::move(hook); }
     uint64_t Submits() const { return submits_; }
     size_t MaxQueueDepth() const { return maxDepth_; }
     int Failed() const { std::lock_guard<std::mutex> lock(mutex_); return failed_; }
@@ -120,11 +124,18 @@ private:
             }
             int r;
             {
+                const auto t0 = std::chrono::steady_clock::now();
                 std::unique_lock<std::timed_mutex> queueLock = lockQueue_ ? lockQueue_() : std::unique_lock<std::timed_mutex>();
+                const auto t1 = std::chrono::steady_clock::now();
                 std::unique_lock<std::mutex> lock(mutex_);
                 const int failed = failed_;
                 lock.unlock();
                 r = failed != 0 ? failed : inner_.Submit(slot);  // nothing reaches the queue after a failure
+                if (timingHook_)
+                {
+                    const auto ns = [](auto d) { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()); };
+                    timingHook_(slot, ns(t1 - t0), ns(std::chrono::steady_clock::now() - t1));
+                }
             }
             std::lock_guard<std::mutex> lock(mutex_);
             if (r != 0 && failed_ == 0)
@@ -137,6 +148,7 @@ private:
 
     SubmissionBackend<Resource>& inner_;
     std::function<std::unique_lock<std::timed_mutex>()> lockQueue_;
+    std::function<void(uint32_t, uint64_t, uint64_t)> timingHook_;
     mutable std::mutex mutex_;
     std::condition_variable wake_, done_;
     std::deque<uint32_t> queue_;

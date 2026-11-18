@@ -12,6 +12,7 @@
 #include "pipeline_key.h"
 #include "stops.h"
 #include "diag_texture_uploads.h"
+#include "diag_watch_stale.h"  // FM4_WRITE_WATCH_VERIFY=1 (diagnostic)
 #include "texture_dump.h"
 #include "texture_upload.h"
 #include "resolve_resident.h"
@@ -743,14 +744,24 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     if (clean)
     {
         image->reserved = false;
-        if (WriteWatchVerify() && image->hashed)
+        // A write recorded after this draw's reservation decided "clean" (cleanReserved; a guest thread racing the draw): the next
+        // bind sees it and reloads, so only a change with no recorded write is a miss.
+        if (WriteWatchVerify() && image->hashed && !WatchClean(*image))
+            diag::ReportReservationRace(d.base.physical);
+        else if (WriteWatchVerify() && image->hashed)
         {
             uint64_t check = 0;
             if (SourceHash(d, c.base, check, error) && check != image->sourceHash)
+            {
+                diag::ReportStalePages(*unit->model.ProtectingWatch(), c.base, d.base.physical, d.base.size, image->watchSequence,
+                                       runtime::PhysicalHostWritable);
+                diag::ReportStalePages(*unit->model.ProtectingWatch(), c.base, d.mips.physical, d.mips.size, image->watchSequence,
+                                       runtime::PhysicalHostWritable);
                 Stop(StopCode::Unimplemented, "write watch verify: the texture at %08X (%s %ux%u, %u bytes) changed without a recorded write (hash %016llX, "
                                               "image %016llX, armed at sequence %llu, now %llu)",
                      d.base.physical, d.info.name, d.width, d.height, d.base.size, (unsigned long long)check, (unsigned long long)image->sourceHash,
                      (unsigned long long)image->watchSequence, (unsigned long long)unit->model.ProtectingWatch()->Current());
+            }
         }
         unit->watchSkipsSince++, unit->watchSkippedBytesSince += d.base.size + d.mips.size;
     }
@@ -1149,6 +1160,20 @@ void ShutdownTextureUnit()
 // so no command buffer can use them: GPU safety); a later bind recreates and reloads the image.
 constexpr size_t kEvictAbove = 3072, kEvictTo = 2048;
 constexpr uint64_t kEvictAboveBytes = 1536ull << 20;
+size_t MarkTexturesStale()
+{
+    if (!unit)
+        return 0;
+    size_t n = 0;
+    for (auto& [key, image] : unit->images)
+        if (!image.resident)
+        {
+            image.hashed = false, image.sourceHash = 0, image.watchArmed = false, image.cleanEpoch = ~0ull, image.cleanAtMark = false;
+            n++;
+        }
+    return n;
+}
+
 void EvictIdleTextures()
 {
     if (!unit)

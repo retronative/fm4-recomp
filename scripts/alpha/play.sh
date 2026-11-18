@@ -29,7 +29,7 @@ source "$HERE/locations.sh"
 loc_game_args "$ROOT" || { echo "play: not starting" >&2; exit 1; }
 DATA="$LOC_DATA_ROOT"
 # The game's in-game Disc 2 setup (the launcher's setup panel, bin/fm4recomp-setup) runs this kit's setup.sh --disc2 against the
-# same locations.conf.
+# same locations.conf; the game's KEYBOARD CONTROLS (Pause menu) writes $FM4_RECOMP_HOME/keybindings.conf.
 export FM4_RECOMP_HOME="$ROOT" FM4_RECOMP_KIT="$HERE"
 if [ -e "$STOP_FLAG" ]; then
   echo "play: refused: $STOP_FLAG exists (an earlier session showed GPU hang evidence). Read it, then delete it yourself:" >&2
@@ -76,16 +76,46 @@ export FM4_DEFER_FENCES=1 FM4_GPU_TIMESTAMPS=1 FM4_RING_MB=256 FM4_WRITE_WATCH=1
   FM4_RESOLVE_RESIDENT_K88=1 FM4_SHADER_NO_PRECISE=1 FM4_TRANSFER_STENCIL_EXPORT=2 FM4_RESOLVE_HOST_WRITE=1 FM4_ASYNC_SUBMIT=1 FM4_WAIT_POLL_US=2000 \
   FM4_OVERWRITE_CLAIM=1 FM4_FETCH_UNCHECKED=2 FM4_RESOLVE_RESIDENT_DEPTH=1 FM4_SHADER_MEMO=1 FM4_RESOLVE_GPU_WORDS16=1 FM4_RESOLVE_RESIDENT_1616=1 \
   FM4_SPLIT_AT_PASS_END=1 FM4_CLEAR_DRAWS=1 FM4_CLEAR_VALUE_OWNERSHIP=1 FM4_RESOLVE_DEFER=1 FM4_INPUT_LIVE=1 \
-  FM4_SKIPPABLE_WELCOME_VIDEO=1 FM4_PUSH_DESCRIPTORS=1  # A skips the long welcome video before the first race (not skippable in retail FM4)
+  FM4_SKIPPABLE_WELCOME_VIDEO=1 FM4_PUSH_DESCRIPTORS=1 FM4_PAUSE_KEYBOARD_CONTROLS=1 FM4_LOAD_WAITS_RELEASES=1
+# A skips the long welcome video before the first race (not skippable in retail FM4); the Pause menu has a KEYBOARD CONTROLS row
+# (config/title_hooks.toml) that opens the KEYBOARD CONTROLS submenu, an option screen of the game's own (runtime/game/).
+# FM4_LOAD_WAITS_RELEASES: a track-heap allocation that fails while releases are queued waits for them (the near road missing
+# after some race starts; runtime/game/release_wait.cpp).
 # Stack v2: shared guest memory read by the
-# GPU, GPU present and texture untile, the vertex cache, submit-when-idle at 32 draws, bulk register runs, async retire.
-export FM4_VARIANT_MEMO=1 FM4_GPU_PRESENT=1 FM4_TEXTURE_PREPARE_ONCE=1 FM4_GUARD_HOT=1 FM4_GUEST_MEMORY_GPU=1 FM4_RESOLVE_RESIDENT_COVER=1 \
-  FM4_TEXTURE_GPU_UNTILE=1 FM4_VERTEX_CACHE_MB=256 FM4_SUBMIT_IF_IDLE=32 FM4_BULK_REGISTERS=1 FM4_ASYNC_RETIRE=1
+# GPU, GPU present, the vertex cache, submit-when-idle at 32 draws, bulk register runs, async retire. GPU texture untile
+# (FM4_TEXTURE_GPU_UNTILE) is off: with it, Free Play -> Quick Race (Bernese Alps) drew the road and grass untextured.
+# Each is a default: a value already in the environment wins (0 turns a setting off), so a defect can be bisected setting by setting.
+export FM4_VARIANT_MEMO="${FM4_VARIANT_MEMO:-1}" FM4_GPU_PRESENT="${FM4_GPU_PRESENT:-1}" FM4_TEXTURE_PREPARE_ONCE="${FM4_TEXTURE_PREPARE_ONCE:-1}" \
+  FM4_GUARD_HOT="${FM4_GUARD_HOT:-1}" FM4_GUEST_MEMORY_GPU="${FM4_GUEST_MEMORY_GPU:-1}" FM4_RESOLVE_RESIDENT_COVER="${FM4_RESOLVE_RESIDENT_COVER:-1}" \
+  FM4_TEXTURE_GPU_UNTILE="${FM4_TEXTURE_GPU_UNTILE:-0}" FM4_VERTEX_CACHE_MB="${FM4_VERTEX_CACHE_MB:-256}" FM4_SUBMIT_IF_IDLE="${FM4_SUBMIT_IF_IDLE:-32}" \
+  FM4_BULK_REGISTERS="${FM4_BULK_REGISTERS:-1}" FM4_ASYNC_RETIRE="${FM4_ASYNC_RETIRE:-1}"
+if [ "$FM4_VERTEX_CACHE_MB" = 0 ]; then unset FM4_VERTEX_CACHE_MB; fi  # 0: no vertex cache (the game refuses a size outside 64-1024)
+# Persistent shader and pipeline caches (FM4_SHADER_CACHE: compiled SPIR-V and the Vulkan pipeline cache, ~35 MB after a race) in the
+# data directory, so a shader's first-use compile stall happens once, not every session. FM4_SHADER_CACHE=0 turns them off; another
+# path moves them.
+FM4_SHADER_CACHE="${FM4_SHADER_CACHE:-$DATA/shader_cache}"
+if [ "$FM4_SHADER_CACHE" = 0 ]; then unset FM4_SHADER_CACHE; else export FM4_SHADER_CACHE; fi
 export FM4_SHADER_DUMP="$LOGS/shaders"  # a refused shader's microcode (<ps|vs>_<hash>.bin) for the developers' offline replay (alpha)
+# FM4_PLAYTEST=1 (acceptance playthroughs): stall stamps (FM4_DIAG_SLOW_SUBMIT: long swaps, long fence waits, slow submits, with
+# wall-clock times), a kept capture every FM4_CAPTURE_KEEP_EVERY swaps (default 3000; captures/), the macOS thermal and performance
+# warning levels every 30 s (thermal.txt), and after the session coreaudiod and RunningBoard events (syslog_playtest.txt).
+PLAYTEST=0
+if [ "${FM4_PLAYTEST:-0}" = 1 ]; then
+  PLAYTEST=1
+  export FM4_DIAG_SLOW_SUBMIT=1 FM4_CAPTURE_KEEP_EVERY="${FM4_CAPTURE_KEEP_EVERY:-3000}"
+fi
+# FM4_RECOMP_AUDIO=mute: no audio device is opened (test sessions on a shared Mac); otherwise the default output device.
+AUDIO=audible
+[ "${FM4_RECOMP_AUDIO:-}" = mute ] && AUDIO=mute
 USER_HOME="$HOME"
 export HOME="$DATA/home"
 echo "play: starting (session limit $MINUTES min; logs in $LOGS)"
 since=$(date +%s); touch "$LOGS/start"
+THERMAL_PID=""
+if [ "$PLAYTEST" = 1 ]; then
+  ( while :; do printf '%s ' "$(date '+%H:%M:%S')"; /usr/bin/pmset -g therm 2>&1 | tr '\n' ' '; echo; sleep 30; done ) > "$LOGS/thermal.txt" 2>&1 &
+  THERMAL_PID=$!
+fi
 status=0
 perl -e '
   my ($deadline, @cmd) = @ARGV;
@@ -94,11 +124,16 @@ perl -e '
   $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[play] session limit: stopped\n"; exit 124 };
   alarm $deadline + 30; waitpid $pid, 0; alarm 0;
   my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-  "$DEADLINE" "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio audible \
+  "$DEADLINE" "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio "$AUDIO" \
   --renderer window --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop \
   --disc-setup "$HERE/bin/fm4recomp-setup" \
   --stop-at-swap 100000000 --deadline "$DEADLINE" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
 echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
+if [ -n "$THERMAL_PID" ]; then kill "$THERMAL_PID" 2>/dev/null || true; fi
+if [ "$PLAYTEST" = 1 ]; then
+  /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" \
+    --predicate 'process == "coreaudiod" OR (process == "runningboardd" AND eventMessage CONTAINS "fm4recomp")' > "$LOGS/syslog_playtest.txt" 2>/dev/null || true
+fi
 sleep 2
 evidence=""
 while IFS= read -r -d '' file; do evidence+="gpuEvent report: $file"$'\n'; done < <(find "$USER_HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -maxdepth 1 -name 'gpuEvent-*.ips' \

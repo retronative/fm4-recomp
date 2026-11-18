@@ -449,6 +449,12 @@ void TestRectClear()
            "colour format 5 (16_16_16_16) with exponent bias 0 decodes: storage 5, base 0");
     Expect(d.target.pitchTiles == 16 && d.target.edramRows == 176 && d.target.targetHeight == 176,
            "a 64 bpp colour target counts its rows at twice the 32 bpp pitch: 176 rows to the depth base");
+    // FM4 Recomp (Photo Mode, s31 trace swap 7771): the same 64 bpp 4X clear with depthctl 0 (z and stencil off): depth is not bound,
+    // so the colour target has 2048 / 32 = 64 tile rows = 512 rows (8 a tile row at 4X); height min(512, 8192) = 512.
+    g = RectClear(), g[xr::kRbColorInfo] = 0x00050000, g[xr::kRbDepthControl] = 0;
+    d = Decode(g, vs, ps);
+    Expect(d.kind == DrawKind::Draw && d.target.edramRows == 512 && d.target.targetHeight == 512,
+           "the 64 bpp 4X clear with depth off: 512 rows (the unbound depth base does not cut it at 176)");
     // Any 6-bit bias with 16_16_16_16 (the shader's 2^(bias - 5)): 0x03F50000 = bias field 0x3F = -1.
     g = RectClear(), g[xr::kRbColorInfo] = 0x03F50000;
     d = Decode(g, vs, ps);
@@ -674,9 +680,32 @@ void TestTextured()
         const DrawState e = Decode(a, vs, ps);
         Expect(e.kind == DrawKind::Draw && e.alphaTest.enabled && e.alphaTest.func == 4 && e.alphaTest.ref == 0.5f, "alpha test greater 0.5");
     }
-    // 1X: 1280 / 80 = 16 tiles a row, 16 rows a tile; 720 tiles -> 45 tile rows = 720 rows; depth not written -> the colour extent alone.
-    Expect(d.target.pitchTiles == 16 && d.target.edramRows == 720 && d.target.targetHeight == 720 && d.target.colorWritten && !d.target.depthWritten,
-           "1280 x 720 at 1X: 720 rows");
+    // 1X: 1280 / 80 = 16 tiles a row, 16 rows a tile. Depth is off (depthctl 00700730), so the depth target at 720 is not bound
+    // (X render_target_cache.cc:627-636) and does not bound the colour target: 2048 tiles / 16 = 128 tile rows = 2048 rows; the
+    // target height is the scissor's 720.
+    Expect(d.target.pitchTiles == 16 && d.target.edramRows == 2048 && d.target.targetHeight == 720 && d.target.colorWritten && !d.target.depthWritten,
+           "1280 x 720 at 1X with depth off: the colour target is not bounded by the unbound depth base (2048 rows, height 720)");
+    // FM4 Recomp (Photo Mode, s31 trace): the 64 bpp accumulation draw: RB_SURFACE_INFO 14000500 (1280, 1X), RB_COLOR_INFO 00050000
+    // (base 0, 16_16_16_16), RB_DEPTH_INFO 000102D0 (base 720), depthctl 087087E0 (z and stencil off), scissor br 02D00500 (720).
+    // 64 bpp rows are 32 tiles: depth unbound -> 2048 / 32 = 64 tile rows = 1024 rows, height 720. Control: depthctl 087087E6
+    // (z on, z write) binds depth: 720 / 32 = 22 tile rows = 352 rows (where the photo's accumulation used to stop).
+    {
+        File a = Textured();
+        a[xr::kRbSurfaceInfo] = 0x14000500, a[xr::kRbColorInfo] = 0x00050000, a[xr::kRbDepthInfo] = 0x000102D0;
+        a[xr::kRbDepthControl] = 0x087087E0;
+        const DrawState off = Decode(a, vs, ps);
+        a[xr::kRbDepthControl] = 0x087087E6;
+        const DrawState on = Decode(a, vs, ps);
+        Expect(off.kind == DrawKind::Draw && off.target.colorFormat == 5 && off.target.edramRows == 1024 && off.target.targetHeight == 720,
+               "Photo Mode 64 bpp draw, depth off: 1024 rows, height 720 (not cut at the unbound depth base)");
+        Expect(on.kind == DrawKind::Draw && on.target.edramRows == 352, "the same draw with depth on stops at the depth base: 352 rows");
+        // depthctl 087087B2: z_enable (bit 1), no z write (bit 2 clear), zfunc (bits 4-6) 3 = LEQUAL: a depth test binds the depth
+        // target (only "always, no write" does not, X draw_util.cc:60-79): 352 rows.
+        a[xr::kRbDepthControl] = 0x087087B2;
+        const DrawState test = Decode(a, vs, ps);
+        Expect(test.kind == DrawKind::Draw && test.target.edramRows == 352 && !test.target.depthWritten,
+               "a depth test without z write binds depth too: 352 rows");
+    }
     Expect(d.scissor.x == 0 && d.scissor.y == 0 && d.scissor.width == 1280 && d.scissor.height == 720, "scissor 1280 x 720");
     // Viewport: all enables set, D3D9 values; + 0.5; clipping with dx clip space.
     // vport (observed): x 640 / 640, y -360 / 360, z scale -1 / offset 1; vtxcntl 5: pix_center 1, so no half pixel (X draw_util.cc:329-332).

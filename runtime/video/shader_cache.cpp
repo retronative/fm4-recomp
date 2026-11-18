@@ -9,6 +9,10 @@
 // SPIR-V's own validation (spirv-val in the census) happens at vkCreateShaderModule under the
 // pinned validation layer, which stops the run at its first message (vulkan_device.cpp).
 #include "shader_cache.h"
+#include "diag_compile.h"  // FM4 Recomp: compile time beside a long swap (diagnostic)
+#include "spirv_disk_cache.h"  // FM4 Recomp (M7 stability): FM4_SPIRV_CACHE
+#include <glslang/build_info.h>
+#include <filesystem>
 #include "kernel/shader_hash.h"
 
 #include <glslang/Public/ResourceLimits.h>
@@ -132,9 +136,53 @@ GlslangCompiler::~GlslangCompiler()
         glslang::FinalizeProcess();
 }
 
+// FM4 Recomp (M7 stability, opt-in FM4_SHADER_CACHE=<directory>; spirv_disk_cache.h): <directory>/spirv, created at the first use; empty
+// when off or when it cannot be created (then every variant is compiled, as before). The pipeline cache is <directory>/pipelines.bin.
+const std::string& SpirvCacheDir()
+{
+    static const std::string dir = [] {
+        const char* v = std::getenv("FM4_SHADER_CACHE");
+        if (v == nullptr || *v == '\0')
+            return std::string();
+        const std::string spirv = std::string(v) + "/spirv";
+        std::error_code ec;
+        std::filesystem::create_directories(spirv, ec);
+        if (ec)
+        {
+            std::fprintf(stderr, "[shader] FM4_SHADER_CACHE: cannot create %s (%s): the SPIR-V disk cache is off\n", spirv.c_str(), ec.message().c_str());
+            return std::string();
+        }
+        std::fprintf(stderr, "[shader] SPIR-V disk cache on (FM4_SHADER_CACHE): compiled variants are kept in %s and read back across sessions\n", spirv.c_str());
+        return spirv;
+    }();
+    return dir;
+}
+
 bool GlslangCompiler::Compile(bool pixel, const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error)
 {
-    return CompileStage(pixel ? EShLangFragment : EShLangVertex, pixel, true, glsl, spirv, warnings, error);
+    const uint64_t start = diag::CompileClockNs();  // diag_compile.h (counted always; printed beside a long swap)
+    std::string cachePath;
+    if (const std::string& dir = SpirvCacheDir(); !dir.empty())
+    {
+        char options[64];  // the options that change the compiled text (CompileStage's rewrites)
+        std::snprintf(options, sizeof options, "noprecise %d vs_no_atomics %d fast_mul %d", int(NoPrecise()), int(DiagVsNoAtomics()), int(DiagFastMul()));
+        char compiler[48];
+        std::snprintf(compiler, sizeof compiler, "glslang %d.%d.%d", GLSLANG_VERSION_MAJOR, GLSLANG_VERSION_MINOR, GLSLANG_VERSION_PATCH);
+        cachePath = dir + "/" + spirv_cache::Key(compiler, pixel ? 'f' : 'v', options, glsl);
+        if (spirv_cache::Load(cachePath, spirv))
+        {
+            warnings.clear();
+            diag::Compiles().glslNs.fetch_add(diag::CompileClockNs() - start, std::memory_order_relaxed);
+            diag::Compiles().glslCached.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    const bool ok = CompileStage(pixel ? EShLangFragment : EShLangVertex, pixel, true, glsl, spirv, warnings, error);
+    if (ok && !cachePath.empty())
+        spirv_cache::Store(cachePath, spirv);  // a failed store only means the next session compiles it again
+    diag::Compiles().glslNs.fetch_add(diag::CompileClockNs() - start, std::memory_order_relaxed);
+    diag::Compiles().glsl.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 bool GlslangCompiler::CompileCompute(const std::string& glsl, std::vector<uint32_t>& spirv, std::string& warnings, std::string& error)
@@ -201,12 +249,15 @@ bool ShaderCache::Dump(const std::string& name, const std::string& text)
 {
     if (dumpDir_.empty() || dumped_ >= kDumpCap)
         return false;
+    const uint64_t start = diag::CompileClockNs();  // diag_compile.h
     FILE* f = std::fopen((dumpDir_ + "/" + name).c_str(), "wb");
     if (f == nullptr)
         return false;
     const bool ok = std::fwrite(text.data(), 1, text.size(), f) == text.size();
     const bool closed = std::fclose(f) == 0;
     dumped_++;
+    diag::Compiles().dumpNs.fetch_add(diag::CompileClockNs() - start, std::memory_order_relaxed);
+    diag::Compiles().dumps.fetch_add(1, std::memory_order_relaxed);
     return ok && closed;
 }
 
@@ -253,7 +304,11 @@ const CachedShader* ShaderCache::Load(uint32_t type, const uint32_t* words, uint
     shader->cls = ScanShaderClass(words, count);
     std::string error;
     stats_.translations++;
-    if (!runtime::shader::TranslateShader(words, count, pixel, shader->t, error))
+    const uint64_t translateStart = diag::CompileClockNs();  // diag_compile.h
+    const bool translated = runtime::shader::TranslateShader(words, count, pixel, shader->t, error);
+    diag::Compiles().translateNs.fetch_add(diag::CompileClockNs() - translateStart, std::memory_order_relaxed);
+    diag::Compiles().translations.fetch_add(1, std::memory_order_relaxed);
+    if (!translated)
     {
         stats_.refusals++;
         reason = Name(*shader) + " (" + std::to_string(count) + " words, class " + ShaderClassName(shader->cls) + ") refused: " + error;

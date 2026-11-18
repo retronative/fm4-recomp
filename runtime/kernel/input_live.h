@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
+// InputGate: adapted from ReCarbon (SpeedBreaker runtime), GPL-3.0-or-later; see the class.
 //
 // FM4 Recomp: a live gamepad on user 0, opt-in FM4_INPUT_LIVE=1 with
 // --renderer window. The window's main loop (window_sdl.cpp) reads an SDL gamepad and the keyboard every iteration and hands
@@ -26,7 +27,8 @@ struct LiveState
 };
 
 // The keyboard's part. Driving: A/D steer (left stick X), W throttle (RT), S brake (LT), arrow keys the d-pad (menus),
-// Enter A, Backspace/Escape B, X X, Y Y, Space START, Tab BACK, Q/E the shoulders, C the right thumb (camera).
+// Enter A, Backspace/Escape B, X X, Y Y, Space START, Tab BACK, Q/E the shoulders, C the right thumb (camera): the Keys fields keep
+// those names; which keys press them is key_bindings.h (defaults: Space A, Backspace B, Left Shift X, Left Ctrl Y, Return START).
 struct Keys
 {
     bool up = false, down = false, left = false, right = false, w = false, a = false, s = false, d = false, enter = false, backspace = false,
@@ -46,6 +48,23 @@ inline LiveState FromKeys(const Keys& k)
     return s;
 }
 
+// A gamepad's buttons by position (SDL_GamepadButton: south, east, west, north are the face buttons, an Xbox pad's A, B, X, Y), as
+// X_INPUT_GAMEPAD button bits.
+struct PadButtons
+{
+    bool south = false, east = false, west = false, north = false, back = false, start = false, leftStick = false, rightStick = false,
+         leftShoulder = false, rightShoulder = false, dpadUp = false, dpadDown = false, dpadLeft = false, dpadRight = false;
+};
+
+inline uint16_t ButtonsFromPad(const PadButtons& p)
+{
+    return uint16_t((p.dpadUp ? button::kDpadUp : 0) | (p.dpadDown ? button::kDpadDown : 0) | (p.dpadLeft ? button::kDpadLeft : 0) |
+                    (p.dpadRight ? button::kDpadRight : 0) | (p.start ? button::kStart : 0) | (p.back ? button::kBack : 0) |
+                    (p.leftStick ? button::kLeftThumb : 0) | (p.rightStick ? button::kRightThumb : 0) |
+                    (p.leftShoulder ? button::kLeftShoulder : 0) | (p.rightShoulder ? button::kRightShoulder : 0) | (p.south ? button::kA : 0) |
+                    (p.east ? button::kB : 0) | (p.west ? button::kX : 0) | (p.north ? button::kY : 0));
+}
+
 // An SDL gamepad axis (-32768..32767, +Y down) as an XInput thumb (+Y up); a trigger axis (0..32767) as 0..255.
 inline int16_t ThumbFromSdl(int16_t axis, bool vertical) { return vertical ? int16_t(axis == -32768 ? 32767 : -axis) : axis; }
 inline uint8_t TriggerFromSdl(int16_t axis) { return uint8_t(std::clamp<int>(axis, 0, 32767) * 255 / 32767); }
@@ -61,6 +80,31 @@ inline LiveState Merge(const LiveState& pad, const LiveState& keys)
         s.leftX = keys.leftX;
     return s;
 }
+
+// While a host screen has the input (the Keyboard Controls screen, controls_screen.h) the game sees an idle pad; after it closes,
+// each button still held stays hidden until released, so the press that closed the screen does not reach the game. Adapted from
+// ReCarbon runtime/hid/input.cpp:731-745 at 66401ea (SpeedBreaker runtime, GPL-3.0-or-later). FM4 Recomp changes: a pure class
+// over LiveState (tested without SDL); no Back-button replay state (FM4 has no scripted Back handling).
+class InputGate
+{
+public:
+    LiveState Filter(const LiveState& in, bool blocked)
+    {
+        if (wasBlocked_ && !blocked)
+            latched_ = in.buttons;
+        wasBlocked_ = blocked;
+        latched_ = uint16_t(latched_ & in.buttons);
+        if (blocked)
+            return LiveState{};
+        LiveState out = in;
+        out.buttons = uint16_t(in.buttons & ~latched_);
+        return out;
+    }
+
+private:
+    bool wasBlocked_ = false;
+    uint16_t latched_ = 0;
+};
 
 // imports_input.cpp: FM4_INPUT_LIVE connects the live pad (main.cpp, window mode only); the window loop updates it.
 void EnableLive();

@@ -228,6 +228,84 @@ class TitleHooks(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 self.gen.title_hooks(text, image, 0x10000)
 
+    def menu_config(self, label='KEY CONTROLS', row=9, copy_sha=None):
+        import hashlib
+        image = bytes(range(64))
+        h = lambda a, n: hashlib.sha256(image[a - 0x10000:a - 0x10000 + n]).hexdigest()
+        return image, (f'[[hook]]\nname = "row"\nkind = "menu_row_append"\nfunction = 0x10008\nflag = "FM4_TEST_ROW"\nbytes = 8\n'
+                       f'sha256 = "{h(0x10008, 8)}"\nlabel = "{label}"\nrow = {row}\nlist_offset = 356\nadd_slot = 112\n'
+                       f'string_new = 0x10010\nstring_new_bytes = 4\nstring_new_sha256 = "{h(0x10010, 4)}"\n'
+                       f'string_copy = 0x10014\nstring_copy_bytes = 4\nstring_copy_sha256 = "{copy_sha or h(0x10014, 4)}"\n'
+                       f'[[hook]]\nname = "chosen"\nkind = "menu_row_action"\nfunction = 0x10020\nflag = "FM4_TEST_ROW"\nbytes = 8\n'
+                       f'sha256 = "{h(0x10020, 8)}"\nrow = {row}\nlist_offset = 356\nchosen_slot = 132\n'
+                       f'focus = 0x10030\nfocus_bytes = 4\nfocus_sha256 = "{h(0x10030, 4)}"\nfocus_offset = 2172\n')
+
+    def test_menu_row_generated(self):
+        # The row: the original first, then the label as UTF-16BE words (hand: 'K' 0x004B, ' ' 0x0020, terminator 0), the user
+        # string, its copy, the list's add call (vtable +112 of *(self + 356)) with the row id, 1 enabled, then the release (+8). The
+        # action: on event 2 the chosen row through vtable +132 with r4 = r6; this row: focus kept (+2172), the screen requested.
+        image, text = self.menu_config()
+        out = self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('0x004B, 0x0045, 0x0059, 0x0020, 0x0043', out)
+        self.assertTrue(out.rstrip().endswith('}'))
+        body = out[out.index('PPC_FUNC(sub_00010008)'):out.index('PPC_FUNC(sub_00010020)')]
+        self.assertLess(body.index('__imp__sub_00010008(ctx, base);'), body.index('sub_00010010(ctx, base);'))
+        self.assertLess(body.index('sub_00010010(ctx, base);'), body.index('sub_00010014(ctx, base);'))
+        self.assertIn('PPC_LOAD_U32(self + 356)', body)
+        self.assertIn('ctx.r4.u64 = 9, ctx.r5.u64 = copy, ctx.r6.u64 = 1;', body)
+        self.assertIn('+ 112));', body)
+        self.assertIn('+ 8));', body)
+        self.assertIn('runtime::controls::Service() != nullptr', body)
+        self.assertEqual(body.count('__imp__sub_00010008(ctx, base);'), 1)  # CONTROL: the original runs once, never twice
+        action = out[out.index('PPC_FUNC(sub_00010020)'):]
+        self.assertIn('ctx.r4.u32 == 2', action)
+        self.assertIn('ctx.r4.u64 = saved.r6.u64', action)
+        self.assertIn('+ 132));', action)
+        self.assertIn('if (chosen == 9)', action)
+        self.assertIn('PPC_STORE_U32(ctx.r3.u32 + 2172, 9);', action)
+        self.assertIn('RequestFromGame("Pause menu")', action)
+        self.assertLess(action.index('if (chosen == 9)'), action.index('__imp__sub_00010020(ctx, base);'))
+        self.assertIn('int TitleHookCount() { return 2; }', out)
+
+    def test_menu_row_before_a_call(self):
+        # With `caller`: the row is added before the original, only when called from that return address (hand: 0x00010044), and
+        # the original then runs as for any hook (once).
+        image, text = self.menu_config()
+        text = text.replace('add_slot = 112\n', 'add_slot = 112\ncaller = 0x10044\n', 1)
+        out = self.gen.title_hooks(text, image, 0x10000)
+        body = out[out.index('PPC_FUNC(sub_00010008)'):out.index('PPC_FUNC(sub_00010020)')]
+        self.assertIn('uint32_t(ctx.lr) == 0x00010044u', body)
+        self.assertLess(body.index('sub_00010010(ctx, base);'), body.index('__imp__sub_00010008(ctx, base);'))
+        self.assertEqual(body.count('__imp__sub_00010008(ctx, base);'), 1)
+        self.assertNotIn('    return;\n}', body)  # CONTROL: the original is not skipped
+
+    def test_delegate_symbols_values(self):
+        # A delegate hands the call to the runtime's handler with the original; a symbol is a checked function address, a value a
+        # number, both defined for runtime/game/title_symbols.h (hand: 0x10010 -> 0x00010010u, value 59 -> 0x0000003Bu).
+        import hashlib
+        image = bytes(range(64))
+        h = lambda a, n: hashlib.sha256(image[a - 0x10000:a - 0x10000 + n]).hexdigest()
+        text = (f'[[hook]]\nname = "d"\nkind = "delegate"\nfunction = 0x10008\nflag = "FM4_TEST_D"\nbytes = 8\nsha256 = "{h(0x10008, 8)}"\n'
+                f'handler = "TestHandler"\n[[symbol]]\nname = "kThing"\naddress = 0x10010\nbytes = 4\nsha256 = "{h(0x10010, 4)}"\n'
+                f'[[value]]\nname = "kScreen"\nvalue = 59\n')
+        out = self.gen.title_hooks(text, image, 0x10000)
+        self.assertIn('void TestHandler(PPCContext& ctx, uint8_t* base, PPCFunc* original);', out)
+        self.assertIn('fm4::title::TestHandler(ctx, base, __imp__sub_00010008);', out)
+        self.assertIn('const uint32_t kThing = 0x00010010u;', out)
+        self.assertIn('const uint32_t kScreen = 0x0000003Bu;', out)
+        body = out[out.index('PPC_FUNC(sub_00010008)'):]
+        self.assertLess(body.index('TestHandler(ctx'), body.index('    __imp__sub_00010008(ctx, base);\n}'))  # flag off: the original
+        for bad in (text.replace(h(0x10010, 4), '0' * 64), text.replace('kThing', 'thing'), text.replace('TestHandler', 'x'),
+                    text + '[[value]]\nname = "kThing"\nvalue = 1\n'):
+            with self.assertRaises(SystemExit):
+                self.gen.title_hooks(bad, image, 0x10000)
+
+    def test_menu_row_refusals(self):
+        for kwargs in ({'label': 'CONTRÔLES'}, {'label': 'X' * 61}, {'label': ''}, {'row': 99}, {'copy_sha': '0' * 64}):
+            image, text = self.menu_config(**kwargs)
+            with self.assertRaises(SystemExit):
+                self.gen.title_hooks(text, image, 0x10000)
+
     def press_config(self, stop_sha=None):
         import hashlib
         image = bytes(range(64))

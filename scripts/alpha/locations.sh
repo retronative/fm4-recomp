@@ -131,7 +131,8 @@ loc_need() {
 
 # loc_game_args <home>: sets LOC_GAME_ARGS, fm4recomp's data arguments from the recorded locations (play.sh), after checking that
 # each is there: a missing folder on a chosen drive is refused (never recreated empty, which would hide the player's saves); the
-# internal default user-data folder is created. Disc 2's two arguments only once setup.sh --disc2 has recorded them.
+# internal default user-data folder is created. Disc 2's two arguments only once setup.sh --disc2 has recorded them;
+# --keybindings only when <home>/keybindings.conf exists (the game checks its contents).
 loc_game_args() {
   local f
   loc_resolve "$1" || return 1
@@ -152,4 +153,8 @@ loc_game_args() {
     LOC_GAME_ARGS+=(--disc2 "$LOC_DISC2_ROOT" --disc2-map "$LOC_DISC2_MAP")
   fi
   LOC_GAME_ARGS+=(--modules "$LOC_DATA_ROOT/modules" --user-data "$LOC_USER_DATA_ROOT")
+  # The keyboard bindings the in-game Keyboard Controls saved; none: the game's defaults (fm4recomp re-reads this path when it closes).
+  if [ -e "$1/keybindings.conf" ]; then
+    LOC_GAME_ARGS+=(--keybindings "$1/keybindings.conf")
+  fi
 }

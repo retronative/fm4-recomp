@@ -17,6 +17,7 @@
 #include "shader/ucode.h"
 #include "video/shader_cache.h"
 #include "video/shader_class.h"
+#include "video/spirv_disk_cache.h"
 
 #include <cstdio>
 #include <fstream>
@@ -492,6 +493,44 @@ void TestLoadMemo()
 
 }  // namespace
 
+
+// FM4 Recomp (M7 stability, FM4_SPIRV_CACHE; spirv_disk_cache.h). SHA-1 against FIPS 180-2 appendix A.1 ("abc" ->
+// a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d). Entries: a 5-word module round-trips; a flipped body byte, a flipped checksum
+// byte, a truncated file, a wrong magic, a word count past the file and a body whose first word is not the SPIR-V magic are all
+// misses. Keys: equal inputs give equal names; the stage, the options, one GLSL character or the compiler version each change it.
+void TestSpirvDiskCache()
+{
+    using namespace runtime::video::spirv_cache;
+    Expect(Sha1Hex("abc", 3) == "a9993e364706816aba3e25717850c26c9cd0d89d", "spirv cache: SHA-1(\"abc\") is the FIPS 180-2 vector");
+    const std::vector<uint32_t> module = {0x07230203u, 0x00010000u, 0x00080001u, 7u, 0u};
+    const std::vector<uint8_t> file = Encode(module);
+    std::vector<uint32_t> back;
+    Expect(file.size() == 8 + 4 + 5 * 4 + 20 && Decode(file, back) && back == module, "spirv cache: a 5-word module round-trips (52 bytes)");
+    auto rejects = [&](std::vector<uint8_t> f) { std::vector<uint32_t> out = {1}; return !Decode(f, out) && out.empty(); };
+    std::vector<uint8_t> f = file;
+    f[8 + 4 + 13] ^= 1;
+    CONTROL(!rejects(f), "spirv cache: a flipped body byte is a miss");
+    f = file, f[f.size() - 1] ^= 0x80;
+    CONTROL(!rejects(f), "spirv cache: a flipped checksum byte is a miss");
+    f = file, f.pop_back();
+    CONTROL(!rejects(f), "spirv cache: a truncated entry is a miss");
+    f = file, f[0] = 'X';
+    CONTROL(!rejects(f), "spirv cache: a wrong magic is a miss");
+    f = file, f[8] = 6;
+    CONTROL(!rejects(f), "spirv cache: a word count past the file is a miss");
+    std::vector<uint32_t> notSpirv = module;
+    notSpirv[0] = 0x03022307u;  // byte-swapped magic
+    CONTROL(!rejects(Encode(notSpirv)), "spirv cache: a module without the SPIR-V magic is a miss");
+    const std::string k = Key("glslang 16.6.0", 'f', "noprecise 1", "void main(){}");
+    Expect(k.size() == 44 && k.substr(40) == ".spv" && k == Key("glslang 16.6.0", 'f', "noprecise 1", "void main(){}"), "spirv cache: the key is a stable SHA-1 name");
+    Expect(k != Key("glslang 16.6.0", 'v', "noprecise 1", "void main(){}") && k != Key("glslang 16.6.0", 'f', "noprecise 0", "void main(){}") &&
+               k != Key("glslang 16.6.0", 'f', "noprecise 1", "void main(){ }") && k != Key("glslang 16.7.0", 'f', "noprecise 1", "void main(){}"),
+           "spirv cache: stage, options, GLSL text and compiler version each change the key");
+    const std::string path = work + "/" + k;
+    std::vector<uint32_t> loaded;
+    Expect(!Load(path, loaded) && Store(path, module) && Load(path, loaded) && loaded == module, "spirv cache: a miss, then a store, then a hit from disk");
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2)
@@ -512,6 +551,7 @@ int main(int argc, char** argv)
     TestCache();
     TestCacheErrorPath();
     TestLoadMemo();
+    TestSpirvDiskCache();
     std::printf("%d failure(s), %d negative control(s)\n", failures, controls);
     return failures == 0 ? 0 : 1;
 }

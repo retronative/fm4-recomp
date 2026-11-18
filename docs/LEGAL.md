@@ -14,14 +14,15 @@ Source code, build scripts, tests and documentation, under the GPL-3.0-or-later
 
 It contains **no game assets** (textures, models, audio, movies or disc files), **no disc images**,
 **no game executables** (original or decrypted) and **no recompiled game code**. The recompiled C++
-and the native build are produced on your Mac from your own disc, and are git-ignored: never commit
-or share them.
+(`ppc/`) and the native build are produced from the disc and are git-ignored: the recompiled C++ is
+never committed to this repository or published. Never commit either, and never share the recompiled
+C++ or a build you made yourself; the released app is the only place the native build is distributed.
 
 To recompile the supported disc, the repository includes data from analysing that disc's
 executable:
 
 - **Guest addresses:** function bounds and entry points, the 394 switch tables of
-  `config/switch_tables.toml`, and the three opt-in hooks of `config/title_hooks.toml`. Each hook
+  `config/switch_tables.toml`, and the opt-in hooks of `config/title_hooks.toml`. Each hook
   carries the SHA-256 of the function bytes it replaces, so it never applies to another build.
 - **Hashes:** SHA-256 of the disc's executable, of the Disc 2 packages and of a Disc 2 file map,
   so setup can confirm your discs are the supported version.
@@ -30,13 +31,19 @@ executable:
 
 ## What the macOS DMG contains
 
-The DMG is built locally (`scripts/release/make_app.sh`, `scripts/release/make_dmg.py`) and is not
-published here. It holds FM4 Recomp.app: the setup app, the `fm4recomp` runtime, open-source tools
-and libraries, and their licences.
+The DMG is built from a tagged commit of this repository (`scripts/release/make_app.sh`,
+`scripts/release/make_dmg.py`) and published on the project's GitHub Releases page. It holds
+FM4 Recomp.app: the setup app, the `fm4recomp` runtime, open-source tools and libraries, and their
+licences (`licenses/THIRD_PARTY_NOTICES.md` in the app, which also says where the source is).
 
-It contains no game assets, disc images or original executables; setup reads your own disc. The
-`fm4recomp` binary does contain native code compiled from the recompiled game executable, so a DMG
-is for local testing only and must not be shared.
+No game files are included or distributed: it contains no game assets, disc images or original
+executables, and setup reads your own disc. The `fm4recomp` program is the native build of the
+recompiled game executable with FM4 Recomp's runtime; it does nothing without the game's data from
+your own, legally obtained disc.
+
+The source of a release is this repository at the release's tag. The source of its replaceable
+LGPL libraries (FFmpeg's XMA decoder and libmspack's LZX decoder) is published on the same release
+page as `FM4-Recomp-<version>-third-party-source.tar.xz` ([THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).
 
 ## Warranty
 

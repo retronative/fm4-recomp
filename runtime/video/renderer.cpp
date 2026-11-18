@@ -28,6 +28,7 @@
 // only while the presenter is blitting from it. The one VkQueue is shared with the presenter: every submission here
 // takes the queue lock first (bounded; uncontended in the other modes).
 #include "renderer.h"
+#include "diag_trigger.h"
 #include "capture_store.h"
 #include "capture_keep.h"
 #include "draw_record.h"
@@ -40,10 +41,15 @@
 #include "async_retire.h"  // FM4 Recomp (M7): FM4_ASYNC_RETIRE
 #include "guest_writes.h"
 #include "pipeline_cache.h"
+#include "push_template.h"  // FM4 Recomp (M7 CPU cost): FM4_PUSH_TEMPLATE
 #include "png.h"
 #include "diag_alpha.h"
 #include "diag_depth.h"
 #include "diag_blend.h"  // FM4 Recomp: FM4_DIAG_BLEND_LOG / FM4_DIAG_PS_SKIP (diagnostic)
+#include "diag_slow_submit.h"  // FM4 Recomp: FM4_DIAG_SLOW_SUBMIT (diagnostic)
+#include "diag_drain.h"  // FM4 Recomp: FM4_DIAG_DRAIN (diagnostic)
+#include "diag_cp_delay.h"  // FM4 Recomp: FM4_DIAG_CP_DELAY_NS (diagnostic)
+#include "diag_compile.h"  // FM4 Recomp: compile time beside a long swap (diagnostic)
 #include "texture_dump.h"
 #include "ps_trace.h"
 #include "shader_cache.h"
@@ -61,7 +67,10 @@
 #include "kernel/graphics.h"
 #include "kernel/av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
 #include "kernel/virtual_memory.h"
+#include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <cstddef>  // offsetof (FM4_PUSH_TEMPLATE)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -169,9 +178,23 @@ struct LastConstants
     std::vector<uint32_t> alu;
     uint32_t bools[8] = {}, loops[32] = {};
     uint64_t vsAt = 0, psAt = 0, lap = 0;
+    uint64_t vsLap = 0, psLap = 0;  // FM4 Recomp (FM4_CONSTANTS_PER_STAGE): each block's own lap (one stage may be older than the other)
     uint32_t vsWords = 0, psWords = 0;
 } lastConstants;
 bool haveLastConstants = false;
+uint64_t stageConstantsReusedSinceSwap[2] = {};  // FM4 Recomp (FM4_CONSTANTS_PER_STAGE): draws that bound one stage's block again (VS, PS)
+// FM4 Recomp (M7 CPU cost): opt-in FM4_CONSTANTS_PER_STAGE=1 (Draw step 7, draw_record.h SameStageConstants).
+bool ConstantsPerStage()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_CONSTANTS_PER_STAGE");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] per-stage constants on (FM4_CONSTANTS_PER_STAGE=1): a stage whose constants equal the previous draw's binds its block again\n");
+        return enabled;
+    }();
+    return on;
+}
 uint64_t constantsReusedSinceSwap = 0;  // FM4_FETCH_UNCHECKED: draws by vertex shader variant; why not provable (draw_state.h FetchProof)
 // FM4 Recomp: per-swap timing (always on, a few clock reads): each FlushSlot (submit, then the bounded wait for completion) by
 // cause, and the texture binds (hash, untile, staging) on the CPU.
@@ -745,6 +768,8 @@ int VariantMemoMode()
 VariantMemo variantMemo{8192};
 uint64_t variantMemoHitsSinceSwap = 0, variantMemoMissesSinceSwap = 0, variantMemoVerifiedSinceSwap = 0;
 std::optional<PipelineCache> pipelines;
+uint64_t pipelinesAtCacheSave = 0;  // FM4_SHADER_CACHE: the pipeline count at the last save
+std::atomic<bool> pipelineCacheSaving{false};  // FM4_SHADER_CACHE: a background save holds the pipeline cache (Shutdown waits for it)
 ShaderClass allowedClasses = kClassStraight;
 SamplerLimits samplerLimits;  // the device's (CreateResources), for PlanDescriptors and the descriptor pools
 const EdramHooks* edramHooks = nullptr;
@@ -787,9 +812,23 @@ public:
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &slots[s].commands;
-        return int(vkQueueSubmit(dev.queue, 1, &submit, slots[s].fence));
+        if (!drain::Enabled())
+            return int(vkQueueSubmit(dev.queue, 1, &submit, slots[s].fence));
+        drain::SubmitBegin(s);  // FM4_DIAG_DRAIN (diagnostic): the submit itself (MoltenVK's Metal encoding)
+        const VkResult r = vkQueueSubmit(dev.queue, 1, &submit, slots[s].fence);
+        drain::SubmitEnd(s);
+        return int(r);
     }
-    int WaitFence(uint32_t s, uint64_t timeoutNs) override { return int(vkWaitForFences(dev.device, 1, &slots[s].fence, VK_TRUE, timeoutNs)); }
+    int WaitFence(uint32_t s, uint64_t timeoutNs) override
+    {
+        if (!drain::Enabled())
+            return int(vkWaitForFences(dev.device, 1, &slots[s].fence, VK_TRUE, timeoutNs));
+        drain::FenceWaitBegin(s);  // FM4_DIAG_DRAIN (diagnostic): when the fence was observed signalled
+        const VkResult r = vkWaitForFences(dev.device, 1, &slots[s].fence, VK_TRUE, timeoutNs);
+        if (r == VK_SUCCESS)
+            drain::FenceObserved(s);
+        return int(r);
+    }
     int FenceStatus(uint32_t s) override { return int(vkGetFenceStatus(dev.device, slots[s].fence)); }
     void Destroy(Transient& t) override
     {
@@ -924,6 +963,8 @@ void SubmitSlot(uint32_t s)
         runtime::gpu::MarkDeferredStoresPart(currentPartSerial);  // the stores queued since the previous part follow this one
         retireBackend->Tag(s, currentPartSerial, presentSwapTag);
     }
+    if (drain::Enabled())  // FM4_DIAG_DRAIN (diagnostic): the part handed to the submission (a present part has no draws)
+        drain::PartHanded(s, currentPartSerial, presentSwapTag != 0 ? 0 : drawsInBuffer);
     Require(guard->Submit(s));
     submitted.push_back(s);
     submittedSerials.push_back(currentPartSerial);  // FM4_PARTIAL_RETIRE
@@ -1322,6 +1363,8 @@ void RetireSlot(uint32_t s)
     const auto retireStart = std::chrono::steady_clock::now();
     for (const uint32_t k : submitted)  // FM4_SUBMIT_SPLIT: every part, in submission order (each a bounded wait)
         Require(guard->Retire(k)), RequireRetireJob(k);  // FM4_ASYNC_RETIRE: the worker's verdict, its write-backs done
+    if (drain::Enabled())
+        drain::RetireObserved();  // FM4_DIAG_DRAIN (diagnostic): the last part's retire seen by the command processor
     retireFenceNsSinceSwap += NsSince(retireStart);
     if (vertexCache)  // FM4 Recomp (M7, vertex reuse across submissions; vertex_cache.h L4): every part so far is confirmed complete
         vertexCache->Retired(currentPartSerial - 1);
@@ -1351,7 +1394,11 @@ void RetireSlot(uint32_t s)
     {
         uint64_t t[2] = {};
         if (vkGetQueryPoolResults(dev.device, slot.timestamps, 0, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] >= t[0])
+        {
             gpuBusyNsSinceSwap += uint64_t(double(t[1] - t[0]) * timestampPeriodNs), gpuTimedSinceSwap++;
+            if (drain::Enabled())
+                drain::GpuSpan(uint64_t(double(t[1] - t[0]) * timestampPeriodNs));  // FM4_DIAG_DRAIN (diagnostic)
+        }
     }
     slot.timed = slot.stamped = false;
     if (PassTimes() && passQueriesUsed != 0)  // FM4_DIAG_PASS_TIMES: every part retired, so every query is available
@@ -1494,6 +1541,16 @@ bool ClearDraws()
 }
 uint64_t clearDrawsDeferredSinceSwap = 0;
 uint64_t pushedSetsSinceSwap = 0;  // FM4 Recomp (FM4_PUSH_DESCRIPTORS): draws whose descriptors were pushed
+uint64_t pushTemplatesSinceSwap = 0;  // FM4 Recomp (FM4_PUSH_TEMPLATE): those pushed through the layout's update template
+// FM4 Recomp (FM4_PUSH_TEMPLATE): the data block of push_template.h PlanPushTemplate: six buffer infos, then the images in slot order.
+struct PushTemplateData
+{
+    VkDescriptorBufferInfo buffers[kPushBufferBindings];
+    VkDescriptorImageInfo images[kTextureBindings];
+};
+static_assert(offsetof(PushTemplateData, images) == kPushBufferBindings * sizeof(VkDescriptorBufferInfo) &&
+                  sizeof(VkDescriptorImageInfo) % alignof(VkDescriptorImageInfo) == 0,
+              "PlanPushTemplate's offsets: the images follow the six buffer infos, each image info one stride after the previous");
 // FM4 Recomp (FM4_DIAG_TRANSFERS=2, diagnostic): the renderer names each draw for the EDRAM unit's first-use tally (render_hooks.h
 // diagDrawSignature); level 1 and off leave it empty.
 bool DiagTransferConsumers()
@@ -1757,12 +1814,22 @@ void EndWithReadback(VkCommandBuffer c)
 // The read-back display image (A2B10G10R10: R bits 0-9) -> a capture: 8-bit RGB keeps each channel's
 // top 8 bits (ForzaRecomp presenter.cpp:396-405).
 // Whether swap `id`'s front buffer is captured (the ring, a listed frame, or a kept every-Nth frame).
-bool FrontBufferCaptured(uint64_t id) { return captureRing || captureFrames.count(id) != 0 || (kept && id % keepEvery == 0); }
+// FM4 Recomp (diagnostic): FM4_CAPTURE_KEEP_FROM_VBLANK=<n> keeps every-Nth frames only from that vblank on (with FM4_CP_TRACE_FROM_VBLANK:
+// the 96 kept files cover the traced screen instead of the boot).
+bool KeepSwap(uint64_t id)
+{
+    static const uint64_t from = [] {
+        const char* v = std::getenv("FM4_CAPTURE_KEEP_FROM_VBLANK");
+        return v != nullptr && *v != '\0' ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    return kept && id % keepEvery == 0 && (from == 0 || runtime::gpu::VblankCount() >= from);
+}
+bool FrontBufferCaptured(uint64_t id) { return captureRing || captureFrames.count(id) != 0 || KeepSwap(id); }
 void Capture(uint64_t id, const char* what)
 {
     const bool frontBuffer = std::strcmp(what, "front buffer") == 0;
     const bool toRing = !frontBuffer || captureRing || captureFrames.count(id) != 0;
-    const bool toKept = frontBuffer && kept && id % keepEvery == 0;
+    const bool toKept = frontBuffer && KeepSwap(id);
     if (!toRing && !toKept)
         return;  // captures off (the default): no conversion or PNG work for this swap (Present skipped the image as well)
     const uint32_t* pixels = static_cast<const uint32_t*>(readback.mapped);
@@ -2005,6 +2072,10 @@ void Shutdown()
         edramHooks->shutdown();
     edramHooks = nullptr;
     endOpenRenderPass = nullptr, beginUnitPass = nullptr, endUnitPass = nullptr, openPass = OpenPass{};
+    while (pipelineCacheSaving.load())  // FM4_SHADER_CACHE: a background save still reads the pipeline cache
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (pipelines && pipelines->PersistentCacheOn())
+        pipelines->SavePersistentCache();  // the last pipelines of the run (ReCarbon saves at exit too)
     pipelines.reset();  // pipelines, render passes, modules, layouts
     shaders.reset();
     variantMemo.Clear();  // FM4_VARIANT_MEMO: its keys and entries point into the cache just destroyed
@@ -2154,7 +2225,15 @@ bool Initialize(const Options& o)
     if (AsyncSubmit())
     {
         const uint64_t boundNs = PresenterWaitBoundNs(gpu::FenceTimeoutNs(timeout.ms));
-        asyncBackend.emplace(backend, kSlots, [boundNs] { return LockQueue(queueLock, boundNs, "submit (worker)"); });
+        asyncBackend.emplace(backend, kSlots, [boundNs] {
+            const uint64_t lockStart = drain::Enabled() ? drain::NowNs() : 0;  // FM4_DIAG_DRAIN (diagnostic): the presenter's queue lock
+            std::unique_lock<std::timed_mutex> lock = LockQueue(queueLock, boundNs, "submit (worker)");
+            if (lockStart != 0)
+                drain::QueueLockWaited(drain::NowNs() - lockStart);
+            return lock;
+        });
+        if (diag::SlowSubmitEnabled())  // FM4_DIAG_SLOW_SUBMIT (diagnostic)
+            asyncBackend->SetTimingHook(diag::ReportSubmit);
     }
     SubmissionBackend<Transient>& submitter =
         asyncBackend ? static_cast<SubmissionBackend<Transient>&>(*asyncBackend) : static_cast<SubmissionBackend<Transient>&>(backend);
@@ -2168,7 +2247,12 @@ bool Initialize(const Options& o)
                 g->Completed(serial);
         };
         hooks.writeBack = [](uint64_t serial, std::string& error) {
-            return edramHooks == nullptr || edramHooks->writeBackHandedOff == nullptr || edramHooks->writeBackHandedOff(serial, error);
+            if (!drain::Enabled())
+                return edramHooks == nullptr || edramHooks->writeBackHandedOff == nullptr || edramHooks->writeBackHandedOff(serial, error);
+            drain::WriteBackBegin(serial);  // FM4_DIAG_DRAIN (diagnostic)
+            const bool ok = edramHooks == nullptr || edramHooks->writeBackHandedOff == nullptr || edramHooks->writeBackHandedOff(serial, error);
+            drain::WriteBackEnd(serial);
+            return ok;
         };
         hooks.present = [](uint64_t presentSwap, std::string& error) {
             if (HandOver().Offer(presentSwap))  // window_policy.h FrameHandOver: the command processor's BeginWrite came first
@@ -2232,10 +2316,19 @@ bool Initialize(const Options& o)
     features.independentBlend = dev.independentBlend;
     features.dynamicBuffers = descriptorCacheOn;
     features.pushDescriptorLimit = dev.pushDescriptors && !descriptorCacheOn ? dev.maxPushDescriptors : 0;  // FM4_PUSH_DESCRIPTORS
+    features.pushTemplates = features.pushDescriptorLimit != 0 && dev.cmdPushDescriptorSetWithTemplate != nullptr;  // FM4_PUSH_TEMPLATE
     KeyResult created;
     pipelines.emplace(dev.device, features, allowedClasses, created);
     if (!created)
         Stop(StopCode::Setup, "renderer: %s", created.reason.c_str());
+    if (const char* dir = std::getenv("FM4_SHADER_CACHE"); dir != nullptr && *dir != '\0')  // FM4 Recomp (M7 stability): pipeline_cache.h
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(dev.gpu, &props);
+        pipelines->UsePersistentCache(std::string(dir) + "/pipelines.bin", props.vendorID, props.deviceID, props.pipelineCacheUUID);
+    }
     SetTextureDumpDir(o.captureDir);              // FM4_DUMP_TEXTURE (diagnostic, texture_dump.h): nothing unless set
     SetTextureHooks(InitializeTextureUnit(dev, &*compiler));  // unit 7 (texture_vk.h)
     // The EDRAM unit (edram_vk.h): its transfer shaders through the same compiler, its resolve writes through main.cpp's
@@ -2304,7 +2397,17 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     if (retireBackend && windowed)
         RetireParts(UINT64_MAX, true);  // an earlier present part when no draw opened the slot since: its hand-over happens before BeginWrite
     if (presentAsync)
+    {
         EvictIdleTextures();  // every submission is confirmed complete; the present part samples no texture
+    diag::TriggerAtRetire(swap, [](const std::string& c) {  // FM4_DIAG_TRIGGER (diagnostic): a live session's probe
+        if (c == "stale-textures")
+            std::fprintf(stderr, "[diag] stale-textures: %zu image(s) to re-hash\n", MarkTexturesStale());
+        else if (c == "stale-vertices" && vertexCache)
+            vertexCache->ForgetAll(), std::fprintf(stderr, "[diag] stale-vertices: the vertex cache forgot its windows\n");
+        else
+            std::fprintf(stderr, "[diag] trigger: unknown command '%s'\n", c.c_str());
+    });
+    }
     const auto presentStart = std::chrono::steady_clock::now();
     if (!image)
         ApplyDisplayGamma(base, nullptr, 0, swap);
@@ -2378,7 +2481,17 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     }
     flushNsSinceSwap[size_t(FlushCause::Swap)] += NsSince(presentStart);
     if (!presentAsync)  // FM4_ASYNC_RETIRE: evicted before the present part was recorded
+    {
         EvictIdleTextures();  // FM4 Recomp: every submission confirmed complete just above (GPU safety: no in-flight use)
+    diag::TriggerAtRetire(swap, [](const std::string& c) {  // FM4_DIAG_TRIGGER (diagnostic): a live session's probe
+        if (c == "stale-textures")
+            std::fprintf(stderr, "[diag] stale-textures: %zu image(s) to re-hash\n", MarkTexturesStale());
+        else if (c == "stale-vertices" && vertexCache)
+            vertexCache->ForgetAll(), std::fprintf(stderr, "[diag] stale-vertices: the vertex cache forgot its windows\n");
+        else
+            std::fprintf(stderr, "[diag] trigger: unknown command '%s'\n", c.c_str());
+    });
+    }
     Capture(swap, "front buffer");  // FM4_ASYNC_RETIRE: never captured (presentAsync), so the readback buffer is not read
     if (windowed && !presentAsync && !HandOver().Offer(swap))  // the main thread blits it to the swapchain and presents (window_present.cpp)
         Stop(StopCode::Setup, "renderer: swap %llu: the window hand-over was not idle after BeginWrite (contract breach)", (unsigned long long)swap);
@@ -2416,6 +2529,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
         if (*separator == ',')
             timing += ")";
         char gpuBusy[1200] = "";  // FM4 Recomp: room for the FM4_GUEST_MEMORY_GPU fields
+        const double diagGpuBusyMs = gpuBusyNsSinceSwap / 1e6;  // FM4_DIAG_SLOW_SUBMIT (diagnostic)
         if (timestampPeriodNs > 0)  // FM4_GPU_TIMESTAMPS (diagnostic)
             std::snprintf(gpuBusy, sizeof gpuBusy, "; GPU busy %.1f ms in %llu submission(s)", gpuBusyNsSinceSwap / 1e6, (unsigned long long)gpuTimedSinceSwap);
         if (ThreadCpuDiag())  // FM4_DIAG_THREAD_CPU (diagnostic): CPU time by thread role and the command processor's idle time
@@ -2515,7 +2629,9 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
         if (dev.pushDescriptors)  // FM4_PUSH_DESCRIPTORS
         {
             std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; %llu pushed descriptor set(s)", (unsigned long long)pushedSetsSinceSwap);
-            pushedSetsSinceSwap = 0;
+            if (pushTemplatesSinceSwap != 0)  // FM4_PUSH_TEMPLATE
+                std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), " (%llu by template)", (unsigned long long)pushTemplatesSinceSwap);
+            pushedSetsSinceSwap = 0, pushTemplatesSinceSwap = 0;
         }
         if (ClearDraws())  // FM4_CLEAR_DRAWS: clear-class draws kept as pending clears of their targets instead of drawn
         {
@@ -2614,7 +2730,10 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
         if (PassMerge())  // FM4_PASS_MERGE: render pass instances begun by draws
             std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; %llu draw render pass(es)", (unsigned long long)passesSinceSwap);
         std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; constants reused %llu draw(s)", (unsigned long long)constantsReusedSinceSwap);
-        constantsReusedSinceSwap = 0;
+        if (ConstantsPerStage())  // FM4_CONSTANTS_PER_STAGE
+            std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), " (and one stage only: VS %llu, PS %llu)",
+                          (unsigned long long)stageConstantsReusedSinceSwap[0], (unsigned long long)stageConstantsReusedSinceSwap[1]);
+        constantsReusedSinceSwap = 0, stageConstantsReusedSinceSwap[0] = stageConstantsReusedSinceSwap[1] = 0;
         if (VariantMemoMode() != 0)  // FM4_VARIANT_MEMO
         {
             std::snprintf(gpuBusy + std::strlen(gpuBusy), sizeof gpuBusy - std::strlen(gpuBusy), "; variant memo %llu hit(s), %llu miss(es), %llu verified, %zu held",
@@ -2635,6 +2754,27 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                      (unsigned long long)swap, NsSince(lastSwapEnd) / 1e6, waits / 1e6, timing.c_str(), retireFenceNsSinceSwap / 1e6, retireWriteBackNsSinceSwap / 1e6, textureBindNsSinceSwap / 1e6,
                      ringNeedSinceSwap[0] / 1048576.0, ringNeedSinceSwap[1] / 1048576.0, ringNeedSinceSwap[2] / 1048576.0, ringNeedSinceSwap[3] / 1048576.0,
                      (unsigned long long)runtime::gpu::VblankCount(), gpuBusy);  // FM4 Recomp: guest time (the input script's clock) per swap
+        // FM4 Recomp (M7 stability, FM4_SHADER_CACHE; after ReCarbon's every-600-frames saver): new pipelines are written out every
+        // 600 swaps on a thread of its own (getting a large cache's data and writing it costs tens of ms: never on this thread).
+        if (pipelines && pipelines->PersistentCacheOn() && swap % 600 == 0 && pipelines->GetStats().pipelines != pipelinesAtCacheSave)
+        {
+            pipelinesAtCacheSave = pipelines->GetStats().pipelines;
+            if (!pipelineCacheSaving.exchange(true))
+                std::thread([] {
+                    pthread_setname_np("fm4 cache save");
+                    if (!pipelines->SavePersistentCache())
+                        std::fprintf(stderr, "[gpu] pipeline cache: the save failed (the next one retries)\n");
+                    pipelineCacheSaving = false;
+                }).detach();
+        }
+        if (diag::SlowSubmitEnabled())  // FM4_DIAG_SLOW_SUBMIT (diagnostic)
+        {
+            diag::ReportFence((unsigned long long)swap, retireFenceNsSinceSwap / 1e6, diagGpuBusyMs);
+            diag::CompileTally& c = diag::Compiles();
+            diag::ReportSwap((unsigned long long)swap, NsSince(lastSwapEnd) / 1e6, waits / 1e6, c.glslNs.exchange(0) / 1e6, c.glsl.exchange(0),
+                             c.pipelineNs.exchange(0) / 1e6, c.pipelines.exchange(0), c.glslCached.exchange(0), c.translateNs.exchange(0) / 1e6,
+                             c.translations.exchange(0), c.dumpNs.exchange(0) / 1e6, c.dumps.exchange(0));
+        }
         if (retireBackend)  // FM4_ASYNC_RETIRE: "retire: fences" above is the command processor's wait for the worker
         {
             const AsyncRetireBackend<Transient>::Counters w = retireBackend->TakeCounters();
@@ -2653,6 +2793,8 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                          w.jobNs / 1e6, (unsigned long long)reapedPartsSinceSwap, (unsigned long long)earlyStoresSinceSwap, (unsigned long long)asyncPresentsSinceSwap);
             reapedPartsSinceSwap = earlyStoresSinceSwap = asyncPresentsSinceSwap = 0;
         }
+        if (drain::Enabled())  // FM4_DIAG_DRAIN (diagnostic): this swap's drains
+            drain::Swap(swap, drawsSinceSwap);
         gpuBusyNsSinceSwap = gpuTimedSinceSwap = passesSinceSwap = 0;
         retireFenceNsSinceSwap = retireWriteBackNsSinceSwap = 0;
         for (uint64_t& n : ringNeedSinceSwap)
@@ -2664,6 +2806,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     // the loading screens draw about 100 to 400; a race frame 1,400 to 2,700). Nothing without a @race script.
     if (drawsSinceSwap >= 1000)
         runtime::input::NotifyRaceStart(runtime::gpu::VblankCount());
+    runtime::input::NoteSwapDraws(drawsSinceSwap);
     drawsSinceSwap = shadersSinceSwap = noWriteSinceSwap = resolvesSinceSwap = ringFlushesSinceSwap = 0;
 }
 
@@ -2671,6 +2814,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
 {
     if (!enabled)
         return;
+    diag::CpDelay();  // FM4_DIAG_CP_DELAY_NS (diagnostic): a CP-time sensitivity test
     const uint64_t draw = drawNumber++;
     // 1. The gate's in-memory state (no file access per draw; GPU_STOP is checked at every Submit, the
     //    single choke point to the queue, execution model §4).
@@ -3317,23 +3461,44 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // FM4 Recomp (M7 CPU cost): consecutive draws mostly share their 2,088 constant words; when they do and the previous draw's
     // two blocks are still in the ring (UploadRing::Intact), they are bound again instead of allocated and filled (2 x 4 KB a
     // draw). Compared by content (memcmp), not by a register-write count: the guest CPU writes registers by memory store too.
-    const bool sameConstants = haveLastConstants && d.aluConstants.size() == 2048 && lastConstants.alu.size() == 2048 &&
-                               d.vsConstantWords == lastConstants.vsWords && d.psConstantWords == lastConstants.psWords &&
-                               std::memcmp(d.aluConstants.data(), lastConstants.alu.data(), size_t(d.vsConstantWords) * 4) == 0 &&
-                               std::memcmp(d.aluConstants.data() + 1024, lastConstants.alu.data() + 1024, size_t(d.psConstantWords) * 4) == 0 &&
-                               std::memcmp(d.boolConstants, lastConstants.bools, sizeof lastConstants.bools) == 0 &&
-                               std::memcmp(d.loopConstants, lastConstants.loops, sizeof lastConstants.loops) == 0 &&
-                               slot.allocator->Intact(lastConstants.vsAt, kConstantsBytes, lastConstants.lap) &&
-                               slot.allocator->Intact(lastConstants.psAt, kConstantsBytes, lastConstants.lap);
-    const uint64_t vsConstantsAt = sameConstants ? lastConstants.vsAt : Allocate(slot, draw, kConstantsBytes, true, "XeVsConstants");
-    const uint64_t psConstantsAt = sameConstants ? lastConstants.psAt : Allocate(slot, draw, kConstantsBytes, true, "XePsConstants");
+    // FM4 Recomp (M7 CPU cost, opt-in FM4_CONSTANTS_PER_STAGE=1): each stage's block is bound again on its own when FillConstants would
+    // write the bytes its shader reads exactly as the previous draw's (draw_record.h SameStageConstants); the other stage is filled.
+    // Invariant (each stage): the block at lastConstants.<stage>At holds FillConstants(previous draw, stage) in the range the shader
+    // reads: a filled block is this draw's; a reused one equals this draw's by the comparison; lastConstants takes this draw's words
+    // whenever a stage was filled (the alu swap below), and is already equal when both were reused.
+    bool reuseVs = false, reusePs = false;
+    if (!ConstantsPerStage())
+        reuseVs = reusePs = haveLastConstants && d.aluConstants.size() == 2048 && lastConstants.alu.size() == 2048 &&
+                            d.vsConstantWords == lastConstants.vsWords && d.psConstantWords == lastConstants.psWords &&
+                            std::memcmp(d.aluConstants.data(), lastConstants.alu.data(), size_t(d.vsConstantWords) * 4) == 0 &&
+                            std::memcmp(d.aluConstants.data() + 1024, lastConstants.alu.data() + 1024, size_t(d.psConstantWords) * 4) == 0 &&
+                            std::memcmp(d.boolConstants, lastConstants.bools, sizeof lastConstants.bools) == 0 &&
+                            std::memcmp(d.loopConstants, lastConstants.loops, sizeof lastConstants.loops) == 0 &&
+                            slot.allocator->Intact(lastConstants.vsAt, kConstantsBytes, lastConstants.lap) &&
+                            slot.allocator->Intact(lastConstants.psAt, kConstantsBytes, lastConstants.lap);
+    else if (haveLastConstants)
+    {
+        reuseVs = SameStageConstants(d, false, lastConstants.vsWords, lastConstants.alu, lastConstants.bools, lastConstants.loops) &&
+                  slot.allocator->Intact(lastConstants.vsAt, kConstantsBytes, lastConstants.vsLap);
+        reusePs = SameStageConstants(d, true, lastConstants.psWords, lastConstants.alu, lastConstants.bools, lastConstants.loops) &&
+                  slot.allocator->Intact(lastConstants.psAt, kConstantsBytes, lastConstants.psLap);
+    }
+    const bool sameConstants = reuseVs && reusePs;
+    const uint64_t vsConstantsAt = reuseVs ? lastConstants.vsAt : Allocate(slot, draw, kConstantsBytes, true, "XeVsConstants");
+    const uint64_t vsLap = slot.allocator->Lap();
+    const uint64_t psConstantsAt = reusePs ? lastConstants.psAt : Allocate(slot, draw, kConstantsBytes, true, "XePsConstants");
     if (sameConstants)
         constantsReusedSinceSwap++;
     else
     {
+        stageConstantsReusedSinceSwap[0] += reuseVs, stageConstantsReusedSinceSwap[1] += reusePs;  // FM4_CONSTANTS_PER_STAGE (0 when off)
         std::memcpy(lastConstants.bools, d.boolConstants, sizeof lastConstants.bools);
         std::memcpy(lastConstants.loops, d.loopConstants, sizeof lastConstants.loops);
         lastConstants.vsAt = vsConstantsAt, lastConstants.psAt = psConstantsAt, lastConstants.lap = slot.allocator->Lap();
+        if (!reuseVs)
+            lastConstants.vsLap = vsLap;
+        if (!reusePs)
+            lastConstants.psLap = slot.allocator->Lap();
         lastConstants.vsWords = d.vsConstantWords, lastConstants.psWords = d.psConstantWords;
         haveLastConstants = true;
     }
@@ -3456,8 +3621,10 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     FillXeSystem(windows, hv, d.systemFlags, ring + systemAt);
     if (!sameConstants)
     {
-        FillConstants(d, false, ring + vsConstantsAt);
-        FillConstants(d, true, ring + psConstantsAt);
+        if (!reuseVs)  // FM4_CONSTANTS_PER_STAGE: one stage may be bound again (off: reuseVs == reusePs == sameConstants)
+            FillConstants(d, false, ring + vsConstantsAt);
+        if (!reusePs)
+            FillConstants(d, true, ring + psConstantsAt);
         lastConstants.alu.swap(d.aluConstants);  // this draw's words become the previous draw's; nothing below reads d.aluConstants
     }
     for (const VertexWindow& w : windows)
@@ -3544,7 +3711,26 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     VkDescriptorBufferInfo pushBuffers[6];
     VkWriteDescriptorSet pushWrites[6 + kTextureBindings];
     uint32_t pushCount = 0;
-    if (push)
+    // FM4 Recomp (M7 CPU cost, FM4_PUSH_TEMPLATE, push_template.h): the same six buffers and images as one data block for the layout's
+    // update template: the buffers in binding order (b[] below is bindings 0-5), then images[] (filled in ascending slot order for
+    // exactly the slots of plan.layoutKey: PlanDescriptors sets dimension[s] for those slots only, pipeline_key.cpp).
+    PushTemplateData pushData;
+    if (push && pipeline.layouts.pushTemplate != VK_NULL_HANDLE)
+    {
+        // PlanPushTemplate's image count is the popcount of the key's slots (push_template.h); with the keys equal (checked first) those
+        // are plan.vsSlots | plan.psSlots (SamplerLayoutKey), so no plan is built per draw.
+        const uint32_t templateImages = uint32_t(__builtin_popcount(plan.vsSlots | plan.psSlots));
+        if (pipeline.layouts.layoutKey != plan.layoutKey || templateImages != imageCount)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: push template of layout %llx for %u images, the draw binds %u (layout %llx)",
+                 (unsigned long long)draw, (unsigned long long)pipeline.layouts.layoutKey, templateImages, imageCount, (unsigned long long)plan.layoutKey);
+        pushData.buffers[0] = {vertexBuffer, vertexAt, vertexBytes}, pushData.buffers[1] = {slot.ring.buffer, systemAt, kSystemBytes};
+        pushData.buffers[2] = {slot.ring.buffer, vsConstantsAt, kConstantsBytes}, pushData.buffers[3] = {slot.ring.buffer, psConstantsAt, kConstantsBytes};
+        pushData.buffers[4] = {slot.ring.buffer, indexAt, indexBytes}, pushData.buffers[5] = {slot.ring.buffer, errorAt, kErrorsBytes};
+        for (uint32_t k = 0; k < imageCount; k++)
+            pushData.images[k] = images[k];
+        pushedSetsSinceSwap++, pushTemplatesSinceSwap++;
+    }
+    else if (push)
     {
         const VkDescriptorBufferInfo b[6] = {{vertexBuffer, vertexAt, vertexBytes}, {slot.ring.buffer, systemAt, kSystemBytes},
                                              {slot.ring.buffer, vsConstantsAt, kConstantsBytes}, {slot.ring.buffer, psConstantsAt, kConstantsBytes},
@@ -3716,7 +3902,14 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     if (openPass.timing >= 0)
         passTimings[size_t(openPass.timing)].draws++;
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
-    if (push)  // FM4_PUSH_DESCRIPTORS
+    if (push && pipeline.layouts.pushTemplate != VK_NULL_HANDLE)  // FM4_PUSH_TEMPLATE
+    {
+        if (pipeline.layouts.layoutKey != plan.layoutKey)  // FM4_SUBSET_MERGE swaps the pipeline: its key keeps samplerLayout (one Layouts entry)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: the bound pipeline's layout %llx is not the draw's %llx", (unsigned long long)draw,
+                 (unsigned long long)pipeline.layouts.layoutKey, (unsigned long long)plan.layoutKey);
+        dev.cmdPushDescriptorSetWithTemplate(c, pipeline.layouts.pushTemplate, pipeline.layouts.pipeline, 0, &pushData);
+    }
+    else if (push)  // FM4_PUSH_DESCRIPTORS
         dev.cmdPushDescriptorSet(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, pushCount, pushWrites);
     else if (descriptorCacheOn)  // the dynamic offsets in binding order (FM4_DESCRIPTOR_CACHE); the vertex binding spans the ring from 0
     {
@@ -3863,7 +4056,11 @@ void SyncGuestWrites(uint32_t opcode)
 {
     if (ResolveDefer() && slots[0].open && GuestWritesPending())
     {
+        if (drain::Enabled())  // FM4_DIAG_DRAIN (diagnostic): the drain's stages (diag_drain.h)
+            drain::FlushBegin(opcode, recording, drawsInBuffer, submitted);
         FlushSlot(0, FlushCause::Sync);
+        if (drain::Enabled())
+            drain::FlushEnd();
         syncFlushesByPacketSinceSwap[opcode & 0x7F]++;
     }
 }

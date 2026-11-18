@@ -40,7 +40,7 @@ if (existsSync(ogFile)) {
 }
 
 // JSON-LD with facts stated on the site only: the WebSite and its source repository on the
-// home page, BreadcrumbList elsewhere. No versions, offers or ratings (nothing is released).
+// home page, BreadcrumbList elsewhere. No versions, offers or ratings.
 function structuredData(meta) {
   const url = absolute(meta.canonical)
   const graph = []

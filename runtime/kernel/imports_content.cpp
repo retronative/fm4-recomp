@@ -13,6 +13,8 @@
 #include "dispatcher.h"
 #include "disc_swap.h"
 #include "stfs.h"
+#include "graphics.h"
+#include "input_script.h"  // FM4 Recomp (M7 stability harness): the input script's @title anchor
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -408,6 +410,7 @@ GUEST_IMPORT(XamShowDeviceSelectorUI, "REFERENCE_DERIVED: Xenia xam_ui.cc:525-53
     if (deviceIdPtr == 0)
         Stop(StopCode::Unimplemented, "XamShowDeviceSelectorUI(user %u, content type %08X) without a device id pointer is not modelled", user, contentType);
     runtime::Store32(base, deviceIdPtr, runtime::kContentDeviceId);
+    runtime::input::NotifyTitleAccepted(runtime::gpu::VblankCount());  // FM4 Recomp: a scripted run's @title section starts here (test only)
     std::fprintf(stderr, "[ui] XamShowDeviceSelectorUI(user %u, content type %08X, flags %08X): answered device %u (the only storage device)\n", user,
                  contentType, flags, runtime::kContentDeviceId);
     ctx.r3.u64 = overlapped != 0 ? runtime::FinishOverlapped(ctx, base, overlapped, 0, 0, 0, "XamShowDeviceSelectorUI") : 0;

@@ -11,9 +11,9 @@ WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 Code taken from other projects keeps its attribution, and changes are noted in
-each file. Third-party components (for example XenonRecomp, MIT; Xenia,
-BSD-3-Clause; FFmpeg, LGPL-2.1) will be listed in THIRD_PARTY_NOTICES.md and
-the LICENSES folder as they are added.
+each file. Third-party components are listed in THIRD_PARTY_NOTICES.md, with
+their licence texts in the LICENSES folder; that file also says where the
+source code of a release is.
 
 FM4 Recomp is an unofficial, fan-made project. It is not affiliated with,
 endorsed by, or sponsored by Microsoft Corporation, Xbox Game Studios or

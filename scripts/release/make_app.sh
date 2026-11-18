@@ -3,7 +3,7 @@
 # Copyright (C) 2026 FM4 Recomp contributors
 #
 # FM4 Recomp.app: the guided first-run setup and launcher (app/setup, SwiftUI) as the app, the kit in
-# Contents/Resources/kit (fm4recomp and the validation layer's negative control from build/native, extract-xiso and xexsurvey
+# Contents/Resources/kit (fm4recomp, xexsurvey and the validation layer's negative control from build/native, extract-xiso
 # and gdfx from tools/, the bundled libraries, setup.sh and play.sh with the GPU safeguards, the README), the icon and the licences. No game file,
 # decrypted image or translation output: the player's own Disc 1 is set up on their Mac.
 # Adapted from reFrozen scripts/release/make_release_app.sh (GPL-3.0-or-later): the kit layout, debug symbols
@@ -20,8 +20,8 @@ APP="$OUT/FM4 Recomp.app"
 KIT="$APP/Contents/Resources/kit"
 ART="$OUT/art"
 for f in "$ROOT/build/native/runtime/fm4recomp" "$ROOT/build/native/tests/fm4_validation_control" "$ROOT/tools/extract-xiso/build/extract-xiso" \
-         "$ROOT/tools/survey/xexsurvey" "$ROOT/tools/survey/gdfx" "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/README.md"; do
-  [ -e "$f" ] || { echo "make_app: $f is missing (scripts/build.sh, scripts/setup_tools.sh)" >&2; exit 1; }
+         "$ROOT/build/native/runtime/xexsurvey" "$ROOT/tools/survey/gdfx" "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/README.md"; do
+  [ -e "$f" ] || { echo "make_app: $f is missing (FM4_RELEASE_FFMPEG=<prefix> scripts/build.sh, scripts/setup_tools.sh)" >&2; exit 1; }
 done
 [ ! -e "$APP" ] || { echo "make_app: $APP exists (never overwritten)" >&2; exit 1; }
 mkdir -p "$APP/Contents/MacOS" "$(dirname "$KIT")" "$ART"

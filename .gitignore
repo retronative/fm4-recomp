@@ -103,7 +103,7 @@ WORKLOG.local.md
 # Retention markers for local temporary data (general/data-retention-and-cleanup.md)
 .retention.json
 
-# Local alpha packages (scripts/package_alpha.sh): the binary contains translated game code; never committed or published.
+# Local alpha packages (scripts/package_alpha.sh): the binary contains translated game code; never committed.
 /dist
 .website/private-patterns.local.json
 

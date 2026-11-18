@@ -133,6 +133,23 @@ struct PipelineKey
             h = (h ^ b[i]) * 0x100000001b3ull;
         return h;
     }
+    // FM4 Recomp (M7 CPU cost, opt-in FM4_PIPELINE_WORD_HASH=1 in PipelineCache): the same bytes as twelve little-endian 64-bit
+    // words, h = ((h ^ w) * 0x9E3779B97F4A7C15) then h ^= h >> 32 per word from FNV's offset basis: 12 dependent multiplies instead
+    // of Hash()'s 96 (PipelineCache::Get's self time was 2.1 % of the command thread, scenario336). Only a bucket choice: equality
+    // stays operator== (memcmp).
+    uint64_t WordHash() const
+    {
+        const auto* b = reinterpret_cast<const unsigned char*>(this);
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (size_t i = 0; i < sizeof *this; i += 8)
+        {
+            uint64_t w;
+            std::memcpy(&w, b + i, 8);
+            h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+            h ^= h >> 32;
+        }
+        return h;
+    }
     struct Hasher
     {
         size_t operator()(const PipelineKey& k) const { return size_t(k.Hash()); }

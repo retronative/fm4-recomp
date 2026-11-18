@@ -2,7 +2,9 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // FM4 Recomp.app's window: welcome -> your Mac -> your Disc 1 -> setting up -> your Disc 2 (optional: Skip, or set up; also
-// "Add Disc 2" in the launcher) -> the launcher (Play, with the GPU safeguards of play.sh). Colours from the logo (assets/fm4-recomp-logo.svg): red #ff4429, asphalt #20242a, white.
+// "Add Disc 2" in the launcher) -> the launcher (Play, with the GPU safeguards of play.sh). Once set up, opening the app starts
+// the game at once (LaunchDecision.swift); missing or moved game data opens Repair instead. The keyboard bindings are changed in
+// the game (Keyboard Controls, ControlsView.swift / ControlsPanel.swift). Colours from the logo (assets/fm4-recomp-logo.svg): red #ff4429, asphalt #20242a, white.
 
 import AppKit
 import SwiftUI
@@ -19,7 +21,7 @@ enum Theme {
 
 @MainActor
 final class SetupModel: ObservableObject {
-  enum Page: String, CaseIterable { case welcome, prerequisites, disc, disc2, installing, failed, launcher }
+  enum Page: String, CaseIterable { case welcome, prerequisites, disc, disc2, installing, failed, launcher, repair }
 
   let paths: Paths
   @Published var page: Page
@@ -43,10 +45,24 @@ final class SetupModel: ObservableObject {
   @Published var gpuStop: String?
   @Published var minutes = 120
   @Published var debugValidation = false  // play.sh --debug: Vulkan and Metal API validation (slower)
+  // Keyboard Controls (KeyBindings.swift; in the game only, ControlsPanel.swift): the saved keyboard bindings, why the saved file was refused (the defaults are shown
+  // then), the action waiting for its new key, a key taken from another action waiting for Replace, the reset question.
+  @Published var bindings: KeyBindings
+  @Published var bindingsProblem: String?
+  @Published var capturing: String?
+  @Published var pendingChange: KeyBindings.Change?
+  @Published var confirmingReset = false
+  @Published var controlsNotice = ""
+  private var keyMonitor: Any?
+  // Why the game cannot start as set up (LaunchDecision.swift .repair), shown on the Repair page.
+  @Published var repairReason = ""
+  private var autoPlayed = false
   // The in-game Disc 2 panel (Panel.swift): set up, then end; "Back to the Game" ends it without the disc.
   var panel = false
   var gameMessage = ""
   private var process: Process?
+
+  static let shared = SetupModel(paths: Paths.standard())  // the app's model (Main.swift: the scene and the automatic start)
 
   init(paths: Paths, preview: Bool = false) {
     self.paths = paths
@@ -54,8 +70,12 @@ final class SetupModel: ObservableObject {
     dataDir = recorded.dataRoot
     userDataDir = recorded.userDataRoot
     disc2Dir = recorded.disc2Root ?? recorded.dataRoot.appendingPathComponent("disc2")
-    page = state(paths) == .ready && !preview ? .launcher : .welcome
+    let saved = KeyBindings.load(paths.keyBindingsFile)
+    bindings = saved.0
+    bindingsProblem = saved.1
+    page = .welcome
     checks = prerequisites(paths)
+    if !preview { applyLaunchDecision() }
     hasDisc2 = disc2Ready(paths)
     refreshGpuStop()
   }
@@ -142,20 +162,55 @@ final class SetupModel: ObservableObject {
     exit(status)
   }
 
-  func play() {
+  func play(automatic: Bool = false) {
     refreshGpuStop()
     guard gpuStop == nil, !playing else { return }
     playing = true
     lastSession = "Starting the game…"
+    var gameEnded: String?
     process = runKitScript(paths, "play.sh", ["\(minutes)"] + (debugValidation ? ["--debug"] : []), line: { text in
-      Task { @MainActor in if text.hasPrefix("play:") { self.lastSession = String(text.dropFirst(6)) } }
-    }, done: { _ in
+      Task { @MainActor in
+        if text.hasPrefix("play: the game ended") {
+          gameEnded = text
+          if automatic && gameEndedNormally(text) { NSApplication.shared.setActivationPolicy(.prohibited) }
+        }
+        if text.hasPrefix("play:") { self.lastSession = String(text.dropFirst(6)) }
+      }
+    }, done: { status in
       Task { @MainActor in
         self.playing = false
         self.process = nil
         self.refreshGpuStop()
+        (self.bindings, self.bindingsProblem) = KeyBindings.load(self.paths.keyBindingsFile)  // changed in the game, perhaps
+        guard automatic else { return }
+        if quitsAfterAutoSession(scriptStatus: status, gameEnded: gameEnded) { NSApplication.shared.terminate(nil) }
+        // Something went wrong: the launcher appears with the session's message (and GPU_STOP's card, if any).
+        NSApplication.shared.setActivationPolicy(.regular)
+        self.applyLaunchDecision()
+        Launcher.show()
       }
     })
+  }
+
+  // The page for the data as it is now: the welcome (never set up), Repair (set up, but the data is missing or moved), or the
+  // launcher (ready; GPU_STOP shows its card there).
+  func applyLaunchDecision() {
+    switch launchDecision(paths) {
+    case .setup: page = .welcome
+    case .repair(let reason): repairReason = reason; page = .repair
+    case .blocked, .play: page = .launcher
+    }
+  }
+
+  // The app was opened and the game is ready: start it at once, once per app launch (not after a session ends, not when
+  // GPU_STOP blocks it, never in the previews or the panels, which do not call this).
+  func launchIfReady() {
+    guard !autoPlayed else { return }
+    autoPlayed = true
+    guard case .play = launchDecision(paths) else { return }
+    // The game alone: the launcher window stays hidden while it runs (it reappears only if the session goes wrong).
+    runningWithoutWindow = true
+    play(automatic: true)
   }
 
   func refreshGpuStop() {
@@ -165,6 +220,87 @@ final class SetupModel: ObservableObject {
   func openLogs() {
     try? FileManager.default.createDirectory(at: paths.logs, withIntermediateDirectories: true)
     NSWorkspace.shared.open(paths.logs)
+  }
+
+  // MARK: Settings -> Controls
+
+  func beginCapture(_ action: String) {
+    endCapture()
+    confirmingReset = false
+    controlsNotice = ""
+    capturing = action
+    // While capturing, every key goes to the capture, none to the window (Return would press the default button).
+    keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+      guard let self else { return event }
+      let consumed = MainActor.assumeIsolated { self.capture(event) }  // local monitors run on the main thread
+      return consumed ? nil : event
+    }
+  }
+
+  func endCapture() {
+    if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+    keyMonitor = nil
+    capturing = nil
+    pendingChange = nil
+  }
+
+  private func capture(_ event: NSEvent) -> Bool {
+    guard let action = capturing else { return false }
+    guard pendingChange == nil else { return true }  // Replace or Cancel first
+    if event.type == .keyDown && event.isARepeat { return true }
+    if event.type == .flagsChanged && !isModifierPress(event) { return true }  // a modifier's release
+    guard let key = keyName(forKeyCode: event.keyCode) else {
+      controlsNotice = "That key cannot be used in the game (Caps Lock, Command, fn, ` and § are not available). Press another key."
+      return true
+    }
+    let change = bindings.change(assigning: key, to: action)
+    if change.from != nil { pendingChange = change } else { apply(change) }
+    return true
+  }
+
+  func apply(_ change: KeyBindings.Change) {
+    save(bindings.applying(change))
+    endCapture()
+  }
+
+  private func save(_ new: KeyBindings) {
+    do {
+      try new.write(to: paths.keyBindingsFile)
+      bindings = new
+      bindingsProblem = nil
+      controlsNotice = "Saved. The new keys apply when you return to the game."
+    } catch {
+      controlsNotice = "Could not save \(paths.keyBindingsFile.path): \(error.localizedDescription)"
+    }
+  }
+
+  // The defaults are no file at all (play.sh then passes no --keybindings).
+  func resetBindings() {
+    endCapture()
+    confirmingReset = false
+    do {
+      if FileManager.default.fileExists(atPath: paths.keyBindingsFile.path) { try FileManager.default.removeItem(at: paths.keyBindingsFile) }
+      bindings = .defaults
+      bindingsProblem = nil
+      controlsNotice = "Reset to the defaults."
+    } catch {
+      controlsNotice = "Could not remove \(paths.keyBindingsFile.path): \(error.localizedDescription)"
+    }
+  }
+
+  // Keyboard Controls in the game (ControlsPanel.swift): Done. The game gets the keyboard back, reloads the file and resumes.
+  // A key still held (Return, which pressed Done) would reach the game as soon as it has the focus again (the system's
+  // auto-repeat), so the panel first waits, at most 2 s, until no game key is down.
+  func leaveControls() {
+    let held = { macKeyNames.keys.contains { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0)) } }
+    let finish: () -> Never = {
+      NSRunningApplication(processIdentifier: getppid())?.activate()
+      fflush(stdout)
+      exit(0)
+    }
+    guard held() else { finish() }
+    let deadline = Date().addingTimeInterval(2)
+    Timer.scheduledTimer(withTimeInterval: 0.02, repeats: true) { _ in if !held() || Date() > deadline { finish() } }
   }
 
   func showForPreview(_ p: Page) {
@@ -183,6 +319,8 @@ final class SetupModel: ObservableObject {
       failure = "setup: default.xex is not the file this build needs: another disc version?"
     case .launcher:
       lastSession = "session over, no GPU hang evidence."
+    case .repair:
+      repairReason = "The game data folder /Volumes/Games/FM4 Recomp/data is missing. If it is on an external drive, connect it."
     default: break
     }
   }
@@ -205,6 +343,7 @@ struct RootView: View {
         case .installing: InstallingPage(model: model)
         case .failed: FailedPage(model: model)
         case .launcher: LauncherPage(model: model)
+        case .repair: RepairPage(model: model)
         }
       }
       .padding(.horizontal, 36)
@@ -226,7 +365,7 @@ struct Header: View {
         Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
           .frame(height: model.page == .launcher ? 150 : 96)
       }
-      if model.page != .launcher && !model.panel { StepIndicator(page: model.page, disc2: model.installingDisc2) }
+      if model.page != .launcher && model.page != .repair && !model.panel { StepIndicator(page: model.page, disc2: model.installingDisc2) }
     }
     .padding(.top, 34)
     .padding(.bottom, 18)
@@ -313,7 +452,7 @@ struct WelcomePage: View {
         Bullet(n: 3, text: "Setup copies the game files (about 8 GB) into your Library or a folder you choose, an external drive too, and checks every one against this build. Nothing leaves your Mac.")
       }
       HStack {
-        Text("Alpha build: expect a low frame rate and known issues (Read Me).").font(.system(size: 12)).foregroundStyle(Theme.secondary)
+        Text("Beta build: expect a low frame rate and known issues (Read Me).").font(.system(size: 12)).foregroundStyle(Theme.secondary)
         Spacer()
         PrimaryButton(title: "Get Started") { model.recheck(); model.page = .prerequisites }
       }
@@ -582,7 +721,7 @@ struct LauncherPage: View {
         HStack(alignment: .top, spacing: 24) {
           VStack(alignment: .leading, spacing: 5) {
             Text("Controls").font(.system(size: 12.5, weight: .semibold))
-            Text("Gamepad: Xbox layout. Keyboard: W throttle, S brake, A/D steer, Enter = A, Esc = B, arrows = D-pad. A skips the welcome video.")
+            Text("Gamepad: Xbox layout. Keyboard: \(model.bindings.summary()). To change the keys, pause a race and choose Keyboard Controls (or press ⌘,). A skips the welcome video.")
               .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
           }
           VStack(alignment: .leading, spacing: 5) {
@@ -597,7 +736,33 @@ struct LauncherPage: View {
         SecondaryButton(title: "Read Me & Known Issues") { NSWorkspace.shared.open(model.paths.readme) }
         if !model.hasDisc2 && !model.playing { SecondaryButton(title: "Add Disc 2…") { model.page = .disc2 } }
         Spacer()
-        Text("Alpha · your saves are kept in your Library").font(.system(size: 11)).foregroundStyle(Theme.secondary)
+        Text("Beta · your saves are kept in your Library").font(.system(size: 11)).foregroundStyle(Theme.secondary)
+      }
+    }
+  }
+}
+
+// Set up, but the game cannot start from what was recorded (LaunchDecision.swift): say what is missing; connect the drive and
+// check again, or set up again (setup.sh keeps what is already there and checks it).
+struct RepairPage: View {
+  @ObservedObject var model: SetupModel
+  var body: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      Label("FM4 Recomp needs a repair", systemImage: "wrench.and.screwdriver.fill").font(.system(size: 22, weight: .bold))
+        .foregroundStyle(Theme.red)
+      Card {
+        Text(model.repairReason).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+        Text("Your saves are not touched. If the data is on an external drive, connect it and choose Check Again. Otherwise set up again with your Disc 1 image.")
+          .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+      }
+      HStack {
+        SecondaryButton(title: "Show Files") { NSWorkspace.shared.open(model.paths.home) }
+        Spacer()
+        if model.bindingsProblem != nil {
+          SecondaryButton(title: "Reset Keys to Defaults") { model.resetBindings(); model.applyLaunchDecision() }
+        }
+        SecondaryButton(title: "Check Again") { model.applyLaunchDecision(); model.refreshGpuStop() }
+        PrimaryButton(title: "Set Up Again") { model.recheck(); model.page = .prerequisites }
       }
     }
   }

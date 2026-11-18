@@ -415,12 +415,82 @@ class Library(Base):
         shutil.rmtree(os.path.join(self.ssd, "disc2"))                               # the drive is disconnected
         self.assertEqual(self.k.lib(show)[0], 1)
 
+    def test_game_args_keybindings(self):
+        # The in-game Keyboard Controls writes <home>/keybindings.conf; without it the game keeps its defaults (no option).
+        self.disc1()
+        show = 'loc_game_args "$FM4_RECOMP_HOME"; printf "%s\\n" "${LOC_GAME_ARGS[@]}"'
+        status, out, err = self.k.lib(show)
+        self.assertEqual(status, 0, err)
+        self.assertNotIn("--keybindings", out.splitlines())                         # CONTROL: no file, no option
+        conf = os.path.join(self.k.home, "keybindings.conf")
+        with open(conf, "w") as f:
+            f.write("throttle = J\n")
+        status, out, err = self.k.lib(show)
+        self.assertEqual(status, 0, err)
+        args = out.splitlines()
+        self.assertEqual(args.count("--keybindings"), 1)
+        self.assertEqual(args[args.index("--keybindings") + 1], conf)               # the path verbatim (a space in it)
+        self.assertEqual(args[-2:], ["--keybindings", conf])
+        os.remove(conf)
+        self.assertNotIn("--keybindings", self.k.lib(show)[1].splitlines())        # removed (Reset to Defaults): gone again
+
     def test_game_args_user_data(self):
         self.disc1("--user-data", os.path.join(self.ssd, "user-data"))
         shutil.rmtree(os.path.join(self.ssd, "user-data"))                           # never recreated empty on a chosen drive
         status, _, err = self.k.lib('loc_game_args "$FM4_RECOMP_HOME"')
         self.assertEqual(status, 1)
         self.assertIn("is its drive connected", err)
+
+
+class PlayDefaults(unittest.TestCase):
+    """play.sh's Stack v2 settings, evaluated under /bin/bash 3.2 with a clean environment: GPU texture untile is off by default
+    (the Quick Race road regression, 2026-11-13 playtest), the other settings keep their values, and an explicit value wins."""
+
+    def settings(self, env):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index("export FM4_VARIANT_MEMO=")
+        end = text.index("\n", text.index("FM4_ASYNC_RETIRE:-1}"))
+        block = text[start:end] + "\nif [ \"$FM4_VERTEX_CACHE_MB\" = 0 ]; then unset FM4_VERTEX_CACHE_MB; fi\n"
+        script = "set -euo pipefail\n" + block + "\nenv | grep '^FM4_' | sort\n"
+        out = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True).stdout
+        return dict(line.split("=", 1) for line in out.splitlines())
+
+    def test_gpu_untile_off_by_default(self):
+        s = self.settings({})
+        self.assertEqual(s["FM4_TEXTURE_GPU_UNTILE"], "0")
+        self.assertEqual((s["FM4_GUEST_MEMORY_GPU"], s["FM4_VERTEX_CACHE_MB"], s["FM4_SUBMIT_IF_IDLE"], s["FM4_ASYNC_RETIRE"]), ("1", "256", "32", "1"))
+        self.assertNotEqual(s["FM4_TEXTURE_GPU_UNTILE"], "1")  # CONTROL: the old default
+
+    def cache(self, env):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index('FM4_SHADER_CACHE="${FM4_SHADER_CACHE:-')
+        end = text.index("\n", text.index("else export FM4_SHADER_CACHE; fi"))
+        script = "set -euo pipefail\nDATA=/kit/data\n" + text[start:end] + "\n{ env | grep '^FM4_' || true; } | sort\n"
+        out = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True).stdout
+        return dict(line.split("=", 1) for line in out.splitlines())
+
+    def test_shader_cache_on_by_default_with_opt_out(self):
+        self.assertEqual(self.cache({}).get("FM4_SHADER_CACHE"), "/kit/data/shader_cache")  # on, in the data directory
+        self.assertNotIn("FM4_SHADER_CACHE", self.cache({"FM4_SHADER_CACHE": "0"}))  # CONTROL: 0 turns it off
+        self.assertEqual(self.cache({"FM4_SHADER_CACHE": "/elsewhere"}).get("FM4_SHADER_CACHE"), "/elsewhere")  # another path moves it
+
+    def audio(self, env):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index("AUDIO=audible")
+        end = text.index("\n", text.index('AUDIO=mute', start))
+        script = "set -euo pipefail\n" + text[start:end] + "\necho $AUDIO\n"
+        return subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_audio_audible_unless_muted(self):
+        self.assertIn('--audio "$AUDIO"', open(os.path.join(ALPHA, "play.sh")).read())
+        self.assertEqual(self.audio({}), "audible")
+        self.assertEqual(self.audio({"FM4_RECOMP_AUDIO": "mute"}), "mute")
+        self.assertEqual(self.audio({"FM4_RECOMP_AUDIO": "loud"}), "audible")  # CONTROL: only "mute" mutes
+
+    def test_explicit_values_win(self):
+        s = self.settings({"FM4_TEXTURE_GPU_UNTILE": "1", "FM4_VERTEX_CACHE_MB": "0"})
+        self.assertEqual(s["FM4_TEXTURE_GPU_UNTILE"], "1")
+        self.assertNotIn("FM4_VERTEX_CACHE_MB", s)
 
 
 if __name__ == "__main__":

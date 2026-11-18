@@ -75,7 +75,8 @@ layout(push_constant) uniform XeTransfer
     uint x0, y0, width, height;  // the sample dump (kResolveDump): the source rectangle
     uint sourcePitchTiles;       // the source key's pitch in tiles, Key::PitchTiles (X :2956-2965: it splits the source tile index)
 } xe_transfer;
-// FM4 Recomp (alpha, RT format 5): XE_SOURCE_64 / XE_DEST_64 name a 64 bpp side (storage 5; kTransferColor64 only). A key's pitch
+// FM4 Recomp (alpha, RT format 5): XE_SOURCE_64 / XE_DEST_64 name a 64 bpp side (storage 5; kTransferColor64, kTransferColorToDepth
+// with XE_SOURCE_64, kTransferDepthToColor with XE_DEST_64). A key's pitch
 // is then doubled (Key::PitchTiles, X :4823, :5223-5224) and its tile 40 samples wide (X :2540-2545, :2912-2913).
 #ifdef XE_SOURCE_64
 const uint xeSource64 = 1u;
@@ -627,6 +628,12 @@ uint XeDepthStencilWord(float depth, uint stencil, uint depthFormat)
 // spirv_shader_translator_rb.cc:236-326, truncating, no [0, 0.5) remap); the word stencil | depth << 8 (X :3614-3617),
 // unpacked into the destination's storage format (X :3621-3690); with XE_DEST_UINT into a 16_16 destination's R16G16_UINT
 // view as the halves (X :3692-3711).
+// FM4 Recomp (alpha, photo mode): with XE_DEST_64 (and XE_DEST_UINT) into a 64 bpp destination (storage 5, its R16G16B16A16_UINT
+// view): XeSourceTexel's 32 -> 64 bpp rule gives the low word's texel, the high word's is the next sample of a 4x source or the next
+// pixel otherwise (X :3005-3023; edram_vk_plan.cpp MapTransferSource `second`); each packed by XeDepthStencilWord (X :3303-3333, the
+// same conversions as the 32 bpp case) and the two words split into the four 16-bit components, low word first (X :3352-3370;
+// edram_vk_plan.h TransferTexelOf64). Without XE_SOURCE_MS both fetches are at lod 0 (a 1x source's second texel at x | 1; a 4x key
+// on a one-sample host image, FM4_HOST_MSAA_1X, reads its one sample for both, as the 32 bpp case does).
 const char* const kTransferDepthToColor = R"(
 #ifdef XE_SOURCE_MS
 layout(set = 0, binding = 0) uniform sampler2DMS xe_source_depth;
@@ -643,6 +650,19 @@ layout(location = 0) out vec4 xe_color;
 void main()
 {
     ivec3 t = XeSourceTexel(uvec2(gl_FragCoord.xy));
+#ifdef XE_DEST_64
+    // The high word's texel (X :3005-3023): the next sample of a 4x source, else the next pixel.
+    ivec2 t1 = xe_transfer.sourceMsaa == 2u ? t.xy : ivec2(t.x | 1, t.y);
+#ifdef XE_SOURCE_MS
+    int s1 = xe_transfer.sourceMsaa == 2u ? (t.z | 1) : t.z;
+    uint w0 = XeDepthStencilWord(texelFetch(xe_source_depth, t.xy, t.z).r, texelFetch(xe_source_stencil, t.xy, t.z).r, xe_transfer.sourceFormat);
+    uint w1 = XeDepthStencilWord(texelFetch(xe_source_depth, t1, s1).r, texelFetch(xe_source_stencil, t1, s1).r, xe_transfer.sourceFormat);
+#else
+    uint w0 = XeDepthStencilWord(texelFetch(xe_source_depth, t.xy, 0).r, texelFetch(xe_source_stencil, t.xy, 0).r, xe_transfer.sourceFormat);
+    uint w1 = XeDepthStencilWord(texelFetch(xe_source_depth, t1, 0).r, texelFetch(xe_source_stencil, t1, 0).r, xe_transfer.sourceFormat);
+#endif
+    xe_word = uvec4(w0 & 0xFFFFu, w0 >> 16u, w1 & 0xFFFFu, w1 >> 16u);  // X :3352-3370 (TransferTexelOf64)
+#else
 #ifdef XE_SOURCE_MS
     float depth = texelFetch(xe_source_depth, t.xy, t.z).r;
     uint stencil = texelFetch(xe_source_stencil, t.xy, t.z).r;
@@ -655,6 +675,7 @@ void main()
     xe_word = XeUnpackUint(word, xe_transfer.destFormat);
 #else
     xe_color = XeUnpack(word, xe_transfer.destFormat);
+#endif
 #endif
 }
 )";
@@ -963,6 +984,8 @@ struct Unit
     // Through a 16_16 transfer view, [source MS]: depth -> colour into it (XE_DEST_UINT), colour -> depth and stencil bit from it
     // (XE_SOURCE_UINT).
     VkShaderModule depthToColorUint[2] = {}, colorToDepthUint[2] = {}, colorToStencilUint[2] = {};
+    // FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key (kTransferDepthToColor XE_DEST_64 + XE_DEST_UINT), [source MS].
+    VkShaderModule depthToColor64[2] = {};
     // The sample dump through a transfer view (kResolveDump XE_SOURCE_UINT), [source MS].
     VkShaderModule dumpUint[2] = {};
     // FM4_TRANSFER_STENCIL_EXPORT: the one-draw depth transfers, [source MS][sample shading]; compiled only with the extension.
@@ -1132,9 +1155,13 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     // FM4 Recomp (alpha, 64 bpp resolve): DecodeResolve now accepts its 1x resolves, which Resolve reads by vkCmdCopyImageToBuffer, not
     // through a pipeline, so this refusal still holds.
     // FM4 Recomp (alpha, Car Select): and colour -> depth from a 64 bpp source (ClassifyTransfer).
+    // FM4 Recomp (alpha, photo mode): and depth -> colour into a 64 bpp destination (ClassifyTransfer).
     const bool colorToDepthKind = kind == PipelineKind::ColorToDepth || kind == PipelineKind::ColorToStencilBit || kind == PipelineKind::ColorToDepthExport;
-    if ((source64 || dest64) && ((kind != PipelineKind::Color && !(colorToDepthKind && source64 && !dest64)) || (source64 && !sourceUint) || (dest64 && !destUint)))
-        return Fail(error, "a 64 bpp (storage 5) side in an EDRAM pass other than a colour transfer or colour -> depth through its transfer view");
+    const bool depthToColor64 = kind == PipelineKind::DepthToColor && dest64 && !source64;
+    if ((source64 || dest64) &&
+        ((kind != PipelineKind::Color && !(colorToDepthKind && source64 && !dest64) && !depthToColor64) || (source64 && !sourceUint) || (dest64 && !destUint)))
+        return Fail(error, "a 64 bpp (storage 5) side in an EDRAM pass other than a colour transfer, colour -> depth or depth -> colour through its "
+                           "transfer view");
     if (const auto it = unit->pipelines.find(key); it != unit->pipelines.end())
         return out = it->second, true;
     VkRenderPass pass = VK_NULL_HANDLE;
@@ -1162,6 +1189,7 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
                                     : kind == PipelineKind::Color && (source64 || dest64)  // FM4 Recomp (alpha, RT format 5)
                                         ? unit->colorWide[sourceMs][sourceUint][destUint][source64][dest64]
                                     : kind == PipelineKind::Color && uintVariant ? unit->colorUint[sourceMs][sourceUint][destUint]
+                                    : depthToColor64 ? unit->depthToColor64[sourceMs]  // FM4 Recomp (alpha, photo mode); before the 16_16 one
                                     : kind == PipelineKind::DepthToColor && uintVariant ? unit->depthToColorUint[sourceMs]
                                     : kind == PipelineKind::ColorToDepth && uintVariant ? unit->colorToDepthUint[sourceMs]
                                     : kind == PipelineKind::ColorToStencilBit && uintVariant ? unit->colorToStencilUint[sourceMs]
@@ -1900,8 +1928,9 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
     if (!b.ok)
         return Fail(error, b.refusal);
     lastBindTransferTiles = 0;  // FM4_DIAG_OVERWRITE
-    for (const auto& list : {b.transfers[0], b.transfers[1]})
-        for (const Transfer& t : list)
+    // FM4 Recomp (M7 CPU cost): by pointer (an initializer list of the two vectors copied both, an allocation each when not empty).
+    for (const std::vector<Transfer>* list : {&b.transfers[0], &b.transfers[1]})
+        for (const Transfer& t : *list)
             if (!t.value)  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_VALUE_OWNERSHIP): a value transfer copies nothing
                 lastBindTransferTiles += t.endTiles - t.startTiles;
     auto refuse = [&](std::string why) { return Fail(error, std::move(why)); };
@@ -2702,7 +2731,8 @@ void Shutdown()
                              unit->colorToDepthExport[0][1], unit->colorToDepthExport[1][0], unit->colorToDepthExport[1][1], unit->colorToDepthExportUint[0][0],
                              unit->colorToDepthExportUint[0][1], unit->colorToDepthExportUint[1][0], unit->colorToDepthExportUint[1][1],
                              unit->colorToDepth64[0], unit->colorToDepth64[1], unit->colorToStencil64[0], unit->colorToStencil64[1], unit->colorToDepthExport64[0][0],
-                             unit->colorToDepthExport64[0][1], unit->colorToDepthExport64[1][0], unit->colorToDepthExport64[1][1]})
+                             unit->colorToDepthExport64[0][1], unit->colorToDepthExport64[1][0], unit->colorToDepthExport64[1][1],
+                             unit->depthToColor64[0], unit->depthToColor64[1]})  // FM4 Recomp (alpha, photo mode)
         vkDestroyShaderModule(device, m, nullptr);  // a VK_NULL_HANDLE (an export module without the extension) is allowed
     for (auto& bySourceUint : unit->colorWide)  // FM4 Recomp (alpha, RT format 5): the uncompiled entries are VK_NULL_HANDLE
         for (auto& byDestUint : bySourceUint)
@@ -2882,6 +2912,10 @@ bool Create(SpirvCompiler& compiler, std::string& error)
     for (uint32_t m = 0; m < 2; m++)
         if (!Module(compiler, true, header + (m ? ms : "") + swap + destUint + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor,
                     unit->depthToColorUint[m], error) ||
+            !Module(compiler, true,
+                    header + (m ? ms : "") + swap + destUint + "#define XE_DEST_64 1\n" + kTransferCommon + kTransferPacking + kDepthPacking +
+                        kTransferDepthToColor,
+                    unit->depthToColor64[m], error) ||  // FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key
             !Module(compiler, true, header + (m ? ms : "") + swap + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,
                     unit->colorToDepthUint[m], error) ||
             !Module(compiler, true, header + (m ? ms : "") + swap + bit + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,

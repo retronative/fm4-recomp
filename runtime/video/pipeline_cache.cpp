@@ -6,8 +6,15 @@
 // StencilOp :2134, topology :1994-2032, cull/front :2073-2082, the blend-enable rule :2203-2209
 // (enabled unless (one, zero, add) for colour and alpha), dynamic states :2260-2272.
 #include "pipeline_cache.h"
+#include "diag_compile.h"  // FM4 Recomp: compile time beside a long swap (diagnostic)
+#include "pipeline_cache_header.h"  // FM4 Recomp (M7 stability): FM4_SHADER_CACHE
+#include <cstdio>
+#include <mutex>
+#include <unistd.h>
+#include "push_template.h"  // FM4 Recomp (FM4_PUSH_TEMPLATE)
 
 #include <cstdio>
+#include <cstdlib>  // FM4 Recomp: getenv (FM4_PIPELINE_WORD_HASH)
 #include <cstring>
 #include <iterator>
 
@@ -92,8 +99,23 @@ VkFormat HostDepthFormat(uint32_t xenosDepthFormat)
     return VK_FORMAT_D32_SFLOAT_S8_UINT;
 }
 
+// FM4 Recomp (M7 CPU cost): opt-in FM4_PIPELINE_WORD_HASH=1 (pipeline_key.h WordHash), read once.
+namespace {
+bool PipelineWordHash()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_PIPELINE_WORD_HASH");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] pipeline word hash on (FM4_PIPELINE_WORD_HASH=1): the pipeline map hashes its 96-byte keys a word at a time\n");
+        return enabled;
+    }();
+    return on;
+}
+}  // namespace
+
 PipelineCache::PipelineCache(VkDevice device, const PipelineDeviceFeatures& features, ShaderClass allowedClasses, KeyResult& result)
-    : device_(device), features_(features), allowed_(allowedClasses)
+    : device_(device), features_(features), allowed_(allowedClasses), pipelines_(0, KeyHasher{PipelineWordHash()})
 {
     Layouts none;
     result = LayoutFor(0, none);
@@ -101,6 +123,8 @@ PipelineCache::PipelineCache(VkDevice device, const PipelineDeviceFeatures& feat
 
 PipelineCache::~PipelineCache()
 {
+    if (cache_ != VK_NULL_HANDLE)
+        vkDestroyPipelineCache(device_, cache_, nullptr);
     for (auto& [key, e] : pipelines_)
         vkDestroyPipeline(device_, e.pipeline, nullptr);
     for (auto& [key, pass] : renderPasses_)
@@ -109,9 +133,78 @@ PipelineCache::~PipelineCache()
         vkDestroyShaderModule(device_, m, nullptr);
     for (auto& [key, l] : layouts_)
     {
+        if (l.pushTemplate != VK_NULL_HANDLE)  // FM4_PUSH_TEMPLATE: before the layouts it was created with
+            vkDestroyDescriptorUpdateTemplate(device_, l.pushTemplate, nullptr);
         vkDestroyPipelineLayout(device_, l.pipeline, nullptr);
         vkDestroyDescriptorSetLayout(device_, l.set, nullptr);
     }
+}
+
+void PipelineCache::UsePersistentCache(const std::string& file, uint32_t vendorID, uint32_t deviceID, const uint8_t (&uuid)[16])
+{
+    std::vector<uint8_t> data;
+    if (FILE* f = std::fopen(file.c_str(), "rb"))
+    {
+        uint8_t chunk[65536];
+        for (size_t n; (n = std::fread(chunk, 1, sizeof chunk, f)) > 0;)
+            data.insert(data.end(), chunk, chunk + n);
+        std::fclose(f);
+    }
+    pipeline_cache::Maker device{vendorID, deviceID, {}};
+    std::memcpy(device.uuid.data(), uuid, device.uuid.size());
+    const pipeline_cache::HeaderCheck check = pipeline_cache::CheckHeader(data.data(), data.size(), device);
+    if (const std::string line = pipeline_cache::LogLine(check, device); !line.empty())
+    {
+        std::fprintf(stderr, "%s\n", line.c_str());
+        data.clear();
+    }
+    VkPipelineCacheCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device_, &info, nullptr, &cache_) != VK_SUCCESS)
+    {
+        std::fprintf(stderr, "[gpu] pipeline cache: the driver refused %zu KB from %s: starting empty\n", data.size() / 1024, file.c_str());
+        data.clear();
+        info.initialDataSize = 0, info.pInitialData = nullptr;
+        if (vkCreatePipelineCache(device_, &info, nullptr, &cache_) != VK_SUCCESS)
+        {
+            cache_ = VK_NULL_HANDLE;
+            std::fprintf(stderr, "[gpu] pipeline cache: vkCreatePipelineCache failed: pipelines are created without a cache\n");
+            return;
+        }
+    }
+    cacheFile_ = file;
+    std::fprintf(stderr, "[gpu] pipeline cache on (FM4_SHADER_CACHE): %zu KB loaded from %s\n", data.size() / 1024, file.c_str());
+}
+
+bool PipelineCache::SavePersistentCache()
+{
+    static std::mutex saveLock;
+    if (!PersistentCacheOn())
+        return false;
+    std::lock_guard guard(saveLock);
+    size_t size = 0;
+    std::vector<uint8_t> data;
+    for (int attempt = 0;; attempt++)  // pipelines may be added between the two calls (VK_INCOMPLETE)
+    {
+        if (vkGetPipelineCacheData(device_, cache_, &size, nullptr) != VK_SUCCESS || size == 0)
+            return false;
+        data.resize(size);
+        const VkResult r = vkGetPipelineCacheData(device_, cache_, &size, data.data());
+        if (r == VK_SUCCESS)
+            break;
+        if (r != VK_INCOMPLETE || attempt == 3)
+            return false;
+    }
+    const std::string temporary = cacheFile_ + ".tmp" + std::to_string(getpid());
+    FILE* f = std::fopen(temporary.c_str(), "wb");
+    if (f == nullptr)
+        return false;
+    const bool written = std::fwrite(data.data(), 1, size, f) == size;
+    if (std::fclose(f) != 0 || !written || std::rename(temporary.c_str(), cacheFile_.c_str()) != 0)
+        return std::remove(temporary.c_str()), false;
+    return true;
 }
 
 KeyResult PipelineCache::LayoutFor(uint64_t layoutKey, Layouts& out)
@@ -159,6 +252,45 @@ KeyResult PipelineCache::LayoutFor(uint64_t layoutKey, Layouts& out)
     {
         vkDestroyDescriptorSetLayout(device_, l.set, nullptr);  // never used by any pipeline or set
         return Refuse(VkError("vkCreatePipelineLayout", r));
+    }
+    l.layoutKey = layoutKey;
+    // FM4 Recomp (M7 CPU cost, FM4_PUSH_TEMPLATE): the push layout's template, one entry per binding declared above, in the order and
+    // with the types of `bindings` (push_template.h PlanPushTemplate gives the same bindings: 0-5, then 8 + each slot of the key in
+    // ascending order). VUID-vkCmdPushDescriptorSetWithTemplate-layout-07993 / -set-07995: the renderer pushes with l.pipeline, set 0.
+    if (l.push && features_.pushTemplates)
+    {
+        const PushTemplatePlan plan = PlanPushTemplate(layoutKey, sizeof(VkDescriptorBufferInfo), sizeof(VkDescriptorImageInfo));
+        if (plan.count != bindings.size())
+        {
+            vkDestroyPipelineLayout(device_, l.pipeline, nullptr), vkDestroyDescriptorSetLayout(device_, l.set, nullptr);  // never used
+            return Refuse("push template: " + std::to_string(plan.count) + " entries for a layout of " + std::to_string(bindings.size()) + " bindings");
+        }
+        VkDescriptorUpdateTemplateEntry entries[kPushBufferBindings + kTextureBindings];
+        for (uint32_t i = 0; i < plan.count; i++)
+        {
+            const PushTemplateEntry& e = plan.entries[i];
+            if (e.binding != bindings[i].binding || (e.image != (bindings[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)))
+            {
+                vkDestroyPipelineLayout(device_, l.pipeline, nullptr), vkDestroyDescriptorSetLayout(device_, l.set, nullptr);
+                return Refuse("push template: entry " + std::to_string(i) + " (binding " + std::to_string(e.binding) + ") is not the layout's binding " +
+                              std::to_string(bindings[i].binding));
+            }
+            entries[i] = {e.binding, 0, 1, bindings[i].descriptorType, e.offset, e.stride};
+        }
+        VkDescriptorUpdateTemplateCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
+        info.descriptorUpdateEntryCount = plan.count;
+        info.pDescriptorUpdateEntries = entries;
+        info.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR;
+        info.descriptorSetLayout = l.set;  // ignored for a push template
+        info.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        info.pipelineLayout = l.pipeline;
+        info.set = 0;
+        if (const VkResult r = vkCreateDescriptorUpdateTemplate(device_, &info, nullptr, &l.pushTemplate); r != VK_SUCCESS)
+        {
+            vkDestroyPipelineLayout(device_, l.pipeline, nullptr), vkDestroyDescriptorSetLayout(device_, l.set, nullptr);
+            return Refuse(VkError("vkCreateDescriptorUpdateTemplate", r));
+        }
     }
     layouts_[layoutKey] = l;
     stats_.layouts++;
@@ -394,8 +526,12 @@ KeyResult PipelineCache::Get(const PipelineKey& key, const CachedShader& vs, Sha
     info.pDynamicState = &dynamicState;
     info.layout = e.layouts.pipeline;
     info.renderPass = e.renderPass;
-    if (const VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &e.pipeline); r != VK_SUCCESS)
-        return Refuse(VkError("vkCreateGraphicsPipelines", r));
+    const uint64_t createStart = diag::CompileClockNs();  // diag_compile.h (counted always; printed beside a long swap)
+    const VkResult created = vkCreateGraphicsPipelines(device_, cache_, 1, &info, nullptr, &e.pipeline);
+    diag::Compiles().pipelineNs.fetch_add(diag::CompileClockNs() - createStart, std::memory_order_relaxed);
+    diag::Compiles().pipelines.fetch_add(1, std::memory_order_relaxed);
+    if (created != VK_SUCCESS)
+        return Refuse(VkError("vkCreateGraphicsPipelines", created));
     pipelines_[key] = e;
     stats_.pipelines++;
     out = e;

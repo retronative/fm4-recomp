@@ -140,10 +140,20 @@ def title_hooks(config_text, image, base):
     """fm4_hooks.cpp from config/title_hooks.toml: one strong override per hook of a translated function's weak definition. Each
     hook's function bytes must hash to its recorded SHA-256 in this image (fail closed: a different disc or build refuses to build).
     With its flag (an environment variable equal to "1") a `returns` hook answers the recorded value in r3, and a `stop_on_press` hook, called
-    from its `caller` after a new A press, calls its `stop` function with the same r3 and answers 0; otherwise the original runs."""
+    from its `caller` after a new A press, calls its `stop` function with the same r3 and answers 0; otherwise the original runs.
+    FM4 Recomp (the Pause menu's Keyboard Controls row; the technique of SpeedBreaker
+    runtime/game/quick_race_cops.cpp at fe04285, GPL-3.0-or-later: one more row through the game's own list call): a `menu_row_append`
+    hook runs the original row builder, then adds `row` with `label` to the option list at r3+`list_offset` (its vtable +`add_slot`,
+    the call the builder makes), the text built as the game builds user strings (`string_new`) and passed as the builder does
+    (`string_copy`); a `menu_row_action` hook, on the list's event (r4 == 2) whose chosen row (the list's vtable +`chosen_slot`, r4 = r6
+    as the original asks) is `row`, keeps the focus on it (`focus` + `focus_offset`, the original's tail) and asks for the in-game
+    Keyboard Controls (kernel/controls_screen.h) instead of the original. Both act only while that screen exists (window, live input)."""
     import hashlib, tomllib
-    hooks = tomllib.loads(config_text).get('hook', [])
-    defs, reports = [], []
+    parsed = tomllib.loads(config_text)
+    hooks = parsed.get('hook', [])
+    defs, reports, handlers, symbols = [], [], set(), []
+    HANDLER = re.compile(r'[A-Z][A-Za-z0-9]{2,63}')
+    SYMBOL = re.compile(r'k[A-Z][A-Za-z0-9]{1,63}')
 
     def checked(name, fn, n, digest):
         if n <= 0 or n % 4:
@@ -155,10 +165,31 @@ def title_hooks(config_text, image, base):
         if got != digest:
             sys.exit(f'gen_runtime_tables: title hook {name!r}: the {n} bytes at {fn:08X} hash to {got}, not the recorded {digest}')
 
+    def gate_of(h):
+        # The row is for the in-game Keyboard Controls: "panel" (the host panel, controls_screen.h) or "live" (the live keyboard).
+        gate = h.get('gate', 'panel')
+        if gate not in ('panel', 'live'):
+            sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad gate')
+        return 'runtime::input::LiveEnabled()' if gate == 'live' else 'runtime::controls::Service() != nullptr'
+
+    # Named addresses and values for the runtime's title code (runtime/game/title_symbols.h declares the names; no address in the
+    # runtime's source): a `symbol` is a function, checked by the SHA-256 of its bytes like a hook; a `value` an offset or an id.
+    for s in parsed.get('symbol', []):
+        if not SYMBOL.fullmatch(str(s['name'])):
+            sys.exit(f'gen_runtime_tables: symbol {s.get("name")!r}: bad name')
+        checked('symbol ' + s['name'], int(s['address']), int(s['bytes']), s['sha256'])
+        symbols.append((s['name'], int(s['address'])))
+    for v in parsed.get('value', []):
+        if not SYMBOL.fullmatch(str(v['name'])) or not 0 <= int(v['value']) <= 0xFFFFFFFF:
+            sys.exit(f'gen_runtime_tables: value {v.get("name")!r}: bad name or value')
+        symbols.append((v['name'], int(v['value'])))
+    if len({n for n, _ in symbols}) != len(symbols):
+        sys.exit('gen_runtime_tables: a symbol or value name is used twice')
+
     for h in hooks:
         kind = h.get('kind', 'returns')
         fn, n, flag = int(h['function']), int(h['bytes']), str(h['flag'])
-        if not FLAG_NAME.fullmatch(flag) or kind not in ('returns', 'stop_on_press'):
+        if not FLAG_NAME.fullmatch(flag) or kind not in ('returns', 'stop_on_press', 'menu_row_append', 'menu_row_action', 'delegate'):
             sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad flag or kind')
         checked(h['name'], fn, n, h['sha256'])
         log = f"""    static std::atomic<uint64_t> calls{{0}};
@@ -176,7 +207,7 @@ def title_hooks(config_text, image, base):
         return;
     }}"""
             what = f'-> {value}'
-        else:
+        elif kind == 'stop_on_press':
             # stop_on_press: called from `caller` (its return address), a new A press since this caller's calls began makes the hook
             # call `stop` with the same r3 and answer 0; a gap of over a second in the calls starts a new baseline (a new screen).
             caller, stop = int(h['caller']), int(h['stop'])
@@ -198,6 +229,111 @@ def title_hooks(config_text, image, base):
         }}
     }}"""
             what = f'A from {caller:08X} -> sub_{stop:08X}, 0'
+        elif kind == 'menu_row_append':
+            label, row, list_offset, add_slot = str(h['label']), int(h['row']), int(h['list_offset']), int(h['add_slot'])
+            new_fn, copy_fn = int(h['string_new']), int(h['string_copy'])
+            if not (label and len(label) <= 60 and label.isascii() and label.isprintable() and '"' not in label and '\\' not in label) or \
+                    not (0 <= row < 64 and 0 <= list_offset < 4096 and add_slot % 4 == 0 and 0 <= add_slot < 1024):
+                sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad label, row, offset or slot')
+            checked(h['name'] + ' (string_new)', new_fn, int(h['string_new_bytes']), h['string_new_sha256'])
+            checked(h['name'] + ' (string_copy)', copy_fn, int(h['string_copy_bytes']), h['string_copy_sha256'])
+            words = ', '.join(f'0x{ord(c):04X}' for c in label) + ', 0'
+            gate = gate_of(h)
+            add = f"""    {{
+        // A frame below the caller's stack: the label (UTF-16BE), the new string's pointer and its copy; registers restored after.
+        static const uint16_t kLabel[] = {{{words}}};
+        const PPCContext saved = ctx;
+        const uint32_t frame = (saved.r1.u32 - 256) & ~15u, out = frame + 96, copy = frame + 104, text = frame + 128;  // past the callee argument area
+        PPC_STORE_U32(frame, saved.r1.u32);  // the back chain
+        for (size_t i = 0; i < sizeof kLabel / sizeof kLabel[0]; i++)
+            PPC_STORE_U16(text + 2 * i, kLabel[i]);
+        ctx.r1.u64 = frame;
+        ctx.r3.u64 = out, ctx.r4.u64 = text, ctx.r5.s64 = -1;
+        sub_{new_fn:08X}(ctx, base);  // a user string with the label (the game's own constructor)
+        ctx.r3.u64 = copy, ctx.r4.u64 = out;
+        sub_{copy_fn:08X}(ctx, base);  // the reference the list takes, as the builder passes it
+        const uint32_t list = PPC_LOAD_U32(self + {list_offset});
+        ctx.r3.u64 = list, ctx.r4.u64 = {row}, ctx.r5.u64 = copy, ctx.r6.u64 = 1;
+        PPC_CALL_INDIRECT_FUNC(PPC_LOAD_U32(PPC_LOAD_U32(list) + {add_slot}));
+        if (const uint32_t made = PPC_LOAD_U32(out))  // the builder's own release of its reference (vtable +8)
+        {{
+            ctx.r3.u64 = made;
+            PPC_CALL_INDIRECT_FUNC(PPC_LOAD_U32(PPC_LOAD_U32(made) + 8));
+        }}
+        ctx = saved;
+        std::fprintf(stderr, "[hook] {h['name']}: row {row} \\"{label}\\" added\\n");
+    }}
+"""
+            if 'caller' in h:
+                # Before the original, when called from `caller` (its return address): the row goes in before the rows the
+                # builder adds after that call, and before it refreshes the list.
+                caller = int(h['caller'])
+                body = f"""    const uint32_t self = ctx.r3.u32;
+    if (on && uint32_t(ctx.lr) == 0x{caller:08X}u && {gate})
+{add}"""
+                after = False
+            else:
+                body = f"""    const uint32_t self = ctx.r3.u32;
+    __imp__sub_{fn:08X}(ctx, base);
+    if (on && {gate})
+{add}    return;"""
+                after = True
+            what = f'+ row {row} \\"{label}\\"' + (f' (from {int(h["caller"]):08X})' if 'caller' in h else '')
+        elif kind == 'menu_row_action':
+            row, list_offset, chosen_slot = int(h['row']), int(h['list_offset']), int(h['chosen_slot'])
+            focus, focus_offset = int(h['focus']), int(h['focus_offset'])
+            if not (0 <= row < 64 and 0 <= list_offset < 4096 and chosen_slot % 4 == 0 and 0 <= chosen_slot < 1024 and 0 <= focus_offset < 65536):
+                sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad row, offset or slot')
+            checked(h['name'] + ' (focus)', focus, int(h['focus_bytes']), h['focus_sha256'])
+            gate = gate_of(h)
+            handler = h.get('handler')
+            if handler is not None and not HANDLER.fullmatch(str(handler)):
+                sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad handler')
+            if handler:
+                handlers.add(f'void {handler}(PPCContext& ctx, uint8_t* base);')
+                act = f'fm4::title::{handler}(ctx, base);  // r3 = the menu'
+            else:
+                act = 'runtime::controls::Service()->RequestFromGame("Pause menu");'
+            body = f"""    if (on && ctx.r4.u32 == 2 && {gate})
+    {{
+        const PPCContext saved = ctx;
+        const uint32_t list = PPC_LOAD_U32(saved.r3.u32 + {list_offset});
+        ctx.r3.u64 = list, ctx.r4.u64 = saved.r6.u64;
+        PPC_CALL_INDIRECT_FUNC(PPC_LOAD_U32(PPC_LOAD_U32(list) + {chosen_slot}));  // the chosen row, as the original asks
+        const uint32_t chosen = ctx.r3.u32;
+        ctx = saved;
+        if (chosen == {row})
+        {{
+            sub_{focus:08X}(ctx, base);
+            PPC_STORE_U32(ctx.r3.u32 + {focus_offset}, {row});  // the menu comes back on this row (the original's tail)
+            ctx = saved;
+            std::fprintf(stderr, "[hook] {h['name']}: row {row} chosen at vblank %llu\\n", (unsigned long long)runtime::gpu::VblankCount());
+            {act}
+            return;
+        }}
+    }}"""
+            what = f'row {row} -> Keyboard Controls'
+        elif kind == 'delegate':
+            handler = str(h['handler'])
+            if not HANDLER.fullmatch(handler):
+                sys.exit(f'gen_runtime_tables: title hook {h["name"]!r}: bad handler')
+            handlers.add(f'void {handler}(PPCContext& ctx, uint8_t* base, PPCFunc* original);')
+            body = f"""    if (on)
+    {{
+        fm4::title::{handler}(ctx, base, __imp__sub_{fn:08X});  // the runtime's handler; it runs the original when it should
+        return;
+    }}"""
+            what = f'-> {handler}'
+        if kind == 'menu_row_append' and after:
+            defs.append(f"""PPC_FUNC_IMPL(__imp__sub_{fn:08X});  // the translation of the original (extern "C", ppc_recomp_*.cpp)
+PPC_FUNC(sub_{fn:08X})  // {h['name']} (config/title_hooks.toml)
+{{
+    static const bool on = HookFlag("{flag}");
+{log}
+{body}
+}}""")
+            reports.append(f'    {{"{h["name"]}", "{flag}", 0x{fn:08X}u, "{what}"}},')
+            continue
         defs.append(f"""PPC_FUNC_IMPL(__imp__sub_{fn:08X});  // the translation of the original (extern "C", ppc_recomp_*.cpp)
 PPC_FUNC(sub_{fn:08X})  // {h['name']} (config/title_hooks.toml)
 {{
@@ -207,15 +343,24 @@ PPC_FUNC(sub_{fn:08X})  // {h['name']} (config/title_hooks.toml)
     __imp__sub_{fn:08X}(ctx, base);
 }}""")
         reports.append(f'    {{"{h["name"]}", "{flag}", 0x{fn:08X}u, "{what}"}},')
+    title_decls = ''.join(f'{d}\n' for d in sorted(handlers))
+    symbol_defs = ''.join(f'extern const uint32_t {n};\nconst uint32_t {n} = 0x{a:08X}u;\n' for n, a in symbols)
     return f"""// Generated by scripts/gen_runtime_tables.py from config/title_hooks.toml and the player's own default.xex; do not edit.
 // Title hooks: strong definitions that override the translation's weak ones (ppc_recomp_shared.h); each is opt-in by its flag.
 #include "graphics.h"
+#include "controls_screen.h"
 #include "input_live.h"
 #include "ppc_recomp_shared.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// The runtime's title code (runtime/game/): its handlers, and the named addresses and values it uses (title_symbols.h).
+namespace fm4::title {{
+{title_decls}}}  // namespace fm4::title
+namespace fm4::sym {{
+{symbol_defs}}}  // namespace fm4::sym
 
 namespace {{
 bool HookFlag(const char* name)

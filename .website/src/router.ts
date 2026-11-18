@@ -1,6 +1,7 @@
-// Adapted from reFrozen .website (GPL-3.0-or-later); FM4 Recomp changes: FM4's routes (home,
-// getting started, one page per docs/*.md and reference note, reference index, licences); one
-// static route per document instead of a slug parameter; no aliases.
+// Adapted from reFrozen .website (GPL-3.0-or-later); FM4 Recomp changes: FM4's routes (home, the
+// documentation index, one page per docs/*.md and reference note, the releases page from
+// docs/status.md, reference index, licences); one static route per document instead of a slug
+// parameter; no aliases.
 import {
   createRouter,
   createMemoryHistory,
@@ -33,20 +34,20 @@ const routes: RouteRecordRaw[] = [
     meta: { title: `${SITE} — Forza Motorsport 4, recompiled for arm64 macOS`, description: SITE_DESCRIPTION, crumb: 'Home' },
   },
   {
-    path: '/getting-started/',
-    name: 'getting-started',
-    component: () => import('./pages/GettingStartedPage.vue'),
+    path: '/docs/',
+    name: 'docs',
+    component: () => import('./pages/DocsIndexPage.vue'),
     meta: {
-      title: `Getting started — ${SITE}`,
-      description: 'Getting started with FM4 Recomp as a developer: the pinned tools, unpacking your own discs and linking them into the repository.',
-      crumb: 'Getting started',
+      title: `Documentation — ${SITE}`,
+      description: 'Getting started, how static recompilation works, status and releases, compatibility, FAQ, the legal notice and the reference notes.',
+      crumb: 'Documentation',
     },
   },
   ...docs.map(
     (doc): RouteRecordRaw => ({
       path: doc.route,
       name: `doc:${doc.path}`,
-      component: DocPage,
+      component: doc.path === 'docs/status.md' ? () => import('./pages/ReleasesPage.vue') : DocPage,
       props: { docRoute: doc.route },
       meta: { title: `${doc.title} — ${SITE}`, description: doc.description, crumb: doc.title },
     }),

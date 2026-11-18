@@ -67,6 +67,9 @@ struct VulkanDevice
     bool pushDescriptors = false;
     uint32_t maxPushDescriptors = 0;
     PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = nullptr;
+    // FM4 Recomp (M7 CPU cost, FM4_PUSH_TEMPLATE=1 with FM4_PUSH_DESCRIPTORS=1): vkCmdPushDescriptorSetWithTemplateKHR (VK_KHR_push_descriptor
+    // with Vulkan 1.1's descriptor update templates; push_template.h); null when not asked.
+    PFN_vkCmdPushDescriptorSetWithTemplateKHR cmdPushDescriptorSetWithTemplate = nullptr;
     // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1): VK_EXT_external_memory_host enabled when asked and offered, its import alignment
     // (VkPhysicalDeviceExternalMemoryHostPropertiesEXT) and vkGetMemoryHostPointerPropertiesEXT (guest_memory_vk.cpp).
     bool externalMemoryHost = false;

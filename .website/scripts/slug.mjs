@@ -1,6 +1,6 @@
 // Adapted from reFrozen .website (GPL-3.0-or-later); FM4 Recomp changes: underscores kept in
 // heading slugs (as GitHub does), repository path -> site route map for docs/, reference/ and
-// THIRD_PARTY_NOTICES.md.
+// THIRD_PARTY_NOTICES.md; the community files link to the repository.
 // Shared by the docs plugin and the checks so heading anchors and routes agree.
 import { posix } from 'node:path'
 
@@ -29,6 +29,10 @@ export const REFERENCE_AREAS = [
 // Repository files with a dedicated page.
 export const DEDICATED_ROUTES = {
   'README.md': '/',
+  'docs/getting-started.md': '/getting-started/',
+  'docs/status.md': '/releases/',
+  'docs/compatibility.md': '/compatibility/',
+  'docs/faq.md': '/faq/',
   'docs/LEGAL.md': '/legal/',
   'reference/README.md': '/reference/',
   'THIRD_PARTY_NOTICES.md': '/licences/',
@@ -46,13 +50,14 @@ export function routeForRepoPath(path) {
   return null
 }
 
-// Licence files linked from the content; they have no page of their own and link to the
-// repository on GitHub.
-export const REPOSITORY_FILES = /^(?:COPYING|NOTICE|LICENSES(?:\/[\w.-]+)?)$/
+// Licence and community files linked from the content; they have no page of their own and link
+// to the repository on GitHub.
+export const REPOSITORY_FILES = /^(?:COPYING|NOTICE|LICENSES(?:\/[\w.-]+){0,2}|CHANGELOG\.md|CONTRIBUTING\.md|SUPPORT\.md|SECURITY\.md|CODE_OF_CONDUCT\.md)$/
 
 /** Repository-relative target of a relative link `href` found in the file `from`. */
 export function resolveRepoLink(href, from) {
-  const [path, hash = ''] = href.split('#')
+  const [path, fragment = ''] = href.split('#')
+  const hash = fragment ? `#${fragment}` : ''
   const target = path === '' ? from : posix.normalize(posix.join(posix.dirname(from), path)).replace(/\/$/, '')
   return { target, hash }
 }

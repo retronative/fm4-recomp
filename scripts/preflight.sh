@@ -28,6 +28,7 @@ check "a build is running" '(^|/)(ninja|make)( |$)|cmake --build'
 check "the recompiler is running" '(^|/)(XenonRecomp|XenonAnalyse)( |$)'
 check "a ForzaRecomp binary is running (never run alongside it)" '/forzarecomp[^ ]*/build/[^ ]*'
 check "an FM4 Recomp binary is running" "$ROOT/build/[^ ]*"
+check "an FM4 Recomp game from an app is running (a test or playtest session)" 'Contents/Resources/kit/bin/fm4recomp( |$)'
 check "a headless Chrome is running (another project's GPU work)" 'Chrome.*--headless'
 check "a ReCarbon game build is running (another game: never run alongside it)" 'ReCarbon\.app/Contents/MacOS/|/recarbon[^ ]*/build/[^ ]*/(ReCarbon|recarbon)( |$)'
 # Spotlight's indexer (mds_stores) ran at 4-5 cores for days on the test Mac and slowed timing runs:

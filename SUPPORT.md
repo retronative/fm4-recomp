@@ -4,7 +4,7 @@ REtronative's temporary public contact address for its projects is
 [retronativeorg@gmail.com](mailto:retronativeorg@gmail.com).
 
 For FM4 Recomp usage questions and bug reports, use the repository's
-[GitHub issues](https://github.com/retronative/fm4-recomp/issues). Include the commit you built,
+[GitHub issues](https://github.com/retronative/fm4-recomp/issues). Include the version (or the commit you built),
 steps to reproduce and the stop line or error message from the log.
 
 Security and community reporting by email is **pending confirmation** of mailbox access,

@@ -173,18 +173,95 @@ uint32_t Heap::Alloc(uint32_t size, uint32_t alignment, uint32_t type, uint32_t 
     const uint32_t step = alignment > pageSize_ ? alignment / pageSize_ : 1;
     if (count == 0 || count > pages_.size())
         return 0;
-    auto fits = [&](uint32_t first) {
-        for (uint32_t i = first; i < first + count; i++)
-            if (pages_[i].state != 0)
-                return false;
-        return true;
+    // FM4 Recomp (M7 stability: FM4's streaming allocations spent ~770 ms of a 1.3 s race stall here, s55): the candidates are the
+    // same as before (every `step`-aligned start, bottom-up or top-down, the first that AllocFixed takes), but a window holding a
+    // blocked page skips every start that would hold it too. Blocked: in use in this heap, or (a physical view) a frame another view
+    // holds, which is what made AllocFixed's Claim refuse start after start across the other view's allocations.
+    // The run of this heap's pages a blocked page belongs to, [lo, hi): the allocation holding it here, or the allocation of the
+    // view that holds one of its frames (its physical range, in this heap's pages). Every page of such a run is blocked, so a start
+    // whose window meets the run never fits: the search jumps past the whole run (FM4's 4 KB-page allocations otherwise walked the
+    // other views' allocations one page at a time: ~180 ms of a race stall, s65).
+    auto blockedRun = [&](uint32_t i, uint32_t& lo, uint32_t& hi) {
+        if (const Page& p = pages_[i]; p.state != 0)
+        {
+            lo = p.allocationBase, hi = p.allocationBase + std::max(p.allocationPages, 1u);
+            return true;
+        }
+        if (kind_ == Kind::Virtual)
+            return false;
+        const uint32_t first = (physicalBase_ + i * pageSize_) / kFrame;
+        for (uint32_t f = first; f < first + pageSize_ / kFrame; f++)
+        {
+            const uint32_t owner = frames[f];
+            if (owner == 0 || owner == base_)
+                continue;
+            lo = i, hi = i + 1;  // the frame alone, unless its owner's allocation is found
+            const Heap* view = owner == 0xA0000000u ? vA0000000.get() : owner == 0xC0000000u ? vC0000000.get() : owner == 0xE0000000u ? vE0000000.get() : nullptr;
+            if (view != nullptr)
+            {
+                const uint64_t physical = uint64_t(f) * kFrame;
+                if (physical >= view->physicalBase_)
+                {
+                    const uint32_t j = uint32_t((physical - view->physicalBase_) / view->pageSize_);
+                    if (j < view->pages_.size() && view->pages_[j].state != 0)
+                    {
+                        const Page& q = view->pages_[j];
+                        const uint64_t start = uint64_t(view->physicalBase_) + uint64_t(q.allocationBase) * view->pageSize_;
+                        const uint64_t stop = start + uint64_t(std::max(q.allocationPages, 1u)) * view->pageSize_;
+                        const uint64_t mine = physicalBase_;
+                        lo = start <= mine ? 0 : uint32_t(std::min<uint64_t>((start - mine) / pageSize_, i));
+                        hi = stop <= mine ? i + 1 : uint32_t(std::min<uint64_t>((stop - mine + pageSize_ - 1) / pageSize_, pages_.size()));
+                        lo = std::min(lo, i), hi = std::max(hi, i + 1);
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
     };
     const uint32_t last = uint32_t(pages_.size()) - count;
-    for (uint32_t k = 0; k <= last / step; k++)
+    uint32_t lo = 0, hi = 0;
+    if (!topDown)
     {
-        const uint32_t first = topDown ? (last / step - k) * step : k * step;
-        if (fits(first) && AllocFixed(base_ + first * pageSize_, count * pageSize_, type | mem::kReserve, protect))
-            return base_ + first * pageSize_;
+        for (uint32_t first = 0; first <= last;)
+        {
+            bool hit = false;  // the highest blocked page of the window and its run
+            for (uint32_t i = first + count; i-- > first;)
+                if (blockedRun(i, lo, hi))
+                {
+                    hit = true;
+                    break;
+                }
+            if (!hit)
+            {
+                if (AllocFixed(base_ + first * pageSize_, count * pageSize_, type | mem::kReserve, protect))
+                    return base_ + first * pageSize_;
+                first += step;
+                continue;
+            }
+            first = (hi + step - 1) / step * step;  // the next start past the run
+        }
+        return 0;
+    }
+    for (int64_t first = int64_t(last / step) * step; first >= 0;)
+    {
+        bool hit = false;  // the lowest blocked page of the window and its run
+        for (uint32_t i = uint32_t(first); i < uint32_t(first) + count; i++)
+            if (blockedRun(i, lo, hi))
+            {
+                hit = true;
+                break;
+            }
+        if (!hit)
+        {
+            if (AllocFixed(base_ + uint32_t(first) * pageSize_, count * pageSize_, type | mem::kReserve, protect))
+                return base_ + uint32_t(first) * pageSize_;
+            first -= step;
+            continue;
+        }
+        if (lo < count)
+            break;
+        first = (int64_t(lo) - int64_t(count)) / step * step;  // the highest start whose window ends before the run
     }
     return 0;
 }

@@ -112,6 +112,7 @@ public:
         entries_[key] = {chunk, chunks_[chunk].generation, offset, dwords, sequence};
     }
     void Forget(uint64_t key) { entries_.erase(key); }
+    void ForgetAll() { entries_.clear(); }  // FM4 Recomp (diagnostic, FM4_DIAG_TRIGGER stale-vertices)
 
     void MarkRead(uint32_t chunk, uint64_t serial)
     {

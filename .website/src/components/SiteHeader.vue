@@ -7,9 +7,10 @@ import BrandMark from './BrandMark.vue'
 const links = [
   { to: '/', label: 'Home' },
   { to: '/getting-started/', label: 'Getting started' },
-  { to: '/reference/', label: 'Reference' },
-  { to: '/legal/', label: 'Legal' },
-  { to: '/licences/', label: 'Licences' },
+  { to: '/compatibility/', label: 'Compatibility' },
+  { to: '/faq/', label: 'FAQ' },
+  { to: '/releases/', label: 'Releases' },
+  { to: '/docs/', label: 'Docs' },
 ]
 
 const route = useRoute()
@@ -17,6 +18,7 @@ const open = ref(false)
 watch(() => route.fullPath, () => (open.value = false))
 
 function isCurrent(to: string) {
+  if (to === '/docs/') return ['/docs/', '/reference/', '/legal/', '/licences/'].some((p) => route.path.startsWith(p))
   return to === '/' ? route.path === '/' : route.path.startsWith(to)
 }
 </script>

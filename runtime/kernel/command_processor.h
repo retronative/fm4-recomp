@@ -101,6 +101,10 @@ uint64_t ImmediateWaits();
 uint64_t MemWaits();
 uint64_t MemWaitNs();
 uint64_t SyncedWaits();
+// FM4 Recomp (FM4_DIAG_DRAIN=1, diagnostic; runtime/video/diag_drain.h): the start and end (steady_clock ns) of the latest of the last
+// 64 memory WAIT_REG_MEM packets that synced whose span holds `ns`; false when none does or the diagnostic is off. Command-processor
+// thread only (the waits are recorded there).
+bool SyncedMemWaitAround(uint64_t ns, uint64_t& startNs, uint64_t& endNs);
 // FM4 Recomp (FM4_IMMEDIATE_INTERRUPTS): INTERRUPT packets raised when reached, and CPU-word waits that synced after the grace.
 uint64_t ImmediateInterrupts();
 uint64_t GraceSyncs();

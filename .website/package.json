@@ -10,10 +10,11 @@
     "preview": "vite preview",
     "check:links": "node scripts/check-links.mjs",
     "check:dist": "node scripts/check-dist.mjs",
+    "check:status": "node scripts/check-status.mjs",
     "check:contrast": "node scripts/check-contrast.mjs",
     "test:routing": "node scripts/test-routing.mjs",
     "pages-sim": "node scripts/pages-sim.mjs",
-    "validate": "npm run check:contrast && npm run build && npm run check:links && npm run check:dist && npm run test:routing"
+    "validate": "npm run check:status && npm run check:contrast && npm run build && npm run check:links && npm run check:dist && npm run test:routing"
   },
   "dependencies": {
     "vue": "3.5.44",

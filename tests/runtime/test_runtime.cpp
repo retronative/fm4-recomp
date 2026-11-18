@@ -32,6 +32,10 @@
 #include "kernel/imports.h"
 #include "kernel/input_script.h"
 #include "kernel/input_live.h"
+#include "kernel/key_bindings.h"
+#include "kernel/controls_menu.h"
+#include "kernel/controls_screen.h"
+#include "kernel/keyboard_ui.h"
 namespace runtime { uint32_t ArmedTimerCountForTests(); }  // kernel/imports_timer.cpp (test hook)
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
@@ -61,6 +65,7 @@ void PpcMmioStore32(uint8_t* base, uint32_t address, uint32_t value);
 #include <fstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <string>
 #include <sys/wait.h>
@@ -774,6 +779,390 @@ int main(int, char** argv)
             only.w = true;
             const input::LiveState m = input::Merge(pad, input::FromKeys(only));
             Expect(m.buttons == 0x2000 && m.leftTrigger == 40 && m.rightTrigger == 255 && m.leftX == 1200, "live pad: the pad and the keyboard merged");
+            // The gamepad's buttons, each alone, to its X_INPUT_GAMEPAD bit (Xenia hid/input.h:30-45, by hand): DPAD_UP 0x1, DOWN 0x2,
+            // LEFT 0x4, RIGHT 0x8, START 0x10, BACK 0x20, LEFT_THUMB 0x40, RIGHT_THUMB 0x80, LEFT_SHOULDER 0x100, RIGHT_SHOULDER 0x200,
+            // A 0x1000 (south), B 0x2000 (east), X 0x4000 (west), Y 0x8000 (north).
+            using PadField = bool input::PadButtons::*;
+            static const std::pair<PadField, uint16_t> kPad[] = {
+                {&input::PadButtons::dpadUp, 0x1},          {&input::PadButtons::dpadDown, 0x2},       {&input::PadButtons::dpadLeft, 0x4},
+                {&input::PadButtons::dpadRight, 0x8},       {&input::PadButtons::start, 0x10},         {&input::PadButtons::back, 0x20},
+                {&input::PadButtons::leftStick, 0x40},      {&input::PadButtons::rightStick, 0x80},    {&input::PadButtons::leftShoulder, 0x100},
+                {&input::PadButtons::rightShoulder, 0x200}, {&input::PadButtons::south, 0x1000},       {&input::PadButtons::east, 0x2000},
+                {&input::PadButtons::west, 0x4000},         {&input::PadButtons::north, 0x8000}};
+            input::PadButtons all;
+            for (const auto& [field, bit] : kPad)
+            {
+                input::PadButtons one;
+                one.*field = true, all.*field = true;
+                char what[96];
+                std::snprintf(what, sizeof what, "live pad: gamepad button alone -> 0x%04X", bit);
+                Expect(input::ButtonsFromPad(one) == bit, what);
+            }
+            Expect(input::ButtonsFromPad(input::PadButtons{}) == 0 && input::ButtonsFromPad(all) == 0xF3FF, "live pad: no gamepad button, every one");
+            Expect(!(input::ButtonsFromPad(all) == 0xFFFF), "control: live pad: bits 0x400 and 0x800 are not gamepad buttons");
+        }
+        {
+            // FM4 Recomp (kernel/key_bindings.h, --keybindings): the live pad's keyboard bindings. Scancodes by hand from SDL3/SDL_scancode.h
+            // (the USB HID keyboard usage IDs): A 4, C 6, D 7, E 8, Q 20, S 22, W 26, X 27, Y 28, Return 40, Escape 41, Backspace 42, Tab 43,
+            // Space 44, Right 79, Left 80, Down 81, Up 82, Left Ctrl 224, Left Shift 225. The defaults: A on Space, B on Backspace, X / Y on
+            // Left Shift / Left Ctrl, START on Return, the rest the map window_sdl.cpp hard-coded before (input_live.h Keys).
+            using KeyField = bool input::Keys::*;
+            static const KeyField kFields[] = {&input::Keys::up, &input::Keys::down, &input::Keys::left, &input::Keys::right, &input::Keys::w,
+                                               &input::Keys::a,  &input::Keys::s,    &input::Keys::d,    &input::Keys::enter, &input::Keys::backspace,
+                                               &input::Keys::space, &input::Keys::tab, &input::Keys::x, &input::Keys::y, &input::Keys::q,
+                                               &input::Keys::e, &input::Keys::c};
+            // Exactly `field` pressed (nullptr: nothing).
+            const auto only = [&](const input::Keys& k, KeyField field) {
+                bool ok = true;
+                for (const KeyField f : kFields)
+                    ok = ok && k.*f == (f == field);
+                return ok;
+            };
+            const auto press = [&](const input::KeyBindings& b, std::initializer_list<int> scancodes) {
+                bool state[512] = {};
+                for (const int s : scancodes)
+                    state[s] = true;
+                return input::KeysFromState(b, state, std::size(state));
+            };
+            const input::KeyBindings defaults = input::DefaultKeyBindings();
+            const std::pair<int, KeyField> kOld[] = {
+                {4, &input::Keys::a},      {7, &input::Keys::d},     {26, &input::Keys::w},   {22, &input::Keys::s},     {82, &input::Keys::up},
+                {81, &input::Keys::down},  {80, &input::Keys::left}, {79, &input::Keys::right}, {44, &input::Keys::enter}, {42, &input::Keys::backspace},
+                {225, &input::Keys::x},    {224, &input::Keys::y},   {40, &input::Keys::space},  {43, &input::Keys::tab},
+                {20, &input::Keys::q},     {8, &input::Keys::e},     {6, &input::Keys::c},
+            };
+            bool keyByKey = true;
+            for (const auto& [scancode, field] : kOld)
+                keyByKey = keyByKey && only(press(defaults, {scancode}), field);
+            bool othersNothing = true;
+            for (size_t i = 0; i < input::kKeyNameCount; i++)
+            {
+                const int s = input::kKeyNames[i].scancode;
+                if (std::none_of(std::begin(kOld), std::end(kOld), [&](const auto& o) { return o.first == s; }))
+                    othersNothing = othersNothing && only(press(defaults, {s}), nullptr);
+            }
+            Expect(keyByKey && othersNothing && input::FromKeys(press(defaults, {42})).buttons == 0x2000 && input::FromKeys(press(defaults, {44})).buttons == 0x1000 &&
+                       input::FromKeys(press(defaults, {40})).buttons == 0x10 && input::FromKeys(press(defaults, {26})).rightTrigger == 255,
+                   "key bindings: the defaults key by key (17 keys: Space A, Backspace B, Left Shift X, Left Ctrl Y, Return START); every other table key presses nothing");
+            Expect(input::DescribeKeyBindings(defaults) ==
+                       "steer_left A, steer_right D, throttle W, brake S, dpad_up Up, dpad_down Down, dpad_left Left, dpad_right Right, a Space, "
+                       "b Backspace, x Left Shift, y Left Ctrl, start Return, back Tab, left_shoulder Q, right_shoulder E, camera C",
+                   "key bindings: the defaults described for the [input] log line");
+            // The table: SDL's names and values (SDL_scancode.h:63,88,90,99,162,173,223,344 for A 4, Z 29, 1 30, 0 39, F1 58, F12 69,
+            // Keypad = 103, Right Option 230; the names SDL 3.4 reports on macOS, SDL_keymap.c), each name and value once.
+            bool unique = true;
+            for (size_t i = 0; i < input::kKeyNameCount; i++)
+                for (size_t j = i + 1; j < input::kKeyNameCount; j++)
+                    unique = unique && std::strcmp(input::kKeyNames[i].name, input::kKeyNames[j].name) && input::kKeyNames[i].scancode != input::kKeyNames[j].scancode;
+            Expect(unique && input::ScancodeFromName("A") == 4 && input::ScancodeFromName("Z") == 29 && input::ScancodeFromName("1") == 30 &&
+                       input::ScancodeFromName("0") == 39 && input::ScancodeFromName("F1") == 58 && input::ScancodeFromName("F12") == 69 &&
+                       input::ScancodeFromName("Keypad =") == 103 && input::ScancodeFromName("Right Option") == 230 && input::ScancodeFromName(",") == 54 &&
+                       std::strcmp(input::NameOfScancode(225), "Left Shift") == 0 && input::ScancodeFromName("a") == -1 &&
+                       input::ScancodeFromName("CapsLock") == -1 && input::ScancodeFromName("Left GUI") == -1 && input::ScancodeFromName("`") == -1 &&
+                       input::NameOfScancode(57) == nullptr,
+                   "key bindings: the key table's spot values; names are exact (case-sensitive); Caps Lock, Command and ` are not bindable");
+            // The file the app writes for the defaults (app/setup/KeyBindings.swift serialize, without its comment) parses to the defaults.
+            const std::string defaultsFile = "steer_left = A\nsteer_right = D\nthrottle = W\nbrake = S\ndpad_up = Up\ndpad_down = Down\ndpad_left = Left\n"
+                                             "dpad_right = Right\na = Space\nb = Backspace\nx = Left Shift\ny = Left Ctrl\nstart = Return\nback = Tab\n"
+                                             "left_shoulder = Q\nright_shoulder = E\ncamera = C\n";
+            input::KeyBindings parsed;
+            std::string error;
+            bool same = input::ParseKeyBindings("# FM4 Recomp keyboard bindings\n\n" + defaultsFile, parsed, error);
+            for (size_t i = 0; i < input::kActionCount; i++)
+                same = same && parsed.keys[i] == defaults.keys[i];
+            Expect(same && error.empty(), "key bindings: the defaults' file (comment, blank line, 18 lines) parses to the defaults");
+            // A custom file: comments, CRLF, spaces, names with spaces, the comma and equals keys, a second key for an action.
+            // Expected: throttle Up 82, brake Down 81, a Space 44, b Escape 41 and , 54, camera = 46, right_shoulder Keypad Enter 88,
+            // left_shoulder Left Shift 225.
+            const std::string custom = "# mine\r\nsteer_left = Left\nsteer_right = Right\r\n  throttle   =   Up  \nbrake = Down\ndpad_up = I\ndpad_down = K\n"
+                                       "dpad_left = J\ndpad_right = L\na = Space\nb = Escape\nb = ,\nx = 1\ny = 2\nstart = Return\nback = Tab\n"
+                                       "left_shoulder = Left Shift\nright_shoulder = Keypad Enter\ncamera = =";
+            input::KeyBindings mine;
+            const bool ok = input::ParseKeyBindings(custom, mine, error);
+            const bool values = ok && mine.keys[2] == std::vector<uint16_t>{82} && mine.keys[3] == std::vector<uint16_t>{81} &&
+                                mine.keys[8] == std::vector<uint16_t>{44} && mine.keys[9] == (std::vector<uint16_t>{41, 54}) &&
+                                mine.keys[14] == std::vector<uint16_t>{225} && mine.keys[15] == std::vector<uint16_t>{88} && mine.keys[16] == std::vector<uint16_t>{46};
+            // Up now throttles (RT 255) and is no d-pad; W does nothing; the comma is B; the pad's own state passes through unchanged.
+            input::LiveState pad;
+            pad.buttons = 0x1000, pad.leftTrigger = 40, pad.leftX = 1200, pad.rightY = -300;
+            const input::LiveState up = input::Merge(pad, input::FromKeys(press(mine, {82})));
+            const input::LiveState padOnly = input::Merge(pad, input::FromKeys(press(mine, {26})));
+            Expect(values && only(press(mine, {82}), &input::Keys::w) && only(press(mine, {26}), nullptr) && only(press(mine, {54}), &input::Keys::backspace) &&
+                       up.rightTrigger == 255 && up.buttons == 0x1000 && up.leftTrigger == 40 && up.leftX == 1200 && up.rightY == -300 && padOnly == pad,
+                   "key bindings: a custom file: Up throttles, W is free, ',' is B; the gamepad's state is unchanged");
+            Expect(!only(press(mine, {82}), &input::Keys::up) && !only(press(defaults, {82}), &input::Keys::w),
+                   "CONTROL: key bindings: Up is the d-pad only under the defaults, the throttle only under the custom file");
+            bool upHigh[512] = {};
+            upHigh[82] = true;
+            Expect(only(input::KeysFromState(defaults, upHigh, 82), nullptr) && only(input::KeysFromState(defaults, upHigh, 83), &input::Keys::up),
+                   "key bindings: a scancode at or past SDL's key count is never read");
+            // Errors name the line (or the action left without a key).
+            const auto fails = [&](const std::string& text, const std::string& expected) {
+                input::KeyBindings b;
+                std::string e;
+                const bool r = input::ParseKeyBindings(text, b, e);
+                if (r || e != expected)
+                    std::printf("  got %s '%s', expected '%s'\n", r ? "success" : "error", e.c_str(), expected.c_str());
+                return !r && e == expected;
+            };
+            Expect(fails("throttle W\n", "line 1: expected '<action> = <key>', not 'throttle W'") &&
+                       fails("\n# c\nnitro = N\n", "line 3: unknown action 'nitro'") && fails("throttle = w\n", "line 1: unknown key 'w'") &&
+                       fails("throttle = CapsLock\n", "line 1: unknown key 'CapsLock'") && fails("throttle =\n", "line 1: unknown key ''") &&
+                       fails("throttle = W\nbrake = W\n", "line 2: key 'W' is already bound to 'throttle' (line 1)") &&
+                       fails("b = X\n\nb = X\n", "line 3: key 'X' is already bound to 'b' (line 1)") &&
+                       fails(defaultsFile.substr(0, defaultsFile.rfind("camera")), "no key for 'camera'") && fails("", "no key for 'steer_left'"),
+                   "key bindings: errors: no '=', unknown action, unknown or excluded key (exact case), a key bound twice, an action without a key");
+            // The loader (main.cpp --keybindings), in children: a bad file stops (9) naming the file and line; a missing one stops (9);
+            // a good one is active and named on the live pad's log line. This process keeps the defaults.
+            const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
+            const std::string good = dir + "/keys ok.conf", bad = dir + "/keys bad.conf", missing = dir + "/keys missing.conf";
+            std::ofstream(good) << custom;
+            std::ofstream(bad) << "throttle = W\nbrake = W\n";
+            const std::string badLine = StderrOf([&] { input::LoadKeyBindings(bad.c_str()); });
+            Expect(badLine == "[stop 9] --keybindings " + bad + " line 2: key 'W' is already bound to 'throttle' (line 1)\n" &&
+                       ExitCodeOf([&] { input::LoadKeyBindings(bad.c_str()); }) == int(StopCode::Setup) &&
+                       ExitCodeOf([&] { input::LoadKeyBindings(missing.c_str()); }) == int(StopCode::Setup),
+                   "--keybindings: an invalid file stops (9) naming the file and line; an unreadable one stops (9)");
+            const std::string liveLine = StderrOf([&] {
+                input::LoadKeyBindings(good.c_str());
+                if (input::ActiveKeyBindings()->keys[2] == std::vector<uint16_t>{82})
+                    input::EnableLive();
+            });
+            Expect(liveLine.starts_with("[input] live pad on user 0 (FM4_INPUT_LIVE=1): an SDL gamepad and the keyboard (bindings from " + good +
+                                        ": steer_left Left, steer_right Right, throttle Up, brake Down,") &&
+                       liveLine.find("b Escape/,") != std::string::npos && liveLine.ends_with("camera =)\n"),
+                   "--keybindings: a valid file is active and the live pad's log line names its bindings");
+            Expect(input::KeyBindingsPath().empty() && input::ActiveKeyBindings()->keys[2] == std::vector<uint16_t>{26},
+                   "key bindings: without --keybindings the defaults are active (throttle W)");
+
+            // FM4 Recomp (in-game Keyboard Controls): ReloadKeyBindings in this process, never a stop. Expected by hand: `custom`'s
+            // throttle is Up (82); the defaults' throttle is W (26); the reload keeps a snapshot taken before it unchanged.
+            const std::shared_ptr<const input::KeyBindings> before = input::ActiveKeyBindings();
+            const input::ReloadResult toCustom = input::ReloadKeyBindings(good);
+            Expect(toCustom.applied && toCustom.changed && input::ActiveKeyBindings()->keys[2] == std::vector<uint16_t>{82} &&
+                       input::KeyBindingsPath() == good && before->keys[2] == std::vector<uint16_t>{26},
+                   "reload: a valid file is active at once; a snapshot taken before keeps the old bindings");
+            const input::ReloadResult again = input::ReloadKeyBindings(good);
+            Expect(again.applied && !again.changed, "reload: the same file again applies and changes nothing");
+            const input::ReloadResult refused = input::ReloadKeyBindings(bad);
+            Expect(!refused.applied && !refused.changed && input::ActiveKeyBindings()->keys[2] == std::vector<uint16_t>{82} &&
+                       refused.message == bad + " line 2: key 'W' is already bound to 'throttle' (line 1): the bindings stay as they were",
+                   "reload: an invalid file is refused without a stop; the active bindings stay; the message names the file and line");
+            const input::ReloadResult reset = input::ReloadKeyBindings(missing);
+            Expect(reset.applied && reset.changed && *input::ActiveKeyBindings() == input::DefaultKeyBindings() && input::KeyBindingsPath().empty(),
+                   "reload: no file (Reset to Defaults removed it) is the defaults");
+            Expect(!(mine == input::DefaultKeyBindings()),
+                   "CONTROL: the custom set differs from the defaults (else the reload checks above would pass vacuously)");
+            // A directory: opened or not, it never parses (an empty text has no key for 'steer_left').
+            const std::string unreadable = dir + "/keys dir.conf";
+            std::filesystem::create_directory(unreadable);
+            const input::ReloadResult dirResult = input::ReloadKeyBindings(unreadable);
+            Expect(!dirResult.applied && *input::ActiveKeyBindings() == input::DefaultKeyBindings(),
+                   "reload: a directory in the file's place is refused; the bindings stay");
+            std::filesystem::remove(unreadable);
+            std::remove(good.c_str()), std::remove(bad.c_str());
+        }
+        {
+            // FM4 Recomp: InputGate (input_live.h; ReCarbon hid/input.cpp:731-745). Bits by hand (Xenia hid/input.h:30-45): A 0x1000,
+            // B 0x2000, START 0x0010.
+            input::InputGate gate;
+            input::LiveState held;
+            held.buttons = 0x2000 | 0x0010, held.rightTrigger = 255, held.leftX = -32768;
+            const input::LiveState open1 = gate.Filter(held, true);
+            const input::LiveState after = gate.Filter(held, false);          // closed with B and START still down: hidden
+            input::LiveState bOnly = held;
+            bOnly.buttons = 0x2000;
+            const input::LiveState released = gate.Filter(bOnly, false);       // START released: B still hidden
+            input::LiveState none;
+            none.buttons = 0;
+            (void)gate.Filter(none, false);                                    // both released
+            input::LiveState again;
+            again.buttons = 0x2000 | 0x1000;
+            const input::LiveState pressed = gate.Filter(again, false);        // pressed anew: seen
+            Expect(open1 == input::LiveState{} && after.buttons == 0 && after.rightTrigger == 255 && after.leftX == -32768 && released.buttons == 0 &&
+                       pressed.buttons == (0x2000 | 0x1000),
+                   "input gate: idle while blocked; after it, buttons held through the close stay hidden until released; axes pass");
+            input::InputGate never;
+            Expect(never.Filter(held, false) == held, "CONTROL: input gate: never blocked, the state passes unchanged");
+        }
+        {
+            // FM4 Recomp: the Keyboard Controls screen (kernel/controls_screen.h) with fake hooks: the order of the steps, refusals,
+            // and the reload before XN_SYS_UI 0.
+            const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
+            const std::string file = dir + "/screen keybindings.conf";
+            std::remove(file.c_str());
+            std::vector<std::string> steps;
+            bool ended = false, startOk = true;
+            const char* other = nullptr;
+            controls::Hooks hooks;
+            hooks.start = [&] { steps.push_back("start"); return startOk; };
+            hooks.finished = [&] { return ended; };
+            hooks.systemUi = [&](bool on) {
+                // The bindings at the moment the game is told: reload must already have happened on close.
+                steps.push_back(std::string(on ? "ui1" : "ui0") + " throttle " + std::to_string(input::ActiveKeyBindings()->keys[2].at(0)));
+            };
+            hooks.busy = [&] { return other; };
+            hooks.bindingsPath = file;
+            controls::Screen screen(hooks);
+            controls::SetService(&screen);
+            other = "the game's keyboard dialog";
+            const bool refusedBusy = !screen.RequestOpen("test") && steps.empty() && !controls::InputBlocked();
+            other = nullptr, startOk = false;
+            const bool refusedStart = !screen.RequestOpen("test") && steps == std::vector<std::string>{"start"} && !controls::InputBlocked();
+            steps.clear(), startOk = true;
+            const bool opened = screen.RequestOpen("test") && controls::InputBlocked() && !screen.RequestOpen("again") && !screen.Pump();
+            std::ofstream(file) << "steer_left = A\nsteer_right = D\nthrottle = J\nbrake = S\ndpad_up = Up\ndpad_down = Down\ndpad_left = Left\n"
+                                   "dpad_right = Right\na = Space\nb = Backspace\nx = Left Shift\ny = Left Ctrl\nstart = Return\nback = Tab\n"
+                                   "left_shoulder = Q\nright_shoulder = E\ncamera = C\n";  // J is scancode 13 (SDL_scancode.h)
+            ended = true;
+            const bool closed = screen.Pump() && !controls::InputBlocked() && !screen.Pump();
+            Expect(refusedBusy && refusedStart && opened && closed &&
+                       steps == std::vector<std::string>{"start", "ui1 throttle 26", "ui0 throttle 13"},
+                   "controls screen: refused while another system screen is up or when it cannot start; opens once (XN_SYS_UI 1, pad idle); "
+                   "on close the file is reloaded before XN_SYS_UI 0");
+            // The Pause menu's row (config/title_hooks.toml menu_row_action) asks from a game thread: nothing opens until the window
+            // loop's next Pump, which opens it (start, XN_SYS_UI 1) and returns false; one request opens once.
+            steps.clear(), ended = false;
+            screen.RequestFromGame("Pause menu");
+            const bool notYet = steps.empty() && !controls::InputBlocked();
+            const bool fromGame = !screen.Pump() && controls::InputBlocked() && steps == std::vector<std::string>{"start", "ui1 throttle 13"};
+            const bool once = !screen.Pump() && steps.size() == 2;
+            ended = true;
+            const bool closedAgain = screen.Pump() && !controls::InputBlocked();
+            Expect(notYet && fromGame && once && closedAgain, "controls screen: a request from the game opens it at the window loop's next Pump, once");
+            controls::SetService(nullptr);
+            std::remove(file.c_str());
+            input::ReloadKeyBindings(file);  // back to the defaults for the tests below
+            Expect(*input::ActiveKeyBindings() == input::DefaultKeyBindings() && !controls::InputBlocked(),
+                   "controls screen: no service, no block; the defaults restored");
+        }
+        {
+            // FM4 Recomp: the in-game KEYBOARD CONTROLS submenu's logic (kernel/controls_menu.h), by hand from the launcher's rules
+            // (KeyBindings.swift change/applying): defaults A steer left (4), D (7), W throttle (26), S brake (22), Space A (44),
+            // Backspace B (42), Return START (40). S to throttle: brake had only S, so brake takes throttle's W (a swap); Backspace
+            // to A: B had only Backspace, so B takes Space; K (14) to A: nobody has K, no question.
+            const input::KeyBindings d = input::DefaultKeyBindings();
+            const controls::Change s = controls::ChangeAssigning(d, 22, 2);
+            const input::KeyBindings swapped = controls::Applying(d, s);
+            const controls::Change bs = controls::ChangeAssigning(d, 42, 8);
+            const controls::Change k = controls::ChangeAssigning(d, 14, 8);
+            Expect(s.from == 3 && s.fromGets == std::vector<uint16_t>{26} && swapped.keys[2] == std::vector<uint16_t>{22} &&
+                       swapped.keys[3] == std::vector<uint16_t>{26} && bs.from == 9 && bs.fromGets == std::vector<uint16_t>{44} && k.from == -1,
+                   "controls menu: a key another action has moves, and that action takes the old keys when it would have none");
+            input::KeyBindings two = d;
+            two.keys[9] = {42, 41};  // B on Backspace and Escape: giving Escape to A leaves B its Backspace
+            const controls::Change esc = controls::ChangeAssigning(two, 41, 8);
+            Expect(esc.from == 9 && esc.fromGets == std::vector<uint16_t>{42}, "controls menu: an action keeps its other keys");
+            Expect(controls::KeyLabel(42) == "DELETE" && controls::KeyLabel(82) == "UP ARROW" && controls::KeyLabel(26) == "W" &&
+                       controls::KeyLabel(44) == "SPACE" && controls::KeyLabel(224) == "LEFT CONTROL" && controls::KeysLabel({42, 41}) == "DELETE / ESC" &&
+                       std::string(controls::ActionLabel(0)) == "STEER LEFT" && std::string(controls::ActionLabel(8)) == "A (CONFIRM)",
+                   "controls menu: labels in the game's style (upper case; Mac names for Backspace, the arrows, Ctrl)");
+            input::KeyBindings parsed;
+            std::string error;
+            Expect(input::ParseKeyBindings(controls::Serialize(two), parsed, error) && parsed == two,
+                   "controls menu: the file it writes is the one the game reads (round trip, two keys on one action)");
+            const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
+            const std::string file = dir + "/menu keybindings.conf";
+            std::remove(file.c_str());
+            controls::Menu menu(d, file);
+            using Mode = controls::Menu::Mode;
+            menu.Select(2);
+            const bool waiting = menu.CurrentMode() == Mode::WaitingForKey && menu.OwnsInput() && menu.RowText(2).value == "PRESS A KEY" &&
+                                 menu.RowText(3).value == "S" && menu.Prompt() == "PRESS THE NEW KEY FOR THROTTLE. ESC OR B CANCELS.";
+            menu.Key(57);  // Caps Lock: not in the game's key table
+            const bool refused = menu.CurrentMode() == Mode::WaitingForKey && menu.Prompt().rfind("THAT KEY CANNOT BE USED", 0) == 0;
+            menu.Key(22);
+            const bool asked = menu.CurrentMode() == Mode::ConfirmReplace &&
+                               menu.Prompt() == "S IS USED BY BRAKE. A (SPACE): REPLACE (BRAKE WILL USE W). B (DELETE): CANCEL." &&
+                               access(file.c_str(), F_OK) != 0;
+            const bool cancelled = menu.Cancel() && menu.CurrentMode() == Mode::Browse && !menu.OwnsInput() && !menu.Cancel() &&
+                                   access(file.c_str(), F_OK) != 0 && !menu.Changed();
+            menu.Select(2), menu.Key(22), menu.Confirm();
+            std::ifstream in(file);
+            const std::string written((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            const bool saved = menu.CurrentMode() == Mode::Browse && input::ParseKeyBindings(written, parsed, error) && parsed == swapped &&
+                               menu.Changed() && menu.RowText(2).value == "S" && menu.RowText(3).value == "W";
+            menu.Select(controls::Menu::kResetRow);
+            const bool resetAsked = menu.CurrentMode() == Mode::ConfirmReset && menu.RowText(controls::Menu::kResetRow).label == "RESET TO DEFAULTS";
+            menu.Confirm();
+            const bool reset = menu.CurrentMode() == Mode::Browse && access(file.c_str(), F_OK) != 0 && menu.Bindings() == d;
+            menu.Select(8), menu.Key(14);  // K to A: no question, saved at once
+            const bool direct = menu.CurrentMode() == Mode::Browse && menu.Bindings().keys[8] == std::vector<uint16_t>{14} && access(file.c_str(), F_OK) == 0;
+            Expect(waiting && refused && asked && cancelled && saved && resetAsked && reset && direct,
+                   "controls menu: waits for a key, refuses an unusable one, asks before taking another action's key, B cancels, "
+                   "saves at once, Reset to Defaults asks and removes the file");
+            Expect(!(menu.Bindings() == d), "control: controls menu: the last change is kept");
+            // ReCarbon's keys (settings_menu.cpp at 66401ea: Y clears :456-460, X restores the row :461-463, Esc cancels a wait
+            // :1329-1333): CAMERA cleared -> "camera = none" in the file, read back as no key; X on CAMERA -> C again; X on THROTTLE
+            // after S went to BRAKE... here: THROTTLE given K, X -> W back with no question (W is free); BRAKE given W first, then X on
+            // THROTTLE asks (W is BRAKE's). The browse prompt names each button's key (A SPACE, Y LEFT CONTROL, X LEFT SHIFT, B DELETE).
+            std::remove(file.c_str());
+            controls::Menu edit(d, file);
+            const bool hint = edit.Prompt() == "A (SPACE): SET KEY   Y (LEFT CONTROL): CLEAR   X (LEFT SHIFT): DEFAULT   B (DELETE): BACK. THE "
+                                               "CONTROLLER LAYOUT IS FIXED.";
+            edit.Clear(16);
+            std::ifstream cleared(file);
+            const std::string clearedText((std::istreambuf_iterator<char>(cleared)), std::istreambuf_iterator<char>());
+            input::KeyBindings back;
+            const bool none = edit.Bindings().keys[16].empty() && edit.RowText(16).value == "NONE" &&
+                              clearedText.find("\ncamera = none\n") != std::string::npos && input::ParseKeyBindings(clearedText, back, error) &&
+                              back.keys[16].empty();
+            edit.RestoreDefault(16);
+            const bool cameraBack = edit.Bindings().keys[16] == std::vector<uint16_t>{6} && edit.CurrentMode() == Mode::Browse;
+            edit.Select(2), edit.Key(41);  // Escape cancels the wait
+            const bool escCancels = edit.CurrentMode() == Mode::Browse && edit.Bindings().keys[2] == std::vector<uint16_t>{26};
+            edit.Select(2), edit.Key(14), edit.RestoreDefault(2);
+            const bool throttleBack = edit.CurrentMode() == Mode::Browse && edit.Bindings().keys[2] == std::vector<uint16_t>{26};
+            edit.Select(3), edit.Key(14), edit.Select(3), edit.Key(26), edit.Confirm();  // BRAKE: K, then W (THROTTLE's): replaced
+            edit.RestoreDefault(2);
+            const bool asks = edit.CurrentMode() == Mode::ConfirmReplace && edit.Prompt().rfind("W IS USED BY BRAKE.", 0) == 0;
+            Expect(hint && none && cameraBack && escCancels && throttleBack && asks,
+                   "controls menu: Y clears (saved as none), X restores the default (asks when taken), Esc cancels a wait, prompts name the keys");
+            input::KeyBindings missing;
+            Expect(!input::ParseKeyBindings("throttle = none\n", missing, error) && error.rfind("no key for 'steer_left'", 0) == 0,
+                   "control: key bindings: an action not named at all is still refused");
+            std::remove(file.c_str());
+            // The session (two threads in the game; driven in order here): A on THROTTLE (game thread) -> the submenu owns the
+            // input; S (window thread) -> the question, one pulse; the pad's B (0x2000) -> cancelled, a pulse; again S, then the
+            // key bound to A (Space, 44) -> replaced and saved; the pad's A held from before the opening is not a press.
+            controls::Session session;
+            session.Open(d, file);
+            session.Pad(0x1000);  // A held while it opens
+            const bool idle = session.IsOpen() && !session.OwnsInput() && !session.TakePulse(0) &&
+                              !session.AcceptsConfirm(1'000'000'000);  // the opener's A, still held, selects nothing
+            session.Select(2);
+            const bool owns = session.OwnsInput() && session.Snapshot().waitingRow == 2;
+            session.KeyDown(22, d);  // Confirm (the pad's A) still held: not captured yet
+            const bool notArmed = session.Snapshot().mode == Mode::WaitingForKey;
+            session.Pad(0x1000, false), session.KeyDown(22, d);  // the pad's A still down
+            const bool stillHeld = session.Snapshot().mode == Mode::WaitingForKey;
+            session.Pad(0, true), session.KeyDown(22, d);  // the key bound to A still down
+            const bool keyHeld = session.Snapshot().mode == Mode::WaitingForKey && !session.AcceptsConfirm(1'000'000'000);
+            session.Pad(0, false);  // everything released: capture starts
+            // Released, A selects again, but not within 250 ms of the opening (the opener's A delivered on its release edge).
+            const bool confirmGate = session.AcceptsConfirm(250'000'000) && !session.AcceptsConfirm(249'999'999);
+            session.KeyDown(22, d);
+            // A pulse is in flight for 500 ms (an X within it is the pulse: once; after it, the player's).
+            const bool question = session.Snapshot().mode == Mode::ConfirmReplace && session.TakePulse(1'000'000'000) && !session.TakePulse(0) &&
+                                  session.ConsumePulse(1'400'000'000) && !session.ConsumePulse(1'400'000'000);
+            session.Pad(0x1000 | 0x2000);  // B pressed (A still held)
+            const bool padCancel = session.Snapshot().mode == Mode::Browse && !session.OwnsInput() && session.TakePulse(2'000'000'000) &&
+                                   !session.ConsumePulse(2'600'000'000);  // past 500 ms: a stale pulse is not taken for the player's X
+            session.Select(2), session.Pad(0, false), session.KeyDown(22, d), session.KeyDown(44, d);
+            const bool replaced = session.Snapshot().mode == Mode::Browse && session.Snapshot().keys[2] == std::vector<uint16_t>{22} &&
+                                  access(file.c_str(), F_OK) == 0;
+            session.KeyDown(26, d);  // browsing: keys are the game's, not the submenu's
+            const bool browsing = session.Snapshot().keys[2] == std::vector<uint16_t>{22};
+            session.Select(4);
+            const bool backCancels = session.Back() && !session.Back();
+            session.Select(2), session.Pad(0, false), session.KeyDown(26, d);  // one more change: a pulse in flight when it closes
+            const bool pending = session.TakePulse(3'000'000'000);
+            const bool closed = pending && session.Close() && !session.IsOpen() && !session.OwnsInput() && !session.ConsumePulse(3'100'000'000);
+            Expect(idle && owns && notArmed && stillHeld && keyHeld && confirmGate && question && padCancel && replaced && browsing &&
+                       backCancels && closed,
+                   "controls menu session: owns the input only while waiting or asking; keys and the pad answer; one pulse per change; "
+                   "B cancels first, then closes; Close reports the change; the A that opened it selects no row");
+            std::remove(file.c_str());
         }
         // The scripted gamepad (kernel/input_script.h; FM4_INPUT_SCRIPT). Without a script (this process never loads one)
         // the other input imports are the generated strict stubs (3).
@@ -857,6 +1246,20 @@ int main(int, char** argv)
                        ignoring.Poll(150).buttons == 0x1000 && e1 && e2,
                    "CONTROL: nothing held before the race list's first event; RaceStarted without @race changes nothing; a second @race and words "
                    "after it are errors");
+            // FM4 Recomp (M7 stability harness): "2000 A / 2010 / @title / 300 DPAD_RIGHT / 310": the second list counts from TitleAccepted
+            // (at 2500: RIGHT from 2800 = event 2, released from 2810 = event 3; A held at 2005 before it). A @title script ignores
+            // RaceStarted, a @race script ignores TitleAccepted, TitleAccepted counts once, @title then @race is an error.
+            input::Script titled;
+            const bool tParsed = input::ParseScript("2000 A\n2010\n@title\n300 DPAD_RIGHT\n310\n", titled, error) && titled.anchorTitle && titled.hasRace;
+            input::Poller tp(titled);
+            const input::Report tA = tp.Poll(2005);
+            const bool tRace = tp.RaceStarted(2400), tFirst = tp.TitleAccepted(2500), tAgain = tp.TitleAccepted(2600);
+            const input::Report tR = tp.Poll(2800), tOff = tp.Poll(2810);
+            input::Poller raceScript(script);
+            const bool tBoth = !input::ParseScript("@title\n@race\n", bad, error);
+            Expect(tParsed && tA.buttons == 0x1000 && !tRace && tFirst && !tAgain && tR.buttons == 0x0008 && tR.event == 2 && tOff.buttons == 0 &&
+                       tOff.event == 3 && !raceScript.TitleAccepted(10) && tBoth,
+                   "input script @title: the second list counts from the title's acceptance; @race and @title are exclusive");
         }
         {
             // The imports with a script, in a child (the parent never loads one). The vblank counter stays 0 here (no
@@ -1070,6 +1473,128 @@ int main(int, char** argv)
             Expect(pending0 && pending1 && ExitCodeOf([&] { (void)read(0, 228, ov); }) == int(StopCode::Unimplemented),
                    "XamUserReadProfileSettings with an XOVERLAPPED: completed at once (0 / 525, length 0 / FFFFFFFF), ERROR_IO_PENDING; "
                    "a completion routine stops (7)");
+            // XamReadTileToTextureEx (Xenia xam_user.cc:761-780 XamReadTileToTexture: the buffer filled with 0xFF, an XOVERLAPPED
+            // completed at once): FM4's argument shape (12, 0, 0, 254, selector, key*, buffer, stride; height and XOVERLAPPED on the
+            // stack at r1 + 0x54 and r1 + 0x5C). Sizes by hand: 64 x 64 ARGB = 16384 bytes (stride 256), 32 x 32 = 4096 (stride 128).
+            {
+                const uint32_t stack = ArenaAlloc(base, 0x100), tile = ArenaAlloc(base, 16384 + 4), key = ArenaAlloc(base, 16);
+                auto call = [&](uint32_t buffer, uint32_t stride, uint32_t height, uint32_t overlapped) {
+                    PPCContext c{};
+                    c.r1.u32 = stack, c.r3.u64 = 12, c.r6.u64 = 254, c.r8.u32 = key, c.r9.u32 = buffer, c.r10.u32 = stride;
+                    StoreBigEndian32(base, stack + 0x54, height);
+                    StoreBigEndian32(base, stack + 0x5C, overlapped);
+                    imp("XamReadTileToTextureEx")(c, base);
+                    return c.r3.u32;
+                };
+                std::memset(base + tile, 0xAA, 16384 + 4);
+                const bool sync = call(tile, 256, 64, 0) == 0 && base[tile] == 0xFF && base[tile + 16383] == 0xFF && base[tile + 16384] == 0xAA;
+                std::memset(base + tile, 0xAA, 16384);
+                std::memset(base + ov, 0, 0x1C);
+                const bool pending = call(tile, 128, 32, ov) == 0x3E5 && be32(ov) == 0 && be32(ov + 0x18) == 0 && base[tile + 4095] == 0xFF &&
+                                     base[tile + 4096] == 0xAA;
+                Expect(sync && pending && ExitCodeOf([&] { (void)call(0, 256, 64, 0); }) == int(StopCode::Unimplemented) &&
+                           ExitCodeOf([&] { (void)call(tile, 512, 64, 0); }) == int(StopCode::Unimplemented),
+                       "XamReadTileToTextureEx: a white 64x64 tile, 0; with an XOVERLAPPED completed at once (0) and ERROR_IO_PENDING, only "
+                       "stride x height bytes written; no buffer or a tile over 16 KB stops (7)");
+            }
+            // FM4 Recomp: XamShowKeyboardUI (keyboard_ui.h; Xenia 67f16c4 xam_ui.cc:468-523, string_util.h copy_and_swap_truncating).
+            // FM4's argument shape (Photo Mode: user 0, flags 20000004, default*, title*, description*, buffer*, length, XOVERLAPPED*).
+            // By hand: buffer length 4 holds 3 characters and the terminator, so OK "Bernese" leaves "Ber\0" and the 5th character
+            // (0xAAAA) untouched; Cancel leaves the buffer untouched with extended error X_ERROR_CANCELLED 0x4C7; both result 0, length
+            // 0, the import returning ERROR_IO_PENDING (0x3E5) with the event set only at completion. XN_SYS_UI (id 9: area 0, mask
+            // bit 0) is queued 1 then 0. Headless (no host) without an XOVERLAPPED answers the default text "Photo" -> "Pho\0", 0.
+            {
+                auto string16 = [&](const char* text) {
+                    const uint32_t a = ArenaAlloc(base, uint32_t(2 * std::strlen(text) + 2));
+                    for (size_t i = 0; i <= std::strlen(text); ++i)
+                        base[a + 2 * i] = 0, base[a + 2 * i + 1] = uint8_t(text[i]);
+                    return a;
+                };
+                const uint32_t defaultText = string16("Photo"), title = string16("Name"), description = string16("Enter a name"),
+                               buffer = ArenaAlloc(base, 16);
+                const uint32_t uiEvent = CreateObject(ObjectType::Event, ArenaAlloc(base, 16), "");
+                const uint32_t uiEventBody = LookupHandle(uiEvent)->header;
+                base[uiEventBody] = 0, Store32(base, uiEventBody + 4, 1);  // a notification event, signalled: the call must reset it
+                PPCContext listenUi{};
+                listenUi.r3.u64 = 1, listenUi.r4.u64 = 9;
+                imp("XamNotifyCreateListener")(listenUi, base);
+                auto note = [&](uint32_t handle) {
+                    const uint32_t out = ArenaAlloc(base, 8);
+                    PPCContext c{};
+                    c.r3.u32 = handle, c.r5.u32 = out, c.r6.u32 = out + 4;
+                    imp("XNotifyGetNext")(c, base);
+                    return std::make_tuple(c.r3.u32, be32(out), be32(out + 4));
+                };
+                keyboard_ui::Request seen;
+                bool activeInside = false, pendingInside = false;
+                auto call = [&](uint32_t bufferAddress, uint32_t overlapped, keyboard_ui::Answer answer, bool withHost = true) {
+                    std::memset(base + buffer, 0xAA, 16);
+                    if (overlapped != 0)
+                        std::memset(base + overlapped, 0, 0x1C), StoreBigEndian32(base, overlapped + 0xC, uiEvent), Store32(base, uiEventBody + 4, 1);
+                    if (withHost)
+                        keyboard_ui::SetHost([&, answer](const keyboard_ui::Request& r) {
+                            seen = r;
+                            PPCContext a{};
+                            imp("XamIsUIActive")(a, base);
+                            activeInside = a.r3.u32 == 1;
+                            pendingInside = overlapped == 0 || (be32(overlapped) == 0x3E5 && be32(uiEventBody + 4) == 0);
+                            return answer;
+                        });
+                    else
+                        keyboard_ui::SetHost(nullptr);
+                    PPCContext c{};
+                    c.r4.u64 = 0x20000004, c.r5.u32 = defaultText, c.r6.u32 = title, c.r7.u32 = description, c.r8.u32 = bufferAddress, c.r9.u64 = 4,
+                    c.r10.u32 = overlapped;
+                    imp("XamShowKeyboardUI")(c, base);
+                    if (overlapped != 0 && c.r3.u32 == 0x3E5)
+                        WaitForEvent(base, uiEventBody);
+                    return c.r3.u32;
+                };
+                const bool invalid = call(0, ov, {false, u"x"}) == 0x57 && be32(ov) == 0 && be32(uiEventBody + 4) == 1;
+                const bool ok = call(buffer, ov, {false, u"Bernese"}) == 0x3E5 && pendingInside && activeInside && seen.title == u"Name" &&
+                                seen.description == u"Enter a name" && seen.defaultText == u"Photo" && seen.bufferLength == 4 && be16(buffer) == 'B' &&
+                                be16(buffer + 2) == 'e' && be16(buffer + 4) == 'r' && be16(buffer + 6) == 0 && be16(buffer + 8) == 0xAAAA &&
+                                be32(ov) == 0 && be32(ov + 0x18) == 0 && be32(ov + 4) == 0;
+                PPCContext after{};
+                imp("XamIsUIActive")(after, base);
+                const bool notes = note(listenUi.r3.u32) == std::make_tuple(1u, 9u, 1u) && note(listenUi.r3.u32) == std::make_tuple(1u, 9u, 0u) &&
+                                   std::get<0>(note(listenUi.r3.u32)) == 0;
+                const bool cancel = call(buffer, ov, {true, u"ignored"}) == 0x3E5 && be16(buffer) == 0xAAAA && be32(ov) == 0 && be32(ov + 0x18) == 0x4C7 &&
+                                    be32(ov + 4) == 0;
+                const bool headless = call(buffer, 0, {}, false) == 0 && be16(buffer) == 'P' && be16(buffer + 4) == 'o' && be16(buffer + 6) == 0;
+                std::vector<keyboard_ui::Answer> answers;
+                std::string answersError;
+                const bool parsed = keyboard_ui::ParseAnswers("ok:Lap 1;cancel", answers, answersError) && answers.size() == 2 &&
+                                    !answers[0].cancelled && answers[0].text == u"Lap 1" && answers[1].cancelled &&
+                                    !keyboard_ui::ParseAnswers("ok:A;yes", answers, answersError);
+                // FM4 Recomp (2026-11-14 playtest: macOS wrote "TSM AdjustCapsLockLED..." to osascript's standard error and it became the
+                // photo's name, so the game asked again): NativeDialogHost takes the answer from standard output only. Stand-ins for
+                // osascript: one writes a warning to standard error and "tp1" to standard output (exit 0) -> OK "tp1"; one writes
+                // "execution error: User canceled. (-128)" to standard error (exit 1) -> Cancel.
+                const std::filesystem::path fakes = std::filesystem::temp_directory_path() / ("fm4_dialog_" + std::to_string(getpid()));
+                std::filesystem::create_directories(fakes);
+                auto fake = [&](const char* name, const char* body) {
+                    const std::filesystem::path path = fakes / name;
+                    std::ofstream(path) << "#!/bin/sh\n" << body << "\n";
+                    std::filesystem::permissions(path, std::filesystem::perms::owner_all);
+                    return path.string();
+                };
+                const keyboard_ui::Answer typed = keyboard_ui::NativeDialogHost(
+                    fake("ok.sh", "echo '2026-11-14 21:44:17.958 osascript[1:2] TSM AdjustCapsLockLED Inhibit' >&2; echo tp1; exit 0"))({});
+                const keyboard_ui::Answer cancelled = keyboard_ui::NativeDialogHost(
+                    fake("cancel.sh", "echo '0:17: execution error: User canceled. (-128)' >&2; exit 1"))({});
+                std::filesystem::remove_all(fakes);
+                Expect(!typed.cancelled && typed.text == u"tp1" && cancelled.cancelled,
+                       "keyboard dialog: the answer is standard output only (a warning on standard error is not the name); -128 is Cancel");
+                const auto scripted = keyboard_ui::ScriptedHost({{false, u"A"}});
+                const bool exhausted = scripted({}).text == u"A" && ExitCodeOf([&] { (void)scripted({}); }) == int(StopCode::Setup);
+                while (std::get<0>(note(listener)) != 0)  // the EF listener above saw the same XN_SYS_UI notifications
+                    ;
+                Expect(invalid && ok && after.r3.u32 == 0 && notes && cancel && headless && parsed && exhausted,
+                       "XamShowKeyboardUI: no buffer 0x57; OK truncated to length - 1 and terminated, Cancel 0x4C7, both pending then completed "
+                       "(0, length 0, the event set); XamIsUIActive only while shown; XN_SYS_UI 1 then 0; headless: the default text; "
+                       "FM4_KEYBOARD_UI_ANSWERS parsed, a dialog past its end stops (Setup)");
+            }
             // XamGetOverlappedResult (Xenia xam_msg.cc:113-136): a completed 0 with length 0x24 -> 0, length 0x24 written;
             // a completed 525 -> 525 (Win32 codes pass XSUCCEEDED, so length FFFFFFFF is written too); pending without an
             // event -> ERROR_IO_INCOMPLETE (3E4), which passes XSUCCEEDED too (xbox.h:33), so its length (0) is written.
@@ -2014,6 +2539,78 @@ int main(int, char** argv)
                    "mounting twice stops (7); XamContentClose unmounts");
         }
         {
+            // A writable root's directory listed (FM4's View Photos lists its photo save folder): children in byte order of their
+            // names, each as ResolveDirectoryPath describes it (Xenia host_path_entry.cc:30-45: directory 0x10, else normal 0x80);
+            // a symlink child stops (9). Expected by hand from the files written here.
+            const std::filesystem::path root = std::filesystem::temp_directory_path() / ("fm4_listing_" + std::to_string(getpid()));
+            std::filesystem::create_directories(root / "photo" / "Album");
+            std::ofstream(root / "photo" / "b.dat", std::ios::binary) << "12345";
+            std::ofstream(root / "photo" / "A.dat", std::ios::binary) << "xy";
+            DiscEntry photo;
+            std::string device;
+            const bool mounted = MountDirectoryRoot("listing", root.string()) && ResolveGuestPath("listing:\\PHOTO", photo, device) == Resolved::Found &&
+                                 photo.directory && photo.writable;
+            const std::vector<DirectoryChild> kids = mounted ? ListDirectory(photo) : std::vector<DirectoryChild>{};
+            const bool listed = kids.size() == 3 && kids[0].name == "A.dat" && kids[0].entry.size == 2 && kids[0].entry.attributes == 0x80 &&
+                                kids[1].name == "Album" && kids[1].entry.directory && kids[1].entry.attributes == 0x10 && kids[2].name == "b.dat" &&
+                                kids[2].entry.size == 5 && kids[0].entry.writable && kids[2].entry.host == (root / "photo" / "b.dat").string();
+            std::filesystem::create_symlink(root / "photo" / "b.dat", root / "photo" / "c.lnk");
+            const bool symlinkStops = ExitCodeOf([&] { (void)ListDirectory(photo); }) == int(StopCode::Setup);
+            std::filesystem::remove_all(root);
+            Expect(mounted && listed && symlinkStops && !(kids.size() == 3 && kids[0].name == "b.dat"),
+                   "ListDirectory on a writable root: A.dat (2, 0x80), Album (0x10), b.dat (5) in byte order; a symlink child stops (9)");
+        }
+        {
+            // FM4 Recomp (Photo Mode's default name, the date and time): a guest name with ':' is stored as "%3A" and '%' as "%25"
+            // (exFAT has no ':'), resolved and listed back as the guest wrote it. By hand: "2026-11-14 17:51" -> "2026-11-14 17%3A51";
+            // "a%b:c" -> "a%25b%3Ac" and back; "%41" (not one of the two codes) is left as it is.
+            Expect(HostNameOf("2026-11-14 17:51") == "2026-11-14 17%3A51" && HostNameOf("a%b:c") == "a%25b%3Ac" &&
+                       GuestNameOf("a%25b%3Ac") == "a%b:c" && GuestNameOf("x%3ay") == "x:y" && GuestNameOf("%41%") == "%41%" && GuestNameOf("plain") == "plain",
+                   "user data names: ':' <-> %3A, '%' <-> %25, other '%' sequences untouched");
+            const std::filesystem::path root = std::filesystem::temp_directory_path() / ("fm4_colon_" + std::to_string(getpid()));
+            std::filesystem::create_directories(root / "photo");
+            DiscEntry e;
+            std::string device;
+            const bool mounted = MountDirectoryRoot("colon", root.string());
+            const bool notFound = mounted && ResolveGuestPath("colon:\\photo\\2026-11-14 17:51", e, device) == Resolved::NotFound &&
+                                  e.host == (root / "photo" / "2026-11-14 17%3A51").string();
+            std::filesystem::create_directories(e.host);
+            DiscEntry again, photo;
+            const bool found = ResolveGuestPath("colon:\\PHOTO\\2026-11-14 17:51", again, device) == Resolved::Found && again.directory &&
+                               ResolveGuestPath("colon:\\photo", photo, device) == Resolved::Found;
+            const std::vector<DirectoryChild> kids = found ? ListDirectory(photo) : std::vector<DirectoryChild>{};
+            std::filesystem::remove_all(root);
+            Expect(notFound && found && kids.size() == 1 && kids[0].name == "2026-11-14 17:51",
+                   "user data: a name with ':' is created as %3A on the host, found again by its guest name and listed as the guest wrote it");
+        }
+        {
+            // FM4 Recomp (View Photos showed 01/01/1970): a writable entry reports its host file's times (Xenia 67f16c4
+            // host_path_entry.cc), a disc entry the fixed 1970-01-01 stamp. By hand: 2026-11-14 10:00:00 UTC = 1794650400 s since 1970
+            // = 1794650400 * 10^7 + 116444736000000000 (11644473600 s from 1601 to 1970) = 134391240000000000 as a FILETIME.
+            Expect(FileTimeFromUnix(1794650400, 0) == 134391240000000000ull && FileTimeFromUnix(0, 0) == 116444736000000000ull &&
+                       FileTimeFromUnix(0, 300) == 116444736000000003ull,
+                   "FileTimeFromUnix: 2026-11-14 10:00 UTC = 134391240000000000, 1970 = 116444736000000000, 300 ns = 3 units");
+            const std::filesystem::path root = std::filesystem::temp_directory_path() / ("fm4_times_" + std::to_string(getpid()));
+            std::filesystem::create_directories(root / "photo");
+            std::ofstream(root / "photo" / "image", std::ios::binary) << "x";
+            const struct timeval when[2] = {{1794650400, 0}, {1794650400, 0}};
+            utimes((root / "photo" / "image").c_str(), when);
+            DiscEntry dir, file;
+            std::string device;
+            const bool mounted = MountDirectoryRoot("times", root.string()) && ResolveGuestPath("times:\\photo", dir, device) == Resolved::Found &&
+                                 ResolveGuestPath("times:\\photo\\image", file, device) == Resolved::Found;
+            const std::vector<DirectoryChild> kids = mounted ? ListDirectory(dir) : std::vector<DirectoryChild>{};
+            uint64_t listed[4] = {}, resolved[4] = {}, disc[4] = {};
+            if (!kids.empty())
+                DiscTimes(kids[0].entry, listed);
+            DiscTimes(file, resolved);
+            DiscTimes(DiscEntry{}, disc);
+            std::filesystem::remove_all(root);
+            Expect(mounted && kids.size() == 1 && listed[2] == 134391240000000000ull && resolved[2] == 134391240000000000ull &&
+                       listed[0] > 116444736000000000ull && disc[0] == 116444736000000000ull && disc[2] == 116444736000000000ull,
+                   "user data times: a listed and a resolved file report the host's last write (2026-11-14 10:00 UTC); a disc entry the 1970 stamp");
+        }
+        {
             // XamShowDeviceSelectorUI(user, content type, flags, total (qword), DWORD* device, XOVERLAPPED*) (Xenia xam_ui.cc:525-537:
             // device 1 = DummyDeviceId::HDD, success; headless dispatch completes the XOVERLAPPED and returns ERROR_IO_PENDING).
             // FM4's call (the local capture input_a1 (not distributed)): user 0, content type 0, flags 1, device at r7, XOVERLAPPED at r8.
@@ -2282,8 +2879,11 @@ int main(int, char** argv)
         {
             const std::string user = disc + "/../user-data";
             mkdir(user.c_str(), 0755);
-            for (const char* kept : {"save0001", "created1", "created2"})  // a failed run keeps its work folder
+            for (const char* kept : {"save0001", "created1", "created2", "agg01"})  // a failed run keeps its work folder
                 unlink((user + "/content/1/00000001/" + kept + ".xcontent").c_str());
+            for (const char* kept : {"._aggroot.xcontent", "._aggroot", ".DS_Store"})
+                unlink((user + "/content/1/00000001/" + kept).c_str());
+            std::filesystem::remove_all(user + "/content/1/00000001/agg01");
             MountUserData(user);
             const uint32_t sizeOut = ArenaAlloc(base, 4), enumOut = ArenaAlloc(base, 4), items = ArenaAlloc(base, 0x200), got = ArenaAlloc(base, 4);
             auto create = [&](uint32_t device, uint32_t type) {
@@ -2514,6 +3114,21 @@ int main(int, char** argv)
                 Expect(unmarked && keptAfterUnmark && marked && removed && ExitCodeOf([&] { (void)dispose(discHandle, 1); }) == int(StopCode::Unimplemented),
                        "NtSetInformationFile(disposition) + NtClose: a marked saved-content file is deleted on close (an unmarked one is kept); "
                        "0 bytes INFO_LENGTH_MISMATCH; a disc file stops (7)");
+                // FM4 Recomp (Photo Mode overwrites a photo: its files, then its folder, marked and closed): a marked saved-content
+                // directory is removed when its handle closes once its files are gone; one still holding a file is left in place (no
+                // stop). Folder "Photo1" (create, FILE_DIRECTORY_FILE 0x1) holding "image"; then "Photo2" holding a kept "image".
+                auto makeDir = [&](const char* path) { return ntCreate(path, kReadWrite, 2, 0x1) == 0 ? be32(fileOut) : 0u; };
+                auto makeFile = [&](const char* path) { return ntCreate(path, kReadWrite, 2, 0x60) == 0 ? be32(fileOut) : 0u; };
+                auto closeHandle = [&](uint32_t handle) { PPCContext c{}; c.r3.u32 = handle; imp("NtClose")(c, base); return c.r3.u32; };
+                const uint32_t dir1 = makeDir("save:\\Photo1"), img1 = makeFile("save:\\Photo1\\image");
+                const bool dirMarked = dir1 != 0 && img1 != 0 && dispose(img1, 1) == 0 && dispose(dir1, 1) == 0 && be32(ioStatus) == 0;
+                const bool dirGone = closeHandle(img1) == 0 && closeHandle(dir1) == 0 && stat((itemDir + "/Photo1").c_str(), &profileInfo) != 0;
+                const uint32_t dir2 = makeDir("save:\\Photo2"), img2 = makeFile("save:\\Photo2\\image");
+                const bool keptDir = dir2 != 0 && img2 != 0 && dispose(dir2, 1) == 0 && closeHandle(img2) == 0 && closeHandle(dir2) == 0 &&
+                                     stat((itemDir + "/Photo2/image").c_str(), &profileInfo) == 0;
+                Expect(dirMarked && dirGone && keptDir,
+                       "NtSetInformationFile(disposition) on a saved-content directory: removed at its close once its files are gone; one "
+                       "still holding a file is left in place");
                 Expect(cut && grown && tooBig && setLength(h, 3, 7) == 0xC0000004 &&
                            ExitCodeOf([&] { (void)setLength(discHandle, 1); }) == int(StopCode::Unimplemented),
                        "NtSetInformationFile(end of file): cut and zero-extended on the host, io {0, 8}; past the free space DISK_FULL, "
@@ -3233,6 +3848,24 @@ int main(int, char** argv)
             agg[3] = 1, agg[7] = 1;
             std::memcpy(agg.data() + 0x108, "agg01", 5);
             const bool made = CreateContent(agg, "aggroot") == 0 && UnmountContentRoot("aggroot");
+            // FM4 Recomp (user data on exFAT): macOS's own files beside the records ("._aggroot.xcontent", an AppleDouble companion of
+            // 4096 bytes, and ".DS_Store") are not records: the listing is the same with them, and no stop (it was 9, "not a 308-byte
+            // content record"). HostOnlyName by hand: ".", "..", "._x", ".DS_Store" yes; "x", ".x", "_x", "a._b" no.
+            const std::vector<ContentData> before = ListContent(1);
+            {
+                char type[16];
+                std::snprintf(type, sizeof type, "%08X", 1u);
+                const std::string dir = UserDataRoot() + "/content/1/" + type;
+                std::ofstream(dir + "/._aggroot.xcontent", std::ios::binary) << std::string(4096, '\0');
+                std::ofstream(dir + "/.DS_Store", std::ios::binary) << std::string(10, 'x');
+                std::ofstream(dir + "/._aggroot", std::ios::binary) << std::string(4096, '\0');
+            }
+            const bool noStop = ExitCodeOf([&] { (void)ListContent(1); }) == 0;
+            const std::vector<ContentData> withMac = noStop ? ListContent(1) : std::vector<ContentData>{};
+            Expect(noStop && withMac == before && HostOnlyName(".") && HostOnlyName("..") && HostOnlyName("._x") && HostOnlyName(".DS_Store") &&
+                       !HostOnlyName("x") && !HostOnlyName(".x") && !HostOnlyName("_x") && !HostOnlyName("a._b"),
+                   "user data: macOS's AppleDouble (._*) and .DS_Store files beside saved content are not listed");
+            Expect(!withMac.empty(), "control: user data: the saved record itself is still listed");
             const std::vector<ContentData> stored = ListContent(1);
             const uint32_t aggHandle = ArenaAlloc(base, 4), aggBuf = ArenaAlloc(base, 0x140), aggGot = ArenaAlloc(base, 4);
             auto createAgg = [&](uint32_t device, uint32_t type, uint32_t handleOut) {
@@ -3538,6 +4171,96 @@ int main(int, char** argv)
                "watch: a decommit tells the observer and the pages are no longer meant writable");
         Expect(a->Release(0xBB000000u, nullptr), "watch: the block released");
         SetWatchObservers(nullptr, nullptr);
+    }
+    {
+        // FM4 Recomp (M7 stability: Heap::Alloc skips past blocked pages, s55's 770 ms in MmAllocatePhysicalMemoryEx). In a child (the
+        // heaps are process-wide): a 16 MB block is taken in the 16 MB view, then 64 KB-view allocations (64 KB, and 1 MB aligned to
+        // 1 MB, top-down and bottom-up) are checked against a brute-force model of the rule built only on Query: a 64 KB page at physical
+        // P is usable when it is free in the 64 KB view, the 16 MB view's page at P is free and the 4 KB view's 16 pages at P are free (the
+        // three physical views share the frames); the answer is the highest (top-down) or
+        // lowest (bottom-up) aligned window of usable pages. CONTROL: no answer overlaps the 16 MB block's frames.
+        const int child = ExitCodeOf([&] {
+            Heap* c = PhysicalHeap(16 * 1024 * 1024);
+            Heap* a = PhysicalHeap(64 * 1024);
+            const uint32_t held = c->Alloc(0x1000000, 0x1000000, mem::kReserve | mem::kCommit, page::kReadWrite, true);
+            if (held == 0)
+                _exit(2);
+            Heap* e = PhysicalHeap(4096);  // the 0xE0000000 view claims frames too (its 4 KB pages)
+            auto usable = [&](uint32_t physicalAddress) {
+                RegionInfo i{};
+                if (!(a->Query(0xA0000000u + physicalAddress, i) && i.state == mem::kFree && c->Query(0xC0000000u + physicalAddress, i) &&
+                      i.state == mem::kFree))
+                    return false;
+                for (uint32_t f = 0; f < 0x10000; f += 0x1000)
+                    if (!(e->Query(0xE0000000u + physicalAddress + f, i) && i.state == mem::kFree))
+                        return false;
+                return true;
+            };
+            auto model = [&](uint32_t size, uint32_t align, bool topDown) -> uint32_t {
+                const uint32_t pages = 0x20000000u / 0x10000, count = size / 0x10000, step = align / 0x10000;
+                for (uint32_t k = 0; k <= (pages - count) / step; k++)
+                {
+                    const uint32_t first = topDown ? ((pages - count) / step - k) * step : k * step;
+                    bool ok = true;
+                    for (uint32_t i = first; ok && i < first + count; i++)
+                        ok = usable(i * 0x10000);
+                    if (ok)
+                        return 0xA0000000u + first * 0x10000;
+                }
+                return 0;
+            };
+            const struct { uint32_t size, align; bool topDown; } cases[] = {
+                {0x10000, 0x10000, true}, {0x100000, 0x100000, true}, {0x100000, 0x100000, true}, {0x100000, 0x100000, false}, {0x10000, 0x10000, false}};
+            for (const auto& k : cases)
+            {
+                const uint32_t want = model(k.size, k.align, k.topDown);
+                const uint32_t got = a->Alloc(k.size, k.align, mem::kReserve | mem::kCommit, page::kReadWrite, k.topDown);
+                if (want == 0 || got != want)
+                {
+                    std::fprintf(stderr, "[test] Heap::Alloc size %X align %X topDown %d: model %08X, Alloc %08X (held %08X)\n", k.size, k.align, int(k.topDown), want, got, held);
+                    _exit(3);
+                }
+                const uint32_t lo = got - 0xA0000000u, hi = lo + k.size, heldLo = held - 0xC0000000u;
+                if (lo < heldLo + 0x1000000u && heldLo < hi)
+                    _exit(4);  // CONTROL: an answer on the 16 MB block's frames
+            }
+            // The 4 KB view (FM4's streaming allocations, top-down): 0xE0000000 + x is physical x + 0x1000 (Xenia's 4 KB physical heap);
+            // a page is usable when free here and in the 64 KB and 16 MB views at that physical address.
+            auto usable4 = [&](uint32_t index) {
+                RegionInfo i{};
+                const uint32_t physicalAddress = index * 0x1000 + 0x1000;
+                return e->Query(0xE0000000u + index * 0x1000, i) && i.state == mem::kFree && a->Query(0xA0000000u + physicalAddress, i) &&
+                       i.state == mem::kFree && c->Query(0xC0000000u + physicalAddress, i) && i.state == mem::kFree;
+            };
+            auto model4 = [&](uint32_t size, bool topDown) -> uint32_t {
+                const uint32_t pages = 0x1FD00000u / 0x1000, count = size / 0x1000;
+                for (uint32_t k = 0; k <= pages - count; k++)
+                {
+                    const uint32_t first = topDown ? pages - count - k : k;
+                    bool ok = true;
+                    for (uint32_t i = first; ok && i < first + count; i++)
+                        ok = usable4(i);
+                    if (ok)
+                        return 0xE0000000u + first * 0x1000;
+                }
+                return 0;
+            };
+            for (const auto& k : {std::pair<uint32_t, bool>{0x1000, true}, {0x4000, true}, {0x10000, true}, {0x1000, false}})
+            {
+                const uint32_t want = model4(k.first, k.second);
+                const uint32_t got = e->Alloc(k.first, 0x1000, mem::kReserve | mem::kCommit, page::kReadWrite, k.second);
+                if (want == 0 || got != want)
+                {
+                    std::fprintf(stderr, "[test] Heap::Alloc 4 KB view size %X topDown %d: model %08X, Alloc %08X\n", k.first, int(k.second), want, got);
+                    _exit(5);
+                }
+            }
+            _exit(0);
+        });
+        if (child != 0)
+            std::printf("  (Heap::Alloc child exit %d)\n", child);
+        Expect(child == 0, "Heap::Alloc: 64 KB and 1 MB blocks, top-down and bottom-up, equal a brute-force model of the rule (free here and "
+                           "in the other physical views), and 4 KB-view blocks (4, 16, 64 KB) likewise; none on the 16 MB view's frames");
     }
     {
         const uint32_t block = physical(0, 0x10000, mem::kLargePages | page::kReadWrite, 0, 0xFFFFFFFF, 0);
@@ -4893,7 +5616,7 @@ int main(int, char** argv)
             bool run = true;
             for (uint32_t i = 0; i < 40; i++)
                 run = run && ReadRegister(base, 0x4100 + i) == 0xA0000000u + i;
-            const bool sides = be32(page + 0x20) == 0xBEEF && ReadRegister(base, 0x579) == 4 && ReadRegister(base, reg::kCoherStatusHost) == 0x80000000u &&
+            const bool sides = be32(page + 0x20) == 0xBEEF && ReadRegister(base, 0x579) == 4 && ReadRegister(base, reg::kCoherStatusHost) == (1u << 31) &&
                                ReadRegister(base, 0xA30) == 5 && ReadRegister(base, 0xA32) == 6;
             const bool constantsOk = ReadRegister(base, 0x4150) == 7 && ReadRegister(base, 0x4151) == 8 && ReadRegister(base, 0x4152) == 9 &&
                                      ReadRegister(base, 0x2100) == 0x51 && ReadRegister(base, 0x2101) == 0x52;

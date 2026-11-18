@@ -54,3 +54,392 @@ stop = 0x826403E8
 # the same prologue and lookup, then bl 0x824a8658 (the stop); blr
 stop_bytes = 144
 stop_sha256 = "9345906d6c6d8615cf33a673bd306f450f8f0cd1ff6704c314a151220734a108"
+
+# The Pause menu's Keyboard Controls row (a visible Keyboard Controls item in FM4's in-game
+# Pause menu). The single-player Pause menu is ForzaUI::CPauseMenu (RTTI .?AVCPauseMenu@ForzaUI@@ at 0x82D6BFB4, vtable 0x82040D94,
+# constructor sub_8259A1A8, scene "925_PAUSE_MENU" through the scene table sub_824E2790). Its row builder sub_825A2FF0 (called once
+# from vtable slot 5 sub_825A86A8) adds each row to COMPONENT_OPTION_LIST (this+356, bound by slot 3 sub_825ACCA8) with
+# `lwz r11,112(list vtable); r4 = row id; r5 = &text; r6 = 1; bctrl`, the text from sub_822B1AE8 (table "PauseMenu") copied by
+# sub_82971220. Row ids 0..8 (Resume, Tune Car, Restart, Photo, Audio, HUD, Head Tracking, Mulligan, Quit Race / End Challenge);
+# the scene's list has 11 slots (SPLASH_MENU_BUTTON..11). Its listener sub_825BA888 (vtable slot 0), on event 2, reads the chosen
+# row id through the list's vtable +132 (r4 = r6) and dispatches 0..8 (`cmplwi r3,8; bgt`); any other id only reaches the tail
+# (HIDE_SCREEN_INFO once, the id stored at sub_82516590()+2172, where the builder restores the focus). The label is built as the game
+# builds user strings: sub_82368BA0(out, UTF-16BE text, -1) = new(16) + CUserString (sub_822CC4B8, the text copied). The builder
+# ends by refreshing the list (`lwz r11,356(r31); addi r3,r11,108; ... lwz r11,40(r11); bctrl` at 825A3564): a row added after it
+# is not shown (run 2026-11-15: seven rows, no Keyboard Controls). So row 9 goes in when the builder asks sub_8259E780 whether
+# Quit Race goes at the bottom (`mr r3,r31; bl 0x8259e780` at 825A348C, return address 825A3490, r3 = the CPauseMenu), before
+# Quit Race and the refresh; sub_8259E780's other callers (825B1258, 825B9348, 825B9448) are unchanged. Choosing the row opens the
+# in-game Keyboard Controls (kernel/controls_screen.h) and returns to the menu. Static reading (disassembly,
+# the menu's code and scene); verified in a run (2026-11-15).
+[[hook]]
+name = "pause menu: Keyboard Controls row"
+kind = "menu_row_append"
+function = 0x8259E780
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+# mflr; ...; mr r31,r3; bl 0x82516590; bl 0x824b0b08; ...; li r3,0; ...; blr: whether Quit Race / End Challenge goes at the top
+bytes = 104
+sha256 = "11ee11124101f1b8a0bfcb1e8caf721924f3d07ca8284ed0c672a8da71dc5e01"
+caller = 0x825A3490
+gate = "live"
+label = "KEYBOARD CONTROLS"
+row = 9
+list_offset = 356
+add_slot = 112
+string_new = 0x82368BA0
+string_new_bytes = 84
+string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c94c36"
+string_copy = 0x82971220
+string_copy_bytes = 96
+string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
+
+[[hook]]
+name = "pause menu: Keyboard Controls chosen"
+kind = "menu_row_action"
+function = 0x825BA888
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 828
+sha256 = "27b95db369851cc178a1ef0db46b612a50a2a05b6e73514638de6c6be83a7aaa"
+row = 9
+list_offset = 356
+chosen_slot = 132
+gate = "live"
+handler = "OpenKeyboardControls"
+# lis r11,-32036; lwz r11,14056(r11); addi r3,r11,16; blr: the object whose +2172 holds the row to focus
+focus = 0x82516590
+focus_bytes = 16
+focus_sha256 = "cfc3b13d36f91a0774d0be4669f0acba5a464cbae2dd6d02bcaf281e8555e4f6"
+focus_offset = 2172
+
+# The KEYBOARD CONTROLS submenu (an in-game submenu styled and navigated like FM4's Audio and HUD menus;
+# runtime/game/keyboard_screen.cpp). It is shown in the option screen the Pause menu opens for HUD: screen id 59 -> factory
+# 0x824B3960 -> ForzaUI::CHudOptions (RTTI; 412 bytes, constructor sub_824B0008, vtable 0x8202507C), scene 300_I_OPT_ASSISTS_DIFFICULTY
+# (an ANIMATED_SCROLLING_LIST of 12 SPINNER slots and a SCROLL_BAR), through the scene table sub_824E2790 (create sub_824B8EE0:
+# factory at table+4+8*id). The Pause menu opens it with `bl 0x822b99b8 (the manager); li r5,59; lwz r4,276(this); li r6,0;
+# li r7,-1; lwz r11,64(vtable); bctrl` (825BAB60/825BAB28), then its tail (825BAB8C) hides the standings once (byte this+380,
+# sub_822B1DC8(this, *(0x82DDE980)) "HIDE_SCREEN_INFO"). The screen's slot 3 sub_8252D340 binds COMPONENT_LIST_SPINNER (+400),
+# TEXT_FOCUSED_DESCRIPTION (+352), TEXT_SCREEN_NAME (+376), builds a CDataItemCollection (+404; new(40), sub_824C9DF0) of
+# CDataSrcDataItem rows (new(28), vtable 0x82027484; +4 source, +12 row, +16 DisplayName and +20 Description through sub_823B3780),
+# their values from CDynamicListDataSource (new(40), sub_82671AC8(src, 2); sub_82672C40(src, v, &label, 0, v, f1 = -1.0, r9 1)),
+# each added with sub_82677DD0(collection+24, &row) and set with row vtable +48 (row, value, 0), then binds the list: list+108 vtable
+# +52 ("DisplayName", 0x8200B0AC) and +0 (collection); its reset redraws with list+108 vtable +40 (sub_82537BC8). Slot 0
+# sub_825174C0 (this, type, sender, row): type 1 from list+8 = focus (description shown), from another sender = a value changed
+# (byte +408 set). Slot 9 sub_82538618 (this, input): this vtable +172 (this, input, codes, n) matches 66 A, 69 B, 80/83 (pages),
+# 129 Y (HUD's reset); B with +408 clear goes to the base screen's Back sub_82529F30 (closes, back to the opener). Slot 4 sub_8251E9E0
+# frees each row's source and row, then the collection. Static reading (2026-11-15).
+[[hook]]
+name = "option screen: KEYBOARD CONTROLS rows"
+kind = "delegate"
+function = 0x8252D340
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 1308
+sha256 = "5eeded07902297a79e01f44316d8fdf68873cd6452ea1dbaf0eb54a52ad85671"
+handler = "KeyboardHudBind"
+
+[[hook]]
+name = "option screen: KEYBOARD CONTROLS title"
+kind = "delegate"
+function = 0x8251E6F0
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 752
+sha256 = "70ade3acde0bab8ef69b5c41972b7bb250a92e24c54abc2a717032926cf4047e"
+handler = "KeyboardHudTitle"
+
+[[hook]]
+name = "option screen: KEYBOARD CONTROLS list events"
+kind = "delegate"
+function = 0x825174C0
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 404
+sha256 = "a8745c6fc9616a1d8a0570250a54375dc7d951827cfc72bca1ef52e7fd0d277d"
+handler = "KeyboardHudList"
+
+[[hook]]
+name = "option screen: KEYBOARD CONTROLS input"
+kind = "delegate"
+function = 0x82538618
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 604
+sha256 = "f19280b789ca895290a41b948fb69e2ac5830db597990572931e7769efc7852c"
+handler = "KeyboardHudInput"
+
+[[hook]]
+name = "option screen: KEYBOARD CONTROLS closing"
+kind = "delegate"
+function = 0x8251E9E0
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 176
+sha256 = "bde08cdb2aadf6e351c4442ef74d0e9e119d96e4d22b3be87d43b253b88629ed"
+handler = "KeyboardHudTeardown"
+
+[[symbol]]
+name = "kScreenManager"
+address = 0x822B99B8
+bytes = 12
+sha256 = "ffe1003d7728a87fb2c67bc6ede7df61e0854fd85af2b98c709390561522bce7"
+[[symbol]]
+name = "kNew"
+address = 0x823E4FF8
+bytes = 4
+sha256 = "d65508530d13923d0e3b04b900efb3bdff0ed605ded463169fedb3518e2769e3"
+[[symbol]]
+name = "kCollectionNew"
+address = 0x824C9DF0
+bytes = 80
+sha256 = "71f92ccc15ae90624b59b2a34430058ff8c0b6a4679c9793aba297cb26358270"
+[[symbol]]
+name = "kCollectionAdd"
+address = 0x82677DD0
+bytes = 212
+sha256 = "d6903dc6fed34893614a877dbe1091ee7816f8e274e56f46741e9057b6d30591"
+[[symbol]]
+name = "kListSourceNew"
+address = 0x82671AC8
+bytes = 104
+sha256 = "076948a11ad5934e1d150fe2bd9227f437f374e2d5efa519aabb32232634ce65"
+[[symbol]]
+name = "kListSourceAdd"
+address = 0x82672C40
+bytes = 176
+sha256 = "01f81661b3bae136be706c23dd9eebf2a86aeaa9e6c7a8ac8253aaf22b97019b"
+[[symbol]]
+name = "kStringAssign"
+address = 0x823B3780
+bytes = 116
+sha256 = "9ca6f885a2dca0b73ebe88aba46707af56d623676517657ac86608204f979db7"
+[[symbol]]
+name = "kUserString"
+address = 0x82368BA0
+bytes = 84
+sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c94c36"
+[[symbol]]
+name = "kStringCopy"
+address = 0x82971220
+bytes = 96
+sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
+[[symbol]]
+name = "kSetText"
+address = 0x82360DD0
+bytes = 80
+sha256 = "f4d58fc821eedec529b5eba6aaec6744a71610ff953725e6d8a1c2ad27075640"
+[[symbol]]
+name = "kFireSceneEvent"
+address = 0x822B1DC8
+bytes = 60
+sha256 = "1f72da1564d01289b62f418794882281b998f905ece7227d95396e6d76e90ee2"
+[[symbol]]
+name = "kHudTeardown"
+address = 0x8251E9E0
+bytes = 176
+sha256 = "bde08cdb2aadf6e351c4442ef74d0e9e119d96e4d22b3be87d43b253b88629ed"
+
+[[value]]
+name = "kHudScreenId"
+value = 59
+[[value]]
+name = "kScreenOwner"
+value = 276
+[[value]]
+name = "kManagerOpen"
+value = 64
+[[value]]
+name = "kHudList"
+value = 400
+[[value]]
+name = "kHudCollection"
+value = 404
+[[value]]
+name = "kHudChanged"
+value = 408
+[[value]]
+name = "kHudDescription"
+value = 352
+[[value]]
+name = "kHudScreenName"
+value = 376
+[[value]]
+name = "kListBinding"
+value = 108
+[[value]]
+name = "kBindingField"
+value = 52
+[[value]]
+name = "kBindingCollection"
+value = 0
+[[value]]
+name = "kBindingRefresh"
+value = 40
+[[value]]
+name = "kListSender"
+value = 8
+[[value]]
+name = "kItemSetValue"
+value = 48
+[[value]]
+name = "kItemVtable"
+value = 0x82027484
+[[value]]
+name = "kItemSize"
+value = 28
+[[value]]
+name = "kCollectionSize"
+value = 40
+[[value]]
+name = "kCollectionItems"
+value = 24
+[[value]]
+name = "kListSourceSize"
+value = 40
+[[value]]
+name = "kDisplayNameField"
+value = 0x8200B0AC
+[[value]]
+name = "kScreenMatchInput"
+value = 172
+[[value]]
+name = "kInputA"
+value = 66
+[[value]]
+name = "kInputB"
+value = 69
+[[value]]
+name = "kInputX"
+value = 126
+[[value]]
+name = "kInputY"
+value = 129
+[[value]]
+name = "kPauseInfoHidden"
+value = 380
+[[value]]
+name = "kHideScreenInfoEvent"
+value = 0x82DDE980
+
+# The Pre-Race screen's KEYBOARD CONTROLS row (the pre-race screen where players adjust Audio and HUD).
+# ForzaUI::CPreRace (RTTI .?AVCPreRace@ForzaUI@@ 0x82D6D36C, vtable 0x820438FC, constructor sub_825BF750, scene 4_C_INI_PRERACE: MENU,
+# an ANIMATED_SCROLLING_LIST of 11 BUTTON_TEXT slots). Its row builder (vtable slot 5, sub_825CA068) adds rows to the list at this+356
+# with list vtable +112 (list, id, &text, 1), ids 0..9 (Assists 0, Audio 1, HUD 3, Quit 9, ...; at most 10 rows), then restores the focus
+# (sub_82516590()+2176) and refreshes (list+108 vtable +40, 825CA93C). Row 10 goes in when the builder asks sub_82514238 whether Audio
+# and HUD are offered (`mr r3,r30; bl 0x82514238` at 825CA6F4, return address 825CA6F8, r3 = the CPreRace), so it sits before Audio.
+# Its listener (vtable slot 0, sub_825CAAF0), on event 2, reads the chosen id through list vtable +132 (r4 = r6) and dispatches 0..9
+# (`cmplwi r3,9; bgt`; 1 opens screen 13, 3 screen 59 as the Pause menu does); a larger id only reaches the tail (byte this+448 = 1,
+# HIDE_SCREEN_INFO *(0x82DDEBC8) through sub_822B1DC8, the id stored at sub_82516590()+2176). Static reading
+# (2026-11-15).
+[[hook]]
+name = "pre-race: Keyboard Controls row"
+kind = "menu_row_append"
+function = 0x82514238
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 36
+sha256 = "b36270c05cf1c82e9388518c67acc2f43d19babcac2bdece01ac5004c81e3e1b"
+caller = 0x825CA6F8
+gate = "live"
+label = "KEYBOARD CONTROLS"
+row = 10
+list_offset = 356
+add_slot = 112
+string_new = 0x82368BA0
+string_new_bytes = 84
+string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c94c36"
+string_copy = 0x82971220
+string_copy_bytes = 96
+string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
+
+[[hook]]
+name = "pre-race: Keyboard Controls chosen"
+kind = "menu_row_action"
+function = 0x825CAAF0
+flag = "FM4_PAUSE_KEYBOARD_CONTROLS"
+bytes = 832
+sha256 = "5b65a3d8697194e0c8faf6f91a98b762662f9b2e1b4985ac83d1e426edfd3c24"
+row = 10
+list_offset = 356
+chosen_slot = 132
+gate = "live"
+handler = "OpenKeyboardControlsPreRace"
+focus = 0x82516590
+focus_bytes = 16
+focus_sha256 = "cfc3b13d36f91a0774d0be4669f0acba5a464cbae2dd6d02bcaf281e8555e4f6"
+focus_offset = 2176
+
+# The option screen's help bar (KEYBOARD CONTROLS shows A SET KEY, X DEFAULT, Y CLEAR, B BACK): the screen's slot 5 sub_8251E6F0 gets it
+# with sub_824B54D8(screen, sub_8298DE68("COMPONENT_HELP_BUTTON_BAR" 0x8202AFF8)) and adds buttons with sub_82639C48(bar, slot, &text)
+# (slot = the glyph: table 0x82D6EDC0[*(bar+344)*11 + slot], 0 A, 1 B, 2 X, 3 Y), text as for rows; sub_82638038(bar, slot) removes one;
+# then bar+108 vtable +40 redraws.
+[[symbol]]
+name = "kNameHash"
+address = 0x8298DE68
+bytes = 72
+sha256 = "2945c4a9d9a3e06e9a603a0d84bd4a2a5bb42dd4aaf04cd71979296689d01dec"
+[[symbol]]
+name = "kComponent"
+address = 0x824B54D8
+bytes = 84
+sha256 = "d1aa33d70a23ed7fd5de4f1e9d29f4ac399a5768a1490ffd1ecaaef09d5c2d54"
+[[symbol]]
+name = "kHelpAdd"
+address = 0x82639C48
+bytes = 52
+sha256 = "012f10154a2bf069c853f9c66156b1b33a18771107cc4fecaa8f94b921219e41"
+[[symbol]]
+name = "kHelpRemove"
+address = 0x82638038
+bytes = 80
+sha256 = "9958317ea8a835a5305d0c54cc122d078cc63db9a2aec23a59cd0d217afdd4c0"
+[[value]]
+name = "kPreRaceInfoHidden"
+value = 448
+[[value]]
+name = "kPreRaceHideScreenInfoEvent"
+value = 0x82DDEBC8
+[[value]]
+name = "kHelpBarName"
+value = 0x8202AFF8
+
+# The near road missing after a race start (seen in playtests of Bernese Alps Quick Race). When the camera's area changes, the game queues the
+# old area's resources for release on the main thread (unload requests, a few per frame through the budgeted pump sub_822C6C18) and
+# starts the new area's loads on its loader threads. OBSERVED (scripted offscreen runs, 2026-11-17): when the
+# switch lands in the frame the race scene starts, the main thread then spends 400-800 ms in the first race frame, the loader's
+# allocations fill the 119.5 MB track resource heap (the heap object at 0x82D9B8DC) before one texture is released, the heap returns
+# null about 950 times (model buffers through sub_8286FBE0, textures through sub_82958D70, loader data), and the game drops that
+# data without a retry: zero near-road draws from then on. Causality both ways (a diagnostic build): holding the main thread's
+# pump 800 ms made 4 of 4 starts bad, letting it finish the queued releases made 10 of 10 good. In good starts this heap returns
+# null 0 times. Other heaps return null routinely (thousands of times a run, with fallbacks) and are left alone.
+# sub_82AA34D0(r3 = heap, r4 = size, r5 = alignment, r6 = tag) is the heap class's allocation entry (vtable 0x820036E4 slot +72):
+# a small-block cache first (sub_82AA0AB8), then sub_82AA2FA8; it returns the block or 0 and changes nothing on 0. The hook retries
+# a null from the track resource heap while requests are queued for other threads (runtime/game/release_wait.cpp).
+[[hook]]
+name = "resource heap: allocate"
+kind = "delegate"
+function = 0x82AA34D0
+flag = "FM4_LOAD_WAITS_RELEASES"
+bytes = 96
+sha256 = "0fab4c12250149d033e8382084d81e75a80e5d3d606388c9cec603564ff9b163"
+handler = "HeapAllocateWaitsForReleases"
+
+# The request queues: sub_82A74870 (the pump for the calling thread) finds the thread id (sub_82335CE0: lwz r11,256(r13);
+# lwz r3,332(r11)) among 38 words at manager + 1200 and pumps the queue at manager + (index + 37) * 16; the worker loops
+# (sub_82A748F0 and its two siblings) load the manager from the word at 0x82DC3748 (lis r11,-32036; lwz r31,14152(r11)).
+[[value]]
+name = "kResourceHeap"
+value = 0x82D9B8DC
+[[value]]
+name = "kResourceManagerPointer"
+value = 0x82DC3748
+[[value]]
+name = "kRequestThreads"
+value = 38
+[[value]]
+name = "kRequestThreadTable"
+value = 1200
+[[value]]
+name = "kRequestQueueFirst"
+value = 37
+[[value]]
+name = "kRequestQueueStride"
+value = 16
+[[value]]
+name = "kCurrentThread"
+value = 256
+[[value]]
+name = "kThreadId"
+value = 332

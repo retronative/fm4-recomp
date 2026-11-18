@@ -5,8 +5,8 @@
 # Builds the local macOS alpha package: dist/fm4-recomp-macos-<version>/ with the current build of
 # fm4recomp, the tools a player needs to turn their own Disc 1 ISO into the game data (extract-xiso, xexsurvey, gdfx.py), the
 # negative-control program of the validation layer, setup.sh, play.sh (the GPU safeguards of scripts/gpu_run.sh, window mode),
-# the README and the logo. No game file, decrypted image or translation output is copied. LOCAL ONLY: the binary contains code
-# translated from the game, so it is never published (README "Before publishing").
+# the README and the logo. No game file, decrypted image or translation output is copied. LOCAL ONLY: this package
+# does not carry the release kit's licence folder or its separate LGPL libraries (scripts/release/bundle_kit.sh); a release is the DMG.
 #   scripts/package_alpha.sh <version> <alpha notes .md>
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

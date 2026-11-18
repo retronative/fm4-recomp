@@ -309,6 +309,17 @@ uint32_t DiscAttributes(const DiscEntry& entry)
     return entry.attributes;
 }
 
+uint64_t FileTimeFromUnix(int64_t seconds, int64_t nanoseconds)
+{
+    return uint64_t(seconds * 10000000 + nanoseconds / 100) + kDiscTimeStamp;  // kDiscTimeStamp is 1970-01-01 as a FILETIME
+}
+
+void DiscTimes(const DiscEntry& entry, uint64_t (&out)[4])
+{
+    for (int i = 0; i < 4; i++)
+        out[i] = entry.writable && entry.times[i] != 0 ? entry.times[i] : kDiscTimeStamp;
+}
+
 uint64_t DiscAllocationSize(const DiscEntry& entry)
 {
     return (entry.size + kDiscSectorSize - 1) / kDiscSectorSize * kDiscSectorSize;
@@ -341,7 +352,22 @@ DiscEntry PackageEntry(const std::shared_ptr<const stfs::Package>& package, int3
     return entry;
 }
 
-// A path inside a writable root's host directory: each part matched in any case; a symlink stops (9).
+// FM4 Recomp: a writable entry's host times (DiscEntry::times) from its lstat (macOS: st_birthtimespec is the creation time).
+void SetHostTimes(DiscEntry& entry, const struct stat& info)
+{
+    entry.times[0] = FileTimeFromUnix(info.st_birthtimespec.tv_sec, info.st_birthtimespec.tv_nsec);
+    entry.times[1] = FileTimeFromUnix(info.st_atimespec.tv_sec, info.st_atimespec.tv_nsec);
+    entry.times[2] = FileTimeFromUnix(info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec);
+    entry.times[3] = FileTimeFromUnix(info.st_ctimespec.tv_sec, info.st_ctimespec.tv_nsec);
+}
+void SetHostTimes(DiscEntry& entry)
+{
+    struct stat info;
+    if (lstat(entry.host.c_str(), &info) == 0)
+        SetHostTimes(entry, info);
+}
+
+// A path inside a writable root's host directory: each part matched in any case (names as GuestNameOf gives them); a symlink stops (9).
 Resolved ResolveDirectoryPath(const std::string& hostDirectory, std::string_view rest, DiscEntry& entry)
 {
     std::string host = hostDirectory;
@@ -361,17 +387,13 @@ Resolved ResolveDirectoryPath(const std::string& hostDirectory, std::string_view
         if (listing == nullptr)
             Stop(StopCode::Setup, "user data: cannot list %s", host.c_str());
         while (const dirent* d = readdir(listing))
-            if (EqualCase(d->d_name, part) && std::string_view(d->d_name) != "." && std::string_view(d->d_name) != "..")
+            if (!HostOnlyName(d->d_name) && EqualCase(GuestNameOf(d->d_name), part))
                 match = d->d_name, matches++;
         closedir(listing);
         if (matches == 0)
         {
             if (k + 1 == parts.size())
-            {
-                if (part.find(':') != std::string_view::npos)
-                    Stop(StopCode::Unimplemented, "user data: the name %.*s (with ':') is not created on the host", int(part.size()), part.data());
-                entry.host = host + "/" + std::string(part);
-            }
+                entry.host = host + "/" + HostNameOf(part);
             return Resolved::NotFound;
         }
         if (matches > 1)
@@ -389,6 +411,7 @@ Resolved ResolveDirectoryPath(const std::string& hostDirectory, std::string_view
     entry.size = size;
     entry.attributes = directory ? file_attribute::kDirectory : 0x80;
     entry.writable = true;
+    SetHostTimes(entry);
     return Resolved::Found;
 }
 
@@ -564,7 +587,35 @@ std::vector<DirectoryChild> ListDirectory(const DiscEntry& directory)
     if (!directory.directory)
         return children;
     if (directory.writable)
-        Stop(StopCode::Unimplemented, "listing the writable content directory %s is not modelled yet", directory.host.c_str());
+    {
+        // A writable root's host directory (saved content, e.g. FM4's photos): its children as ResolveDirectoryPath describes each
+        // (Xenia host_path_entry.cc:30-45: a directory, else kFileAttributeNormal), in byte order of their names (Xenia lists the
+        // host directory's own order, which macOS does not fix); a symlink or another kind stops (9) as when resolving one.
+        DIR* listing = opendir(directory.host.c_str());
+        if (listing == nullptr)
+            Stop(StopCode::Setup, "user data: cannot list %s", directory.host.c_str());
+        std::vector<std::pair<std::string, std::string>> names;  // (guest name, host name), in byte order of the guest names
+        while (const dirent* d = readdir(listing))
+            if (!HostOnlyName(d->d_name))
+                names.emplace_back(GuestNameOf(d->d_name), d->d_name);
+        closedir(listing);
+        std::sort(names.begin(), names.end());
+        for (const auto& [name, hostName] : names)
+        {
+            DiscEntry e;
+            e.writable = true;
+            e.host = directory.host + "/" + hostName;
+            struct stat info;
+            if (lstat(e.host.c_str(), &info) != 0 || S_ISLNK(info.st_mode) || !(S_ISDIR(info.st_mode) || S_ISREG(info.st_mode)))
+                Stop(StopCode::Setup, "user data: %s is a symlink, unreadable or not a file or directory", e.host.c_str());
+            e.directory = S_ISDIR(info.st_mode);
+            e.size = e.directory ? 0 : uint64_t(info.st_size);
+            e.attributes = e.directory ? file_attribute::kDirectory : 0x80;
+            SetHostTimes(e, info);
+            children.push_back({name, e});
+        }
+        return children;
+    }
     if (directory.package)
     {
         const auto& files = directory.package->Files();
@@ -621,8 +672,16 @@ bool TruncateHostFile(const std::string& host)
 void RemoveHostFile(const DiscEntry& entry)
 {
     struct stat info;
-    if (!entry.writable || entry.directory)
-        Stop(StopCode::Unimplemented, "removing %s: not a file in a writable content root", entry.host.c_str());
+    if (!entry.writable)
+        Stop(StopCode::Unimplemented, "removing %s: not in a writable content root", entry.host.c_str());
+    if (entry.directory)  // FM4 Recomp: an empty saved-content directory; one still holding files is left as it is (logged)
+    {
+        if (lstat(entry.host.c_str(), &info) != 0 || !S_ISDIR(info.st_mode))
+            Stop(StopCode::Setup, "user data: removing %s failed (gone or not a directory)", entry.host.c_str());
+        if (rmdir(entry.host.c_str()) != 0)
+            std::fprintf(stderr, "[fs] %s: delete-on-close of a directory that still holds files: left in place\n", entry.host.c_str());
+        return;
+    }
     if (lstat(entry.host.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || unlink(entry.host.c_str()) != 0)
         Stop(StopCode::Setup, "user data: removing %s failed (gone, not a regular file, or refused)", entry.host.c_str());
 }
@@ -687,7 +746,7 @@ uint32_t OpenDiscFile(uint8_t* base, const DiscEntry& entry, bool synchronous)
 {
     // The body is a waitable object, as Xenia's XFile (xfile.cc:27-32 at 67f16c4): an auto-reset event, not signalled, that
     // each completed NtReadFile and NtWriteFile sets (FM4's ReadFile without an OVERLAPPED waits on the file handle after
-    // PENDING, sub_8275A968; a Disc 2 install waited there forever on a body that was no event).
+    // PENDING, the game's wait loop; a Disc 2 install waited there forever on a body that was no event).
     const uint32_t body = ArenaAlloc(base, 16);
     std::memset(base + body, 0, 16), base[body] = dispatch::kSynchronizationEvent;  // signal state (+4) 0
     {
@@ -756,6 +815,39 @@ uint32_t ReadDiscFile(const DiscEntry& entry, uint64_t offset, uint8_t* buffer, 
     }
     close(fd);
     return done;
+}
+
+std::string HostNameOf(std::string_view guest)
+{
+    std::string out;
+    for (const char c : guest)
+        out += c == '%' ? std::string("%25") : c == ':' ? std::string("%3A") : std::string(1, c);
+    return out;
+}
+
+bool HostOnlyName(std::string_view host)
+{
+    return host == "." || host == ".." || host.substr(0, 2) == "._" || host == ".DS_Store";
+}
+
+std::string GuestNameOf(std::string_view host)
+{
+    std::string out;
+    for (size_t i = 0; i < host.size(); i++)
+    {
+        if (host[i] == '%' && i + 2 < host.size())
+        {
+            const std::string_view code = host.substr(i + 1, 2);
+            if (code == "25" || code == "3A" || code == "3a")
+            {
+                out += code == "25" ? '%' : ':';
+                i += 2;
+                continue;
+            }
+        }
+        out += host[i];
+    }
+    return out;
 }
 
 }  // namespace runtime

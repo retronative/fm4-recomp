@@ -382,6 +382,17 @@ void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes])
     std::memcpy(out + kConstantsLoopOffset, d.loopConstants, sizeof d.loopConstants);
 }
 
+bool SameStageConstants(const DrawState& d, bool pixel, uint32_t lastWords, const std::vector<uint32_t>& lastAlu, const uint32_t lastBools[8],
+                        const uint32_t lastLoops[32])
+{
+    const uint32_t words = pixel ? d.psConstantWords : d.vsConstantWords;
+    if (d.aluConstants.size() < 2048 || lastAlu.size() < 2048 || words != lastWords || words > 1024)
+        return false;
+    const size_t first = pixel ? 1024 : 0;
+    return std::memcmp(d.aluConstants.data() + first, lastAlu.data() + first, size_t(words) * 4) == 0 &&
+           std::memcmp(d.boolConstants, lastBools, sizeof d.boolConstants) == 0 && std::memcmp(d.loopConstants, lastLoops, sizeof d.loopConstants) == 0;
+}
+
 bool BoundTargetHeight(const DrawState& d, const shader::ShaderTranslation& vs, const uint32_t* window, size_t windowDwords, uint32_t endian,
                        const HostIndices& indices, uint32_t& height, std::string& note)
 {

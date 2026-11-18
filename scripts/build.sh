@@ -25,8 +25,17 @@ export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 export SDKROOT="$(xcrun --show-sdk-path)"
 # The oldest macOS the build runs on (the alpha targets macOS 26 on Apple silicon).
 export MACOSX_DEPLOYMENT_TARGET=26.0
+# The release build (FM4_RELEASE_FFMPEG=<a `shared` prefix of scripts/build_ffmpeg_xma.sh>): FFmpeg and the LZX decoder as
+# separate libraries (runtime/CMakeLists.txt, FM4_LGPL_SHARED). Without it, the development build (static tools/ffmpeg-xma).
+if [ -n "${FM4_RELEASE_FFMPEG:-}" ]; then
+  [ -f "$FM4_RELEASE_FFMPEG/lib/libavcodec.61.dylib" ] || { echo "build.sh: FM4_RELEASE_FFMPEG=$FM4_RELEASE_FFMPEG has no lib/libavcodec.61.dylib" >&2; exit 1; }
+  LGPL_SHARED=ON; FFMPEG_XMA="$(cd "$FM4_RELEASE_FFMPEG" && pwd)"
+else
+  LGPL_SHARED=OFF; FFMPEG_XMA="$ROOT/tools/ffmpeg-xma"
+fi
 {
   echo "date $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "LGPL parts: $([ $LGPL_SHARED = ON ] && echo "separate libraries, FFmpeg from $FFMPEG_XMA" || echo "linked in (development build)")"
   echo "SDKROOT $SDKROOT $(xcrun --show-sdk-version), deployment target $MACOSX_DEPLOYMENT_TARGET"
   "$LLVM/clang++" --version | head -1
   echo "cmake $(cmake --version | head -1)"
@@ -37,7 +46,8 @@ cat "$OUT/env.txt"
 : > "$OUT/tu.tsv"
 cmake -S "$ROOT" -B "$ROOT/build/native" -G Ninja -Wno-dev \
   -DCMAKE_CXX_COMPILER="$LLVM/clang++" -DCMAKE_OSX_SYSROOT="$SDKROOT" -DCMAKE_OSX_DEPLOYMENT_TARGET="$MACOSX_DEPLOYMENT_TARGET" \
-  -DCMAKE_CXX_COMPILER_LAUNCHER="$ROOT/scripts/measure_tu.sh;$OUT/tu.tsv" > "$OUT/configure.log"
+  -DCMAKE_CXX_COMPILER_LAUNCHER="$ROOT/scripts/measure_tu.sh;$OUT/tu.tsv" \
+  -DFM4_LGPL_SHARED="$LGPL_SHARED" -DFM4_FFMPEG_XMA="$FFMPEG_XMA" > "$OUT/configure.log"
 
 # Combined compiler RSS, sampled until the build ends.
 ( peak=0
@@ -61,6 +71,6 @@ peak=$(cat "$OUT/peak_combined_kib.txt" 2>/dev/null || echo 0)
   echo "peak_combined_compiler_rss_mib $((peak / 1024))"
   awk -F'\t' 'NR > 0 {n++; t += $2; if ($3 > m) {m = $3; f = $1}} END {printf "compiles %d, cpu_seconds %.1f, max_tu_rss_mib %d (%s)\n", n, t, m / 1048576, f}' "$OUT/tu.tsv"
 } | tee "$OUT/summary.txt"
-find "$ROOT/build/native" -maxdepth 2 -type f \( -name '*.a' -o -perm -u+x -a ! -name '*.sh' \) ! -path '*/CMakeFiles/*' \
+find "$ROOT/build/native" -maxdepth 2 -type f \( -name '*.a' -o -name '*.dylib' -o -perm -u+x -a ! -name '*.sh' \) ! -path '*/CMakeFiles/*' \
   -exec shasum -a 256 {} + | sed "s|$ROOT/||" | tee "$OUT/artefacts.sha256"
 exit $status

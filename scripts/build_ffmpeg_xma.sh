@@ -2,16 +2,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 FM4 Recomp contributors
 #
-# FFmpeg for XMA audio: a minimal static libavcodec + libavutil with only the "xmaframes" decoder (and the WMA Pro
+# FFmpeg for XMA audio: a minimal libavcodec + libavutil with only the "xmaframes" decoder (and the WMA Pro
 # decoder it is built on), from a pinned source release with patches/ffmpeg/*.patch applied. Fail-closed on the
 # licence: the build must configure as LGPL (no GPL, no version 3, no nonfree part) and enable no other decoder.
 # Design after ReCarbon scripts/build_ffmpeg_xma.sh (GPL-3.0-or-later); FM4 Recomp changes: the
-# xmaframes decoder only (Xenia's frame-at-a-time decoder, patches/ffmpeg/0001), static libraries, the licence
-# and decoder checks, and build-info.txt.
+# xmaframes decoder only (Xenia's frame-at-a-time decoder, patches/ffmpeg/0001), the licence and decoder checks, and
+# build-info.txt. `static` is the development build's (tools/ffmpeg-xma, scripts/setup_tools.sh). `shared` is the release's,
+# as in ReCarbon: libavcodec.<major>.dylib and libavutil.<major>.dylib, named @rpath/<file> with header room for the
+# kit's rpath, so they stay separate files a user can replace (LGPL-2.1 section 6; THIRD_PARTY_NOTICES.md).
 #
-#   scripts/build_ffmpeg_xma.sh <ffmpeg-<version>.tar.xz> <install prefix> <C compiler>
+#   scripts/build_ffmpeg_xma.sh <ffmpeg-<version>.tar.xz> <install prefix> <C compiler> <static|shared>
+# <install prefix>: a folder of its own; its include/ and lib/ are replaced.
 set -euo pipefail
-[ $# -eq 3 ] || { echo "usage: scripts/build_ffmpeg_xma.sh <ffmpeg-<version>.tar.xz> <install prefix> <C compiler>" >&2; exit 2; }
+[ $# -eq 4 ] || { echo "usage: scripts/build_ffmpeg_xma.sh <ffmpeg-<version>.tar.xz> <install prefix> <C compiler> <static|shared>" >&2; exit 2; }
+case "$4" in
+  static) LINKAGE=(--enable-static --disable-shared) ;;
+  shared) LINKAGE=(--disable-static --enable-shared --install-name-dir=@rpath --extra-ldsoflags=-Wl,-headerpad_max_install_names) ;;
+  *) echo "build_ffmpeg_xma.sh: '$4' is not static or shared" >&2; exit 2 ;;
+esac
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARBALL="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 PREFIX="$2"
@@ -31,7 +39,7 @@ SDKROOT="$(xcrun --show-sdk-path)"
 ./configure --cc="$CC_BIN" --sysroot="$SDKROOT" --prefix=/ \
     --disable-everything --disable-programs --disable-doc --disable-debug --disable-network --disable-autodetect \
     --disable-avdevice --disable-avformat --disable-swscale --disable-swresample --disable-postproc --disable-avfilter \
-    --enable-decoder=xmaframes --enable-static --disable-shared --enable-pic > "$WORK/configure.log" \
+    --enable-decoder=xmaframes "${LINKAGE[@]}" --enable-pic > "$WORK/configure.log" \
   || { tail -5 "$WORK/configure.log"; tail -15 ffbuild/config.log; echo "build_ffmpeg_xma.sh: configure failed ($WORK)"; exit 1; } >&2
 # Licence and contents, from what configure decided (not from the options asked for).
 license="$(sed -n 's/^License: //p' "$WORK/configure.log")"
@@ -54,6 +62,7 @@ cp COPYING.LGPLv2.1 LICENSE.md "$PREFIX/"
   echo "license (configure): $license"
   grep -E '^#define CONFIG_(GPL|VERSION3|NONFREE) ' config.h
   echo "decoders: $decoders"
+  echo "libraries: $4"
   echo "configuration: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' config.h)"
 } > "$PREFIX/build-info.txt"
 cd "$ROOT"

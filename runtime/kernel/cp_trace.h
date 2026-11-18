@@ -15,6 +15,8 @@ namespace runtime::gpu {
 
 // ShaderHash: kernel/shader_hash.h (shared with runtime/video/shader_cache.h).
 bool TraceEnabled();
+// A `swap <n> vblank <v>` line when the command processor presents swap n (maps the draws between two lines to that capture).
+void TraceSwap(uint64_t swap);
 void TraceDraw(const uint8_t* base, uint64_t draw, uint32_t opcode, uint32_t vizQueryToken);
 // After TraceDraw, from the renderer (which knows the bound shaders): a `tex <slot> <6 dwords>` line for each slot in
 // `slotMask` (bit s = texture fetch constant s, registers 4800 + 6 * s) that TraceDraw did not already log (it logs

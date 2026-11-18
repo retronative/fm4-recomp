@@ -12,7 +12,7 @@ Thanks for your interest. FM4 Recomp is an unofficial fan project in early devel
   [SECURITY.md](SECURITY.md).
 - **No game files.** Never attach, commit or link game files, disc images, executables (original
   or decrypted), extracted packages, the recompiled C++ (`ppc/`), captures or traces of the game,
-  or a built `fm4recomp` binary or DMG, in issues, pull requests or commits. You need your own
+  or a `fm4recomp` binary or DMG you built yourself, in issues, pull requests or commits. You need your own
   legally obtained copy of *Forza Motorsport 4* to build and test FM4 Recomp.
 - **No online services.** Contributions that target Xbox network services or bypass security
   checks will not be accepted.

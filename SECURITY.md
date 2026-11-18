@@ -29,7 +29,7 @@ disclose it publicly.
 
 ## Supported versions
 
-FM4 Recomp has not made a release yet. Only the `main` branch is supported; fixes land there.
+Only the latest release and the `main` branch are supported; fixes land on `main`.
 
 ## Scope
 

@@ -105,7 +105,10 @@ enum class TransferKind
 // R16G16_UINT transfer view (X :1628-1653, :3545-3576, :3692-3711; observed: the 1x kD24FS8 key
 // 6082D0 into the 4x 16_16 key 1106B40). Storage 14 (32_FLOAT) stays colour <-> colour only.
 // FM4 Recomp (alpha, RT format 5): storage 5 (16_16_16_16, 64 bpp) is Color to and from every colour storage above and itself at
-// another sample count (MapTransferSource); depth <-> storage 5 is refused by name (not modelled yet).
+// another sample count (MapTransferSource); storage 5 -> depth is ColorToDepth (the half of the source sample, TransferWordOf64) and
+// depth -> storage 5 DepthToColor (FM4 Recomp, alpha, photo mode: two depth samples a 64 bpp sample, MapTransferSource's first and
+// second, each PackDepthStencilWord, joined by TransferTexelOf64; X :3005-3023, :3303-3333, :3352-3370), with the MSAA pairs above.
+// The other 64 bpp formats (16_16_16_16_FLOAT, 32_32_FLOAT) are refused by name.
 TransferKind ClassifyTransfer(edram::Key source, edram::Key dest, std::string& why);
 
 // FM4 Recomp (M7 GPU cost, FM4_HOST_MSAA_1X): the source bits of an EDRAM unit pipeline (edram_vk.cpp Pipeline's `sourceFlags`) for a
@@ -179,9 +182,12 @@ SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, e
 //     sample | 1 from a 4x source, x | 1 otherwise), else equal to `first`;
 //   - `half`: 64 -> 32, the half of the source sample that is the destination's word (X :2714-2717 the destination's horizontal
 //     sample at 4x, :2771-2774 its horizontal pixel otherwise; :3080-3102 the pick), else 0.
-// For two 32 bpp keys (or two 64 bpp keys) `first` is MapEdramTexel's former result, `second` == `first`, `half` 0. Cross-aspect
-// pairs with a 64 bpp side are refused (ClassifyTransfer). The GLSL XeSourceTexel with XE_SOURCE_64 / XE_DEST_64 (edram_vk.cpp
-// kTransferCommon) and kTransferColor64 are the same arithmetic.
+// For two 32 bpp keys (or two 64 bpp keys) `first` is MapEdramTexel's former result, `second` == `first`, `half` 0. A cross-aspect
+// pair with a 64 bpp side (a 64 bpp colour source into depth, a depth source into 64 bpp colour) takes the column swap after the
+// MSAA rule at the source's width (X :2912-2936: 20 pixels for a 4x depth source, 10 for a 4x 64 bpp colour one), before the tile
+// offset; `second` keeps `first`'s parity (the swap and tile widths are even). The GLSL XeSourceTexel with XE_SOURCE_64 / XE_DEST_64
+// (edram_vk.cpp kTransferCommon), kTransferColor64, kTransferColorToDepth (XE_SOURCE_64) and kTransferDepthToColor (XE_DEST_64) are
+// the same arithmetic.
 struct TransferSource
 {
     SourceTexel first, second;

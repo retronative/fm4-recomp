@@ -873,8 +873,54 @@ void TestSubsetMergeKey()
     CONTROL(passPart(SubsetMergeKeyDepthOnly(dk, 3)) == passPart(open), "a depth-only draw merged with another colour format is not compatible");
 }
 
+// FM4 Recomp (M7 CPU cost, FM4_CONSTANTS_PER_STAGE): SameStageConstants. The bytes a stage's shader reads from its block are the
+// first vsConstantWords / psConstantWords alu words (bytes 0 to 4 x words) and the bool / loop tail (4096-4255) (shader_glsl.h
+// kConstants*Offset, DrawState::vsConstantWords): a stage may be bound again exactly when those are equal. Values by hand.
+void TestStageConstants()
+{
+    DrawState last;
+    last.aluConstants.assign(2048, 0);
+    for (uint32_t i = 0; i < 2048; i++)
+        last.aluConstants[i] = 0x1000 + i;
+    last.vsConstantWords = 8, last.psConstantWords = 4;
+    last.boolConstants[0] = 0x5, last.loopConstants[31] = 0x40;
+    const auto same = [&](const DrawState& d, bool pixel) {
+        return SameStageConstants(d, pixel, pixel ? last.psConstantWords : last.vsConstantWords, last.aluConstants, last.boolConstants, last.loopConstants);
+    };
+    DrawState d = last;
+    Expect(same(d, false) && same(d, true), "per-stage constants: an identical draw reuses both stages");
+    d.aluConstants[1024 + 3] = 0;  // PS c0.w (read: the PS reads 4 words)
+    Expect(same(d, false) && !same(d, true), "per-stage constants: a PS word it reads differs: the VS block is reused, the PS block is filled");
+    d = last;
+    d.aluConstants[7] = 0;  // VS c1.w, the last word the VS reads
+    Expect(!same(d, false) && same(d, true), "per-stage constants: the VS's last read word differs: only the PS block is reused");
+    d = last;
+    d.aluConstants[8] = 0, d.aluConstants[1024 + 4] = 0;  // the first word past each stage's range (never read)
+    Expect(same(d, false) && same(d, true), "per-stage constants: words past the stage's range do not matter");
+    {
+        // The effect: FillConstants writes the same read bytes for both draws (0-31 for the VS, 4096-4255) when SameStageConstants holds.
+        uint8_t a[kConstantsBytes], b[kConstantsBytes];
+        FillConstants(last, false, a), FillConstants(d, false, b);
+        Expect(std::memcmp(a, b, 32) == 0 && std::memcmp(a + 4096, b + 4096, kConstantsBytes - 4096) == 0,
+               "per-stage constants: the VS block's read bytes are those of the previous draw");
+    }
+    d = last;
+    d.boolConstants[0] = 0x4;
+    Expect(!same(d, false) && !same(d, true), "per-stage constants: a bool dword is in both blocks' tails: neither is reused");
+    d = last;
+    d.loopConstants[31] = 0;
+    Expect(!same(d, false) && !same(d, true), "per-stage constants: a loop dword is in both tails: neither is reused");
+    d = last;
+    d.psConstantWords = 8;  // the PS now reads c1, which the previous block may hold stale
+    Expect(same(d, false) && !same(d, true), "per-stage constants: a different word count is never reused");
+    d = last;
+    d.aluConstants.clear();  // FillConstants zero-fills such a block
+    CONTROL(same(d, false) || same(d, true), "an alu vector without its 2048 words is never reused");
+}
+
 int main()
 {
+    TestStageConstants();
     TestSubsetMergeKey();
     TestKeys();
     TestVariants();

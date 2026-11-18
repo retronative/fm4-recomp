@@ -1526,8 +1526,9 @@ void TestK16_16_16_16()
     CHECK(ClassifyTransfer(f32, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, f32, why) == TransferKind::Color);
     CHECK(ClassifyTransfer(c5a, c5b, why) == TransferKind::Color && ClassifyTransfer(c5b, c5h, why) == TransferKind::Color);
     CONTROL(ClassifyTransfer(c5b, c5b, why) != TransferKind::Refused);  // a key as its own source
-    // Named stops: depth -> 64 bpp, and the other 64 bpp formats. FM4 Recomp (alpha): 64 bpp -> depth is modelled.
-    CHECK(ClassifyTransfer(kBd, c5b, why) == TransferKind::Refused && why.find("64 bpp") != std::string::npos);
+    // Named stops: the other 64 bpp formats. FM4 Recomp (alpha): 64 bpp -> depth is modelled; (photo mode) depth -> 64 bpp too
+    // (TestDepthToColor64).
+    CHECK(ClassifyTransfer(kBd, c5b, why) == TransferKind::DepthToColor);
     CHECK(ClassifyTransfer(c5a, kAd, why) == TransferKind::ColorToDepth && ClassifyTransfer(c5b, kBd, why) == TransferKind::ColorToDepth);
     CHECK(ClassifyTransfer(c5b, Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16_Float), why) == TransferKind::Refused);
 
@@ -1619,6 +1620,67 @@ void TestK16_16_16_16()
     CONTROL(DecodeColorClearUint(0x12345678u, 5, k));
     PendingClear pc;
     CONTROL(ValueClear(c5b, 0, edram::Rect{0, 0, 40, 16}, pc));
+}
+
+// FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key, the stop of draw 6591705: the 4x kD24FS8 key 710400 (base 1024,
+// 32 tiles a row) into the 1x 16_16_16_16 key 1408000 (base 0, 16 tiles a row at 32 bpp, 32 at 64 bpp). Every texel below comes from
+// the EDRAM layout, not from MapTransferSource: a tile row is 80 dwords; a 64 bpp 1x pixel (x, y) of its 40x16-pixel tile is dwords 2x
+// (low word) and 2x + 1 (high word) of row y (X :5554-5556, :3352-3370); a depth tile holds the colour tile's two 40-dword halves
+// swapped, depth column = c + 40 for c < 40, else c - 40 (X :2916-2936); a 4x depth pixel (X, Y) host sample h is dword column
+// 2X + (h & 1), row 2Y + (h >> 1) of its 40x8-pixel tile (X :2597-2598). The destination's EDRAM tile is (y / 16) * 32 + x / 40 (its
+// 64 bpp pitch, X :4823); the source's is that - 1024 modulo 2048 (X :2938-2954), at row t / 32, column t % 32 of the source (its
+// pitch, X :2956-2987), i.e. pixel offset (40 * column, 8 * row). Xenia's table for 32 -> 64 bpp 4x -> 1x agrees (X :2648-2662
+// "D p0,0 = S p0,0 s0,0 | S p0,0 s1,0", "D p0,1 = S p0,0 s0,1 | S p0,0 s1,1").
+void TestDepthToColor64()
+{
+    std::string why;
+    const Key s4 = Key::Depth(1024, 32, Msaa::X4, DepthFormat::D24FS8), d5 = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16);
+    CHECK(s4.packed == 0x710400u && d5.packed == 0x1408000u);  // the stop's keys
+    CHECK(ClassifyTransfer(Key{0x710400u}, Key{0x1408000u}, why) == TransferKind::DepthToColor);
+    CHECK(ClassifyTransfer(Key::Depth(1024, 32, Msaa::X4, DepthFormat::D24S8), d5, why) == TransferKind::DepthToColor);  // kD24S8
+    CHECK(ClassifyTransfer(s4, Key::Color(0, 16, Msaa::X2, ColorFormat::k16_16_16_16), why) == TransferKind::DepthToColor);  // 4x -> 2x
+    CHECK(ClassifyTransfer(kBd, Key::Color(0, 16, Msaa::X4, ColorFormat::k16_16_16_16), why) == TransferKind::DepthToColor);  // 1x -> 4x
+    // Still refused by name: msaa_samples 3, and the other 64 bpp formats (7 16_16_16_16_FLOAT, 13 32_32_FLOAT).
+    CHECK(ClassifyTransfer(Key::Depth(1024, 32, Msaa(3), DepthFormat::D24FS8), d5, why) == TransferKind::Refused &&
+          why.find("msaa_samples 3") != std::string::npos);
+    const Key d7 = Key::Color(0, 16, Msaa::X1, ColorFormat::k16_16_16_16_Float), d13 = Key::Color(0, 16, Msaa::X1, ColorFormat::k32_32_Float);
+    CHECK(ClassifyTransfer(s4, d7, why) == TransferKind::Refused && why.find("other than 0, 2, 3, 4 and 5") != std::string::npos);
+    CHECK(ClassifyTransfer(s4, d13, why) == TransferKind::Refused);
+    CONTROL(ClassifyTransfer(s4, d7, why) == TransferKind::DepthToColor);
+
+    auto is = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
+    // (0, 0): EDRAM tile 0, dwords 0, 1 of row 0 -> depth columns 40, 41 -> 4x pixel (20, 0), samples 0 and 1; source tile
+    // (0 - 1024) & 2047 = 1024 = row 32, column 0 -> (20, 256).
+    TransferSource m = MapTransferSource(0, 0, 0, s4, d5);
+    CHECK(is(m.first, 20, 256, 0) && is(m.second, 20, 256, 1));
+    CONTROL(is(m.first, 40, 256, 0));                 // the column swap of a 1x source (40 pixels) on a 4x one
+    CONTROL(m.second.sample == m.first.sample);       // both words from one sample
+    // (0, 1): dwords 0, 1 of row 1 -> depth columns 40, 41, row 1 -> 4x pixel (20, 0), samples 2 and 3.
+    m = MapTransferSource(0, 1, 0, s4, d5);
+    CHECK(is(m.first, 20, 256, 2) && is(m.second, 20, 256, 3));
+    // (25, 0): dwords 50, 51 -> depth columns 10, 11 -> 4x pixel (5, 0), samples 0 and 1 (the other side of the swap).
+    m = MapTransferSource(25, 0, 0, s4, d5);
+    CHECK(is(m.first, 5, 256, 0) && is(m.second, 5, 256, 1));
+    // (1250, 37): EDRAM tile 2 * 32 + 31 = 95, pixel (10, 5) of it: dwords 20, 21 of row 5 -> depth columns 60, 61, row 5 -> 4x pixel
+    // (30, 2), samples 2 and 3; source tile (95 - 1024) & 2047 = 1119 = row 34, column 31 -> (30 + 1240, 2 + 272).
+    m = MapTransferSource(1250, 37, 0, s4, d5);
+    CHECK(is(m.first, 1270, 274, 2) && is(m.second, 1270, 274, 3));
+    CONTROL(is(MapTransferSource(1250, 37, 0, s4, d5).first, 1270, 266, 2));  // the destination tile split by its 32 bpp pitch (16)
+    // A 1x depth source (kBd's shape at base 0) into the 1x 64 bpp key: (3, 0) = dwords 6, 7 -> depth columns 46, 47 = 1x pixels 46, 47.
+    m = MapTransferSource(3, 0, 0, Key::Depth(0, 16, Msaa::X1, DepthFormat::D24FS8), d5);
+    CHECK(is(m.first, 46, 0, 0) && is(m.second, 47, 0, 0));
+
+    // The 64 bpp texel from the two samples' words (X :3303-3333: BitFieldInsert(stencil, depth24, 8, 24); :3352-3370: component i =
+    // bits 16 (i & 1) of word i >> 1). kD24FS8 (Depth32To20e4, by hand): 1.0 = 2^0 -> exponent 15, mantissa 0 -> 0xF00000; 0.5 -> 0xE00000.
+    uint32_t u[4] = {9, 9, 9, 9};
+    TransferTexelOf64(PackDepthStencilWord(1.0f, 0x5A, DepthFormat::D24FS8), PackDepthStencilWord(0.5f, 0x01, DepthFormat::D24FS8), u);
+    CHECK(u[0] == 0x005Au && u[1] == 0xF000u && u[2] == 0x0001u && u[3] == 0xE000u);  // words 0xF000005A, 0xE0000001
+    CONTROL(u[0] == 0x0001u);  // the second sample's word as the low half
+    // kD24S8 (X :3593-3604 RoundEven(d * 16777215)): 0.5 -> 8388607.5 (exact in float32) -> 8388608 = 0x800000 (even); 0.25 ->
+    // 4194303.75 -> 4194304 = 0x400000.
+    TransferTexelOf64(PackDepthStencilWord(0.5f, 0xAB, DepthFormat::D24S8), PackDepthStencilWord(0.25f, 0x10, DepthFormat::D24S8), u);
+    CHECK(u[0] == 0x00ABu && u[1] == 0x8000u && u[2] == 0x0010u && u[3] == 0x4000u);  // words 8000 00AB, 4000 0010 (hex)
+    CONTROL(u[1] == 0x7FFFu);  // truncation (8388607 = 0x7FFFFF) instead of round-half-even
 }
 
 // The 16_16 resolve FM4 stops on: colour 0 of RB_COLOR_INFO format 4
@@ -2583,6 +2645,7 @@ int main()
     TestDepth4xTo2x();
     TestK16_16();
     TestK16_16_16_16();  // FM4 Recomp (alpha, RT format 5)
+    TestDepthToColor64();  // FM4 Recomp (alpha, photo mode)
     TestRg16Resolve();
     TestResolve64();  // FM4 Recomp (alpha, 64 bpp resolve)
     TestResident1616();

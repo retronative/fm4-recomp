@@ -5,6 +5,7 @@
 // (src/xenia/kernel/xam/), cited per import. ForzaRecomp's
 // console_config.h (its choices for region, language, system version) is not taken.
 #include "imports.h"
+#include "keyboard_ui.h"
 #include "loader.h"
 #include "module.h"
 #include "overlapped.h"
@@ -149,6 +150,31 @@ GUEST_IMPORT(XamUserGetDeviceContext, "REFERENCE_DERIVED: Xenia xam_input.cc:221
     ctx.r3.u64 = (1u << 31) | (7u << 16) | 0x48F;
 }
 
+GUEST_IMPORT(XamReadTileToTextureEx, "REFERENCE_DERIVED: Xenia xam_user.cc:761-780 XamReadTileToTexture (the buffer filled with 0xFF, an "
+                                     "XOVERLAPPED completed at once); the argument layout VERIFIED from FM4's caller")
+{
+    // (tile type, title id, tile id, user index, size selector, gamer tile key*, buffer, stride, height, XOVERLAPPED*). FM4's
+    // gamer-picture reader resolves this by ordinal (0x2FD) when the dashboard version allows, else it parses the tile key and
+    // calls XamReadTileToTexture with the same buffer, stride, height and XOVERLAPPED (VERIFIED in our translation), so those four
+    // are arguments 6-9 here. The offline profile has no gamer picture: as Xenia's XamReadTileToTexture (the Ex form is unlisted
+    // there), the tile is white (0xFF) and the call succeeds, through the XOVERLAPPED when one is given. A tile is 64 x 64 ARGB at
+    // most; no buffer, or a larger size, stops (7).
+    const uint32_t buffer = runtime::Argument(ctx, base, 6), stride = runtime::Argument(ctx, base, 7), height = runtime::Argument(ctx, base, 8);
+    const uint32_t overlapped = runtime::Argument(ctx, base, 9);
+    const uint64_t bytes = uint64_t(stride) * height;
+    if (buffer == 0 || bytes == 0 || bytes > 64 * 64 * 4)
+        Stop(StopCode::Unimplemented, "XamReadTileToTextureEx(type %u, user %u): buffer %08X, stride %u, height %u is not modelled", ctx.r3.u32,
+             ctx.r6.u32, buffer, stride, height);
+    std::memset(base + buffer, 0xFF, size_t(bytes));
+    uint32_t result = 0;
+    if (overlapped != 0)
+    {
+        runtime::CompleteOverlappedImmediate(ctx, base, overlapped, 0, "XamReadTileToTextureEx");
+        result = runtime::overlapped::kErrorIoPending;
+    }
+    ctx.r3.u64 = result;
+}
+
 GUEST_IMPORT(XamUserGetName, "REFERENCE_DERIVED: Xenia xam_user.cc:111-126, string_util.h:43-52 (copy_truncating)")
 {
     // (user index, char buffer*, length): an index of 4 or more is X_E_INVALIDARG; a signed-in user (user.h) gets
@@ -286,8 +312,9 @@ GUEST_IMPORT(PsCamDeviceRequest, "INFERRED: no Xbox Live Vision camera (STATUS_D
 }
 
 // FM4 Recomp: reached by SpeechFacade_default.xex.
-GUEST_IMPORT(XamIsUIActive, "REFERENCE_DERIVED: Xenia 67f16c4 xam_ui.cc:207 (xeXamIsUIActive: a XAM dialog is shown); this runtime shows none")
+GUEST_IMPORT(XamIsUIActive, "REFERENCE_DERIVED: Xenia 67f16c4 xam_ui.cc:207 (xeXamIsUIActive: a XAM dialog is shown)")
 {
-    // (): whether a system UI (guide, dialog) is open. This runtime opens no XAM dialog, so never: FALSE.
-    ctx.r3.u64 = 0;
+    // (): whether a system UI (guide, dialog) is open: the only one this runtime shows is XamShowKeyboardUI's (keyboard_ui.h).
+    (void)base;
+    ctx.r3.u64 = runtime::keyboard_ui::Active() ? 1 : 0;
 }

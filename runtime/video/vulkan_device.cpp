@@ -5,6 +5,7 @@
 #define VK_ENABLE_BETA_EXTENSIONS  // VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h)
 #include "vulkan_device.h"
 #include "guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked
+#include "push_template.h"   // FM4 Recomp: PushTemplateAsked
 #include "stops.h"
 #include <algorithm>
 #include <atomic>
@@ -104,6 +105,13 @@ void RequirePinnedLayer()
 }
 
 }  // namespace
+
+// FM4 Recomp (M7 CPU cost): opt-in FM4_PUSH_TEMPLATE=1 (push_template.h).
+bool PushTemplateAsked()
+{
+    static const bool on = [] { const char* v = std::getenv("FM4_PUSH_TEMPLATE"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    return on;
+}
 
 uint64_t ValidationMessageCount() { return validationMessages.load(); }
 
@@ -296,9 +304,22 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
         if (d.cmdPushDescriptorSet == nullptr)
             Stop(StopCode::Setup, "vulkan: VK_KHR_push_descriptor is enabled but vkCmdPushDescriptorSetKHR is not available");
         std::fprintf(stderr, "[gpu] push descriptors on (FM4_PUSH_DESCRIPTORS=1): VK_KHR_push_descriptor, at most %u descriptors a set\n", d.maxPushDescriptors);
+        if (PushTemplateAsked())  // FM4_PUSH_TEMPLATE: the extension's template command (Vulkan 1.1 core templates; the instance asks 1.2)
+        {
+            d.cmdPushDescriptorSetWithTemplate =
+                reinterpret_cast<PFN_vkCmdPushDescriptorSetWithTemplateKHR>(vkGetDeviceProcAddr(d.device, "vkCmdPushDescriptorSetWithTemplateKHR"));
+            if (d.cmdPushDescriptorSetWithTemplate == nullptr)
+                Stop(StopCode::Setup, "vulkan: FM4_PUSH_TEMPLATE=1 but vkCmdPushDescriptorSetWithTemplateKHR is not available");
+            std::fprintf(stderr, "[gpu] push templates on (FM4_PUSH_TEMPLATE=1): each push layout's set is pushed with one descriptor update template\n");
+        }
     }
-    else if (PushDescriptorsAsked())
-        std::fprintf(stderr, "[gpu] FM4_PUSH_DESCRIPTORS=1 ignored: the device does not offer VK_KHR_push_descriptor\n");
+    else
+    {
+        if (PushDescriptorsAsked())
+            std::fprintf(stderr, "[gpu] FM4_PUSH_DESCRIPTORS=1 ignored: the device does not offer VK_KHR_push_descriptor\n");
+        if (PushTemplateAsked())
+            std::fprintf(stderr, "[gpu] FM4_PUSH_TEMPLATE=1 ignored: it needs FM4_PUSH_DESCRIPTORS=1 and VK_KHR_push_descriptor\n");
+    }
     if (d.externalMemoryHost)  // FM4_GUEST_MEMORY_GPU: the extension's command (guest_memory_vk.cpp checks it)
         d.getMemoryHostPointerProperties =
             reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(vkGetDeviceProcAddr(d.device, "vkGetMemoryHostPointerPropertiesEXT"));

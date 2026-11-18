@@ -28,5 +28,8 @@ std::string TextureUnitSummary();
 // FM4 Recomp: at each swap, only after its RetireSlot (every submission confirmed complete): destroys idle images above the
 // thresholds (texture_vk.cpp kEvictAbove).
 void EvictIdleTextures();
+// FM4 Recomp (diagnostic, FM4_DIAG_TRIGGER stale-textures; every submission confirmed complete): every non-resident image is re-hashed
+// at its next bind (re-uploaded if its guest bytes differ). Returns how many.
+size_t MarkTexturesStale();
 
 }  // namespace runtime::video

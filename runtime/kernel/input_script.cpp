@@ -56,7 +56,7 @@ bool Fail(std::string& error, unsigned line, const char* what, std::string_view 
 
 bool ParseScript(std::string_view text, Script& out, std::string& error)
 {
-    out.events.clear(), out.race.clear(), out.hasRace = false;
+    out.events.clear(), out.race.clear(), out.hasRace = false, out.anchorTitle = false;
     error.clear();
     unsigned number = 0;
     while (!text.empty())
@@ -71,11 +71,11 @@ bool ParseScript(std::string_view text, Script& out, std::string& error)
         const std::string_view first = Token(line, at);
         if (first.empty())
             continue;
-        if (first == "@race")
+        if (first == "@race" || first == "@title")
         {
             if (out.hasRace || !Token(line, at).empty())
-                return Fail(error, number, "a second @race or words after it", first);
-            out.hasRace = true;
+                return Fail(error, number, "a second @race or @title anchor, or words after it", first);
+            out.hasRace = true, out.anchorTitle = first == "@title";
             continue;
         }
         std::vector<Event>& list = out.hasRace ? out.race : out.events;
@@ -113,7 +113,15 @@ long ActiveEvent(const Script& script, uint64_t vblank)
 
 bool Poller::RaceStarted(uint64_t vblank)
 {
-    if (!script_.hasRace || raced_)
+    if (!script_.hasRace || script_.anchorTitle || raced_)
+        return false;
+    raced_ = true, raceStart_ = vblank;
+    return true;
+}
+
+bool Poller::TitleAccepted(uint64_t vblank)
+{
+    if (!script_.hasRace || !script_.anchorTitle || raced_)
         return false;
     raced_ = true, raceStart_ = vblank;
     return true;

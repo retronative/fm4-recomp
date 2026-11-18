@@ -91,14 +91,11 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
         return k.Format() == uint32_t(ColorFormat::k8_8_8_8) || k.Format() == uint32_t(ColorFormat::k2_10_10_10) ||
                k.Format() == uint32_t(ColorFormat::k2_10_10_10_Float) || k.Format() == uint32_t(ColorFormat::k16_16);
     };
-    // FM4 Recomp (alpha, RT format 5): a 64 bpp colour key (storage 5) moves to and from colour keys only (kTransferColor64). Its
-    // depth <-> colour transfers (X packs two depth samples into one 64 bpp sample, :3303-3333, and picks a 32 bpp half for a
-    // depth destination, :3080-3102) are not modelled yet: refused by name, so the run that needs one says so.
-    // FM4 Recomp (alpha, Car Select): colour -> depth from a 64 bpp key is modelled (the half of the source sample by
-    // the destination pixel, X :2686-2777 and :3080-3102, then the column swap at the source's 64 bpp width, :2912-2936: MapTransferSource,
-    // TransferWordOf64); depth -> colour into one stays refused.
-    if (source.IsDepth() && dest.Is64bpp())
-        return refuse("depth -> colour into a 64 bpp key (storage 5) is not modelled yet (X :3303-3333)");
+    // FM4 Recomp (alpha, RT format 5): a 64 bpp colour key (storage 5) moves to and from colour keys (kTransferColor64) and, across
+    // aspects, both ways with a depth key. FM4 Recomp (alpha, Car Select): colour -> depth from a 64 bpp key (the half of the source
+    // sample by the destination pixel, X :2686-2777 and :3080-3102, then the column swap at the source's 64 bpp width, :2912-2936:
+    // MapTransferSource, TransferWordOf64). FM4 Recomp (alpha, photo mode): depth -> colour into one, DepthToColor below (two depth
+    // samples a 64 bpp sample, X :3005-3023; each packed as the 32 bpp case, :3303-3333; the two words split, :3352-3370).
     if (!source.IsDepth() && dest.IsDepth() && source.Is64bpp())
     {
         const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
@@ -119,8 +116,13 @@ TransferKind ClassifyTransfer(Key source, Key dest, std::string& why)
         // FM4 Recomp: 1x <-> 2x through MapTransferTexel's rule (X :2868-2898), per destination sample as every other pair
         // (observed: the 1x kD24FS8 key 602040 into the 2x 8_8_8_8 key 082800).
         // Both depth formats: kD24FS8 through Depth32To20e4, kD24S8 through Depth32ToUnorm24 (X :3591-3609).
-        if (!colorStorage(dest))
-            return refuse("depth -> colour into a storage format other than 0, 2, 3 and 4");
+        // FM4 Recomp (alpha, photo mode): storage 5 (16_16_16_16) too, through its R16G16B16A16_UINT transfer view: the two source
+        // texels of MapTransferSource (first, second: X :2607-2685, :3005-3023), each packed to its depth/stencil word (X :3303-3333,
+        // the same conversions as :3591-3617), split into the four 16-bit components (X :3352-3370, TransferTexelOf64). Observed: the
+        // 4x kD24FS8 key 710400 (base 1024, 32 tiles a row) into the 1x 16_16_16_16 key 1408000 (base 0). The other 64 bpp formats
+        // (16_16_16_16_FLOAT, 32_32_FLOAT) stay refused here by name (edram::SupportedKey refuses their keys too).
+        if (!colorStorage(dest) && dest.Format() != uint32_t(ColorFormat::k16_16_16_16))
+            return refuse("depth -> colour into a storage format other than 0, 2, 3, 4 and 5");
         return TransferKind::DepthToColor;
     }
     // Different bases go through the tile offset of MapEdramTexel (X uses one tile-offset path for every transfer mode,
@@ -284,7 +286,7 @@ TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSa
             s = 0;
         r.first.x = x, r.first.y = y, r.first.sample = s;
     }
-    if (source.IsDepth() != dest.IsDepth())  // X :2916-2936: only between colour and depth (never with a 64 bpp side: ClassifyTransfer)
+    if (source.IsDepth() != dest.IsDepth())  // X :2916-2936: only between colour and depth (a 64 bpp side: at the source's width, :2912-2913)
     {
         const uint32_t half = edram::kTileWidthSamples >> (1 + edram::SamplesXLog2(sm) + (s64 ? 1 : 0));  // X :2912-2920
         r.first.x = r.first.x < half ? r.first.x + half : r.first.x - half;                              // X :2921-2935

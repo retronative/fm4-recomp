@@ -25,6 +25,7 @@ struct Paths {
   var logs: URL { home.appendingPathComponent("logs") }
   var gpuStop: URL { home.appendingPathComponent("GPU_STOP") }
   var locationsFile: URL { home.appendingPathComponent("locations.conf") }
+  var keyBindingsFile: URL { home.appendingPathComponent("keybindings.conf") }  // Keyboard Controls in the game (KeyBindings.swift); play.sh passes it
   var setupDone: URL { Locations.read(self).dataRoot.appendingPathComponent("setup.ok") }
   var readme: URL { kit.appendingPathComponent("README.md") }
   var logo: URL { kit.appendingPathComponent("resources/logo@2x.png") }
@@ -207,6 +208,8 @@ func runKitScript(_ paths: Paths, _ script: String, _ arguments: [String], line:
   process.arguments = [paths.kit.appendingPathComponent(script).path] + arguments
   var env = ProcessInfo.processInfo.environment
   env["FM4_RECOMP_HOME"] = paths.home.path
+  // The game started from here has no Dock icon of its own: this app's branded icon stands for it (runtime/video/window_sdl.cpp).
+  if script == "play.sh" { env["SDL_MAC_BACKGROUND_APP"] = "1" }
   process.environment = env
   process.currentDirectoryURL = paths.kit
   let pipe = Pipe()

@@ -95,7 +95,7 @@ fi
 echo "$FFMPEG_SHA256  $tarball" | shasum -a 256 -c --quiet || { echo "setup_tools: $tarball does not match its SHA-256" >&2; exit 1; }
 stamp="$( { echo "$FFMPEG_SHA256 target $MACOSX_DEPLOYMENT_TARGET"; shasum -a 256 "$ROOT"/patches/ffmpeg/*.patch "$ROOT/scripts/build_ffmpeg_xma.sh" | cut -d' ' -f1; "$LLVM/clang" --version | head -1; } | shasum -a 256 | cut -d' ' -f1)"
 if [ "$(cat "$FF/stamp" 2>/dev/null)" != "$stamp" ]; then
-  "$ROOT/scripts/build_ffmpeg_xma.sh" "$tarball" "$FF" "$LLVM/clang"
+  "$ROOT/scripts/build_ffmpeg_xma.sh" "$tarball" "$FF" "$LLVM/clang" static
   echo "$stamp" > "$FF/stamp"
 fi
 

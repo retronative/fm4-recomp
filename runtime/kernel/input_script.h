@@ -37,11 +37,15 @@ struct Event
 // FM4 Recomp (M7 A/B harness): a line `@race` starts a second list whose vblanks count from the race start (Poller::RaceStarted;
 // renderer.cpp reports it), so the race inputs are the same whatever the load time. Before it the first list applies; from the
 // race start only the race list does (nothing held before its first event). Without `@race` RaceStarted changes nothing.
+// FM4 Recomp (M7 stability harness): `@title` instead anchors the second list on the title screen's acceptance (the game's storage
+// device prompt, XamShowDeviceSelectorUI: Poller::TitleAccepted), so the menu route keeps its timing whatever the boot time; the first
+// list can then press A repeatedly until the title takes it. One anchor a script.
 struct Script
 {
     std::vector<Event> events;  // in vblank order
-    std::vector<Event> race;    // in vblank order, relative to the race start
-    bool hasRace = false;
+    std::vector<Event> race;    // in vblank order, relative to the anchor (the race start, or the title's acceptance with `@title`)
+    bool hasRace = false;       // a second list is present
+    bool anchorTitle = false;   // it is anchored on the title (`@title`), not the race start (`@race`)
 };
 
 // Parses `text`; false with `error` ("line N: ...") on a malformed line, an unknown name or a vblank not above the
@@ -73,6 +77,8 @@ public:
     Report Poll(uint64_t vblank);
     // The race start at `vblank` (the first call counts; false when the script has no `@race` section or it was already set).
     bool RaceStarted(uint64_t vblank);
+    // The title screen took input at `vblank` (the first call counts; false unless the script's second list is `@title`).
+    bool TitleAccepted(uint64_t vblank);
 
 private:
     Script script_;
@@ -84,6 +90,12 @@ private:
 
 // FM4 Recomp: Poller::RaceStarted on the loaded script, if any (imports_input.cpp; logged once). Any thread.
 void NotifyRaceStart(uint64_t vblank);
+// FM4 Recomp: each swap's draw count (renderer.cpp); a race scene draws 1,000 or more (the @race heuristic): Command-comma pauses
+// only there (window_sdl.cpp). Any thread.
+void NoteSwapDraws(uint64_t draws);
+bool InRaceScene();
+// FM4 Recomp: Poller::TitleAccepted on the loaded script, if any (imports_content.cpp XamShowDeviceSelectorUI; logged once).
+void NotifyTitleAccepted(uint64_t vblank);
 
 // The names of the buttons held in a report, space-separated ("" when none), for the log.
 std::string Describe(uint16_t buttons, uint8_t leftTrigger, uint8_t rightTrigger);

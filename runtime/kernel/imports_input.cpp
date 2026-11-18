@@ -14,6 +14,7 @@
 #include "graphics.h"
 #include "input_script.h"
 #include "input_live.h"  // FM4 Recomp: FM4_INPUT_LIVE
+#include "key_bindings.h"  // FM4 Recomp: --keybindings
 #include "av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
 #include <atomic>
 #include <cstdio>
@@ -88,12 +89,29 @@ void NotifyRaceStart(uint64_t vblank)
                      (unsigned long long)vblank, poller->script().race.size());
 }
 
+namespace {
+std::atomic<bool> raceScene{false};
+}  // namespace
+
+void NoteSwapDraws(uint64_t draws) { raceScene.store(draws >= 1000, std::memory_order_relaxed); }
+bool InRaceScene() { return raceScene.load(std::memory_order_relaxed); }
+
+void NotifyTitleAccepted(uint64_t vblank)
+{
+    std::lock_guard guard(lock);
+    if (poller && poller->TitleAccepted(vblank))
+        std::fprintf(stderr, "[input] title accepted at vblank %llu: the script's @title section (%zu events) runs from here\n",
+                     (unsigned long long)vblank, poller->script().race.size());
+}
+
 void EnableLive()
 {
     std::lock_guard guard(lock);
     live = true;
-    std::fprintf(stderr, "[input] live pad on user 0 (FM4_INPUT_LIVE=1): an SDL gamepad and the keyboard (A/D steer, W throttle, S brake, arrows d-pad, "
-                         "Enter A, Backspace/Escape B, X, Y, Space START, Tab BACK, Q/E shoulders, C right thumb)\n");
+    // FM4 Recomp (key_bindings.h): the keyboard's bindings, the defaults or --keybindings' file (loaded before this).
+    const std::string bindings = KeyBindingsPath();
+    std::fprintf(stderr, "[input] live pad on user 0 (FM4_INPUT_LIVE=1): an SDL gamepad and the keyboard (%s%s: %s)\n", !bindings.empty() ? "bindings from " : "default bindings",
+                 bindings.c_str(), DescribeKeyBindings(*ActiveKeyBindings()).c_str());
 }
 
 bool LiveEnabled()

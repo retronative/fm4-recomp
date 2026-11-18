@@ -14,6 +14,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <sys/stat.h>
 
 namespace runtime::gpu {
 namespace {
@@ -36,6 +37,29 @@ FILE* Open()
                 std::setvbuf(file, nullptr, _IOLBF, 1 << 16);
         }
     }
+    // FM4 Recomp (diagnostic): FM4_CP_TRACE_FROM_VBLANK=<n> starts the trace at that vblank, so the 64 MB cap covers a chosen
+    // screen (a race start) instead of the boot.
+    static const uint64_t from = [] {
+        const char* v = std::getenv("FM4_CP_TRACE_FROM_VBLANK");
+        return v != nullptr && *v != '\0' ? std::strtoull(v, nullptr, 10) : 0ull;
+    }();
+    if (from != 0 && VblankCount() < from)
+        return nullptr;
+    // FM4_CP_TRACE_TRIGGER=<path> (diagnostic, a live session): nothing until that file exists (checked once a vblank), then on.
+    static const char* trigger = std::getenv("FM4_CP_TRACE_TRIGGER");
+    static bool triggered = false;
+    static uint64_t checkedVblank = ~0ull;
+    if (trigger != nullptr && *trigger != '\0' && !triggered)
+    {
+        if (VblankCount() == checkedVblank)
+            return nullptr;
+        checkedVblank = VblankCount();
+        struct stat st;
+        if (stat(trigger, &st) != 0)
+            return nullptr;
+        triggered = true;
+        std::fprintf(stderr, "[diag] CP trace triggered at vblank %llu (%s)\n", (unsigned long long)checkedVblank, trigger);
+    }
     return capped ? nullptr : file;
 }
 
@@ -43,9 +67,15 @@ void Line(const char* text, int length)
 {
     if (length <= 0)
         return;
-    if (written + uint64_t(length) > kCap)
+    // FM4 Recomp (diagnostic): FM4_CP_TRACE_CAP_MB=<n> (at most 1024) raises the cap for a windowed trace (FM4_CP_TRACE_FROM_VBLANK).
+    static const uint64_t cap = [] {
+        const char* v = std::getenv("FM4_CP_TRACE_CAP_MB");
+        const uint64_t mb = v != nullptr && *v != '\0' ? std::strtoull(v, nullptr, 10) : 0;
+        return mb != 0 && mb <= 1024 ? mb << 20 : kCap;
+    }();
+    if (written + uint64_t(length) > cap)
     {
-        std::fputs("trace capped at 64 MB\n", file);
+        std::fputs("trace capped\n", file);
         std::fflush(file);
         capped = true;
         return;
@@ -55,6 +85,15 @@ void Line(const char* text, int length)
 }
 
 }  // namespace
+
+void TraceSwap(uint64_t swap)
+{
+    std::lock_guard guard(traceLock);
+    if (Open() == nullptr)
+        return;
+    char text[64];
+    Line(text, std::snprintf(text, sizeof text, "swap %llu vblank %llu\n", (unsigned long long)swap, (unsigned long long)VblankCount()));
+}
 
 bool TraceEnabled()
 {

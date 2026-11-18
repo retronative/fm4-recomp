@@ -24,6 +24,7 @@ compiler options, FM4's name and scripts.
 │   ├── prerender.mjs       Renders every route, writes 404.html, sitemap.xml, robots.txt, .nojekyll
 │   ├── check-links.mjs     Link and anchor checker for dist/ (under SITE_BASE)
 │   ├── check-dist.mjs      Artifact hygiene check for dist/ (file types, private content, third-party requests)
+│   ├── check-status.mjs    Milestone states appear only in docs/status.md
 │   ├── check-contrast.mjs  WCAG contrast audit of the text colours on each surface
 │   ├── pages-sim.mjs       Local static server emulating GitHub Pages semantics
 │   └── test-routing.mjs    Requests every route (with/without trailing slash) through pages-sim
@@ -36,13 +37,14 @@ compiler options, FM4's name and scripts.
     ├── entry-server.ts     Server render used only by the prerender step
     ├── docs.ts             Access to the docs data
     ├── data/links.ts       The repository URL
-    ├── components/         Header, footer, page hero, document layout, prose renderer, logo
+    ├── components/         Header, footer, page hero, document layout, prose renderer, logo, download button
     ├── pages/              One lazy-loaded component per route
     └── styles/main.css     Design tokens and all custom styling
 ```
 
-Routes: `/`, `/getting-started/`, `/legal/` (and `/docs/<name>/` for any further `docs/*.md`),
-`/reference/`, `/reference/<area>/<note>/`, `/licences/`, plus a 404 page.
+Routes: `/`, `/docs/` (the index), `/getting-started/`, `/compatibility/`, `/faq/`, `/releases/`
+(`docs/status.md`), `/legal/` (and `/docs/<name>/` for any further `docs/*.md`, e.g.
+`/docs/how-it-works/`), `/reference/`, `/reference/<area>/<note>/`, `/licences/`, plus a 404 page.
 
 ## Where the content comes from
 
@@ -51,8 +53,9 @@ The website never copies the repository's Markdown. `plugins/docs.mjs` reads it 
 
 | Source | Page |
 |---|---|
-| `README.md`: the introduction, the `[!IMPORTANT]` notice, the commands of "Getting started (developers)", the License paragraph | Home, Getting started, Licences. Nothing else from `README.md` is published |
-| `docs/LEGAL.md` | `/legal/` (other `docs/*.md`: `/docs/<name>/`) |
+| `README.md`: the introduction, the `[!IMPORTANT]` notice, the License paragraph | Home, Licences. Nothing else from `README.md` is published |
+| `docs/getting-started.md`, `docs/compatibility.md`, `docs/faq.md`, `docs/LEGAL.md` | `/getting-started/`, `/compatibility/`, `/faq/`, `/legal/` (other `docs/*.md`: `/docs/<name>/`) |
+| `docs/status.md` | `/releases/`; its front matter also gives the release headline and the download button (below) |
 | `reference/README.md` | `/reference/` |
 | `reference/{recompiler,kernel,gpu,perf}/*.md` | `/reference/<area>/<note>/` |
 | `THIRD_PARTY_NOTICES.md` | `/licences/` |
@@ -61,14 +64,25 @@ The website never copies the repository's Markdown. `plugins/docs.mjs` reads it 
   under `reference/` is opened. Every note must have a row in the Notes table of
   `reference/README.md`, which gives its description and order; the build fails otherwise (and
   for a row without a note). A new area needs an entry in `REFERENCE_AREAS`.
-- Titles are each file's `# ` heading; no front matter.
+- Titles are each file's `# ` heading. `docs/*.md` may start with front matter: `description`
+  (the page's meta description and its line in the index; otherwise the first paragraph's leading
+  sentences) and `order` (position in the index; 99 when absent).
+- **Release status**: `docs/status.md` is the one place that says whether a release exists. Its
+  front matter needs `release_headline` and `release_planned`; `release_version` (e.g.
+  `v0.1.0`) and `release_url` are set together once that release is published, and
+  `release_url` must be that tag's page on GitHub Releases. Until then the download button is a
+  disabled "Coming soon"; after, it links the release page (never a file). Milestone states are
+  written only in `docs/status.md` (`check:status`).
 - `html: false` escapes any raw HTML in the Markdown and markdown-it's link validation rejects
   `javascript:`/`data:` URLs; that is the sanitisation.
 - Headings get stable ids (`scripts/slug.mjs`, underscores kept as on GitHub).
 - Relative links are resolved against the linking file's repository path, so the same files work
   on GitHub and on the site: links to the files above become site routes, links to `COPYING`,
-  `NOTICE` and `LICENSES/` go to the repository on GitHub, and **any other relative link fails
-  the build** (no page would exist for it).
+  `NOTICE`, files and folders under `LICENSES/`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SUPPORT.md`,
+  `SECURITY.md` and `CODE_OF_CONDUCT.md` go to the repository on GitHub (the file must exist), and
+  **any other relative link fails the build** (no page would exist for it). One exception:
+  `THIRD_PARTY_NOTICES.md` also ships inside the app, and its `third-party/...` links name files
+  of the app's `licenses/` folder; the site shows those as plain text.
 - GitHub alert blockquotes (`> [!IMPORTANT]` etc.) become labelled callouts.
 - The build fails if rendered text matches `scripts/private-content.mjs` (local-only files and
   folders, absolute local paths and similar); `check:dist` applies the same patterns to `dist/`.
@@ -85,9 +99,10 @@ npm run build          # vue-tsc type-check, client build, SSR build, prerender 
 npm run preview        # serve dist/ locally
 npm run check:links    # internal links and anchors in dist/
 npm run check:dist     # artifact hygiene check of dist/
+npm run check:status   # milestone states only in docs/status.md
 npm run check:contrast # WCAG contrast of the design tokens
 npm run test:routing   # every route through the GitHub Pages simulation
-npm run validate       # check:contrast, build, check:links, check:dist, test:routing
+npm run validate       # check:status, check:contrast, build, check:links, check:dist, test:routing
 ```
 
 ### Configuration
@@ -105,7 +120,8 @@ npm run validate       # check:contrast, build, check:links, check:dist, test:ro
 - **check:dist**: only allowlisted file types (html, css, js, svg, woff2, txt, xml, json, ico,
   webmanifest, `CNAME`, `.nojekyll`; PNG only as the future icon and Open Graph files, ≤ 500 kB);
   no source maps; no file over 1 MB; no private-looking content (`scripts/private-content.mjs`);
-  no link to a `.dmg`; no third-party runtime requests (external scripts, stylesheets, images,
+  no link to a `.dmg`; the download button on the home and releases pages agrees with
+  `docs/status.md` (a link to `release_url`, or disabled); no third-party runtime requests (external scripts, stylesheets, images,
   preconnects, CSS `@import`/`url()`, web-font services).
 - **check:contrast** computes WCAG contrast for each text colour on each surface it is used on and
   fails below AA (3:1 for the red focus ring and rules).
@@ -149,7 +165,8 @@ names, and `test:routing` then checks the image's declared size.
   project. The footer of every page carries `docs/LEGAL.md`'s first paragraph verbatim.
 - **Font**: Inter (SIL Open Font License 1.1), self-hosted as a latin variable-weight woff2 subset,
   with its licence text beside the file in `public/fonts/` (also published). `font-display: swap`.
-- **No download**: the site has no download button and links no DMG (none is published).
+- **Download**: the site hosts no DMG and links no file; the download button goes to the GitHub
+  Release page only, and only once `docs/status.md` names a published release.
 
 ## Accessibility
 

@@ -147,6 +147,20 @@ bool MemWaitDiag()
     }();
     return on;
 }
+// FM4 Recomp (FM4_DIAG_DRAIN=1, diagnostic; runtime/video/diag_drain.h): the spans of the last memory waits that synced
+// (SyncedMemWaitAround). Command-processor thread only.
+bool DrainDiag()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_DIAG_DRAIN");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+struct WaitSpan { uint64_t start = 0, end = 0; };
+constexpr uint32_t kSyncedWaitSpans = 64;
+WaitSpan syncedWaitSpans[kSyncedWaitSpans];
+uint32_t syncedWaitNext = 0;
 // FM4 Recomp (opt-in FM4_IMMEDIATE_INTERRUPTS=1, with FM4_DEFER_FENCES): an INTERRUPT is raised when the command processor
 // reaches it, as Xenia and ShiftGlue's split recording (ShiftGlue SDK src/graphics/command_processor.cpp:2496-
 // 2499) do, unless the CPU could learn from it that earlier GPU work finished: a stream store is queued before it (fence order), or
@@ -454,6 +468,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 std::fprintf(stderr, "\n");
                 binDraws.clear(), binSelectChanges = 0;
             }
+            TraceSwap(state.swaps);  // FM4_CP_TRACE (diagnostic): the draws above this line are swap n's
             if (renderer)  // presented before the stop at swap n, so swap n is captured
             {
                 uint32_t fetch[6];
@@ -576,6 +591,8 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             {
                 const uint64_t totalNs = NowNs() - waitStart;
                 memWaits++, memWaitNs += totalNs, syncedWaits += synced ? 1 : 0;
+                if (synced && DrainDiag())  // FM4_DIAG_DRAIN (diagnostic): the wait's span, for the renderer's drain lines
+                    syncedWaitSpans[syncedWaitNext++ % kSyncedWaitSpans] = {waitStart, waitStart + totalNs};
                 static std::atomic<uint32_t> lines{0};
                 if (MemWaitDiag() && state.swaps % 50 == 0 && lines.fetch_add(1) < 4000)
                 {
@@ -786,6 +803,16 @@ uint64_t ImmediateWaits() { return immediateWaits.load(); }
 uint64_t SyncedWaits() { return syncedWaits.load(); }
 uint64_t MemWaits() { return memWaits.load(); }
 uint64_t MemWaitNs() { return memWaitNs.load(); }
+bool SyncedMemWaitAround(uint64_t ns, uint64_t& startNs, uint64_t& endNs)
+{
+    for (uint32_t i = 1; DrainDiag() && i <= kSyncedWaitSpans && i <= syncedWaitNext; i++)  // newest first
+        if (const WaitSpan& w = syncedWaitSpans[(syncedWaitNext - i) % kSyncedWaitSpans]; w.start <= ns && ns <= w.end)
+        {
+            startNs = w.start, endNs = w.end;
+            return true;
+        }
+    return false;
+}
 uint64_t ImmediateInterrupts() { return immediateInterrupts.load(); }
 uint64_t GraceSyncs() { return graceSyncs.load(); }
 void SetImmediateInterrupts(bool on) { immediateInterruptsOverride = on ? 1 : 0; }

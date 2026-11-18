@@ -34,6 +34,9 @@ struct PipelineDeviceFeatures
     // FM4 Recomp (FM4_PUSH_DESCRIPTORS): VK_KHR_push_descriptor's maxPushDescriptors, 0 when off (never with dynamicBuffers): a layout
     // whose bindings fit is created with VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR (Layouts::push); larger ones keep sets.
     uint32_t pushDescriptorLimit = 0;
+    // FM4 Recomp (M7 CPU cost, FM4_PUSH_TEMPLATE): each push layout also gets a VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR
+    // template (Layouts::pushTemplate, push_template.h PlanPushTemplate); only with pushDescriptorLimit.
+    bool pushTemplates = false;
 };
 
 // The host formats of the Xenos render target formats pipeline_key.h ColorFormatMapped accepts.
@@ -63,6 +66,10 @@ public:
         VkDescriptorSetLayout set = VK_NULL_HANDLE;
         VkPipelineLayout pipeline = VK_NULL_HANDLE;
         bool push = false;  // FM4 Recomp (FM4_PUSH_DESCRIPTORS): a push-descriptor set layout (vkCmdPushDescriptorSetKHR, no set allocated)
+        // FM4 Recomp (FM4_PUSH_TEMPLATE): the push layout's update template (vkCmdPushDescriptorSetWithTemplateKHR with the data block of
+        // push_template.h PlanPushTemplate(layoutKey)); VK_NULL_HANDLE when off or not a push layout. Destroyed in the destructor.
+        VkDescriptorUpdateTemplate pushTemplate = VK_NULL_HANDLE;
+        uint64_t layoutKey = 0;  // the key it was created for (the renderer checks its data block against the same plan)
     };
     KeyResult LayoutFor(uint64_t layoutKey, Layouts& out);
 
@@ -86,6 +93,16 @@ public:
     };
     const Stats& GetStats() const { return stats_; }
 
+    // FM4 Recomp (M7 stability, opt-in FM4_SHADER_CACHE; after ReCarbon runtime/gpu/renderer.cpp CreatePipelineCache /
+    // SavePipelineCache, GPL-3.0): a VkPipelineCache every pipeline is created through, started from `file` when its header
+    // (pipeline_cache_header.h) says this GPU, driver and OS made it; an unreadable or foreign file is set aside (one log line) and the
+    // cache starts empty, as does a vkCreatePipelineCache that refuses the data. Before any pipeline is created.
+    void UsePersistentCache(const std::string& file, uint32_t vendorID, uint32_t deviceID, const uint8_t (&uuid)[16]);
+    // Writes the cache's data to the file (a temporary name renamed into place); false on any failure (nothing torn left behind).
+    // Any thread: the pipeline cache is internally synchronized; saves are serialized.
+    bool SavePersistentCache();
+    bool PersistentCacheOn() const { return cache_ != VK_NULL_HANDLE && !cacheFile_.empty(); }
+
 private:
     KeyResult Module(const CachedShader& shader, ShaderVariant& variant);
     KeyResult RenderPass(const PipelineKey& key, VkRenderPass& out);
@@ -94,10 +111,18 @@ private:
     PipelineDeviceFeatures features_;
     ShaderClass allowed_;
     std::unordered_map<uint64_t, Layouts> layouts_;  // by DescriptorPlan::layoutKey
-    std::unordered_map<PipelineKey, Entry, PipelineKey::Hasher> pipelines_;
+    // FM4 Recomp (M7 CPU cost, FM4_PIPELINE_WORD_HASH=1): the bucket hash, PipelineKey::WordHash when asked (fixed for the run), else Hash.
+    struct KeyHasher
+    {
+        bool words = false;
+        size_t operator()(const PipelineKey& k) const { return size_t(words ? k.WordHash() : k.Hash()); }
+    };
+    std::unordered_map<PipelineKey, Entry, KeyHasher> pipelines_;
     std::unordered_map<uint64_t, VkRenderPass> renderPasses_;  // by the attachment part of the key
     std::vector<VkShaderModule> modules_;                       // every module created, for the destructor
     Stats stats_;
+    VkPipelineCache cache_ = VK_NULL_HANDLE;  // FM4_SHADER_CACHE (null: pipelines are created without a cache, as before)
+    std::string cacheFile_;
 };
 
 }  // namespace runtime::video

@@ -22,7 +22,7 @@ mkdir -p "$OUT"
 rm -rf "$OUT/work" && mkdir "$OUT/work"
 export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
 FLAGS=(-std=c++20 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -isysroot "$SDKROOT" -I"$SRC/runtime" -I"$ROOT/runtime")
-perl -e 'alarm 300; exec @ARGV' "$LLVM/clang++" "${FLAGS[@]}" -I"$GLSLANG_PREFIX/include" \
+perl -e 'alarm 300; exec @ARGV' "$LLVM/clang++" "${FLAGS[@]}" -I"$GLSLANG_PREFIX/include" -I"$ROOT/tools/XenonRecomp/thirdparty/TinySHA1" \
   "$SRC/tests/runtime/test_shader_cache.cpp" "$SRC/runtime/video/shader_cache.cpp" "$ROOT/runtime/shader/shader_glsl.cpp" \
   -L"$GLSLANG_PREFIX/lib" -lglslang -lSPIRV -lglslang-default-resource-limits -Wl,-rpath,"$GLSLANG_PREFIX/lib" \
   -o "$OUT/test_shader_cache"

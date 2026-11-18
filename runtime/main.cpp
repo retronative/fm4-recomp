@@ -32,9 +32,13 @@
 #include "video/guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked (FM4_GUEST_MEMORY_GPU)
 #include "video/window_sdl.h"
 #include "disc_setup_sdl.h"
+#include "controls_panel_sdl.h"
+#include "kernel/controls_screen.h"
 #include "kernel/disc_swap.h"
 #include "kernel/imports.h"
 #include "kernel/input_live.h"
+#include "kernel/key_bindings.h"
+#include "kernel/keyboard_ui.h"
 #include "kernel/loader.h"
 #include "kernel/module.h"
 #include "kernel/thread_state.h"
@@ -132,6 +136,8 @@ int main(int argc, char** argv)
     const char* gpuCaptureDir = nullptr;
     const char* vkValidation = nullptr;
     const char* shaderClasses = nullptr;
+    const char* keyBindingsPath = nullptr;  // FM4 Recomp: the live pad's keyboard bindings (kernel/key_bindings.h); absent: the defaults
+    const char* controlsPanel = nullptr;  // FM4 Recomp: the in-game Keyboard Controls screen (kernel/controls_screen.h; window, live input)
     int stopAtSwap = 0;
     int deadline = 0;
     for (int i = 1; i < argc; i += 2)
@@ -153,6 +159,8 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--gpu-capture")) gpuCaptureDir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--vk-validation")) vkValidation = argv[i + 1];
         else if (!std::strcmp(argv[i], "--shader-classes")) shaderClasses = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--keybindings")) keyBindingsPath = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--controls-panel")) controlsPanel = argv[i + 1];
         else if (!std::strcmp(argv[i], "--stop-at-swap")) stopAtSwap = std::atoi(argv[i + 1]);
         else if (!std::strcmp(argv[i], "--deadline")) deadline = std::atoi(argv[i + 1]);
         else Stop(StopCode::Setup, "unknown option %s", argv[i]);
@@ -162,7 +170,8 @@ int main(int argc, char** argv)
              "--modules <game/modules> --gpu-stop <research/GPU_STOP> --user-data <game/user-data> --audio <audible|mute> --renderer <headless|self-check|present|window> --stop-at-swap <n> --deadline <seconds> (all required; "
              "a renderer other than headless also requires --gpu-capture <evidence dir> --vk-validation <on|off> --shader-classes <none|branch,predicate,loop>; "
              "optional: --disc2 <extracted Disc 2> --disc2-map <disc2_gdfx.tsv>, both or neither; with --renderer window, --disc-setup <the kit's setup panel, bin/fm4recomp-setup> "
-             "sets up a disc the game asks for that is not given)");
+             "sets up a disc the game asks for that is not given; with FM4_INPUT_LIVE=1, --keybindings <keybindings.conf> replaces the keyboard's default bindings "
+             "and, with --renderer window, --controls-panel <the kit's launcher, bin/fm4recomp-setup> opens Keyboard Controls on Command-comma)");
     if ((disc2Path == nullptr) != (disc2MapPath == nullptr))
         Stop(StopCode::Setup, "--disc2 and --disc2-map go together (the extracted Disc 2 and its GDFX map)");
     // Audio (audio policy): audible plays through the default device (SDL3); mute opens no device and keeps
@@ -184,8 +193,25 @@ int main(int argc, char** argv)
     const bool liveInput = std::getenv("FM4_INPUT_LIVE") != nullptr && !std::strcmp(std::getenv("FM4_INPUT_LIVE"), "1");
     if (liveInput && (std::strcmp(rendererMode, "window") || runtime::input::ScriptLoaded()))
         Stop(StopCode::Setup, "FM4_INPUT_LIVE=1 needs --renderer window and no FM4_INPUT_SCRIPT");
+    if (keyBindingsPath != nullptr && !liveInput)
+        Stop(StopCode::Setup, "--keybindings needs FM4_INPUT_LIVE=1 (the bindings are the live pad's keyboard)");
+    if (keyBindingsPath != nullptr)
+        runtime::input::LoadKeyBindings(keyBindingsPath);  // a malformed file stops (9) here, naming its line
     if (liveInput)
         runtime::input::EnableLive();
+    // FM4 Recomp: XamShowKeyboardUI's dialog (kernel/keyboard_ui.h): FM4_KEYBOARD_UI_ANSWERS (test only) answers from a list; a
+    // window run shows a native dialog; any other run is headless (the default text, as Xenia's headless mode).
+    if (const char* answers = std::getenv("FM4_KEYBOARD_UI_ANSWERS"); answers != nullptr && *answers != '\0')
+    {
+        std::vector<runtime::keyboard_ui::Answer> list;
+        std::string error;
+        if (!runtime::keyboard_ui::ParseAnswers(answers, list, error))
+            Stop(StopCode::Setup, "FM4_KEYBOARD_UI_ANSWERS: %s", error.c_str());
+        std::fprintf(stderr, "[ui] XamShowKeyboardUI answers %zu dialog(s) from FM4_KEYBOARD_UI_ANSWERS\n", list.size());
+        runtime::keyboard_ui::SetHost(runtime::keyboard_ui::ScriptedHost(std::move(list)));
+    }
+    else if (!std::strcmp(rendererMode, "window"))
+        runtime::keyboard_ui::SetHost(runtime::keyboard_ui::NativeDialogHost());
     runtime::xma::SetDecoderFactory(runtime::xma::FfmpegDecoderFactory());  // XMA decoding (kernel/xma.h)
     runtime::ldi::SetFactory(runtime::ldi::MspackDecoderFactory());  // LZX decompression (kernel/ldi.h)
     runtime::gpu::SetStopAtSwap(uint32_t(stopAtSwap));
@@ -216,6 +242,26 @@ int main(int argc, char** argv)
     runtime::MountDisc(discPath, discMapPath);
     if (disc2Path != nullptr)
         runtime::AddDisc(2, disc2Path, disc2MapPath);  // put in the drive when the game asks (XamSwapDisc, kernel/file_system.h)
+    if (controlsPanel != nullptr)
+    {
+        // FM4 Recomp (kernel/controls_screen.h): Command-comma opens the launcher's Keyboard Controls over the game window; the
+        // game sees a system screen (XN_SYS_UI, as for its keyboard dialog) and an idle pad; the bindings are reloaded on close.
+        if (!liveInput || std::strcmp(rendererMode, "window"))
+            Stop(StopCode::Setup, "--controls-panel needs --renderer window and FM4_INPUT_LIVE=1 (it rebinds the live pad's keyboard)");
+        static runtime::controls::Screen controls(runtime::controls::MakeSdlHooks(
+            controlsPanel,
+            [](bool open) { open ? runtime::keyboard_ui::BeginSystemUi(base) : runtime::keyboard_ui::EndSystemUi(base); },
+            []() -> const char* {
+                if (runtime::keyboard_ui::Active())
+                    return "the game's keyboard dialog";
+                const runtime::disc::SwapService* disc = runtime::disc::Service();
+                return disc != nullptr && disc->Current() != runtime::disc::SwapService::State::Idle ? "the Disc 2 setup" : nullptr;
+            }));
+        // One file: the screen writes $FM4_RECOMP_HOME/keybindings.conf and the reload reads it, so --keybindings must name it too.
+        if (keyBindingsPath != nullptr && runtime::input::KeyBindingsPath() != std::string(std::getenv("FM4_RECOMP_HOME")) + "/keybindings.conf")
+            Stop(StopCode::Setup, "--keybindings %s is not $FM4_RECOMP_HOME/keybindings.conf, the file Keyboard Controls writes", keyBindingsPath);
+        runtime::controls::SetService(&controls);
+    }
     if (discSetupTool != nullptr)
     {
         // A disc the game asks for and the launcher did not give is set up from the game (kernel/disc_swap.h): the launcher's

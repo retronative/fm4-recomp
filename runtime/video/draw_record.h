@@ -191,6 +191,14 @@ void FillXeSystem(const std::vector<VertexWindow>& windows, const HostViewport& 
 // the 8 bool and 32 loop dwords (both stages get the same).
 void FillConstants(const DrawState& d, bool pixel, uint8_t out[kConstantsBytes]);
 
+// FM4 Recomp (M7 CPU cost, opt-in FM4_CONSTANTS_PER_STAGE=1 in the renderer): whether FillConstants(d, pixel) writes the bytes the
+// stage's shader reads (its first `words` alu words, then the bool and loop tail) exactly as it did for a previous draw whose stage
+// had `lastWords` words, alu words `lastAlu` (2048) and bool / loop dwords `lastBools` / `lastLoops`. Conservative: false unless both
+// alu vectors have the 2048 words FillConstants copies from, the word counts are equal, and every word compared is equal (the bytes
+// past `words` up to 4096 are never read by the shader: DrawState::vsConstantWords / psConstantWords).
+bool SameStageConstants(const DrawState& d, bool pixel, uint32_t lastWords, const std::vector<uint32_t>& lastAlu, const uint32_t lastBools[8],
+                        const uint32_t lastLoops[32]);
+
 // ---- The draw extent from the vertices (FM4 Recomp) -----------------------------------------
 
 // The rows the EDRAM bind may claim for this draw (edram::Bind's heightUsed): d.target.targetHeight, lowered to

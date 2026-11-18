@@ -98,7 +98,7 @@ for (const route of routes) {
 const deepLinks = routes
   .map((route) => {
     const html = readFileSync(join(dist, route, 'index.html'), 'utf8')
-    const id = /<div class="prose"[^>]*>[\s\S]*?<h2 id="([^"]+)"/.exec(html)?.[1]
+    const id = /<div class="prose[^"]*"[^>]*>[\s\S]*?<h2 id="([^"]+)"/.exec(html)?.[1]
     return id && route ? `${base}${route.replace(/\/$/, '')}#${id}` : null
   })
   .filter(Boolean)

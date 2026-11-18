@@ -11,9 +11,14 @@
 //
 //   tests/run_shader_pipeline_tests.sh
 #include "video/pipeline_key.h"
+#include "video/push_template.h"  // FM4 Recomp (FM4_PUSH_TEMPLATE): header-only plan
+#include "video/pipeline_cache_header.h"  // FM4 Recomp (M7 stability, FM4_SHADER_CACHE)
 
 #include <cstdio>
+#include <cstring>
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace runtime::video;
@@ -659,8 +664,133 @@ void TestUploadRing()
 
 }  // namespace
 
+// FM4 Recomp (M7 CPU cost, FM4_PIPELINE_WORD_HASH): PipelineKey::WordHash. Expected values from an independent Python evaluation of
+// the documented formula (h = FNV offset basis; per little-endian 64-bit word w: h = ((h ^ w) * 0x9E3779B97F4A7C15) mod 2^64,
+// h ^= h >> 32), never from the code: all zero 0x63f02b6947b8cb00; vsHash = 1 (word 0) 0x0aba1c58462352f4; depthUsed = 1 (byte 46:
+// word 5 = 1 << 48) 0x985e5e731463dd0e.
+void TestWordHash()
+{
+    PipelineKey zero;
+    std::memset(&zero, 0, sizeof zero);
+    Expect(zero.WordHash() == 0x63f02b6947b8cb00ull, "word hash: the all-zero key");
+    PipelineKey vs = zero;
+    vs.vsHash = 1;
+    Expect(vs.WordHash() == 0x0aba1c58462352f4ull, "word hash: vsHash 1 (the first word)");
+    PipelineKey depth = zero;
+    depth.depthUsed = 1;
+    Expect(depth.WordHash() == 0x985e5e731463dd0eull, "word hash: depthUsed 1 (byte 46, the sixth word's byte 6)");
+    PipelineKey last = zero;
+    last.color[3].alphaOp = 1;  // the key's last byte (95): the twelfth word must be hashed
+    CONTROL(last.WordHash() == zero.WordHash(), "the last byte changes the word hash (a loop that stopped one word early would not see it)");
+}
+
+// FM4 Recomp (M7 CPU cost, FM4_PUSH_TEMPLATE): push_template.h PlanPushTemplate against the writes Draw records for a push layout
+// (renderer.cpp step 8: bindings 0-5 one buffer each in binding order, then binding 8 + s for each texture slot s of the layout,
+// ascending). Offsets by hand: six 24-byte buffer infos at 0, 24, ..., 120; the image infos from 144, 24 bytes apart. Then a model of
+// both update forms (Vulkan spec: a VkWriteDescriptorSet writes its pBufferInfo / pImageInfo element to dstBinding; a template entry
+// reads the element at pData + offset for dstBinding) must give every binding the same info.
+void TestPushTemplate()
+{
+    {
+        const PushTemplatePlan p = PlanPushTemplate(0, 24, 24);
+        bool ok = p.count == 6 && p.images == 0 && p.bytes == 144;
+        for (uint32_t b = 0; b < 6 && ok; b++)
+            ok = p.entries[b].binding == b && !p.entries[b].image && p.entries[b].offset == 24 * b && p.entries[b].stride == 24;
+        Expect(ok, "push template: a layout without textures is bindings 0-5 at 0, 24, ..., 120 (144 bytes)");
+    }
+    {
+        // VS slot 0, PS slots 0 and 3 (slot 0 in both stages is one binding): bindings 8 and 11 at 144 and 168, 192 bytes.
+        const PushTemplatePlan p = PlanPushTemplate(SamplerLayoutKey(0x1, 0x9), 24, 24);
+        Expect(p.count == 8 && p.images == 2 && p.bytes == 192 && p.entries[6].binding == 8 && p.entries[6].image && p.entries[6].offset == 144 &&
+                   p.entries[7].binding == 11 && p.entries[7].image && p.entries[7].offset == 168 && p.entries[7].stride == 24,
+               "push template: slots 0 (both stages) and 3 (PS) are bindings 8 and 11 at 144 and 168");
+    }
+    {
+        const PushTemplatePlan p = PlanPushTemplate(SamplerLayoutKey(1u << 31, 0), 24, 24);
+        Expect(p.count == 7 && p.entries[6].binding == 39 && p.entries[6].offset == 144 && p.bytes == 168, "push template: VS slot 31 is binding 39");
+        const PushTemplatePlan all = PlanPushTemplate(SamplerLayoutKey(0xFFFFFFFFu, 0xFFFFFFFFu), 24, 24);
+        Expect(all.count == 38 && all.images == 32 && all.bytes == 912 && all.entries[37].binding == 39 && all.entries[37].offset == 144 + 31 * 24,
+               "push template: all 32 slots: 38 entries, 912 bytes (the renderer's PushTemplateData)");
+    }
+    // The model: binding -> the 8-byte tag of the info it receives. Infos are 24 bytes whose first 8 bytes carry a tag.
+    const uint32_t vsSlots = 0x00000014u, psSlots = 0x00010004u;  // slots 2 (both), 4 (VS), 16 (PS)
+    const uint64_t key = SamplerLayoutKey(vsSlots, psSlots);
+    struct Info
+    {
+        uint64_t tag, a, b;
+    };
+    static_assert(sizeof(Info) == 24);
+    Info buffers[6], images[3];
+    for (uint64_t k = 0; k < 6; k++)
+        buffers[k] = {0xB0 + k, 0, 0};
+    for (uint64_t k = 0; k < 3; k++)
+        images[k] = {0x10 + k, 0, 0};
+    // What Draw writes today, by hand: 0-5 the buffers; 8 + 2 = 10 image 0, 8 + 4 = 12 image 1, 8 + 16 = 24 image 2.
+    const std::map<uint32_t, uint64_t> writes = {{0, 0xB0}, {1, 0xB1}, {2, 0xB2}, {3, 0xB3}, {4, 0xB4}, {5, 0xB5}, {10, 0x10}, {12, 0x11}, {24, 0x12}};
+    uint8_t data[6 * 24 + 32 * 24] = {};
+    std::memcpy(data, buffers, sizeof buffers);
+    std::memcpy(data + 6 * 24, images, sizeof images);  // the renderer's block: images[] in ascending slot order after the buffers
+    const auto apply = [&](const PushTemplatePlan& p) {
+        std::map<uint32_t, uint64_t> got;
+        for (uint32_t i = 0; i < p.count; i++)
+        {
+            uint64_t tag = 0;
+            std::memcpy(&tag, data + p.entries[i].offset, 8);
+            got[p.entries[i].binding] = tag;
+        }
+        return got;
+    };
+    const PushTemplatePlan plan = PlanPushTemplate(key, 24, 24);
+    Expect(apply(plan) == writes, "push template: every binding receives the info the writes give it (slots 2, 4, 16)");
+    PushTemplatePlan swapped = plan;
+    std::swap(swapped.entries[6].offset, swapped.entries[7].offset);
+    CONTROL(apply(swapped) == writes, "two image offsets exchanged give bindings 10 and 12 each other's image");
+    const PushTemplatePlan vsOnly = PlanPushTemplate(SamplerLayoutKey(vsSlots, 0), 24, 24);
+    CONTROL(apply(vsOnly) == writes, "a template of the VS slots alone misses binding 24");
+}
+
+
+// FM4 Recomp (M7 stability, FM4_SHADER_CACHE; pipeline_cache_header.h after ReCarbon): VkPipelineCacheHeaderVersionOne by hand
+// (Vulkan spec, vkGetPipelineCacheData: headerSize 32, headerVersion 1, vendorID, deviceID, pipelineCacheUUID[16], little-endian).
+// Device: Apple 0x106B, device ID 0x1B000207 (macOS 27.0 on MoltenVK's encoding), UUID bytes 0..15.
+void TestPipelineCacheHeader()
+{
+    using namespace runtime::video::pipeline_cache;
+    Maker device{0x106B, 0x1B000207, {}};
+    for (int i = 0; i < 16; i++)
+        device.uuid[size_t(i)] = uint8_t(i);
+    auto header = [&](uint32_t size, uint32_t version, uint32_t vendor, uint32_t id, uint8_t uuidFirst) {
+        std::vector<uint8_t> h = {uint8_t(size), uint8_t(size >> 8), uint8_t(size >> 16), uint8_t(size >> 24),
+                                  uint8_t(version), 0, 0, 0,
+                                  uint8_t(vendor), uint8_t(vendor >> 8), uint8_t(vendor >> 16), uint8_t(vendor >> 24),
+                                  uint8_t(id), uint8_t(id >> 8), uint8_t(id >> 16), uint8_t(id >> 24)};
+        for (int i = 0; i < 16; i++)
+            h.push_back(uint8_t(i == 0 ? uuidFirst : i));
+        h.push_back(0xAB);  // driver data after the header
+        return h;
+    };
+    std::vector<uint8_t> ok = header(32, 1, 0x106B, 0x1B000207, 0);
+    Expect(CheckHeader(nullptr, 0, device).verdict == Verdict::Empty, "pipeline cache header: no file is Empty");
+    Expect(CheckHeader(ok.data(), ok.size(), device).verdict == Verdict::Usable && LogLine(CheckHeader(ok.data(), ok.size(), device), device).empty(),
+           "pipeline cache header: this device's header is Usable, no log line");
+    std::vector<uint8_t> other = header(32, 1, 0x106B, 0x1B000207, 9);
+    CONTROL(CheckHeader(other.data(), other.size(), device).verdict != Verdict::OtherMaker, "pipeline cache header: another UUID is OtherMaker");
+    other = header(32, 1, 0x106B, 0x1A050207, 0);
+    const HeaderCheck os = CheckHeader(other.data(), other.size(), device);
+    CONTROL(!(os.verdict == Verdict::OtherMaker && LogLine(os, device).find("OS 26.5 -> 27.0") != std::string::npos),
+            "pipeline cache header: an older macOS (device ID 1a050207) is OtherMaker, named OS 26.5 -> 27.0");
+    CONTROL(CheckHeader(ok.data(), 31, device).verdict != Verdict::Unreadable, "pipeline cache header: 31 bytes is Unreadable");
+    other = header(32, 2, 0x106B, 0x1B000207, 0);
+    CONTROL(CheckHeader(other.data(), other.size(), device).verdict != Verdict::Unreadable, "pipeline cache header: header version 2 is Unreadable");
+    other = header(48, 1, 0x106B, 0x1B000207, 0);
+    CONTROL(CheckHeader(other.data(), other.size(), device).verdict != Verdict::Unreadable, "pipeline cache header: header size 48 is Unreadable");
+}
+
 int main()
 {
+    TestWordHash();
+    TestPipelineCacheHeader();
+    TestPushTemplate();
     TestKeyEquality();
     TestKeyNormalization();
     TestRefusals();

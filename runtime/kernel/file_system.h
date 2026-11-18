@@ -74,8 +74,16 @@ struct DiscEntry
     std::string relative;  // a disc entry: its path under the disc root ('/'-separated, disc case; "" for the root)
     bool writable = false;  // in a writable content root (saved content, a host directory under the user data)
     uint32_t disc = 0;      // the disc it is on (a disc entry, or a file of a package mounted from a disc); 0 elsewhere
+    // FM4 Recomp (writable entries): the host file's creation, last access, last write and change times as FILETIMEs (100 ns since
+    // 1601-01-01); 0 elsewhere (the disc's fixed stamp is reported instead: DiscTimes).
+    uint64_t times[4] = {0, 0, 0, 0};
 };
 uint32_t DiscAttributes(const DiscEntry& entry);
+// The four times a query reports for `entry` (creation, last access, last write, change): a writable entry's host times (Xenia
+// 67f16c4 host_path_entry.cc: a host file's own times), else kDiscTimeStamp for each.
+void DiscTimes(const DiscEntry& entry, uint64_t (&out)[4]);
+// A host time (seconds and nanoseconds since 1970-01-01) as a FILETIME: (seconds * 10^7 + nanoseconds / 100) + 116444736000000000.
+uint64_t FileTimeFromUnix(int64_t seconds, int64_t nanoseconds);
 uint64_t DiscAllocationSize(const DiscEntry& entry);
 
 // No title update is installed: the translation is of the base default.xex, so update content (an .xexp
@@ -105,6 +113,15 @@ bool UnmountContentRoot(const std::string& root);
 // vfs/devices/disc_image_device.cc:126-187), as the disc map lists them; in a package its file table order
 // (stfs_container_device.cc:94). A file has none.
 struct DirectoryChild { std::string name; DiscEntry entry; };
+// FM4 Recomp (user data): a guest name as stored on the host and back. ':' (FM4's default photo name is the date and time,
+// "2026-11-14 17:51") is not valid on every host volume (exFAT), so it is stored as "%3A", and '%' as "%25"; GuestNameOf reverses
+// exactly those two (any other '%' sequence is left as it is). Pure.
+std::string HostNameOf(std::string_view guest);
+std::string GuestNameOf(std::string_view host);
+// FM4 Recomp (user data): a host directory entry that is not the game's: "." and "..", and the files macOS adds itself: an
+// AppleDouble companion "._<name>" (extended attributes on a volume without them, e.g. exFAT: TN1188 / Apple's AppleDouble
+// format) and ".DS_Store" (Finder). Listings of saved content leave them out. Pure.
+bool HostOnlyName(std::string_view host);
 std::vector<DirectoryChild> ListDirectory(const DiscEntry& directory);
 
 enum class Resolved { Found, NotFound, OtherDevice };
@@ -136,7 +153,7 @@ uint32_t WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* b
 // root and (9) if the host refuses.
 void SetHostFileLength(const DiscEntry& entry, uint64_t length);
 // Removes a writable root's host file (not a directory; a symlink or a host failure stops (9)).
-void RemoveHostFile(const DiscEntry& entry);
+void RemoveHostFile(const DiscEntry& entry);  // FM4 Recomp: an empty saved-content directory too (one still holding files is left)
 // Whether a writable root is mounted on this host directory (an open content item).
 bool DirectoryRootMountedAt(const std::string& hostDirectory);
 // A writable entry's current size on the host (other handles may have written since it was opened).

@@ -56,7 +56,8 @@ const SurfaceRequest* OpenWindow();
 // The window's size in pixels now (SDL_GetWindowSizeInPixels; main thread).
 VkExtent2D WindowPixels();
 // Main thread, after the guest thread started. Never returns. FM4 Recomp (Disc 2): each turn also pumps a pending disc
-// swap's dialogs (kernel/disc_swap.h PumpMainThread).
+// swap's dialogs (kernel/disc_swap.h PumpMainThread); FM4 Recomp (in-game Keyboard Controls): Command-comma opens the screen and
+// each turn pumps it (kernel/controls_screen.h).
 [[noreturn]] void RunWindowLoop();
 // Main thread: the window's title.
 void SetWindowTitle(const char* title);

@@ -48,8 +48,9 @@ std::string ObjectPath(const PPCContext& ctx, const uint8_t* base, uint32_t attr
 constexpr uint32_t kNetworkOpenInformationSize = 56;
 void WriteNetworkOpenInformation(uint8_t* base, uint32_t info, const runtime::DiscEntry& entry)
 {
-    const uint64_t values[6] = {runtime::kDiscTimeStamp, runtime::kDiscTimeStamp, runtime::kDiscTimeStamp,
-                                runtime::kDiscTimeStamp, runtime::DiscAllocationSize(entry), entry.size};
+    uint64_t times[4];
+    runtime::DiscTimes(entry, times);
+    const uint64_t values[6] = {times[0], times[1], times[2], times[3], runtime::DiscAllocationSize(entry), entry.size};
     for (int i = 0; i < 6; i++)
     {
         runtime::Store32(base, info + 8 * i, uint32_t(values[i] >> 32));
@@ -268,8 +269,9 @@ GUEST_IMPORT(NtQueryDirectoryFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:547-
             status = child == nullptr && name.empty() ? (1u << 31 | 0x6) : 0xC000000F;  // STATUS_NO_MORE_FILES : STATUS_NO_SUCH_FILE
         else
         {
-            const uint64_t times = runtime::kDiscTimeStamp;
-            const uint64_t values[6] = {times, times, times, times, child->entry.size, runtime::DiscAllocationSize(child->entry)};
+            uint64_t times[4];
+            runtime::DiscTimes(child->entry, times);
+            const uint64_t values[6] = {times[0], times[1], times[2], times[3], child->entry.size, runtime::DiscAllocationSize(child->entry)};
             runtime::Store32(base, info, 0);
             runtime::Store32(base, info + 4, uint32_t(file->findIndex));
             for (int i = 0; i < 6; i++)
@@ -415,8 +417,10 @@ GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc
         return (void)(ctx.r3.u64 = runtime::status::kInvalidHandle);
     if (infoClass == kDisposition)
     {
-        if (!file->entry.writable || file->entry.directory)
-            Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): delete-on-close of a disc file or a directory", handle);
+        // FM4 Recomp: a saved-content directory too (FM4 overwrites a photo by deleting its three files and then its folder): it is
+        // removed when this handle closes, once its files are gone (RemoveHostFile). A disc file stops (7).
+        if (!file->entry.writable)
+            Stop(StopCode::Unimplemented, "NtSetInformationFile(%08X): delete-on-close of a disc file", handle);
         file->deleteOnClose = base[info] != 0;
         if (ioStatus)
             runtime::Store32(base, ioStatus, 0), runtime::Store32(base, ioStatus + 4, 0);

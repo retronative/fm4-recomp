@@ -487,7 +487,20 @@ Binding Bind(Ownership& ownership, const BindRegisters& regs, uint32_t heightUse
         }
 
     // :776-797: sorted by base, then by index.
-    std::vector<std::pair<uint32_t, uint32_t>> sorted;
+    // FM4 Recomp (M7 CPU cost): at most 1 + kColorTargets entries, in place (a vector cost an allocation and a free a draw; the
+    // command thread's operator new had edram::Bind as a caller for 14 %, scenario336). The same calls as the vector's below.
+    struct
+    {
+        std::pair<uint32_t, uint32_t> v[1 + kColorTargets];
+        size_t n = 0;
+        void emplace_back(uint32_t base, uint32_t index) { v[n++] = {base, index}; }
+        std::pair<uint32_t, uint32_t>* begin() { return v; }
+        std::pair<uint32_t, uint32_t>* end() { return v + n; }
+        bool empty() const { return n == 0; }
+        size_t size() const { return n; }
+        const std::pair<uint32_t, uint32_t>& operator[](size_t i) const { return v[i]; }
+        const std::pair<uint32_t, uint32_t>& back() const { return v[n - 1]; }
+    } sorted;
     for (uint32_t i = 0; i < 1 + kColorTargets; i++)
         if (used[i])
             sorted.emplace_back(bases[i], i);

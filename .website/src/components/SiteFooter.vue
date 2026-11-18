@@ -35,6 +35,10 @@ if (!disclaimer) throw new Error('docs/LEGAL.md: no first paragraph for the foot
           <p class="eyebrow mb-3">Pages</p>
           <ul class="list-none m-0 p-0 space-y-1.5 text-[.95rem]">
             <li><RouterLink to="/getting-started/">Getting started</RouterLink></li>
+            <li><RouterLink to="/compatibility/">Compatibility</RouterLink></li>
+            <li><RouterLink to="/faq/">FAQ</RouterLink></li>
+            <li><RouterLink to="/releases/">Status and releases</RouterLink></li>
+            <li><RouterLink to="/docs/">Documentation</RouterLink></li>
             <li><RouterLink to="/reference/">Reference notes</RouterLink></li>
             <li><RouterLink to="/legal/">Legal notice and contents</RouterLink></li>
             <li><RouterLink to="/licences/">Licences and third-party notices</RouterLink></li>

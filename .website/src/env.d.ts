@@ -1,5 +1,6 @@
 // Adapted from reFrozen .website (GPL-3.0-or-later); FM4 Recomp changes: the virtual:docs shape
-// of plugins/docs.mjs (docs, reference notes, README parts, third-party notices); no status.
+// of plugins/docs.mjs (docs, reference notes, README parts, third-party notices); the status is
+// the release headline and link only.
 /// <reference types="vite/client" />
 
 declare module 'virtual:docs' {
@@ -18,6 +19,16 @@ declare module 'virtual:docs' {
   }
   export interface Doc extends Page {
     description: string
+    /** Front matter `order` (docs/*.md); 99 when absent. */
+    order?: number
+  }
+  /** docs/status.md's front matter. */
+  export interface Status {
+    releaseHeadline: string
+    releasePlanned: string
+    /** The published release's page on GitHub; null until a release is published. */
+    releaseUrl: string | null
+    releaseVersion: string | null
   }
   export interface Note extends Doc {
     area: string
@@ -32,10 +43,10 @@ declare module 'virtual:docs' {
   export interface ReadmeParts {
     intro: string
     notice: string
-    gettingStarted: string
     license: string
   }
   export const docs: Doc[]
+  export const status: Status
   export const notes: Note[]
   export const areas: Area[]
   export const referenceIndex: Doc

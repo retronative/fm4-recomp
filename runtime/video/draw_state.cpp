@@ -390,8 +390,14 @@ struct Decoder
         const auto limit = [](uint32_t base, uint32_t other) { return other > base ? other : 2048u; };
         const auto rows = [&](uint32_t tiles, uint32_t pitchTiles) { return tiles / pitchTiles * rowsPerTile; };
         uint32_t edramRows = rows(2048, t.pitchTiles);
+        // FM4 Recomp (Photo Mode): the depth target bounds the colour target only when it is bound (X draw_util.cc:60-79
+        // GetNormalizedDepthControl, render_target_cache.cc:627-636; edram.cpp Bind): stencil, or a depth test other than
+        // "always, no write". Photo Mode's 64 bpp accumulation draws (depth off, depth base 720) otherwise stopped at row 352.
+        const bool depthBound =
+            d.depthStencil.stencilEnable || (d.depthStencil.zEnable && (d.depthStencil.zWriteEnable || d.depthStencil.zFunc != 7));
         if (t.colorWritten)
-            edramRows = std::min(edramRows, rows(limit(t.colorBase, t.depthBase) - t.colorBase, t.pitchTiles << (t.colorFormat == 5 ? 1 : 0)));
+            edramRows = std::min(edramRows, rows((depthBound ? limit(t.colorBase, t.depthBase) : 2048u) - t.colorBase,
+                                                 t.pitchTiles << (t.colorFormat == 5 ? 1 : 0)));
         if (t.depthWritten)
             edramRows = std::min(edramRows, rows(limit(t.depthBase, t.colorBase) - t.depthBase, t.pitchTiles));
         t.edramRows = edramRows;
@@ -475,8 +481,11 @@ struct Decoder
     bool TextureFetches()
     {
         struct Use { uint32_t slot, dimension; shader::ShaderTranslation::Filters filters; };
-        std::vector<Use> uses;
-        uses.reserve(in.vs->textureSlots.size() + in.ps->textureSlots.size());  // FM4 Recomp (M7 CPU cost): the upper bound; one allocation
+        // FM4 Recomp (M7 CPU cost): the thread's scratch, cleared each decode (its storage stays: an allocation and a free a draw before;
+        // Decoder::TextureFetches was 3.8 % of the command thread's frees, scenario336). Nothing keeps a reference past this call.
+        thread_local std::vector<Use> uses;
+        uses.clear();
+        uses.reserve(in.vs->textureSlots.size() + in.ps->textureSlots.size());  // the upper bound
         for (const shader::ShaderTranslation* stage : {in.vs, in.ps})
             for (size_t i = 0; i < stage->textureSlots.size(); i++)
             {

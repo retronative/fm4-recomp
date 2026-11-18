@@ -75,7 +75,7 @@ std::vector<ContentData> ListContent(uint32_t contentType)
         while (const dirent* e = readdir(d))
         {
             const std::string name = e->d_name;
-            if (name.size() > 9 && name.compare(name.size() - 9, 9, ".xcontent") == 0)
+            if (!HostOnlyName(name) && name.size() > 9 && name.compare(name.size() - 9, 9, ".xcontent") == 0)
                 names.push_back(name);
         }
         closedir(d);
@@ -99,7 +99,7 @@ std::vector<ContentData> ListContent(uint32_t contentType)
         {
             const std::string name = e->d_name;
             struct stat info;
-            if (!(name.size() > 9 && name.compare(name.size() - 9, 9, ".xcontent") == 0) &&
+            if (!HostOnlyName(name) && !(name.size() > 9 && name.compare(name.size() - 9, 9, ".xcontent") == 0) &&
                 lstat((directory + "/" + name).c_str(), &info) == 0 && S_ISREG(info.st_mode))
                 files.push_back(name);
         }
