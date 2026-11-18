@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="740" viewBox="0 0 1200 740" role="img" aria-labelledby="title desc">
+<title id="title">FM4 Recomp controller guide</title><desc id="desc">Xbox-layout 8BitDo Ultimate 2 Wireless. Left stick steers, LT brakes, RT accelerates, right stick click changes camera, Start pauses. Keyboard equivalents are listed below.</desc>
+<defs>
+<linearGradient id="shell" x2="0%" y2="100%" gradientUnits="objectBoundingBox"><stop stop-color="#303641"/><stop offset="1" stop-color="#171b22"/></linearGradient>
+<radialGradient id="stick"><stop stop-color="#353c47"/><stop offset="1" stop-color="#20252d"/></radialGradient>
+<style>text{font-family:Helvetica,Arial,sans-serif;fill:#f5f6f9}.label{font-size:19px;font-weight:700}.sub{font-size:15px;fill:#aeb8c8}.wire{fill:none;stroke:#8794a8;stroke-width:1.5}.dot{fill:#ff503d}.button{fill:#151920;stroke:#525c6b;stroke-width:1.5}.cap{font-size:14px;font-weight:700;text-anchor:middle}.key{font-size:17px;fill:#d9e0ec}</style>
+</defs>
+<rect width="1200" height="740" rx="24" fill="#101319"/>
+<path d="M64 60h36" stroke="#ff503d" stroke-width="5"/>
+<text x="64" y="113" font-size="47" font-weight="700">FM4 Recomp <tspan fill="#ff503d">Controls</tspan></text>
+<text x="66" y="145" class="sub">8BitDo Ultimate 2 Wireless · Xbox layout</text>
+<!-- Shoulders and front shell -->
+<path d="M393 258v-39q0-16 20-20h102q13 1 13 16v46m144 0v-46q0-15 13-16h102q20 4 20 20v39" fill="#20252d" stroke="#535d6c" stroke-width="2"/>
+<path d="M390 266v-15q0-20 37-22h94l25 15h108l25-15h94q37 2 37 22v15" fill="#363d49" stroke="#535d6c" stroke-width="2"/>
+<path d="M419 246q39-8 93 1 88 12 176 0 54-9 93-1 35 8 44 50l40 186q12 57-19 69-28 11-50-19l-69-97q-15-20-41-20H514q-26 0-41 20l-69 97q-22 30-50 19-31-12-19-69l40-186q9-42 44-50Z" fill="url(#shell)" stroke="#697484" stroke-width="2"/>
+<g stroke-width="3" fill="url(#stick)"><circle cx="463" cy="313" r="38" stroke="#76869a"/><circle cx="673" cy="392" r="38" stroke="#76869a"/></g>
+<g fill="#232831" stroke="#4e5969" stroke-width="2"><circle cx="463" cy="313" r="27"/><circle cx="673" cy="392" r="27"/></g>
+<path d="M506 365h20v18h18v20h-18v18h-20v-18h-18v-20h18z" class="button"/>
+<circle cx="575" cy="309" r="10" class="button"/><circle cx="625" cy="309" r="10" class="button"/>
+<path d="M571 306h8v6h-8z M621 306h8m-8 3h8m-8 3h8" fill="none" stroke="#aeb8c8"/>
+<circle cx="600" cy="350" r="13" class="button"/><circle cx="600" cy="350" r="4" fill="#969fac"/>
+<g class="button"><circle cx="745" cy="282" r="16"/><circle cx="716" cy="311" r="16"/><circle cx="774" cy="311" r="16"/><circle cx="745" cy="340" r="16"/></g>
+<g class="cap"><text x="745" y="287" fill="#f6d26a">Y</text><text x="716" y="316" fill="#86baff">X</text><text x="774" y="316" fill="#ff8274">B</text><text x="745" y="345" fill="#8ee5a5">A</text></g>
+<!-- Callouts -->
+<g class="wire"><path d="M264 203h146"/><path d="M264 287h99l70 26h30"/><path d="M264 394h252"/><path d="M936 203H790"/><path d="M936 285H828l-33 28"/><path d="M936 379H812l-32 13H673"/><path d="M936 472H793l-92-10-76-82v-71"/></g>
+<g class="dot"><circle cx="410" cy="203" r="4"/><circle cx="463" cy="313" r="4"/><circle cx="516" cy="394" r="4"/><circle cx="790" cy="203" r="4"/><circle cx="795" cy="313" r="4"/><circle cx="673" cy="392" r="4"/><circle cx="625" cy="309" r="4"/></g>
+<g class="label"><text x="64" y="199">LT · Brake</text><text x="64" y="283">Left stick · Steer</text><text x="64" y="390">D-pad · Navigate</text><text x="952" y="199">RT · Throttle</text><text x="952" y="281">A / B · Select / Back</text><text x="952" y="375">Right stick click</text><text x="952" y="468">Start · Pause</text></g>
+<g class="sub"><text x="64" y="223">Keyboard S</text><text x="64" y="307">Keyboard A / D</text><text x="64" y="414">Arrow keys</text><text x="952" y="223">Keyboard W</text><text x="952" y="305">Space / Backspace</text><text x="952" y="399">Change camera · C</text><text x="952" y="492">Return · ⌘, during a race</text></g>
+<path d="M64 585h1072" stroke="#383f4c"/>
+<text x="64" y="628" class="label">Other keyboard equivalents</text>
+<g class="key"><text x="64" y="663">LB / RB · Q / E</text><text x="298" y="663">Back · Tab</text><text x="520" y="663">X · Left Shift</text><text x="765" y="663">Y · Left Control</text></g>
+<text x="64" y="704" class="sub">Rebind keys under KEYBOARD CONTROLS in the Pause or Pre-Race menu.</text>
+</svg>

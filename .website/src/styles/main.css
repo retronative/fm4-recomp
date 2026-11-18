@@ -392,3 +392,44 @@
     animation: none !important;
   }
 }
+
+
+.prose #install + ol {
+  counter-reset: install-step;
+  display: grid;
+  gap: 0.75rem;
+  list-style: none;
+  padding: 0;
+}
+
+.prose #install + ol > li {
+  counter-increment: install-step;
+  position: relative;
+  margin: 0;
+  padding: 1rem 1rem 1rem 3.75rem;
+  border: 1px solid var(--color-seam);
+  border-radius: 0.75rem;
+  background: var(--color-panel, #181b22);
+  overflow-wrap: anywhere;
+}
+
+.prose #install + ol > li::before {
+  content: counter(install-step, decimal-leading-zero);
+  position: absolute;
+  left: 1rem;
+  top: 1rem;
+  color: #ff7666;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.prose #install + ol > li > strong:first-child {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.prose .controller-guide {
+  display: block;
+  width: 100%;
+  height: auto;
+}

@@ -78,6 +78,14 @@ function createRenderer(base, repoUrl, repoRoot) {
     for (const block of state.tokens) {
       const children = block.children ?? []
       for (const [index, token] of children.entries()) {
+        if (token.type === 'image' && from === 'docs/getting-started.md' &&
+            token.attrGet('src') === '../.website/public/brand/fm4-controller-guide.svg') {
+          token.attrSet('src', base + 'brand/fm4-controller-guide.svg')
+          token.attrSet('width', '1200')
+          token.attrSet('height', '740')
+          token.attrSet('class', 'controller-guide')
+          token.attrSet('loading', 'lazy')
+        }
         if (token.type !== 'link_open') continue
         const href = token.attrGet('href') ?? ''
         // THIRD_PARTY_NOTICES.md also ships inside the app (licenses/), where third-party/ holds

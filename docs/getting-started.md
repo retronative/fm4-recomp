@@ -29,16 +29,16 @@ needed: the app includes everything it runs. No Homebrew, Xcode or developer too
 
 ## Install
 
-1. **Download** `FM4-Recomp-0.1.0.dmg`. To check it, run `shasum -a 256 FM4-Recomp-0.1.0.dmg` in
+1. **Download the DMG.** Get `FM4-Recomp-0.1.0.dmg` from the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0). To check it, run `shasum -a 256 FM4-Recomp-0.1.0.dmg` in
    Terminal, in the folder with the download. It must print
    `b471494684c0f409875908a3bc8cfdd2aff21a1a7810e861395b42924f02dfca`.
-2. **Open the disk image** and drag **FM4 Recomp** onto **Applications**. Open it from
+2. **Move the app to Applications.** Open the disk image and drag **FM4 Recomp** onto **Applications**. Open it from
    Applications.
-3. **The first open.** The beta is ad hoc signed and **not notarised**: Apple has not checked it,
+3. **Allow the first launch.** The beta is ad hoc signed and **not notarised**: Apple has not checked it,
    so macOS may refuse to open it the first time. Opening it anyway is your own decision to make
    an exception for this app; do it only for a download whose checksum matches. Open **System
    Settings → Privacy & Security**, choose **Open Anyway** for FM4 Recomp, and open it again.
-4. **The first-run setup.** FM4 Recomp checks your Mac, then asks where to keep the game data and
+4. **Choose your Disc 1 image.** FM4 Recomp checks your Mac, then asks where to keep the game data and
    your saves: your Library by default, or any folder, an external SSD included (keep that drive
    connected to play). Choose your Disc 1 image or drop it on the window. Setup copies and checks
    the game files, which takes a few minutes; your disc image is only read, and every file is
@@ -58,6 +58,8 @@ watch the progress (Cancel and Try Again are there). The panel closes once Disc 
 the game then shows its own "Install Additional Content" screen; confirm with A.
 
 ## Controls
+
+![8BitDo Ultimate 2 Wireless controller showing the FM4 controls and default keyboard equivalents.](../.website/public/brand/fm4-controller-guide.svg)
 
 | Gamepad (Xbox layout) | Keyboard (default) |
 |---|---|
