@@ -7,7 +7,10 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
-The first public beta, 0.1.0, is in preparation. It is not published yet.
+## [0.1.0] - 2026-11-18
+
+The first public beta. The full notes are on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0). The SHA-256 of
+`FM4-Recomp-0.1.0.dmg` is `b471494684c0f409875908a3bc8cfdd2aff21a1a7810e861395b42924f02dfca`.
 
 ### Added
 

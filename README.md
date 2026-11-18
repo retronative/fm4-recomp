@@ -12,11 +12,11 @@ arm64 macOS, built on [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
 
 ## Status
 
-**No release is published yet.** The first public beta, FM4 Recomp 0.1.0, for Apple
-silicon Macs (macOS 26 or later), is in preparation. It plays the game in a window with sound,
-from the title screen through the menus into a race, with a gamepad or the keyboard, from your own
-Disc 1 (Disc 2 is optional). It is an early, unoptimised build: expect a low frame rate.
-[Getting started](docs/getting-started.md) describes how it installs.
+**[FM4 Recomp 0.1.0](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0) is available** for Apple silicon Macs (macOS 26 or later): the
+first public beta. It plays the game in a window with sound, from the title screen through the
+menus into a race, with a gamepad or the keyboard, from your own Disc 1 (Disc 2 is optional). It
+is an early, unoptimised build: expect a low frame rate. To install it, follow
+[Getting started](docs/getting-started.md); the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0) list its known issues.
 
 Changes by release are in [CHANGELOG.md](CHANGELOG.md). The public status of each milestone, the
 beta's contents and its known issues are in [docs/status.md](docs/status.md). See also

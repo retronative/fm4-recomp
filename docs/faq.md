@@ -20,8 +20,9 @@ Motorsport 4* (USA); setup reads a disc image you made from it.
 
 ## Is there a release?
 
-Not yet. The first public beta, FM4 Recomp 0.1.0, is in preparation. The current state
-is on the [Status and releases](status.md) page.
+Yes. **FM4 Recomp 0.1.0**, the first public beta, was published on 18 November 2026. See
+[Getting started](getting-started.md) to install it, and the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0) for its notes.
+The current state is on the [Status and releases](status.md) page.
 
 ## Which version of the game do I need?
 

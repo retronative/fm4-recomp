@@ -1,16 +1,15 @@
 ---
 title: Getting started
-description: How to install the FM4 Recomp beta on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
+description: How to install FM4 Recomp 0.1.0 on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
 order: 1
 ---
 
 # Getting started
 
 > [!NOTE]
-> **No release is published yet.** The first public beta, FM4 Recomp 0.1.0, is in
-> preparation. This page describes how it installs; the download will be on the project's
-> [releases page](https://github.com/retronative/fm4-recomp/releases). See
-> [Status and releases](status.md).
+> **FM4 Recomp 0.1.0** is available: the first public beta, an early and unoptimised build.
+> Download `FM4-Recomp-0.1.0.dmg` from the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0), which also has the release
+> notes. See [Status and releases](status.md) for its known issues.
 
 ## What you will need
 
@@ -30,8 +29,9 @@ needed: the app includes everything it runs. No Homebrew, Xcode or developer too
 
 ## Install
 
-1. **Download** the disk image from the release page and check it: run `shasum -a 256` on the
-   downloaded file in Terminal. It must print the SHA-256 the release page gives.
+1. **Download** `FM4-Recomp-0.1.0.dmg`. To check it, run `shasum -a 256 FM4-Recomp-0.1.0.dmg` in
+   Terminal, in the folder with the download. It must print
+   `b471494684c0f409875908a3bc8cfdd2aff21a1a7810e861395b42924f02dfca`.
 2. **Open the disk image** and drag **FM4 Recomp** onto **Applications**. Open it from
    Applications.
 3. **The first open.** The beta is ad hoc signed and **not notarised**: Apple has not checked it,

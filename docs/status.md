@@ -1,9 +1,11 @@
 ---
 title: Status and releases
-description: The single public record of FM4 Recomp's milestones and releases. The first public beta, 0.1.0, is in preparation; no release is published yet.
+description: The single public record of FM4 Recomp's milestones and releases. FM4 Recomp 0.1.0, the first public beta, is available.
 order: 3
-release_headline: First beta in preparation
-release_planned: FM4 Recomp 0.1.0 for Apple silicon Macs, macOS 26 or later
+release_headline: FM4 Recomp 0.1.0 available
+release_planned: The first public beta, for Apple silicon Macs with macOS 26 or later, published 18 November 2026
+release_url: https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0
+release_version: v0.1.0
 ---
 
 # Status and releases
@@ -24,15 +26,16 @@ its acceptance criteria have been met and observed.
 | M5 | Front end: title, menus, audio, movies, input | Passed | |
 | M6 | Race load and first race frame | Passed | |
 | M7 | Playable racing | Under review | About 29 frames per second in a race on an Apple M5 Mac (see Known issues). |
-| M8 | Polish and distribution | Under review | The beta's disk image, its fresh install and its licence audit. |
+| M8 | Polish and distribution | Passed | FM4 Recomp 0.1.0 is published. |
 | M9 | High-resolution rendering and Extended View | Future work | After the beta. |
 
 ## Releases
 
-**No release is published yet.** The first public beta, **FM4 Recomp 0.1.0**, is in
-preparation. It will be published as a disk image on the project's
-[releases page](https://github.com/retronative/fm4-recomp/releases), with its SHA-256 and release
-notes. [Getting started](getting-started.md) describes how it installs.
+**FM4 Recomp 0.1.0** is the first public beta. It was published on 18 November 2026:
+[download and release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0). The SHA-256 of `FM4-Recomp-0.1.0.dmg` is
+`b471494684c0f409875908a3bc8cfdd2aff21a1a7810e861395b42924f02dfca`. To install it, follow [Getting started](getting-started.md). The source of its
+replaceable LGPL libraries is published on the same page, as the [legal notice](LEGAL.md)
+describes.
 
 ### In the first beta
 
