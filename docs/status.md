@@ -25,7 +25,7 @@ its acceptance criteria have been met and observed.
 | M4 | First frames: GPU safety, execution model, shader census | Passed | |
 | M5 | Front end: title, menus, audio, movies, input | Passed | |
 | M6 | Race load and first race frame | Passed | |
-| M7 | Playable racing | Under review | About 29 frames per second in a race on an Apple M5 Mac (see Known issues). |
+| M7 | Playable racing | Passed | With documented residuals: about 29 frames per second in a race on an Apple M5 Mac, and the race sound can start up to a second before the picture (see Known issues). |
 | M8 | Polish and distribution | Passed | FM4 Recomp 0.1.0 is published. |
 | M9 | High-resolution rendering and Extended View | Future work | After the beta. |
 
