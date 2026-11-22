@@ -10,6 +10,7 @@
 #include "content.h"
 #include "objects.h"
 #include <optional>
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include "dispatcher.h"
@@ -106,6 +107,16 @@ constexpr uint32_t kNonDirectoryFile = 0x40;                     // FILE_NON_DIR
 constexpr uint32_t kSynchronousIo = 0x10 | 0x20;
 constexpr std::string_view kHardDisk = "\\Device\\Harddisk0";  // absent (owner policy, below)                 // FILE_SYNCHRONOUS_IO_ALERT, _NONALERT
 
+// FM4 Recomp: one line per STATUS_DISK_FULL returned to the game, with the figures behind it (content.h ContentFree).
+void LogDiskFull(const char* import, const std::string& host, uint64_t growth)
+{
+    std::fprintf(stderr, "[fs] %s(%s): STATUS_DISK_FULL: %llu more byte(s) wanted; saved content has %llu byte(s) free (the Mac's volume has "
+                         "%llu available, of which %llu are kept in reserve; %llu of the device's %llu stored)\n",
+                 import, host.c_str(), (unsigned long long)growth, (unsigned long long)runtime::ContentFreeBytes(),
+                 (unsigned long long)runtime::HostAvailableBytes(), (unsigned long long)runtime::kHostReserve,
+                 (unsigned long long)runtime::ContentBytesUsed(), (unsigned long long)runtime::kContentCapacity);
+}
+
 // NtCreateFile/NtOpenFile on the read-only disc (Xenia xboxkrnl_io.cc:98, virtual_file_system.cc:181).
 void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t handleOut, uint32_t access, uint32_t attributes,
                 uint32_t ioStatus, uint32_t disposition, uint32_t options)
@@ -163,7 +174,14 @@ void OpenOnDisc(PPCContext& ctx, uint8_t* base, const char* import, uint32_t han
         {
             const bool directory = (options & kDirectoryFile) != 0;
             if (!runtime::CreateHostEntry(entry.host, directory))
-                return finish(0xC0000022, kDoesNotExist, 0xFFFFFFFF);  // STATUS_ACCESS_DENIED
+            {
+                // FM4 Recomp: a full host volume (mkdir/open ENOSPC, file_system.h HostVolumeFull) is STATUS_DISK_FULL (NT; Xenia
+                // has one status for every failed create); anything else ACCESS_DENIED as before.
+                const bool full = runtime::HostVolumeFull(errno);
+                if (full)
+                    LogDiskFull(import, entry.host, 0);
+                return finish(full ? 0xC000007F : 0xC0000022, kDoesNotExist, 0xFFFFFFFF);  // STATUS_DISK_FULL : STATUS_ACCESS_DENIED
+            }
             entry.directory = directory, entry.size = 0, entry.attributes = directory ? runtime::file_attribute::kDirectory : 0x80;
             action = kCreated;
         }
@@ -327,9 +345,20 @@ GUEST_IMPORT(NtWriteFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io.cc:354-429 NtWri
     }
     const uint64_t size = runtime::HostFileSize(file->entry), end = offset + length;
     const uint64_t growth = length != 0 && end > size ? end - size : 0;
-    if (growth != 0 && growth > runtime::ContentFreeBytes())  // FM4 Recomp (Disc 2): the device's and the host's free space (content.h)
+    // FM4 Recomp (Disc 2): the device's and the host's free space (content.h). A refusal is logged: without the line a write the
+    // game was refused leaves no trace in the log. The host volume filling
+    // under the write itself (ENOSPC, file_system.h HostVolumeFull) is the same status, not a stop.
+    if (growth != 0 && growth > runtime::ContentFreeBytes())
+    {
+        LogDiskFull("NtWriteFile", file->entry.host, growth);
         return fail(0xC000007F);  // STATUS_DISK_FULL
-    const uint32_t bytes = length != 0 ? runtime::WriteHostFile(file->entry, offset, base + buffer, length) : 0;
+    }
+    if (length != 0 && !runtime::WriteHostFile(file->entry, offset, base + buffer, length))
+    {
+        LogDiskFull("NtWriteFile (the host write)", file->entry.host, growth);
+        return fail(0xC000007F);
+    }
+    const uint32_t bytes = length;
     file->entry.size = std::max(size, offset + bytes);
     file->position = file->synchronous ? offset + bytes : file->position + bytes;
     if (ioStatus)
@@ -444,8 +473,12 @@ GUEST_IMPORT(NtSetInformationFile, "REFERENCE_DERIVED: Xenia xboxkrnl_io_info.cc
         const uint64_t size = runtime::HostFileSize(file->entry);
         if (value > size && value - size > runtime::ContentFreeBytes())  // FM4 Recomp (Disc 2): the device's free space (content.h)
             status = 0xC000007F;  // STATUS_DISK_FULL
+        else if (!runtime::SetHostFileLength(file->entry, value))  // FM4 Recomp: the host volume filled (file_system.h HostVolumeFull)
+            status = 0xC000007F;
         else
-            runtime::SetHostFileLength(file->entry, value), file->entry.size = value;
+            file->entry.size = value;
+        if (status != 0)
+            LogDiskFull("NtSetInformationFile(end of file)", file->entry.host, value > size ? value - size : 0);
     }
     if (ioStatus)
         runtime::Store32(base, ioStatus, status), runtime::Store32(base, ioStatus + 4, 8);

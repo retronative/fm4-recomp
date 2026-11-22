@@ -15,6 +15,7 @@
 //
 //   fm4recomp --image game/survey/image.bin --xex game/files/default.xex --disc game/files --modules game/modules
 //             --deadline <seconds>
+#include "thread_qos.h"
 #include "fm4_image.h"
 #include "fm4_modules.h"
 #include "guest_memory.h"
@@ -104,6 +105,7 @@ runtime::ThreadState mainThread;
 void* RunGuest(void*)
 {
     pthread_setname_np("fm4 guest main");  // FM4 Recomp: thread_cpu.h roles
+    runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default)
     runtime::UseFaultStackOnThisThread();
     PPCContext ctx{};
     ctx.r1.u64 = mainThread.stackBase - 0x100;  // room for the entry's back chain and save area
@@ -372,7 +374,9 @@ int main(int argc, char** argv)
                                                    runtime::video::DeferFences() ? runtime::video::WorkOpen : nullptr,
                                                    // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1): the GPU read guard's hooks only when asked
                                                    runtime::video::GuestMemoryGpuAsked() ? runtime::video::HonourGpuReadGuard : nullptr,
-                                                   runtime::video::GuestMemoryGpuAsked() ? runtime::video::BeforeCpWrite : nullptr};
+                                                   runtime::video::GuestMemoryGpuAsked() ? runtime::video::BeforeCpWrite : nullptr,
+                                                   // FM4 Recomp (M9, FM4_OCCLUSION_QUERIES): ZpassDone answers 0 unless the renderer counts
+                                                   runtime::video::ZpassDone, runtime::video::ZpdCount};
     if (runtime::video::Initialize(video))
     {
         if (video.mode == runtime::video::Mode::SelfCheck)

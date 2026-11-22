@@ -4,6 +4,8 @@
 //
 #define VK_ENABLE_BETA_EXTENSIONS  // VkPhysicalDevicePortabilitySubsetFeaturesKHR (vulkan_beta.h)
 #include "vulkan_device.h"
+#include "hdr_output.h"
+#include "post_aa.h"  // FM4 Recomp (M9): FM4_POST_AA
 #include "guest_memory_vk.h"  // FM4 Recomp: GuestMemoryGpuAsked
 #include "push_template.h"   // FM4 Recomp: PushTemplateAsked
 #include "stops.h"
@@ -133,6 +135,24 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
         for (const char* wanted : surface->instanceExtensions)
             if (std::none_of(extensions.begin(), extensions.end(), [&](const char* e) { return !std::strcmp(e, wanted); }))
                 extensions.push_back(wanted);
+    if (surface != nullptr)  // FM4 Recomp (M9, FM4_HDR; hdr_output.h): the extended colour spaces, when asked and offered
+    {
+        bool asked = false;
+        std::string error;
+        const char* live = std::getenv("FM4_GRAPHICS_LIVE");  // the GRAPHICS menu may turn HDR on while the game runs
+        if ((hdr::Parse(std::getenv("FM4_HDR"), asked, error) && asked) || (live != nullptr && live[0] == '1' && live[1] == '\0'))
+        {
+            uint32_t count = 0;
+            Check(vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr), "vkEnumerateInstanceExtensionProperties");
+            std::vector<VkExtensionProperties> offered(count);
+            Check(vkEnumerateInstanceExtensionProperties(nullptr, &count, offered.data()), "vkEnumerateInstanceExtensionProperties");
+            offered.resize(count);
+            for (const VkExtensionProperties& e : offered)
+                d.swapchainColorspace = d.swapchainColorspace || !std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+            if (d.swapchainColorspace)
+                extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+        }
+    }
     VkApplicationInfo application{};
     application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     application.pApplicationName = "fm4recomp";
@@ -272,7 +292,21 @@ VulkanDevice CreateVulkanDevice(bool validation, const SurfaceRequest* surface)
     d.imageViewFormatSwizzle = portabilityOffered && portability.imageViewFormatSwizzle == VK_TRUE;
     d.samplerAnisotropy = features.features.samplerAnisotropy == VK_TRUE;
     d.sampleRateShading = features.features.sampleRateShading == VK_TRUE;  // FM4_TRANSFER_STENCIL_EXPORT (vulkan_device.h)
+    {  // FM4 Recomp (M9, FM4_POST_AA): a refused spelling stops in the renderer (CreateResources); here it reads as off
+        bool postAa = false;
+        std::string ignored;
+        const char* live = std::getenv("FM4_GRAPHICS_LIVE");  // the pass may be turned on while the game runs (renderer.cpp PostAaUnit)
+        d.storageImageExtendedFormats = ((runtime::video::postaa::Parse(std::getenv("FM4_POST_AA"), postAa, ignored) && postAa) ||
+                                         (live != nullptr && live[0] == '1' && live[1] == '\0')) &&
+                                        features.features.shaderStorageImageExtendedFormats == VK_TRUE;
+    }
+    {  // FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1): the renderer names the outcome (Initialize)
+        const char* v = std::getenv("FM4_OCCLUSION_QUERIES");
+        d.occlusionQueryPrecise = v != nullptr && v[0] == '1' && v[1] == '\0' && features.features.occlusionQueryPrecise == VK_TRUE;
+    }
     VkPhysicalDeviceFeatures enabledFeatures{};
+    enabledFeatures.occlusionQueryPrecise = d.occlusionQueryPrecise ? VK_TRUE : VK_FALSE;
+    enabledFeatures.shaderStorageImageExtendedFormats = d.storageImageExtendedFormats ? VK_TRUE : VK_FALSE;
     enabledFeatures.sampleRateShading = d.sampleRateShading ? VK_TRUE : VK_FALSE;
     enabledFeatures.samplerAnisotropy = d.samplerAnisotropy ? VK_TRUE : VK_FALSE;
     enabledFeatures.textureCompressionBC = d.textureCompressionBC ? VK_TRUE : VK_FALSE;

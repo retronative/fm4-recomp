@@ -6,6 +6,7 @@
 // the memory type from both type masks preferring HOST_VISIBLE | HOST_COHERENT (:6560). FM4 Recomp changes: a dedicated host view
 // instead of the guest view itself, the alignment and range checks, storage use only, the fallback instead of a shadow copy.
 #include "guest_memory_vk.h"
+#include "mem_ledger.h"  // FM4 Recomp (M9, FM4_DIAG_MEMORY)
 #include "vulkan_device.h"
 #include "guest_memory.h"
 #include "stops.h"
@@ -166,6 +167,8 @@ const char* Import(const VulkanDevice& dev, uint8_t*& host, uint32_t& type)
             vkFreeMemory(dev.device, memory, nullptr), memory = VK_NULL_HANDLE;
         vkDestroyBuffer(dev.device, view.buffer, nullptr), view.buffer = VK_NULL_HANDLE;
     }
+    if (why == nullptr)  // the guest's own pages, seen by the GPU: shared, never added to the renderer's total (mem_ledger.h)
+        runtime::video::mem::Global().Add(runtime::video::mem::Kind::GuestShared, runtime::kPhysicalSize, "guest physical memory (host pointer import)");
     return why;
 }
 

@@ -276,6 +276,7 @@ bool VertexFetchProvablyInside(const DrawState& d, uint32_t highIndex);
 struct TextureSlot
 {
     uint32_t slot = 0;        // 0-31
+    bool fetchOffsets = false;  // FM4 Recomp (M9): a shader fetch of this slot uses a texel offset (shader_glsl.h textureOffsets)
     uint32_t words[6] = {};   // the raw constant (for the error text and the texture cache key)
     uint32_t type = 0;        // dword 0 bits 0-1 (2 kTexture)
     uint32_t sign[4] = {};    // bits 2-9, x y z w (xenos.h:121-129 TextureSign)
@@ -348,6 +349,7 @@ struct DrawState
 
     // The packet.
     uint32_t opcode = 0, initiator = 0, vizQueryToken = 0;
+    bool countedOnly = false;    // FM4 Recomp (FM4_OCCLUSION_QUERIES; DrawInputs::countNoWrite): writes nothing, drawn for an occlusion query's count
     uint32_t primitiveType = 0;  // initiator bits 0-5
     HostPrimitive hostPrimitive = HostPrimitive::TriangleList;
     uint32_t sourceSelect = 0, majorMode = 0;  // bits 6-7, 8-9
@@ -413,6 +415,9 @@ struct DrawInputs
     std::vector<uint32_t>* constantsScratch = nullptr;
     uint32_t opcode = 0;          // 0x22 DRAW_INDX or 0x36 DRAW_INDX_2
     uint32_t vizQueryToken = 0;   // DRAW_INDX's first word; 0 for DRAW_INDX_2
+    // FM4 Recomp (M9, FM4_OCCLUSION_QUERIES): an occlusion query is counting (renderer.cpp ZpassDone), so a draw that writes nothing
+    // but tests depth is decoded in full and drawn for its count (DrawState::countedOnly) instead of being classified NoWrite.
+    bool countNoWrite = false;
     uint64_t physicalBytes = 0;   // the guest's physical memory size: every address range the draw reads must fit (512 MB on the console)
     const shader::ShaderTranslation* vs = nullptr;
     const shader::ShaderTranslation* ps = nullptr;

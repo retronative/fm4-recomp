@@ -57,6 +57,20 @@ FormatChoice ChooseSurfaceFormat(std::span<const VkSurfaceFormatKHR> offered, Bl
                        "(VUID-VkSwapchainCreateInfoKHR-imageFormat-01273, VUID-vkCmdBlitImage-dstImage-02000)"};
 }
 
+// FM4 Recomp (M9, FM4_HDR; hdr_output.h): the swapchain for HDR output on macOS: 16-bit float in extended linear sRGB (1.0 is SDR
+// white, values above it use the display's headroom). The pair must match exactly: MoltenVK lists B8G8R8A8_UNORM in every colour
+// space, and its last entry is Display P3 linear, which looks washed out (SpeedBreaker presenter.cpp:993-998 at ea7311a). Not
+// offered (no VK_EXT_swapchain_colorspace, another platform) or not a blit destination: not ok, and the caller presents in
+// standard range (ChooseSurfaceFormat).
+template <typename BlitDst>
+FormatChoice ChooseHdrSurfaceFormat(std::span<const VkSurfaceFormatKHR> offered, BlitDst blitDst)
+{
+    for (const VkSurfaceFormatKHR& f : offered)
+        if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT && f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT && blitDst(f.format))
+            return {true, f, {}};
+    return {false, {}, "the surface offers no R16G16B16A16_SFLOAT format in EXTENDED_SRGB_LINEAR that the device can blit to"};
+}
+
 // The swapchain extent. A defined currentExtent must be used as is; 0xFFFFFFFF means the swapchain decides, so the
 // window's pixel size, clamped to [minImageExtent, maxImageExtent] (Vulkan: VkSurfaceCapabilitiesKHR currentExtent).
 // A zero width or height (a minimized window) yields nothing: no swapchain may have a zero extent

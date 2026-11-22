@@ -95,6 +95,12 @@ trip() {
   exit 3
 }
 
+# The folder the Vulkan loader searches for layers (VK_LAYER_PATH) holds the validation layer's manifest and nothing else: any other
+# entry (macOS's "._" attribute twin on a volume without extended attributes, a stray file) would be read as a manifest too.
+only_layer_manifest() {
+  [ "$(ls -A "$1")" = VkLayer_khronos_validation.json ]
+}
+
 if [ "${1:-}" = "--self-test" ]; then
   mkdir -p "$ROOT/build"
   work="$(mktemp -d "$ROOT/build/gpu_run_selftest.XXXXXX")"
@@ -139,8 +145,15 @@ if [ "${1:-}" = "--self-test" ]; then
   grep -q "planted evidence" "$STOP_FLAG" || { echo "self-test FAIL: GPU_STOP not written" >&2; exit 1; }
   if ( refuse_if_stopped "$STOP_FLAG" ) 2>/dev/null; then echo "self-test FAIL: a stop flag did not refuse" >&2; exit 1; fi
   ( refuse_if_stopped "$work/absent" ) || { echo "self-test FAIL: refused without a stop flag" >&2; exit 1; }
+  mkdir "$work/layers"; : > "$work/layers/VkLayer_khronos_validation.json"
+  only_layer_manifest "$work/layers" || { echo "self-test FAIL: the one layer manifest refused" >&2; exit 1; }
+  : > "$work/layers/._VkLayer_khronos_validation.json"
+  if only_layer_manifest "$work/layers"; then echo "self-test FAIL: an attribute twin beside the layer manifest accepted" >&2; exit 1; fi
+  rm "$work/layers/VkLayer_khronos_validation.json" "$work/layers/._VkLayer_khronos_validation.json"; rmdir "$work/layers"
+  if ( mkdir "$work/layers" && only_layer_manifest "$work/layers" ); then echo "self-test FAIL: an empty layer folder accepted" >&2; exit 1; fi
+  rmdir "$work/layers"
   rm -r "$work"  # the self-test's own temporary directory under build/
-  echo "gpu_run self-test: PASS (reports: empty, new, old; log pattern: the real Metal hang line, a GPU restart, an ordinary line, the log tool's own line excluded; the real system log (a marked logger line found); GPU_STOP written; refusal with and without a flag; lock: taken, released, stale reclaimed, live refused)"
+  echo "gpu_run self-test: PASS (layer folder: the one manifest, an attribute twin, empty; reports: empty, new, old; log pattern: the real Metal hang line, a GPU restart, an ordinary line, the log tool's own line excluded; the real system log (a marked logger line found); GPU_STOP written; refusal with and without a flag; lock: taken, released, stale reclaimed, live refused)"
   exit 0
 fi
 
@@ -199,9 +212,21 @@ elif [ "$RENDERER" != headless ]; then
     "$LAYERS/VkLayer_khronos_validation.json" > "$OUT/vulkan/VkLayer_khronos_validation.json"
   grep -q '"library_path": "/opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib"' "$OUT/vulkan/VkLayer_khronos_validation.json" ||
     { echo "gpu_run: the layer manifest's library_path was not rewritten" >&2; exit 1; }
+  # The loader reads every *.json in VK_LAYER_PATH, and on a volume without extended attributes (an ExFAT evidence disk) macOS keeps
+  # a file's attributes in a "._<name>" twin beside it: "._VkLayer_khronos_validation.json" is then read as a manifest, refused
+  # ("loader_get_json: Invalid JSON file", an error-severity loader message) and the run stops (9) before any GPU work (2026-11-21).
+  # So the loader gets a folder of its own under build/ (the repository's volume) holding that one manifest and nothing else, checked;
+  # the copy in the evidence folder stays as the record, and the two must be the same bytes.
+  LAYER_DIR="$ROOT/build/gpu_run_layers"
+  rm -rf "$LAYER_DIR"  # this launcher's own scratch folder (one run at a time: the lock)
+  mkdir -p "$LAYER_DIR"
+  cp "$OUT/vulkan/VkLayer_khronos_validation.json" "$LAYER_DIR/VkLayer_khronos_validation.json"
+  cmp -s "$OUT/vulkan/VkLayer_khronos_validation.json" "$LAYER_DIR/VkLayer_khronos_validation.json" ||
+    { echo "gpu_run: the loader's layer manifest differs from the evidence copy" >&2; exit 1; }
+  only_layer_manifest "$LAYER_DIR" || { echo "gpu_run: $LAYER_DIR holds more than the one layer manifest: $(ls -A "$LAYER_DIR" | tr '\n' ' ')" >&2; exit 1; }
   # The ICD's library_path (../../../lib/libMoltenVK.dylib) is relative to its manifest: the loader resolves it.
-  export VK_LAYER_PATH="$OUT/vulkan" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer MTL_DEBUG_LAYER=1
-  shasum -a 256 "$ICD" "$LAYERS/VkLayer_khronos_validation.json" "$OUT/vulkan/VkLayer_khronos_validation.json" \
+  export VK_LAYER_PATH="$LAYER_DIR" VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer MTL_DEBUG_LAYER=1
+  shasum -a 256 "$ICD" "$LAYERS/VkLayer_khronos_validation.json" "$OUT/vulkan/VkLayer_khronos_validation.json" "$LAYER_DIR/VkLayer_khronos_validation.json" \
     /opt/homebrew/opt/vulkan-validationlayers/lib/libVkLayer_khronos_validation.dylib | tee -a "$OUT/binary.sha256"
   if [ "$RENDERER" = window ]; then
     # SDL opens a Vulkan loader of its own for the window (SDL_Vulkan_LoadLibrary): it must be the one fm4recomp links

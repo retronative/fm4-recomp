@@ -851,7 +851,7 @@ void TestClearVs()
     CHECK(Has(g, "if (e == 2u || e == 3u)\n        v = (v << 16) | (v >> 16);"));
     // Viewport fold (host contract) of the fixed-up position q: homogeneous, so it holds for w != 1
     // (the fix-up itself: TestPositionFormatFlags).
-    CHECK(Has(g, "    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n    gl_Position = vec4(xe_ndc, q.w);\n"));
+    CHECK(Has(g, "#ifdef XE_OVERLAY_PIN\n    if (q.w != 0.0)\n    {\n        vec2 xe_f = q.xy / q.w;\n        if (xe_viewport_offset.w > 1.0)\n            xe_f.x = abs(xe_f.x) >= 0.998 ? sign(xe_f.x) : xe_f.x / xe_viewport_offset.w;\n        if (xe_viewport_scale.w > 1.0)\n            xe_f.y = abs(xe_f.y) >= 0.998 ? sign(xe_f.y) : xe_f.y / xe_viewport_scale.w;\n        q.xy = xe_f * q.w;\n    }\n#endif\n    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n    gl_Position = vec4(xe_ndc, q.w);\n"));
     CHECK(Has(g, "    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n"));
     CHECK(Has(g, "layout(location = 0) out vec4 xe_interp_0;"));
     CHECK(Has(g, "layout(std140, set = 0, binding = 2) uniform XeVsConstants"));
@@ -1258,8 +1258,8 @@ void TestPositionFormatFlags()
     CHECK(Has(g, "    xe_vertex(uint(gl_VertexIndex), p, interp);\n    xe_emit(xe_fixup(p), interp);\n"));
     CHECK(Has(g, "    xe_vertex(xe_indices[3u * rect + 2u], p2, i2);\n") && Has(g, "    p0 = xe_fixup(p0);\n    p1 = xe_fixup(p1);\n    p2 = xe_fixup(p2);\n"));
     CHECK(g.find("p2 = xe_fixup(p2);") < g.find("float len0 = xe_len2(p1, p2)"));
-    CHECK(Has(g, "void xe_emit(vec4 q, vec4 interp[1])\n{\n    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n"
-                 "    gl_Position = vec4(xe_ndc, q.w);\n"));
+    CHECK(Has(g, "void xe_emit(vec4 q, vec4 interp[1])\n{\n#ifdef XE_OVERLAY_PIN\n    if (q.w != 0.0)\n    {\n        vec2 xe_f = q.xy / q.w;\n        if (xe_viewport_offset.w > 1.0)\n            xe_f.x = abs(xe_f.x) >= 0.998 ? sign(xe_f.x) : xe_f.x / xe_viewport_offset.w;\n        if (xe_viewport_scale.w > 1.0)\n            xe_f.y = abs(xe_f.y) >= 0.998 ? sign(xe_f.y) : xe_f.y / xe_viewport_scale.w;\n        q.xy = xe_f * q.w;\n    }\n#endif\n    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n"
+                   "    gl_Position = vec4(xe_ndc, q.w);\n"));
     CONTROL(Has(g, "gl_Position = vec4(p.xyz * xe_viewport_scale.xyz"));  // the old fold on the raw export is gone
     CONTROL(Has(g, "xe_emit(p, interp);\n}\n#else"));                     // and so is the unfixed plain path
     CHECK(Compiles(g, false));

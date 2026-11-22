@@ -58,6 +58,15 @@ struct VulkanDevice
     // EDRAM unit's depth transfers in one draw instead of nine per sample (edram_vk.cpp ExecuteTransfers).
     bool stencilExport = false;
     bool sampleRateShading = false;
+    // FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1): precise occlusion queries (occlusionQueryPrecise), enabled only when asked
+    // for and offered; the renderer then counts the game's occlusion queries on the GPU (renderer.cpp, zpd_report.h).
+    bool occlusionQueryPrecise = false;
+    // FM4 Recomp (M9, opt-in FM4_HDR): VK_EXT_swapchain_colorspace on the instance (the surface then lists its extended colour
+    // spaces), enabled only in window mode, when asked and offered.
+    bool swapchainColorspace = false;
+    // FM4 Recomp (M9, opt-in FM4_POST_AA, post_aa.h): shaderStorageImageExtendedFormats, enabled only when the pass is asked for and
+    // the device offers it (the pass stores to the display image's rgb10_a2 format).
+    bool storageImageExtendedFormats = false;
     // Window mode only: the surface (created right after the instance) and VK_KHR_swapchain enabled on the device.
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     void (*destroySurface)(VkInstance, VkSurfaceKHR) = nullptr;

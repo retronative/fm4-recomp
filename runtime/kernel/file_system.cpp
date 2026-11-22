@@ -695,16 +695,30 @@ bool DirectoryRootMountedAt(const std::string& hostDirectory)
     return false;
 }
 
-void SetHostFileLength(const DiscEntry& entry, uint64_t length)
+bool HostVolumeFull(int error) { return error == ENOSPC || error == EDQUOT; }
+
+bool SetHostFileLength(const DiscEntry& entry, uint64_t length)
 {
     if (!entry.writable || entry.directory)
         Stop(StopCode::Unimplemented, "setting the length of %s: not a file in a writable content root", entry.host.c_str());
     const int fd = open(entry.host.c_str(), O_WRONLY | O_NOFOLLOW);
-    if (fd < 0 || ftruncate(fd, off_t(length)) != 0 || close(fd) != 0)
-        Stop(StopCode::Setup, "user data: setting the length of %s to %llu failed", entry.host.c_str(), (unsigned long long)length);
+    if (fd < 0)
+        Stop(StopCode::Setup, "user data: cannot open %s to set its length", entry.host.c_str());
+    if (ftruncate(fd, off_t(length)) != 0)
+    {
+        const int error = errno;
+        close(fd);
+        if (HostVolumeFull(error))
+            return false;
+        Stop(StopCode::Setup, "user data: setting the length of %s to %llu failed (%s)", entry.host.c_str(), (unsigned long long)length,
+             std::strerror(error));
+    }
+    if (close(fd) != 0)
+        Stop(StopCode::Setup, "user data: closing %s after setting its length failed", entry.host.c_str());
+    return true;
 }
 
-uint32_t WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* buffer, uint32_t size)
+bool WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* buffer, uint32_t size)
 {
     if (!entry.writable || entry.directory)
         Stop(StopCode::Unimplemented, "writing %s: not a file in a writable content root", entry.host.c_str());
@@ -717,14 +731,18 @@ uint32_t WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* b
         const ssize_t n = pwrite(fd, buffer + done, size - done, off_t(offset + done));
         if (n <= 0)
         {
+            const int error = n < 0 ? errno : 0;
             close(fd);
-            Stop(StopCode::Setup, "user data: writing %s at %llu failed", entry.host.c_str(), (unsigned long long)(offset + done));
+            if (HostVolumeFull(error))  // FM4 Recomp: the Mac's disk filled under the write: the guest's STATUS_DISK_FULL (NtWriteFile)
+                return false;
+            Stop(StopCode::Setup, "user data: writing %s at %llu failed (%s)", entry.host.c_str(), (unsigned long long)(offset + done),
+                 error != 0 ? std::strerror(error) : "nothing written");
         }
         done += uint32_t(n);
     }
     if (close(fd) != 0)
         Stop(StopCode::Setup, "user data: closing %s after a write failed", entry.host.c_str());
-    return done;
+    return true;
 }
 
 void SyncHostFile(const DiscEntry& entry)

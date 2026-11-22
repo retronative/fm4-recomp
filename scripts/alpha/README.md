@@ -64,17 +64,29 @@ action uses asks before it moves (A: replace, B: cancel); **RESET TO DEFAULTS** 
 folder) and apply when you leave the screen, and in every later session. Caps Lock, Command, fn, ` and § cannot be used. The gamepad
 layout is fixed. If the saved file is ever invalid, FM4 Recomp.app opens Repair instead of the game, with Reset Keys to Defaults.
 
+The graphics settings are in the game too: choose **GRAPHICS** in the Pause menu or on the Pre-Race screen (with a controller or
+the keyboard). It has the rendering resolution (720p, Full HD, QHD, 4K; Full HD by default) and the edge smoothing (Off, Soft,
+Standard, Strong; Standard by default): left and right change a value, X restores its default, B goes back. A choice is saved at
+once (in `graphics.conf` in the FM4 Recomp data folder). A choice changes at once, the resolution included (the picture
+may hitch for a moment while its render targets are rebuilt). **HDR** (Off by default, or Auto) changes at once too: Auto shows brighter
+highlights on a display that supports HDR and the standard picture on any other; the menu says which is active ("HDR ACTIVE", or "SDR ACTIVE" and why). The same settings are in the Settings panel: press **Command-comma (⌘,)** in the game's menus (not during a race,
+where it opens the Pause menu) and choose its **Graphics** tab; a choice made there applies when you close the panel.
+
 Once set up, opening FM4 Recomp.app starts the game directly. If the game data is missing (moved, deleted, or on a drive that is
 not connected), the app opens Repair instead.
 
 A skips the long welcome video before the first race. Retail FM4 cannot skip it; this build adds that.
 
-## Performance (measured on the developers' M5, 1280x720 game resolution)
+## Performance (measured on the developers' M5, automated runs without a window, a race in Free Play)
 
-| Scene | Frame rate |
+| Rendering resolution | Frame rate while driving |
 |---|---|
-| Menus | about 20 fps |
-| Race, in a window | about 29 fps (median frame 35 ms; 90 % of frames under 50 ms) |
+| 720p | about 38 fps |
+| Full HD (the default), Standard edge smoothing | about 40 fps (about half of the frames at 60 fps) |
+| QHD, Standard edge smoothing | about 31 fps (about 1 % of frames longer than two screen refreshes) |
+
+The game paces itself on the screen's 60 Hz: a frame lasts one, two or three refreshes. In a window the rate can be a little lower.
+4K is very heavy: expect a low frame rate.
 
 Normal play runs without the Vulkan validation layer (it is in Debug mode, below), which cost about two thirds of the
 renderer's CPU time.
@@ -94,7 +106,7 @@ renderer's CPU time.
 
 ## Known issues
 
-- **Low frame rate in the window** (see Performance).
+- **The frame rate is below 60 fps in races** (see Performance); QHD stays near 30 fps.
 - **A stutter before a race and an abrupt start**: the loading spinner on the last Pre-Race screen hitches once, the first second
   or so of the race arrives as a few very long frames, and the race sound can start up to a second before the picture. The cause
   is not known yet (it also happens when every shader is already cached); under investigation.

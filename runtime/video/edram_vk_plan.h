@@ -170,7 +170,15 @@ SourceTexel MapCrossAspectTexel(uint32_t destX, uint32_t destY, uint32_t destSam
 // colour and depth (:2916). With equal bases it equals MapTransferTexel (80x16 / 40x8 tiles keep the parity of x and y).
 // The destination tile index splits by the destination's pitch (X :2516-2577), the source tile index by the source's
 // (:2956-2987). The GLSL XeSourceTexel (edram_vk.cpp) is the same arithmetic.
-SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
+// FM4 Recomp (M9, FM4_INTERNAL_RES): `halves` is the internal scale in halves (render_scale.h: 2 = 1x, 3 = 1.5x, 4 = 2x): coordinates
+// are host pixels of images halves / 2 times the keys' guest size, a tile as many times the host pixels on both axes (the shader's
+// XE_HALVES), each host pixel with the
+// key's own sample count; the MSAA rules run on the scaled tile pixel (X draw_resolution_scale, ShiftGlue 72b7dd6
+// vulkan/render_target_cache.cpp:2567-2600). Each pair stays a bijection of host samples within a tile.
+// `sourceHalves` (0: the same as `halves`, the destination's): FM4_INTERNAL_SCALE_PITCH, a source image at another scale. The
+// destination's tile pixel is first taken to the source's scale (floor(p * sourceHalves / halves): the nearest pixel at the lower
+// resolution), then mapped as between two images of the source's scale.
+SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest, uint32_t halves = 2, uint32_t sourceHalves = 0);
 
 // FM4 Recomp (alpha, RT format 5): MapEdramTexel with 64 bpp keys (storage 5). A 64 bpp tile is 40x16 samples of 8 bytes (X
 // vulkan_render_target_cache.cc:2540-2545 tile width >> dest_is_64bpp; :2912-2913 and :2966-2987 the source's, >> source_is_64bpp;
@@ -193,7 +201,7 @@ struct TransferSource
     SourceTexel first, second;
     uint32_t half = 0;
 };
-TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest);
+TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, edram::Key source, edram::Key dest, uint32_t halves = 2, uint32_t sourceHalves = 0);
 // FM4 Recomp (alpha, RT format 5): the 32-bit guest word of half `half` of a 64 bpp 16_16_16_16 sample read through its
 // R16G16B16A16_UINT view (X :3080-3102 the half's two components, :3545-3576 the first the low 16 bits): half 0 r | g << 16, half 1
 // b | a << 16. And the sample from its two words (X :3352-3370 "unpack two packed 32-bit parts"): r, g the low word's halves, b, a

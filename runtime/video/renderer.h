@@ -73,6 +73,38 @@ gpu::SubmissionGate& Submissions();
 // From main, before the title starts. False headless. Stops on any failure (fail closed).
 bool Initialize(const Options& options);
 bool Enabled();
+// FM4 Recomp (FM4_GRAPHICS_LIVE): edge smoothing (off, soft, on, strong) from the next presented swap; false when this run cannot
+// switch it (the change then applies at the next start). Any thread.
+bool SetPostAaLive(const char* spelling);
+// FM4 Recomp (M9, live resolution; FM4_GRAPHICS_LIVE): asks for another internal resolution (FM4_INTERNAL_RES's spellings: 720p, fhd,
+// qhd, 4k and their synonyms) while the game runs. Any thread; it only records the request. False when this run cannot switch (no
+// FM4_GRAPHICS_LIVE=1, not a present or window run, FM4_INTERNAL_OUTPUT=720p, FM4_DIAG_POST_AA_PAIR or FM4_GPU_PRESENT_CHECK set, an
+// unknown spelling): the change then applies at the next start. True: the command processor's thread makes the change at one of
+// the next swaps, when nothing is in flight, or refuses it with one "[renderer] resolution: ... is refused" line (the device cannot
+// make something at that size, or the renderer was not idle for 120 swaps) and the resolution stays. So a caller that shows the
+// setting reads InternalResNow() afterwards: it changes only when the switch was made; InternalResPending() says a request is waiting.
+bool RequestInternalRes(const char* spelling);
+// The internal resolution in effect, as "720p", "fhd", "qhd" or "4k". Any thread.
+const char* InternalResNow();
+bool InternalResPending();
+// FM4 Recomp (M9, FM4_HDR; hdr_output.h): the display's current headroom (1: none), from the window's thread at each present; the
+// next swap's pass expands the picture's highlights into it. Changes are logged (the first 20).
+void SetHdrHeadroom(float headroom);
+// FM4 Recomp (the in-game GRAPHICS menu and the Settings panel): the HDR preference, Off or Auto, from the next presented swap. Any
+// thread. Auto shows HDR only where this run can present it and the display the window is on supports it; otherwise the picture is
+// standard range. The first time HDR is in effect the pass's objects are created at that swap and the window's swapchain is
+// rebuilt once; after that a change only moves the expansion (not in effect: the standard picture through the same swapchain).
+void SetHdrPreference(bool automatic);
+// The window's thread, about once a second: whether the display the window is on can show HDR.
+void SetHdrDisplay(bool supported);
+// What is shown now, and why it is standard range ("HDR is off", "this display does not support HDR", "HDR is not available on
+// this system", "restart required"; empty when active). Any thread.
+struct HdrOutput
+{
+    bool active;
+    const char* reason;
+};
+HdrOutput HdrOutputNow();
 
 // The self-check (Mode::SelfCheck): never returns.
 [[noreturn]] void RunSelfCheck();
@@ -96,6 +128,10 @@ void SyncGuestWrites(uint32_t opcode);
 // open (true: queued); RingIdle submits and retires the open slot when the ring is drained with stores queued.
 bool DeferFences();
 bool DeferStore(uint32_t physical);
+// FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1; command_processor.h RendererHooks::zpassDone / zpdCount): occlusion queries
+// counted on the GPU. ZpassDone answers 0 when off.
+uint32_t ZpassDone(uint32_t physical);
+uint32_t ZpdCount(uint32_t token);
 void RingIdle();
 bool PendingAt(uint32_t physical, uint32_t bytes);
 // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU=1; gpu_read_guard.h G5; command_processor.h honourGpuReadGuard / beforeCpWrite):

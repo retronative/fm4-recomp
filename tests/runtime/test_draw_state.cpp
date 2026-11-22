@@ -222,9 +222,10 @@ void Sample(ShaderTranslation& t, uint32_t slot, uint32_t dimension, ShaderTrans
     t.textureFilters.push_back(filters);
 }
 
-DrawState Decode(File& f, const ShaderTranslation& vs, const ShaderTranslation& ps, uint32_t opcode = 0x36, uint32_t vizToken = 0)
+DrawState Decode(File& f, const ShaderTranslation& vs, const ShaderTranslation& ps, uint32_t opcode = 0x36, uint32_t vizToken = 0, bool countNoWrite = false)
 {
     DrawInputs in;
+    in.countNoWrite = countNoWrite;
     in.read = ReadVector;
     in.context = &f.regs;
     in.opcode = opcode;
@@ -273,6 +274,31 @@ void TestPointDraws()
     g[xr::kPaScWindowScissorBr] = 0x20002000;
     d = Decode(g, vs, ps);
     Expect(d.kind == DrawKind::DepthOnly && d.colorWriteMask == 0 && d.target.depthWritten && !d.target.colorWritten, "mode 5 with a depth write: DepthOnly, colour mask forced 0");
+    // FM4 Recomp (FM4_OCCLUSION_QUERIES; DrawInputs::countNoWrite): while an occlusion query counts, a draw that only tests depth
+    // (RB_DEPTHCONTROL 0x32: z on (bit 1), no write (bit 2 clear), func 3 LEQUAL in bits 4-6; colour mask 0, mode 4) is decoded in
+    // full and drawn for its count, into the depth target alone; without the flag it is NoWrite as before.
+    File q = PointDraw();
+    q[xr::kVgtDrawInitiator] = 0x00030084;
+    q[xr::kRbModeControl] = 4;
+    q[xr::kRbColorMask] = 0;
+    q[xr::kRbDepthControl] = 0x32;
+    q[xr::kRbSurfaceInfo] = 0x0A020280;
+    q[xr::kRbDepthInfo] = 0x000102D0;
+    q[xr::kPaScWindowScissorBr] = 0x20002000;
+    const DrawState plain = Decode(q, vs, ps), counted = Decode(q, vs, ps, 0x36, 0, true);
+    Expect(plain.kind == DrawKind::NoWrite && !plain.countedOnly, "a depth-tested draw that writes nothing: NoWrite when no occlusion query counts");
+    Expect(counted.kind == DrawKind::Draw && counted.countedOnly && counted.error.empty() && counted.colorWriteMask == 0 && !counted.target.colorWritten &&
+               !counted.target.depthWritten && counted.depthStencil.zEnable && !counted.depthStencil.zWriteEnable && counted.depthStencil.zFunc == 3,
+           "the same draw while an occlusion query counts: decoded as a Draw for the count only (depth tested LEQUAL, nothing written)");
+    q[xr::kRbDepthControl] = 0;  // CONTROL: no depth test, so no attachment to draw into
+    const DrawState untested = Decode(q, vs, ps, 0x36, 0, true);
+    q[xr::kRbDepthControl] = 0x32, q[xr::kRbColorMask] = 0xF;  // CONTROL: a writing draw is an ordinary Draw
+    const DrawState writing = Decode(q, vs, ps, 0x36, 0, true);
+    q[xr::kRbColorMask] = 0, q[xr::kPaScVizQuery] = 0xF9;  // CONTROL: a VIZ_QUERY kill draw stays dropped
+    const DrawState killed = Decode(q, vs, ps, 0x36, 0, true);
+    Expect(untested.kind == DrawKind::NoWrite && !untested.countedOnly && writing.kind == DrawKind::Draw && !writing.countedOnly &&
+               killed.kind == DrawKind::NoWrite && !killed.countedOnly,
+           "counting: without a depth test still NoWrite; a writing draw is not count-only; a VIZ_QUERY kill draw stays NoWrite (CONTROLS)");
     // FM4 Recomp: RB_COLORCONTROL 8700000C (alpha test bit 3 on, func 4 GREATER) on the kDepth clear of FM4's welcome screen
     // (the local capture glow (not distributed)): no alpha test in mode 5 (Xenia uses no pixel shader there); the same state in mode 4 keeps it.
     g[xr::kRbColorControl] = 1u << 31 | 0x0700000C;  // 8700000C

@@ -215,5 +215,43 @@ func renderPages(paths: Paths, to dir: URL) -> Int32 {
   }
   model.capturing = nil
   model.pendingChange = nil
+  // Graphics (GraphicsView.swift): the default, and QHD chosen in a game that started at 720p.
+  model.settingsTab = .graphics
+  let graphicsShots: [(String, InternalResolution, SmoothingStrength?)] =
+    [("graphics", .hd, nil), ("graphics-qhd", .qhd, nil), ("graphics-smoothing", .hd, .standard), ("graphics-smoothing-strong", .qhd, .strong)]
+  for (name, resolution, smoothing) in graphicsShots {
+    model.graphics.resolution = resolution
+    model.graphics.antiAliasing = smoothing != nil
+    model.graphics.strength = smoothing ?? .standard
+    model.graphicsAtStart = .hd
+    model.antiAliasingAtStart = false
+    let renderer = ImageRenderer(content: ControlsRoot(model: model).environment(\.colorScheme, .dark))
+    renderer.scale = 2
+    guard let image = renderer.cgImage else { failed = true; continue }
+    let url = dir.appendingPathComponent("panel-\(name).png")
+    do { try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: url); print("wrote \(url.path)") } catch { failed = true }
+  }
+  // HDR output Auto: active on a display that supports it, standard range on one that does not; and Off.
+  let hdrShots: [(String, Bool, Bool, HdrStatus?)] = [("graphics-hdr-active", true, true, HdrStatus(active: true, reason: "")),
+                                                     ("graphics-hdr-unsupported", true, false, HdrStatus(active: false, reason: "this display does not support HDR")),
+                                                     ("graphics-hdr-off", false, true, HdrStatus(active: false, reason: "HDR is off"))]
+  for (name, auto, display, running) in hdrShots {
+    model.graphics = GraphicsSettings(resolution: .fhd, antiAliasing: true, strength: .standard, hdr: auto, extendedView: auto)
+    model.graphicsAtStart = .fhd
+    model.antiAliasingAtStart = true
+    model.strengthAtStart = .standard
+    model.hdrAtStart = false
+    model.hdrLive = true
+    model.extendedOffered = auto  // the Extended View row in the Auto shots only (not offered in 0.2.0)
+    model.displayHdr = display
+    model.hdrRunning = running
+    let renderer = ImageRenderer(content: ControlsRoot(model: model).environment(\.colorScheme, .dark))
+    renderer.scale = 2
+    guard let image = renderer.cgImage else { failed = true; continue }
+    let url = dir.appendingPathComponent("panel-\(name).png")
+    do { try NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])!.write(to: url); print("wrote \(url.path)") } catch { failed = true }
+  }
+  model.settingsTab = .keyboard
+  model.graphics = GraphicsSettings.load(paths.graphicsFile).0
   return failed ? 1 : 0
 }

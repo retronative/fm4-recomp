@@ -91,6 +91,13 @@ string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c
 string_copy = 0x82971220
 string_copy_bytes = 96
 string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
+# The GRAPHICS row (owner request 2026-11-20: the graphics settings in the Pause menu, like the keys): row id 10, after KEYBOARD
+# CONTROLS and before Quit Race, whenever the player's data folder is known (the settings file can be written; no live keyboard
+# needed). The scene's list has 11 slots: the game's nine rows at most, and these two.
+[[hook.more]]
+label = "GRAPHICS"
+row = 10
+gate = "home"
 
 [[hook]]
 name = "pause menu: Keyboard Controls chosen"
@@ -109,6 +116,10 @@ focus = 0x82516590
 focus_bytes = 16
 focus_sha256 = "cfc3b13d36f91a0774d0be4669f0acba5a464cbae2dd6d02bcaf281e8555e4f6"
 focus_offset = 2172
+[[hook.more]]
+row = 10
+gate = "home"
+handler = "OpenGraphics"
 
 # The KEYBOARD CONTROLS submenu (an in-game submenu styled and navigated like FM4's Audio and HUD menus;
 # runtime/game/keyboard_screen.cpp). It is shown in the option screen the Pause menu opens for HUD: screen id 59 -> factory
@@ -274,6 +285,13 @@ value = 8
 [[value]]
 name = "kItemSetValue"
 value = 48
+# A row's selected option (the GRAPHICS submenu reads it after the player's left / right): every setter of the row's vtable ends by
+# storing the option's index at row+8: +48 sub_824BAF80 (`lwz r3,4(r3)` the source; its vtable +20 (source, value) -> index; -1 becomes
+# 0; `stw r11,8(r31)`), +44 sub_824BAFD0 the same through the source's +16; +40 sub_824BAEC8 passes `lwz r4,8(r3)` to the source's +36.
+# Static reading of the translation (2026-11-20); our options' values are their indices (keyboard_screen.cpp AddOption).
+[[value]]
+name = "kItemValue"
+value = 8
 [[value]]
 name = "kItemVtable"
 value = 0x82027484
@@ -343,6 +361,13 @@ string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c
 string_copy = 0x82971220
 string_copy_bytes = 96
 string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
+# The GRAPHICS row here too (owner request 2026-11-21: wherever KEYBOARD CONTROLS is): row id 11, after KEYBOARD CONTROLS and before
+# Audio; the listener sends every id above 9 to its tail (above). The list has 11 slots and the game adds at most 10 rows of its own:
+# whether a twelfth row is reachable (the list is an ANIMATED_SCROLLING_LIST) is UNRESOLVED until seen with every row present.
+[[hook.more]]
+label = "GRAPHICS"
+row = 11
+gate = "home"
 
 [[hook]]
 name = "pre-race: Keyboard Controls chosen"
@@ -360,6 +385,10 @@ focus = 0x82516590
 focus_bytes = 16
 focus_sha256 = "cfc3b13d36f91a0774d0be4669f0acba5a464cbae2dd6d02bcaf281e8555e4f6"
 focus_offset = 2176
+[[hook.more]]
+row = 11
+gate = "home"
+handler = "OpenGraphicsPreRace"
 
 # The option screen's help bar (KEYBOARD CONTROLS shows A SET KEY, X DEFAULT, Y CLEAR, B BACK): the screen's slot 5 sub_8251E6F0 gets it
 # with sub_824B54D8(screen, sub_8298DE68("COMPONENT_HELP_BUTTON_BAR" 0x8202AFF8)) and adds buttons with sub_82639C48(bar, slot, &text)
@@ -443,3 +472,61 @@ value = 256
 [[value]]
 name = "kThreadId"
 value = 332
+
+# Extended View (runtime/kernel/extended_view.h, runtime/game/extended_view.cpp): the main 3D view's aspect ratio.
+# sub_822B6380 is the viewport aspect getter, 12 instructions: lwz r11,12(r3); lwz r10,8(r3); ... fcfid; frsp; fdivs f1,f13,f0; blr
+# = width (+8) / height (+12) of the viewport in r3, as a single in f1. It has three direct callers and no data reference.
+# sub_822CAB88 (the per-view setup; r3 = the view, its viewport at +8) calls it twice:
+#   0x822CAC28 bl sub_822B6380, then lwz r11,60(r30); mtctr; bctrl: the result to the camera's vtable slot +60 (sub_828C9E08: stfs
+#     f1,256(r3); stb 1,464(r3): the camera's aspect and its dirty flag). The projection builder sub_822A39F0 divides cot(fov/2) by
+#     that field for [0][0] (0x822A3AE8 fdivs f0,f12,f13 with f13 = 256(r31)), and the camera's frustum (sub_822DFB88 ->
+#     sub_822C1078: atan(tan(fov/2) x aspect)) reads the same field, so the projection and the culling change together.
+#   0x822CAE88 bl sub_822B6380, then stfs f1,180(r1): into the view's record {matrix, fov, aspect, near, far} for sub_822A5870.
+# The handler multiplies the result for those two callers and a 1280x720 viewport; the third caller (sub_825E0198, a 2D overlay)
+# and every other viewport keep the game's answer. Mirrors (sub_828CE598: 384x128, aspect 4.5) and cube maps set constants and never
+# call the getter. Static reading (research/m9/ultrawide/REPORT.md); OBSERVED in a run: research/m9/ultrawide/RESULTS.md.
+# Another FM4 port describes the same mechanism for its revision (a hook on the viewport aspect getter used by the main view's
+# setup); its addresses are for another build and are not used.
+[[hook]]
+name = "extended view: the main view's aspect"
+kind = "delegate"
+function = 0x822B6380
+flag = "FM4_EXTENDED_VIEW_HOOK"
+bytes = 48
+sha256 = "e84752c6b4f6c724f1e4051ca8df257f25a89d4d8ffdd3e222cdffb0108bc74b"
+handler = "ViewportAspect"
+
+[[symbol]]
+name = "kMainViewSetup"
+address = 0x822CAB88
+bytes = 900
+sha256 = "3ad0ae836737734b2798c58a7350fb1d3765375ee76bcc62e27b95b77354f8f2"
+[[value]]
+name = "kAspectForCamera"
+value = 164
+[[value]]
+name = "kAspectForRecord"
+value = 772
+
+# Extended View for a window narrower than 16:9: the main view's vertical field of view.
+# sub_822EC938 is two instructions: lfs f1,256(r3); blr: the field of view (radians) of the view's source object. It has five
+# direct callers; sub_822CAB88 calls it twice, each time just before the aspect getter above:
+#   0x822CABF4 bl sub_822EC938, then fmuls f1,f1,f31 (x 57.2958, the float at 0x82000DE0) and the camera's vtable slot +48;
+#   0x822CAE78 bl sub_822EC938, then fmuls f0,f1,f31; stfs f0,176(r1): the same value into the view's record.
+# The projection builder stores cot(fov / 2) as [1][1] and cot(fov / 2) / aspect as [0][0], so tan(fov' / 2) = tan(fov / 2) x t with
+# the aspect divided by t leaves [0][0] alone and widens only the vertical view.
+[[hook]]
+name = "extended view: the main view's field of view"
+kind = "delegate"
+function = 0x822EC938
+flag = "FM4_EXTENDED_VIEW_HOOK"
+bytes = 8
+sha256 = "3cac332e7a439a77f956ad2c5c489c3035114b33273c316091c40a887754f228"
+handler = "ViewFieldOfView"
+
+[[value]]
+name = "kFovForCamera"
+value = 112
+[[value]]
+name = "kFovForRecord"
+value = 756

@@ -54,6 +54,21 @@ final class SetupModel: ObservableObject {
   @Published var confirmingReset = false
   @Published var controlsNotice = ""
   private var keyMonitor: Any?
+  // Graphics (GraphicsSettings.swift; the panel's second tab, ControlsPanel.swift): the saved choice, why the saved file was refused
+  // (720p is shown then), the choice the running game started with (the panel only), and the last save's result.
+  enum SettingsTab { case keyboard, graphics }
+  @Published var settingsTab = SettingsTab.keyboard
+  @Published var graphics: GraphicsSettings
+  @Published var graphicsProblem: String?
+  @Published var graphicsNotice = ""
+  var graphicsAtStart: InternalResolution?
+  var antiAliasingAtStart: Bool?
+  var strengthAtStart: SmoothingStrength?  // nil: the game started without the smoothing
+  var hdrAtStart: Bool?  // whether the running game was started with HDR output asked for (FM4_HDR)
+  var displayHdr: Bool?  // whether the screen can show HDR (nil: not known, e.g. a headless render)
+  var hdrLive = false    // the running game takes an HDR change when this panel closes (FM4_GRAPHICS_LIVE=1); otherwise at its next start
+  var extendedOffered = false  // Extended View has a row here (FM4_EXTENDED_VIEW_OFFERED=1; not in 0.2.0)
+  var hdrRunning: HdrStatus?  // the running game's last word on its output (hdr_status); nil: none
   // Why the game cannot start as set up (LaunchDecision.swift .repair), shown on the Repair page.
   @Published var repairReason = ""
   private var autoPlayed = false
@@ -73,6 +88,9 @@ final class SetupModel: ObservableObject {
     let saved = KeyBindings.load(paths.keyBindingsFile)
     bindings = saved.0
     bindingsProblem = saved.1
+    let savedGraphics = GraphicsSettings.load(paths.graphicsFile)
+    graphics = savedGraphics.0
+    graphicsProblem = savedGraphics.1
     page = .welcome
     checks = prerequisites(paths)
     if !preview { applyLaunchDecision() }
@@ -285,6 +303,52 @@ final class SetupModel: ObservableObject {
       controlsNotice = "Reset to the defaults."
     } catch {
       controlsNotice = "Could not remove \(paths.keyBindingsFile.path): \(error.localizedDescription)"
+    }
+  }
+
+  // MARK: Settings -> Graphics
+
+  // Saved at once; the game reads it when it next starts (play.sh).
+  func choose(_ resolution: InternalResolution) {
+    var new = graphics
+    new.resolution = resolution
+    save(new)
+  }
+
+  func setAntiAliasing(_ on: Bool) {
+    var new = graphics
+    new.antiAliasing = on
+    if !on { new.strength = .standard }  // off has no strength (GraphicsSettings.swift)
+    save(new)
+  }
+
+  func choose(_ strength: SmoothingStrength) {
+    var new = graphics
+    new.antiAliasing = true
+    new.strength = strength
+    save(new)
+  }
+
+  func setExtendedView(_ on: Bool) {
+    var new = graphics
+    new.extendedView = on
+    save(new)
+  }
+
+  func setHdr(_ on: Bool) {
+    var new = graphics
+    new.hdr = on
+    save(new)
+  }
+
+  private func save(_ new: GraphicsSettings) {
+    do {
+      try new.write(to: paths.graphicsFile)
+      graphics = new
+      graphicsProblem = nil
+      graphicsNotice = ""
+    } catch {
+      graphicsNotice = "Could not save \(paths.graphicsFile.path): \(error.localizedDescription)"
     }
   }
 

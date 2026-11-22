@@ -41,6 +41,7 @@
 #include "gpu_guard.h"
 #include "renderer.h"
 #include "stops.h"
+#include "kernel/extended_view.h"
 #include "window_sdl.h"
 #include <chrono>
 #include <cstdio>
@@ -108,6 +109,7 @@ const char* FormatName(VkFormat f)
     case VK_FORMAT_B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return "A2B10G10R10_UNORM_PACK32";
     case VK_FORMAT_R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return "R16G16B16A16_SFLOAT";
     default: return "other";
     }
 }
@@ -138,6 +140,12 @@ public:
 } backend;
 std::optional<GpuGuard<int, 1>> guard;
 
+bool hdrSwapchain = false, hdrFallbackNamed = false;  // FM4_HDR: the current swapchain is the HDR pair; the fallback was said
+std::atomic<VkImage> hdrImage{VK_NULL_HANDLE};        // the linear-light picture (PresenterSetup::hdr, or SetPresenterHdr later)
+std::atomic<bool> hdrRefused{false};
+std::atomic<float> stretch{1.0f};  // Extended View: the handed-over frame's horizontal stretch (SetPresenterStretch)
+VkFilter hdrFilter = VK_FILTER_NEAREST;
+
 bool FormatUsable(VkFormat f)
 {
     VkFormatProperties p{};
@@ -162,7 +170,23 @@ bool CreateSwapchain()
     std::vector<VkPresentModeKHR> modes(count);
     Check(vkGetPhysicalDeviceSurfacePresentModesKHR(d.gpu, d.surface, &count, modes.data()), "vkGetPhysicalDeviceSurfacePresentModesKHR");
 
-    const window::FormatChoice format = window::ChooseSurfaceFormat(formats, FormatUsable);
+    // FM4 Recomp (M9, FM4_HDR): the HDR pair when asked and offered; otherwise standard range, said once.
+    window::FormatChoice format;
+    if (hdrImage.load() != VK_NULL_HANDLE)
+    {
+        format = window::ChooseHdrSurfaceFormat(formats, FormatUsable);
+        if (!format.ok)
+            hdrRefused = true;
+        if (!format.ok && !hdrFallbackNamed)
+        {
+            hdrFallbackNamed = true;
+            std::fprintf(stderr, "[window] FM4_HDR: %s (%zu format(s) offered%s): standard range\n", format.reason.c_str(), formats.size(),
+                         d.swapchainColorspace ? "" : "; VK_EXT_swapchain_colorspace is not available");
+        }
+    }
+    hdrSwapchain = format.ok;
+    if (!format.ok)
+        format = window::ChooseSurfaceFormat(formats, FormatUsable);
     if (!format.ok)
         Stop(StopCode::Setup, "window: %s", format.reason.c_str());
     if (!window::UsageSupported(caps))
@@ -211,8 +235,9 @@ bool CreateSwapchain()
         Check(vkCreateSemaphore(d.device, &semaphore, nullptr, &s), "vkCreateSemaphore");
     planner.Created(retiring);
     stats.recreated += retiring ? 1 : 0;
-    std::fprintf(stderr, "[window] swapchain: %s, %ux%u, FIFO, %u images (window %ux%u pixels; %u retired, kept)\n", FormatName(surfaceFormat.format),
-                 extent.width, extent.height, count, planner.Window().width, planner.Window().height, planner.Retired());
+    std::fprintf(stderr, "[window] swapchain: %s, %ux%u, FIFO, %u images (window %ux%u pixels; %u retired, kept)%s\n", FormatName(surfaceFormat.format),
+                 extent.width, extent.height, count, planner.Window().width, planner.Window().height, planner.Retired(),
+                 hdrSwapchain ? "; HDR: extended linear sRGB (FM4_HDR)" : "");
     return true;
 }
 
@@ -249,13 +274,22 @@ void Record(VkImage target)
     // The display image is in TRANSFER_SRC_OPTIMAL: the command processor's submission that left it there (renderer.cpp
     // RecordReadback, whose barrier made the upload visible to transfer reads for every later command in submission
     // order) was retired before the hand-over.
-    const window::Rect r = window::FitRect(setup.displayExtent, extent);
+    // FM4 Recomp (Extended View): a frame drawn with a widened main view fills the window's width up to its factor's aspect.
+    const float factor = stretch.load(std::memory_order_relaxed);
+    window::Rect r = window::FitRect(setup.displayExtent, extent);
+    if (factor != 1.0f)
+    {
+        const runtime::view::Placement p = runtime::view::PlaceStretched(extent.width, extent.height, factor);
+        r = {p.x0, p.y0, p.x1, p.y1};
+    }
     VkImageBlit blit{};
     blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     blit.srcOffsets[1] = {int32_t(setup.displayExtent.width), int32_t(setup.displayExtent.height), 1};
     blit.dstOffsets[0] = {r.x0, r.y0, 0};
     blit.dstOffsets[1] = {r.x1, r.y1, 1};
-    vkCmdBlitImage(commands, setup.display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+    // FM4_HDR: an HDR swapchain takes the linear-light picture (hdr_output.h), left in TRANSFER_SRC_OPTIMAL by the same submission.
+    vkCmdBlitImage(commands, hdrSwapchain ? hdrImage.load() : setup.display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                   &blit, hdrSwapchain ? hdrFilter : filter);
     ImageBarrier(target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT,
                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
     Check(vkEndCommandBuffer(commands), "vkEndCommandBuffer");
@@ -296,6 +330,7 @@ std::unique_lock<std::timed_mutex> LockQueue(std::timed_mutex& lock, uint64_t bo
 void InitializePresenter(const PresenterSetup& s)
 {
     setup = s;
+    hdrImage = s.hdr;
     const VulkanDevice& d = *setup.dev;
     if (d.surface == VK_NULL_HANDLE || !d.swapchain)
         Stop(StopCode::Setup, "window: the device was created without a surface or VK_KHR_swapchain");
@@ -304,6 +339,9 @@ void InitializePresenter(const PresenterSetup& s)
     if (!(display.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT))
         Stop(StopCode::Setup, "window: A2B10G10R10_UNORM images cannot be blit sources (VUID-vkCmdBlitImage-srcImage-01999)");
     filter = (display.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    VkFormatProperties linearLight{};
+    vkGetPhysicalDeviceFormatProperties(d.gpu, VK_FORMAT_R16G16B16A16_SFLOAT, &linearLight);  // FM4_HDR: its source (the renderer checked BLIT_SRC)
+    hdrFilter = (linearLight.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     guard.emplace(backend, *setup.gate, setup.gpuStopPath, setup.fenceTimeoutNs);
     Require(guard->Begin("window initialize"));
     VkCommandPoolCreateInfo poolInfo{};
@@ -326,6 +364,13 @@ void InitializePresenter(const PresenterSetup& s)
     planner.WindowResized(window::WindowPixels(), NowNs());
     if (planner.Decide(NowNs()) != window::SwapchainPlanner::Decision::Create || !CreateSwapchain())
         Stop(StopCode::Setup, "window: no swapchain at start (window %ux%u pixels)", planner.Window().width, planner.Window().height);
+    if (hdrSwapchain)  // FM4_HDR
+    {
+        float potential = 1.0f;
+        const float now = window::HdrHeadroom(&potential);
+        std::fprintf(stderr, "[window] HDR output on: the display's headroom is %.2fx SDR white now, %.2fx at most%s\n", now, potential,
+                     potential <= 1.01f ? " (a standard-range display: the picture stays the standard one unless the window moves to an HDR display)" : "");
+    }
     std::fprintf(stderr, "[window] presenter: blit filter %s, acquire bound %llu ms, queue-lock and hand-over bound %llu ms\n",
                  filter == VK_FILTER_LINEAR ? "LINEAR" : "NEAREST", (unsigned long long)(kAcquireTimeoutNs / 1000000),
                  (unsigned long long)(PresenterWaitBoundNs(setup.fenceTimeoutNs) / 1000000));
@@ -338,12 +383,38 @@ void WindowEvent(window::EventAction action, VkExtent2D pixels)
     planner.WindowResized(pixels, NowNs());
 }
 
+bool PresenterHdr() { return hdrSwapchain; }
+void SetPresenterHdr(VkImage image) { hdrImage = image; }
+// FM4 Recomp (M9, live resolution, step 2): plain stores. The command processor calls this only between its BeginWrite and its next
+// Offer, while this thread reads `setup.display` and `setup.displayExtent` only between Take and Finish (Record); the hand-over's
+// mutex orders the two, and this thread's own submission that read the old image was retired before its Finish. The swapchain is
+// untouched: it has the window's size, and the blit's source rectangle follows the new extent.
+void SetPresenterDisplay(VkImage image, VkExtent2D displayExtent) { setup.display = image, setup.displayExtent = displayExtent; }
+void SetPresenterStretch(float factor) { stretch.store(factor, std::memory_order_relaxed); }
+bool PresenterHdrRefused() { return hdrRefused.load(); }
+
 bool PresentHandedOverFrame(uint64_t waitNs)
 {
+    if (hdrSwapchain)  // FM4_HDR: the display's headroom now (it follows the brightness setting), for the next frame's pass
+        SetHdrHeadroom(window::HdrHeadroom());
     const std::optional<uint64_t> swap = handOver.Take(waitNs);
     if (!swap)
         return false;
     Require(guard->Begin("window present"));  // GPU_STOP, a stop in progress, a stranding
+    // FM4_HDR switched on while the game runs: the HDR picture exists from this frame on, the swapchain is still the standard one.
+    // One rebuild through the planner (our own submission is retired, below, every frame); never the last retirements, which
+    // window resizes need.
+    if (hdrImage.load() != VK_NULL_HANDLE && !hdrSwapchain && !hdrRefused.load())
+    {
+        if (planner.Retired() + 2 < window::SwapchainPlanner::kMaxRetired)
+            planner.MarkSuboptimal();  // Decide: a rebuild (the window's size has long settled)
+        else
+        {
+            hdrRefused = true;
+            std::fprintf(stderr, "[window] FM4_HDR: %u retired swapchains are kept already: no rebuild for HDR in this session (standard range; "
+                                 "it applies at the next start)\n", planner.Retired());
+        }
+    }
     using Decision = window::SwapchainPlanner::Decision;
     switch (planner.Decide(NowNs()))
     {

@@ -14,6 +14,7 @@
 #include "graphics.h"
 #include "input_script.h"
 #include "input_live.h"  // FM4 Recomp: FM4_INPUT_LIVE
+#include "rumble.h"  // FM4 Recomp: controller rumble
 #include "key_bindings.h"  // FM4 Recomp: --keybindings
 #include "av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
 #include <atomic>
@@ -35,6 +36,7 @@ std::unique_ptr<runtime::input::Poller> poller;  // null: no script, no pad
 std::string scriptPath;
 long logged = -1;       // the last event reported in the log
 uint64_t rumbles = 0;
+std::atomic<uint32_t> gameRumble{0};  // FM4 Recomp (rumble.h): user 0's last X_INPUT_VIBRATION word, for the window loop
 // FM4 Recomp (FM4_INPUT_LIVE, input_live.h): the live pad, updated by the window loop; its packet number counts its changes.
 bool live = false;
 runtime::input::LiveState liveState;
@@ -122,6 +124,8 @@ bool LiveEnabled()
 
 uint64_t APresses() { return aPresses.load(std::memory_order_relaxed); }
 
+RumbleRequest GameRumble() { return RumbleFromGuestWord(gameRumble.load(std::memory_order_relaxed)); }
+
 void SetLiveState(const LiveState& state)
 {
     std::lock_guard guard(lock);
@@ -207,6 +211,8 @@ GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-121; a 
         NoteButtons(report.buttons);
         base[state + 6] = report.leftTrigger;
         base[state + 7] = report.rightTrigger;
+        for (uint32_t axis = 0; axis < 4; axis++)  // LX, LY, RX, RY (hid/input.h:57-72); 0 unless the script names a direction
+            runtime::Store16(base, state + 8 + 2 * axis, uint16_t(report.thumbs[axis]));
     }
     ctx.r3.u64 = 0;
 }
@@ -267,8 +273,9 @@ GUEST_IMPORT(XamInputSetState, "REFERENCE_DERIVED: Xenia xam_input.cc:126-146 (a
     // (user index, flags (unused in Xenia), X_INPUT_VIBRATION*): an index of 4 or more is X_E_DEVICE_NOT_CONNECTED (the
     // HRESULT, unlike XamInputGetState's Win32 code); no vibration pointer ERROR_BAD_ARGUMENTS (0xA0); users 1-3 have no
     // pad (0x48F); user 0's scripted pad accepts the two motor speeds (u16 u16, hid/input.h:74-78) and answers 0, as
-    // Xenia's SDL driver does when its rumble call succeeds. The scripted pad has no motors: the speeds are discarded,
-    // which the log says once (never silently). Without a script this is the generated strict stub.
+    // Xenia's SDL driver does when its rumble call succeeds. FM4 Recomp (rumble.h): the speeds are kept for the window loop,
+    // which sends them to a live SDL gamepad; the scripted pad has no motors, which the log says once (never silently).
+    // Without a script or a live pad this is the generated strict stub.
     const uint32_t index = ctx.r3.u32, vibration = ctx.r5.u32;
     std::lock_guard guard(lock);
     if (!Connected())
@@ -279,8 +286,13 @@ GUEST_IMPORT(XamInputSetState, "REFERENCE_DERIVED: Xenia xam_input.cc:126-146 (a
         return (void)(ctx.r3.u64 = kErrorBadArguments);
     if (index != 0)
         return (void)(ctx.r3.u64 = kErrorDeviceNotConnected);
-    if (rumbles++ == 0)
-        std::fprintf(stderr, "[input] XamInputSetState: rumble (left %04X, right %04X) accepted and discarded: the pad has no motors (reported once)\n",
-                     runtime::Load32(base, vibration) >> 16, runtime::Load32(base, vibration) & 0xFFFF);
+    const uint32_t word = runtime::Load32(base, vibration);
+    gameRumble.store(word, std::memory_order_relaxed);
+    // The first request and the first that asks a motor to run are named (a race asks for a new one almost every frame).
+    static bool running = false;
+    if (rumbles++ == 0 || (word != 0 && !running))
+        std::fprintf(stderr, "[input] XamInputSetState: rumble (left %04X, right %04X) accepted%s (the first request and the first running one are reported)\n",
+                     word >> 16, word & 0xFFFF, live ? ": the game's motor speeds go to the controller" : " and discarded: the pad has no motors");
+    running = running || word != 0;
     ctx.r3.u64 = 0;
 }

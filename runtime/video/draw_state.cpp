@@ -480,7 +480,7 @@ struct Decoder
 
     bool TextureFetches()
     {
-        struct Use { uint32_t slot, dimension; shader::ShaderTranslation::Filters filters; };
+        struct Use { uint32_t slot, dimension; shader::ShaderTranslation::Filters filters; bool offsets; };
         // FM4 Recomp (M7 CPU cost): the thread's scratch, cleared each decode (its storage stays: an allocation and a free a draw before;
         // Decoder::TextureFetches was 3.8 % of the command thread's frees, scenario336). Nothing keeps a reference past this call.
         thread_local std::vector<Use> uses;
@@ -489,7 +489,7 @@ struct Decoder
         for (const shader::ShaderTranslation* stage : {in.vs, in.ps})
             for (size_t i = 0; i < stage->textureSlots.size(); i++)
             {
-                const Use u{stage->textureSlots[i], stage->textureDimensions[i], stage->textureFilters[i]};
+                const Use u{stage->textureSlots[i], stage->textureDimensions[i], stage->textureFilters[i], i < stage->textureOffsets.size() && stage->textureOffsets[i] != 0};
                 auto same = std::find_if(uses.begin(), uses.end(), [&](const Use& v) { return v.slot == u.slot; });
                 if (same == uses.end())
                     uses.push_back(u);
@@ -497,6 +497,8 @@ struct Decoder
                 else if ((same->dimension == 0 ? 1 : same->dimension) != (u.dimension == 0 ? 1 : u.dimension) || same->filters.mag != u.filters.mag || same->filters.min != u.filters.min ||
                          same->filters.volMag != u.filters.volMag || same->filters.volMin != u.filters.volMin || same->filters.mip != u.filters.mip)
                     return Refuse("texture slot " + Num(u.slot) + " is fetched with different filters or dimensions by the vertex and pixel shaders");
+                else
+                    same->offsets = same->offsets || u.offsets;
             }
         std::sort(uses.begin(), uses.end(), [](const Use& a, const Use& b) { return a.slot < b.slot; });
         d.textureSlots.reserve(uses.size());  // FM4 Recomp (M7 CPU cost): one allocation at most
@@ -504,6 +506,7 @@ struct Decoder
         {
             TextureSlot t;
             t.slot = u.slot;
+            t.fetchOffsets = u.offsets;
             if (t.slot >= 32)
                 return Refuse("texture fetch slot " + Num(t.slot) + " is past the 32 texture fetch constants");
             for (uint32_t i = 0; i < 6; i++)
@@ -825,6 +828,12 @@ void DecodeDrawState(const DrawInputs& in, DrawState& out)
     x.DepthStencilDecode();
     d.colorWriteMask = d.edramMode == 5 ? 0 : x.Reg(xr::kRbColorMask) & 0xF;  // X registers.h:702-724; draw_util.cc:726-734
     d.kind = x.WritesNothing() ? DrawKind::NoWrite : d.edramMode == 5 ? DrawKind::DepthOnly : DrawKind::Draw;
+    // FM4 Recomp (M9, FM4_OCCLUSION_QUERIES): while an occlusion query counts, a draw that only tests depth is what it counts (FM4's
+    // sun quad): drawn into the depth target alone, read-only (colour mask 0: no colour attachment; KeyFromDrawState). One without a
+    // depth test has no attachment to draw into and stays NoWrite (the renderer names it, not counted).
+    d.countedOnly = d.kind == DrawKind::NoWrite && in.countNoWrite && !x.vizQueryKill_ && d.depthStencil.zEnable;
+    if (d.countedOnly)
+        d.kind = d.edramMode == 5 ? DrawKind::DepthOnly : DrawKind::Draw;
     if (!x.Primitive())
         return;
     if (d.kind == DrawKind::NoWrite)  // nothing reaches the GPU: the rest of the state is irrelevant and not validated

@@ -26,6 +26,8 @@ struct Paths {
   var gpuStop: URL { home.appendingPathComponent("GPU_STOP") }
   var locationsFile: URL { home.appendingPathComponent("locations.conf") }
   var keyBindingsFile: URL { home.appendingPathComponent("keybindings.conf") }  // Keyboard Controls in the game (KeyBindings.swift); play.sh passes it
+  var hdrStatusFile: URL { home.appendingPathComponent("hdr_status") }  // written by the running game (GraphicsSettings.swift HdrStatus)
+  var graphicsFile: URL { home.appendingPathComponent("graphics.conf") }  // Graphics in the game (GraphicsSettings.swift); play.sh reads it at the start
   var setupDone: URL { Locations.read(self).dataRoot.appendingPathComponent("setup.ok") }
   var readme: URL { kit.appendingPathComponent("README.md") }
   var logo: URL { kit.appendingPathComponent("resources/logo@2x.png") }

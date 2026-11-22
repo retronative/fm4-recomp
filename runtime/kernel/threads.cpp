@@ -4,6 +4,7 @@
 //
 // Taken from ForzaRecomp runtime/kernel/threads.cpp (GPL-3.0-or-later, same owner), reviewed and
 // re-tested here (tests/run_runtime_tests.sh). FM4 Recomp changes: none.
+#include "thread_qos.h"
 #include "threads.h"
 #include "dispatcher.h"
 #include "guest_memory.h"
@@ -42,6 +43,7 @@ void* Run(void* argument)
         char name[32];  // FM4 Recomp: "fm4 guest <id>" (thread_cpu.h roles; visible in sample and Instruments)
         std::snprintf(name, sizeof name, "fm4 guest %08X", k);
         pthread_setname_np(name);
+        runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default)
     }
     {
         std::unique_lock guard(suspendLock);
@@ -153,6 +155,7 @@ void StartServiceThread(uint8_t* base, uint8_t cpu, std::function<void(PPCContex
     const auto run = [](void* argument) -> void* {
         std::unique_ptr<Service> service(static_cast<Service*>(argument));
         pthread_setname_np("fm4 guest service");  // FM4 Recomp: thread_cpu.h roles
+        runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default)
         UseFaultStackOnThisThread();
         PPCContext ctx{};
         ctx.r1.u64 = service->state.stackBase - 0x100;

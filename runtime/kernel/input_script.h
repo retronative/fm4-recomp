@@ -6,7 +6,9 @@
 // exactly those buttons held (an empty list releases everything) until the next line; `#` starts a comment. Names:
 // A B X Y START BACK LB RB DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT LS RS (X_INPUT_GAMEPAD button bits, Xenia
 // xenia-canary 67f16c4e315f src/xenia/hid/input.h:31-47) and LT RT (the analogue triggers, pulled fully: 0xFF;
-// input.h:59-60). Thumbsticks stay centred (0). Vblanks must increase strictly from line to line.
+// input.h:59-60). Thumbsticks stay centred (0) unless a line names a direction: LS_LEFT LS_RIGHT LS_UP LS_DOWN RS_LEFT RS_RIGHT
+// RS_UP RS_DOWN push that stick fully along the axis (-32768 / 32767, +Y up; input.h:57-72). Vblanks must increase strictly from
+// line to line.
 //
 // Without a script nothing here is reached and XamInputGetState keeps reporting no controller (imports_xam.cpp).
 // This layer is pure (no guest memory, no stop): parsing reports an error message, the import file turns it into
@@ -32,6 +34,7 @@ struct Event
     uint64_t vblank = 0;
     uint16_t buttons = 0;
     uint8_t leftTrigger = 0, rightTrigger = 0;  // 0 or 0xFF (LT / RT named)
+    int16_t thumbs[4] = {};                     // LX, LY, RX, RY: 0, -32768 or 32767 (LS_* / RS_* named)
 };
 
 // FM4 Recomp (M7 A/B harness): a line `@race` starts a second list whose vblanks count from the race start (Poller::RaceStarted;
@@ -56,12 +59,13 @@ bool ParseScript(std::string_view text, Script& out, std::string& error);
 // first. Pure.
 long ActiveEvent(const Script& script, uint64_t vblank);
 
-// What one XamInputGetState poll reports (X_INPUT_STATE without the thumbsticks, which are always 0).
+// What one XamInputGetState poll reports (X_INPUT_STATE).
 struct Report
 {
     uint32_t packet = 0;
     uint16_t buttons = 0;
     uint8_t leftTrigger = 0, rightTrigger = 0;
+    int16_t thumbs[4] = {};  // LX, LY, RX, RY
     long event = -1;  // the active event, -1 before the first
 };
 

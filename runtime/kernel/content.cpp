@@ -138,15 +138,26 @@ uint64_t ContentFree(uint64_t used, uint64_t hostAvailable)
     return std::min(device, host);
 }
 
-uint64_t ContentFreeBytes()
+uint64_t HostAvailableBytes()
 {
     if (userData.empty())
         Stop(StopCode::Setup, "no user-data directory is mounted (--user-data)");
+    if (const char* given = std::getenv("FM4_TEST_HOST_AVAILABLE_BYTES"); given != nullptr && *given != '\0')  // test only (content.h)
+    {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long bytes = std::strtoull(given, &end, 10);
+        if (errno != 0 || *end != '\0' || *given < '0' || *given > '9')
+            Stop(StopCode::Setup, "FM4_TEST_HOST_AVAILABLE_BYTES=%s is not a decimal number of bytes", given);
+        return uint64_t(bytes);
+    }
     struct statvfs volume;
     if (statvfs(userData.c_str(), &volume) != 0)
         Stop(StopCode::Setup, "user data: statvfs(%s) failed", userData.c_str());
-    return ContentFree(ContentBytesUsed(), uint64_t(volume.f_bavail) * uint64_t(volume.f_frsize));
+    return uint64_t(volume.f_bavail) * uint64_t(volume.f_frsize);
 }
+
+uint64_t ContentFreeBytes() { return ContentFree(ContentBytesUsed(), HostAvailableBytes()); }
 
 namespace {
 bool SafeComponent(const std::string& name)

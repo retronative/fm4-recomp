@@ -31,5 +31,8 @@ void EvictIdleTextures();
 // FM4 Recomp (diagnostic, FM4_DIAG_TRIGGER stale-textures; every submission confirmed complete): every non-resident image is re-hashed
 // at its next bind (re-uploaded if its guest bytes differ). Returns how many.
 size_t MarkTexturesStale();
+// FM4 Recomp (M9, live resolution, step 2): at a change of the internal scale, only with every submission confirmed complete and no
+// command buffer open: destroys every scaled twin (texture_vk.cpp HostImage::hiImage) and its views. Returns how many.
+size_t DestroyTextureTwins();
 
 }  // namespace runtime::video

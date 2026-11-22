@@ -4,6 +4,8 @@
 // See draw_record.h.
 #include "draw_record.h"
 #include "host_samples.h"  // FM4 Recomp (FM4_HOST_MSAA_1X): HostSampleCount, HostMsaa1x
+#include "render_scale.h"  // FM4 Recomp (M9, FM4_INTERNAL_RES): InternalHalvesQuiet
+#include "edram.h"         // FM4 Recomp (M9, FM4_INTERNAL_SCALE_PITCH): PitchTilesAt32bpp
 
 #include <cmath>
 #include <algorithm>
@@ -180,6 +182,13 @@ KeyResult VariantsFromDrawState(const DrawState& d, const CachedShader& vs, cons
         if (d.hostPrimitive == HostPrimitive::LineList)
             psDefines.Add("XE_PARAM_GEN_LINE 1");  // z's sign set: X spirv_shader_translator.cc:2107-2120
     }
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): the variants that read the pixel position take it in guest pixels (render_scale.h
+    // ScaleFragCoordReads, applied by shader_cache.cpp VariantGlsl); the define also keeps their cached SPIR-V apart from 1x's.
+    // (FM4_INTERNAL_SCALE_PITCH: the scale of this draw's targets, by their pitch.)
+    if (const uint32_t halves = runtime::video::scale::HalvesForPitch(edram::PitchTilesAt32bpp(d.target.pitch, edram::Msaa(d.target.msaa)),
+                                                                      runtime::video::scale::InternalHalvesQuiet(), runtime::video::scale::PitchScaled());
+        halves > runtime::video::scale::kHalves1x && ((d.program.paramGen && d.program.paramGenPos < 16) || d.alphaToMask != 0))
+        psDefines.Add("XE_HALVES " + Num(halves) + "u");
     if (d.alphaToMask != 0)  // the offsets and the target's sample count (shader_glsl.cpp XE_ALPHA_TO_MASK)
     {
         psDefines.Add("XE_ALPHA_TO_MASK " + Num(d.alphaToMask & 0xFF) + "u");

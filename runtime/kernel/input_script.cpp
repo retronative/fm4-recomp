@@ -17,6 +17,13 @@ constexpr Name kNames[] = {
     {"DPAD_LEFT", kDpadLeft, 0}, {"DPAD_RIGHT", kDpadRight, 0}, {"LS", kLeftThumb, 0}, {"RS", kRightThumb, 0},
 };
 
+// A stick pushed fully along one axis: thumbs[axis] = value.
+struct Stick { const char* text; uint8_t axis; int16_t value; };
+constexpr Stick kSticks[] = {
+    {"LS_LEFT", 0, -32768}, {"LS_RIGHT", 0, 32767}, {"LS_DOWN", 1, -32768}, {"LS_UP", 1, 32767},
+    {"RS_LEFT", 2, -32768}, {"RS_RIGHT", 2, 32767}, {"RS_DOWN", 3, -32768}, {"RS_UP", 3, 32767},
+};
+
 bool IsSpace(char c) { return c == ' ' || c == '\t' || c == '\r'; }
 
 // The next whitespace-separated token of `line` from `at`, or empty at its end.
@@ -91,7 +98,16 @@ bool ParseScript(std::string_view text, Script& out, std::string& error)
                 if (token == name.text)
                     found = &name;
             if (found == nullptr)
-                return Fail(error, number, "unknown button", token);
+            {
+                const Stick* stick = nullptr;
+                for (const Stick& candidate : kSticks)
+                    if (token == candidate.text)
+                        stick = &candidate;
+                if (stick == nullptr)
+                    return Fail(error, number, "unknown button", token);
+                event.thumbs[stick->axis] = stick->value;
+                continue;
+            }
             event.buttons |= found->button;
             if (found->trigger == 1)
                 event.leftTrigger = 0xFF;
@@ -151,6 +167,7 @@ Report Poller::Poll(uint64_t vblank)
     {
         const Event& e = raced_ ? script_.race[size_t(race)] : script_.events[size_t(report.event)];
         report.buttons = e.buttons, report.leftTrigger = e.leftTrigger, report.rightTrigger = e.rightTrigger;
+        std::copy(std::begin(e.thumbs), std::end(e.thumbs), report.thumbs);
     }
     return report;
 }

@@ -46,7 +46,7 @@ struct ControlsPage: View {
           ForEach(keyActions, id: \.id) { action in ActionRow(model: model, action: action) }
         }
       }
-      .frame(height: 236)
+      .frame(height: 366)  // the panel is 790 high (ControlsPanel.swift: the Graphics page needs it)
       .background(RoundedRectangle(cornerRadius: 12).fill(Theme.card))
       .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.line))
       StatusBar(model: model).frame(height: 44)

@@ -595,6 +595,7 @@ private:
     bool vertexIndexOverwritten_ = false;
     std::map<uint32_t, ShaderTranslation::Filters> textureFilters_;  // per slot: the instruction filters
     std::map<uint32_t, uint32_t> textureDimensions_;                  // per slot: kDimension2D or 3DOrStacked
+    std::set<uint32_t> textureOffsetSlots_;                           // FM4 Recomp (M9): slots fetched with a texel offset
     bool haveFullFetch_ = false;
     // The control-flow index of the predicated exec holding the last full vertex fetch, or ~0u
     // outside one (FM4 Recomp: mini fetches must not reach into another exec's block).
@@ -1660,6 +1661,8 @@ bool Translator::TextureFetchOp(const uint32_t w[3], uint32_t slot)
     // offset / 2 / size. Xenia also adds a 1.5/1024-texel epsilon for point sampling between
     // texels, which is not done here.
     if (t.offsetX != 0 || t.offsetY != 0 || t.offsetZ != 0)
+        textureOffsetSlots_.insert(t.constIndex);  // FM4 Recomp (M9): ShaderTranslation::textureOffsets
+    if (t.offsetX != 0 || t.offsetY != 0 || t.offsetZ != 0)
         coordinates = "(" + coordinates + " + " + vec + "(" + std::to_string(t.offsetX) + ".0, " + std::to_string(t.offsetY) + ".0" +
                       (volume ? ", " + std::to_string(t.offsetZ) + ".0" : std::string()) + ") * 0.5 / " + vec + "(textureSize(" +
                       sampler + ", 0)))";
@@ -2277,8 +2280,10 @@ void Translator::Finish(const std::vector<Translator>& analyses, ShaderTranslati
     out.textureSlots.assign(textureSlots_.begin(), textureSlots_.end());
     out.textureFilters.clear();
     out.textureDimensions.clear();
+    out.textureOffsets.clear();
     for (uint32_t s : textureSlots_)
     {
+        out.textureOffsets.push_back(textureOffsetSlots_.count(s) ? 1 : 0);
         out.textureFilters.push_back(textureFilters_[s]);
         out.textureDimensions.push_back(textureDimensions_[s]);
     }
@@ -2629,6 +2634,9 @@ std::string Translator::Assemble(uint32_t interpolators) const
              "#endif\n"
              "        if (xe_m == 0)\n            discard;\n"
              "#if XE_ALPHA_TO_MASK_SAMPLES > 1\n        gl_SampleMask[0] = xe_m;\n#endif\n    }\n#endif\n";
+        // FM4 Recomp (HDR output, video/hdr_output.h HudGain; a variant only the HUD's and menus' draws take while HDR is in effect):
+        // the draw's colour is scaled so that its white, once the picture's highlights are expanded, is standard white, not the peak.
+        g += "#ifdef XE_OVERLAY_GAIN\n    xe_color0.xyz *= XE_OVERLAY_GAIN;\n#endif\n";
         g += "#ifdef XE_COLOR0_GAMMA\n    xe_color0.xyz = xe_linear_to_pwl_gamma(xe_color0.xyz);\n#endif\n";
         g += "#ifdef XE_COLOR0_7E3\n    xe_color0 = mix(vec4(0.0), min(xe_color0, vec4(31.875, 31.875, 31.875, 1.0)), "
              "greaterThan(xe_color0, vec4(0.0)));\n#endif\n";
@@ -2671,6 +2679,14 @@ std::string Translator::Assemble(uint32_t interpolators) const
 )";
     g += "void xe_emit(vec4 q, vec4 interp[" + n + "])\n{\n";
     // The viewport fold (:1556-1575, NoContraction): q is the fixed-up position, q.w the real W.
+    // FM4 Recomp (Extended View, kernel/extended_view.h; a variant only the HUD's and menus' draws whose viewport is the whole
+    // frame take while the main view is widened): before the fold, where -1..1 is the frame, the draw is narrowed about the centre
+    // (x by xe_viewport_offset.w, y by xe_viewport_scale.w, each only above 1), except vertices at the frame's edge, which stay
+    // there, so a full-screen dim, fade or bar still covers the whole picture (view::PinNarrow is the same rule).
+    g += "#ifdef XE_OVERLAY_PIN\n    if (q.w != 0.0)\n    {\n        vec2 xe_f = q.xy / q.w;\n"
+         "        if (xe_viewport_offset.w > 1.0)\n            xe_f.x = abs(xe_f.x) >= 0.998 ? sign(xe_f.x) : xe_f.x / xe_viewport_offset.w;\n"
+         "        if (xe_viewport_scale.w > 1.0)\n            xe_f.y = abs(xe_f.y) >= 0.998 ? sign(xe_f.y) : xe_f.y / xe_viewport_scale.w;\n"
+         "        q.xy = xe_f * q.w;\n    }\n#endif\n";
     g += "    precise vec3 xe_ndc = q.xyz * xe_viewport_scale.xyz + xe_viewport_offset.xyz * q.w;\n";
     g += "    gl_Position = vec4(xe_ndc, q.w);\n";
     for (uint32_t i = 0; i < interpolators; i++)

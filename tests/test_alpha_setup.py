@@ -16,6 +16,7 @@
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -449,7 +450,7 @@ class PlayDefaults(unittest.TestCase):
     def settings(self, env):
         text = open(os.path.join(ALPHA, "play.sh")).read()
         start = text.index("export FM4_VARIANT_MEMO=")
-        end = text.index("\n", text.index("FM4_ASYNC_RETIRE:-1}"))
+        end = text.index("\n", text.index("FM4_EDRAM_RELEASE_REPLACED:-1}"))
         block = text[start:end] + "\nif [ \"$FM4_VERTEX_CACHE_MB\" = 0 ]; then unset FM4_VERTEX_CACHE_MB; fi\n"
         script = "set -euo pipefail\n" + block + "\nenv | grep '^FM4_' | sort\n"
         out = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True).stdout
@@ -458,7 +459,11 @@ class PlayDefaults(unittest.TestCase):
     def test_gpu_untile_off_by_default(self):
         s = self.settings({})
         self.assertEqual(s["FM4_TEXTURE_GPU_UNTILE"], "0")
-        self.assertEqual((s["FM4_GUEST_MEMORY_GPU"], s["FM4_VERTEX_CACHE_MB"], s["FM4_SUBMIT_IF_IDLE"], s["FM4_ASYNC_RETIRE"]), ("1", "256", "32", "1"))
+        self.assertEqual((s["FM4_GUEST_MEMORY_GPU"], s["FM4_VERTEX_CACHE_MB"], s["FM4_SUBMIT_IF_IDLE"], s["FM4_ASYNC_RETIRE"]), ("1", "256", "8", "1"))
+        # The four speed settings of the internal resolutions are on by default (owner decision 2026-11-22); 0 turns one off.
+        self.assertEqual([s[k] for k in ("FM4_INTERNAL_SCALE_PITCH", "FM4_RESOLVE_FUSED", "FM4_PRESENT_LAZY", "FM4_EDRAM_RELEASE_REPLACED")], ["1"] * 4)
+        self.assertEqual(self.settings({"FM4_RESOLVE_FUSED": "0", "FM4_SUBMIT_IF_IDLE": "32"})["FM4_RESOLVE_FUSED"], "0")  # CONTROL: the environment wins
+        self.assertEqual(self.settings({"FM4_SUBMIT_IF_IDLE": "32"})["FM4_SUBMIT_IF_IDLE"], "32")
         self.assertNotEqual(s["FM4_TEXTURE_GPU_UNTILE"], "1")  # CONTROL: the old default
 
     def cache(self, env):
@@ -474,12 +479,159 @@ class PlayDefaults(unittest.TestCase):
         self.assertNotIn("FM4_SHADER_CACHE", self.cache({"FM4_SHADER_CACHE": "0"}))  # CONTROL: 0 turns it off
         self.assertEqual(self.cache({"FM4_SHADER_CACHE": "/elsewhere"}).get("FM4_SHADER_CACHE"), "/elsewhere")  # another path moves it
 
+    def resolution(self, env, conf=None):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index("RES=fhd")
+        end = text.index("\n", text.index('export FM4_INTERNAL_RES="$RES"'))
+        with tempfile.TemporaryDirectory() as root:
+            if conf is not None:
+                with open(os.path.join(root, "graphics.conf"), "w", newline="") as f:
+                    f.write(conf)
+            script = "set -euo pipefail\nROOT=" + shlex.quote(root) + "\n" + text[start:end] + "\necho \"$FM4_INTERNAL_RES\"\n"
+            done = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True)
+        return done.stdout.strip(), done.stderr
+
+    def test_rendering_resolution_from_graphics_conf(self):
+        header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
+        self.assertEqual(self.resolution({}), ("fhd", ""))                                         # no file: the default (owner decision 2026-11-21)
+        self.assertEqual(self.resolution({}, header + "internal_resolution = 720p\n"), ("720p", ""))
+        self.assertEqual(self.resolution({}, header + "internal_resolution = fhd\n"), ("fhd", ""))   # the app's file (GraphicsSettings.swift)
+        self.assertEqual(self.resolution({}, header + "internal_resolution = qhd\n"), ("qhd", ""))
+        self.assertEqual(self.resolution({}, "internal_resolution=qhd\r\n"), ("qhd", ""))            # CRLF, no spaces
+        self.assertEqual(self.resolution({}, header + "internal_resolution = 4k\n"), ("4k", ""))
+        out, err = self.resolution({}, header + "internal_resolution = 8k\n")                      # CONTROL: an unknown value is never exported
+        self.assertEqual(out, "fhd")
+        self.assertIn("unknown resolution '8k': using fhd", err)
+        self.assertEqual(self.resolution({}, header)[0], "fhd")                                   # a file with no setting
+        self.assertEqual(self.resolution({"FM4_INTERNAL_RES": "720p"}, "internal_resolution = qhd\n"), ("720p", ""))  # the environment wins
+        self.assertEqual(self.resolution({"FM4_INTERNAL_RES": "qhd"}), ("qhd", ""))
+
+    def smoothing(self, env, conf=None):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index("AA=on")
+        end = text.index("\n", text.index('export FM4_POST_AA="$AA"'))
+        with tempfile.TemporaryDirectory() as root:
+            if conf is not None:
+                with open(os.path.join(root, "graphics.conf"), "w", newline="") as f:
+                    f.write(conf)
+            script = "set -euo pipefail\nROOT=" + shlex.quote(root) + "\n" + text[start:end] + "\necho \"$FM4_POST_AA\"\n"
+            done = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True)
+        return done.stdout.strip(), done.stderr
+
+    def test_edge_smoothing_from_graphics_conf(self):
+        header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
+        self.assertEqual(self.smoothing({}), ("on", ""))                                                        # no file: Standard, the default
+        self.assertEqual(self.smoothing({}, header + "internal_resolution = qhd\n"), ("on", ""))                # a file that does not name it: the default
+        self.assertEqual(self.smoothing({}, header + "internal_resolution = qhd\nanti_aliasing = on\n"), ("on", ""))  # and on (GraphicsSettings.swift)
+        self.assertEqual(self.smoothing({}, "anti_aliasing=on\r\n"), ("on", ""))                                # CRLF, no spaces
+        self.assertEqual(self.smoothing({}, "anti_aliasing = off\n"), ("off", ""))
+        self.assertEqual(self.smoothing({}, header + "internal_resolution = qhd\nanti_aliasing = soft\n"), ("soft", ""))    # the strengths
+        self.assertEqual(self.smoothing({}, "anti_aliasing = strong\n"), ("strong", ""))
+        out, err = self.smoothing({}, "anti_aliasing = standard\n")                                             # CONTROL: Standard is spelled on
+        self.assertEqual(out, "on")
+        self.assertIn("unknown anti_aliasing 'standard': using on", err)
+        out, err = self.smoothing({}, "anti_aliasing = yes\n")                                                  # CONTROL: an unknown value is never exported
+        self.assertEqual(out, "on")
+        self.assertIn("unknown anti_aliasing 'yes': using on", err)
+        self.assertEqual(self.smoothing({"FM4_POST_AA": "off"}, "anti_aliasing = on\n"), ("off", ""))            # the environment wins
+        self.assertEqual(self.smoothing({"FM4_POST_AA": "off"}), ("off", ""))
+        # the resolution is read as before from a file that also names the smoothing
+        self.assertEqual(self.resolution({}, header + "internal_resolution = fhd\nanti_aliasing = on\n"), ("fhd", ""))
+
+    def hdr(self, env, conf=None):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index("HDR=off")
+        end = text.index("\n", text.index('export FM4_HDR="$HDR"'))
+        with tempfile.TemporaryDirectory() as root:
+            if conf is not None:
+                with open(os.path.join(root, "graphics.conf"), "w", newline="") as f:
+                    f.write(conf)
+            script = "set -euo pipefail\nROOT=" + shlex.quote(root) + "\n" + text[start:end] + "\necho \"$FM4_HDR\"\n"
+            done = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True)
+        return done.stdout.strip(), done.stderr
+
+    def test_hdr_from_graphics_conf(self):
+        header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
+        self.assertEqual(self.hdr({}), ("off", ""))                                                                  # no file: off, the default
+        self.assertEqual(self.hdr({}, header + "internal_resolution = qhd\nanti_aliasing = on\n"), ("off", ""))      # a file that does not name it
+        self.assertEqual(self.hdr({}, header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\n"), ("auto", ""))
+        self.assertEqual(self.hdr({}, "hdr=auto\r\n"), ("auto", ""))                                                     # CRLF, no spaces
+        self.assertEqual(self.hdr({}, "hdr = off\n"), ("off", ""))
+        out, err = self.hdr({}, "hdr = yes\n")                                                                       # CONTROL: an unknown value is never exported
+        self.assertEqual(out, "off")
+        self.assertIn("unknown hdr 'yes': using off", err)
+        self.assertEqual(self.hdr({"FM4_HDR": "off"}, "hdr = auto\n"), ("off", ""))                                    # the environment wins
+        self.assertEqual(self.hdr({"FM4_HDR": "auto"}), ("auto", ""))
+        out, err = self.hdr({}, "hdr = on\n")                                                                        # CONTROL: the preference is off or auto
+        self.assertEqual(out, "off")
+        self.assertIn("unknown hdr 'on': using off", err)
+        # the other two settings are read as before from a file that also names hdr
+        self.assertEqual(self.resolution({}, header + "internal_resolution = qhd\nanti_aliasing = soft\nhdr = auto\n"), ("qhd", ""))
+        self.assertEqual(self.smoothing({}, header + "internal_resolution = qhd\nanti_aliasing = soft\nhdr = auto\n"), ("soft", ""))
+
+    def extended(self, env, conf=None):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        start = text.index('export FM4_EXTENDED_VIEW_OFFERED=')
+        end = text.index("\n", text.index('export FM4_EXTENDED_VIEW_HOOK='))
+        with tempfile.TemporaryDirectory() as root:
+            if conf is not None:
+                with open(os.path.join(root, "graphics.conf"), "w", newline="") as f:
+                    f.write(conf)
+            script = "set -euo pipefail\nROOT=" + shlex.quote(root) + "\n" + text[start:end] + "\necho \"$FM4_EXTENDED_VIEW $FM4_EXTENDED_VIEW_HOOK\"\n"
+            done = subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True)
+        return done.stdout.strip(), done.stderr
+
+    def test_extended_view_from_graphics_conf(self):
+        header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
+        on = {"FM4_EXTENDED_VIEW_OFFERED": "1"}
+        # Not offered (0.2.0): off and the hook disarmed whatever the file or the environment says.
+        self.assertEqual(self.extended({}), ("off 0", ""))
+        self.assertEqual(self.extended({}, "extended_view = on\n"), ("off 0", ""))
+        self.assertEqual(self.extended({"FM4_EXTENDED_VIEW": "on", "FM4_EXTENDED_VIEW_HOOK": "1"}, "extended_view = on\n"), ("off 0", ""))
+        # Offered (FM4_EXTENDED_VIEW_OFFERED=1, a playtest): the file's value, the hook armed for a live switch.
+        self.assertEqual(self.extended(on), ("off 1", ""))
+        self.assertEqual(self.extended(on, header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\n"), ("off 1", ""))
+        self.assertEqual(self.extended(on, header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\nextended_view = on\n"), ("on 1", ""))
+        self.assertEqual(self.extended(on, "extended_view=on\r\n"), ("on 1", ""))                                      # CRLF, no spaces
+        out, err = self.extended(on, "extended_view = wide\n")                                                         # CONTROL: an unknown value is never exported
+        self.assertEqual(out, "off 1")
+        self.assertIn("unknown extended_view 'wide': using off", err)
+        self.assertEqual(self.extended({**on, "FM4_EXTENDED_VIEW": "off"}, "extended_view = on\n"), ("off 1", ""))      # the environment wins
+        self.assertEqual(self.extended({**on, "FM4_EXTENDED_VIEW_HOOK": "0"}, "extended_view = on\n"), ("on 0", ""))    # the hook disarmed
+        # the other settings are read as before from a file that also names it
+        self.assertEqual(self.hdr({}, header + "internal_resolution = qhd\nhdr = auto\nextended_view = on\n"), ("auto", ""))
+        self.assertEqual(self.resolution({}, header + "internal_resolution = qhd\nhdr = auto\nextended_view = on\n"), ("qhd", ""))
+
+    def occlusion(self, env):
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        line = [l for l in text.split("\n") if l.startswith("export FM4_OCCLUSION_QUERIES=")]
+        self.assertEqual(len(line), 1)
+        done = subprocess.run(["/bin/bash", "-c", "set -euo pipefail\n" + line[0] + "\necho \"$FM4_OCCLUSION_QUERIES\"\n"], env={"PATH": "/usr/bin:/bin", **env},
+                              capture_output=True, text=True, check=True)
+        return done.stdout.strip()
+
+    def test_occlusion_queries_default(self):
+        self.assertEqual(self.occlusion({}), "1")                                # on by default (owner decision 2026-11-23)
+        self.assertEqual(self.occlusion({"FM4_OCCLUSION_QUERIES": "0"}), "0")    # the environment turns it off
+
     def audio(self, env):
         text = open(os.path.join(ALPHA, "play.sh")).read()
         start = text.index("AUDIO=audible")
         end = text.index("\n", text.index('AUDIO=mute', start))
         script = "set -euo pipefail\n" + text[start:end] + "\necho $AUDIO\n"
         return subprocess.run(["/bin/bash", "-c", script], env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, check=True).stdout.strip()
+
+    def test_settings_panel_is_wired(self):
+        # Command-comma in the menus opens the Settings panel (Graphics): the game needs the panel's program (it was once dropped).
+        self.assertIn('--controls-panel "$HERE/bin/fm4recomp-setup"', open(os.path.join(ALPHA, "play.sh")).read())
+
+    def test_pause_menu_graphics_is_wired(self):
+        # The Pause menu's GRAPHICS row (and KEYBOARD CONTROLS) needs the hooks' flag, and the data folder for graphics.conf, in the
+        # game's environment; the file it writes is the one read above.
+        text = open(os.path.join(ALPHA, "play.sh")).read()
+        self.assertIn("FM4_PAUSE_KEYBOARD_CONTROLS=1", text)
+        self.assertIn('export FM4_RECOMP_HOME="$ROOT"', text)
+        self.assertIn('"$ROOT/graphics.conf"', text)
 
     def test_audio_audible_unless_muted(self):
         self.assertIn('--audio "$AUDIO"', open(os.path.join(ALPHA, "play.sh")).read())

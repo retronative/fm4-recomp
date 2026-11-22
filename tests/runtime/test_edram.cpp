@@ -2129,6 +2129,42 @@ void TestResolve64Clear()
     CONTROL(o.At(4) == i.source);  // the 32 bpp range 4-15
 }
 
+// FM4 Recomp (M9, live resolution, step 2): Ownership::Reset, the map of a switch of the internal resolution
+// (every host image destroyed and made again zeroed). Expected by hand from the model's own rules: a new map has no owner, no
+// shadow and no constant (the constructor; TestOwnership), so a claim on it transfers nothing; the setting and the tallies are
+// not part of what the images hold and stay. The states before the reset are TestTransferSkip's (one skipped run of 720 tiles)
+// and TestClearValueOwnership's (720 recorded tiles).
+void TestOwnershipReset()
+{
+    std::vector<Transfer> t;
+    std::string why;
+    uint32_t w = 0;
+    Ownership o;
+    o.skipUnwritten = true;
+    CHECK(o.Change(kAd, 0, 720, t, why) && o.Change(kBd, 0, 720, t, why, nullptr, false));  // kBd borrows 720-1439 read-only: shadow kAd
+    t.clear();
+    CHECK(o.Change(kAd, 0, 720, t, why) && t.empty() && o.Skipped().transfers == 1 && o.Skipped().tiles == 720);  // handed back without a copy
+    CHECK(o.Change(kBd, 0, 720, t, why, nullptr, false) && o.ShadowAt(720) == kAd);  // lent again: a shadow to lose
+    CHECK(o.Change(kAc, 0, 720, t, why) && o.SetClearValue(kAc, Rect{0, 0, 640, 360}, 0x12345678u) == 720 && o.ClearValueTiles() == 720);
+    o.Reset();
+    CHECK(o.Count(kAc) == 0 && o.Count(kAd) == 0 && o.Count(kBd) == 0 && o.At(0).Empty() && o.At(720).Empty() && o.At(2047).Empty());
+    CHECK(o.ShadowAt(720).Empty() && o.ShadowAt(1439).Empty());
+    CHECK(o.ClearValueTiles() == 0);
+    CONTROL(o.ClearValue(0, w));
+    CHECK(o.skipUnwritten && o.Skipped().transfers == 1 && o.Skipped().tiles == 720);  // kept: the swap line subtracts the tallies
+    // As on a new map: the first claims find no owner and no constant, so they emit no transfer, value or copy.
+    t.clear();
+    CHECK(o.Change(kBc, 0, 720, t, why) && t.empty() && o.Count(kBc) == 720);
+    CHECK(o.Change(kBd, 0, 720, t, why) && t.empty() && o.Count(kBd) == 720);
+    CHECK(o.Skipped().tiles == 720);  // and no skip was taken for them
+    // CONTROL: without the reset the same claim takes the constants from kAc as a value transfer (TestClearValueOwnership).
+    Ownership c;
+    t.clear();
+    CHECK(c.Change(kAc, 0, 720, t, why) && c.SetClearValue(kAc, Rect{0, 0, 640, 360}, 0x12345678u) == 720);
+    CHECK(c.Change(kBc, 0, 720, t, why) && t == T({{0, 720, kAc, true, 0x12345678u}}));
+    CONTROL(t.empty());
+}
+
 int main(int argc, char** argv)
 {
     if (argc > 1)
@@ -2158,6 +2194,7 @@ int main(int argc, char** argv)
     TestOwnership64();  // FM4 Recomp (alpha, RT format 5)
     TestResolve64Decode();  // FM4 Recomp (alpha, 64 bpp resolve)
     TestResolve64Clear();  // FM4 Recomp (alpha, 64 bpp resolve clear)
+    TestOwnershipReset();  // FM4 Recomp (M9, live resolution, step 2)
     std::printf("%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

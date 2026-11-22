@@ -14,6 +14,9 @@
 #include "kernel/controls_screen.h"
 #include "kernel/controls_menu.h"
 #include "kernel/input_script.h"
+#include "kernel/rumble.h"
+#include "kernel/graphics_menu.h"
+#include "kernel/extended_view.h"
 #include <atomic>
 #include <chrono>
 #include <SDL3/SDL.h>
@@ -34,6 +37,36 @@ SDL_Gamepad* gamepad = nullptr;  // FM4_INPUT_LIVE: the first gamepad SDL report
 // FM4 Recomp (FM4_INPUT_LIVE, input_live.h): the keyboard and the gamepad now, merged, handed to XamInputGetState.
 std::atomic<bool> pausePressed{false};  // Command-comma in a race (the event loop) -> one START press (PollLiveInput)
 
+// FM4 Recomp (kernel/rumble.h; ReCarbon's SDL approach): the game's motor speeds to the gamepad. Main thread only.
+runtime::input::RumblePlanner rumble;
+bool rumbleCapable = false;  // the open gamepad says it can rumble and has not refused
+uint64_t rumbleSends = 0;
+
+// The motors off now (the pad is about to be closed, or the process to end). A pad that is gone ignores it.
+void StopRumble()
+{
+    if (gamepad != nullptr && rumbleCapable && rumble.Running())
+        SDL_RumbleGamepad(gamepad, 0, 0, 0);
+    rumble.Refused();  // nothing running from here
+}
+
+void UpdateRumble()
+{
+    // Not while the window is in the background or the game waits behind the Settings panel: the motors stop, and the game's
+    // request is sent again when the game is back in front.
+    const bool active = (SDL_GetWindowFlags(sdlWindow) & SDL_WINDOW_INPUT_FOCUS) != 0 && !runtime::controls::InputBlocked();
+    const runtime::input::RumbleCommand c = rumble.Step(runtime::input::GameRumble(), gamepad != nullptr && rumbleCapable, active, SDL_GetTicks());
+    if (!c.send)
+        return;
+    if (!SDL_RumbleGamepad(gamepad, c.low, c.high, c.durationMs))
+    {
+        std::fprintf(stderr, "[input] rumble: the gamepad refused it (%s): no rumble on this controller\n", SDL_GetError());
+        rumbleCapable = false, rumble.Refused();
+    }
+    else if (rumbleSends++ < 8)
+        std::fprintf(stderr, "[input] rumble: low %u, high %u to the gamepad%s\n", unsigned(c.low), unsigned(c.high), rumbleSends == 8 ? " (no further lines)" : "");
+}
+
 void PollLiveInput()
 {
     using namespace runtime::input;
@@ -43,14 +76,19 @@ void PollLiveInput()
         if (SDL_JoystickID* ids = SDL_GetGamepads(&count))
         {
             if (count > 0 && (gamepad = SDL_OpenGamepad(ids[0])) != nullptr)
-                std::fprintf(stderr, "[input] gamepad connected: %s\n", SDL_GetGamepadName(gamepad));
+            {
+                // What it can do (as ReCarbon's hid/input.cpp): a pad without motors is never sent a rumble.
+                rumbleCapable = SDL_GetBooleanProperty(SDL_GetGamepadProperties(gamepad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+                std::fprintf(stderr, "[input] gamepad connected: %s (rumble %s)\n", SDL_GetGamepadName(gamepad), rumbleCapable ? "yes" : "no: not supported by this controller");
+            }
             SDL_free(ids);
         }
     }
     LiveState pad;
     if (gamepad != nullptr && !SDL_GamepadConnected(gamepad))
     {
-        SDL_CloseGamepad(gamepad), gamepad = nullptr;
+        StopRumble();  // best effort; the planner starts the next pad still
+        SDL_CloseGamepad(gamepad), gamepad = nullptr, rumbleCapable = false;
         std::fprintf(stderr, "[input] gamepad disconnected\n");
     }
     if (gamepad != nullptr)
@@ -98,6 +136,7 @@ void PollLiveInput()
     else if (now < pauseUntil)
         state.buttons = uint16_t(state.buttons | button::kStart);  // Command-comma in a race: START, FM4's own Pause menu
     SetLiveState(state);
+    UpdateRumble();
 }
 
 // FM4 Recomp (kernel/controls_screen.h): Command-comma, the Mac's Settings shortcut (ReCarbon's too, runtime/ui/ui.cpp:665-673 at
@@ -144,6 +183,7 @@ void DestroySurface(VkInstance instance, VkSurfaceKHR surface) { SDL_Vulkan_Dest
 {
     // A normal-context stop: Stop drains the command processor's submissions in flight (bounded; this thread has none
     // of its own: the presenter retired its submission before returning to the loop), then _exit.
+    StopRumble();  // FM4 Recomp: the motors do not outlive the game (any other end: the 1 s hold runs out, kernel/rumble.h)
     Stop(StopCode::WindowClosed, "the window was closed by the user (%s)", what);
 }
 
@@ -210,6 +250,22 @@ VkExtent2D WindowPixels()
     return {uint32_t(w < 0 ? 0 : w), uint32_t(h < 0 ? 0 : h)};
 }
 
+float HdrHeadroom(float* potential)
+{
+    if (potential != nullptr)
+        *potential = 1.0f;
+    void* window = SDL_GetPointerProperty(SDL_GetWindowProperties(sdlWindow), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+    if (window == nullptr)
+        return 1.0f;
+    const id screen = reinterpret_cast<id (*)(id, SEL)>(objc_msgSend)(reinterpret_cast<id>(window), sel_registerName("screen"));
+    if (screen == nullptr)  // the window is on no screen (off every display)
+        return 1.0f;
+    using Value = double (*)(id, SEL);  // CGFloat
+    if (potential != nullptr)
+        *potential = float(reinterpret_cast<Value>(objc_msgSend)(screen, sel_registerName("maximumPotentialExtendedDynamicRangeColorComponentValue")));
+    return float(reinterpret_cast<Value>(objc_msgSend)(screen, sel_registerName("maximumExtendedDynamicRangeColorComponentValue")));
+}
+
 void SetWindowTitle(const char* title)
 {
     SDL_SetWindowTitle(sdlWindow, title);
@@ -230,16 +286,19 @@ void RunWindowLoop()
         SDL_Event event;
         while (SDL_PollEvent(&event))
         {
-            if (runtime::controls::Screen* controls = runtime::controls::Service(); controls != nullptr && IsControlsShortcut(event))
-                controls->RequestOpen("Command-comma");
-            else if (IsControlsShortcut(event) && runtime::input::LiveEnabled() && runtime::input::InRaceScene() &&
-                     !runtime::controls::KeyboardMenu().IsOpen())
+            if (IsControlsShortcut(event) && runtime::input::LiveEnabled() && runtime::input::InRaceScene())
             {
                 // FM4 Recomp: Command-comma during a race opens FM4's own Pause menu (its KEYBOARD CONTROLS row is there), as START on
                 // a controller does, so no controller is needed.
-                pausePressed = true;
-                std::fprintf(stderr, "[input] Command-comma: START (the Pause menu)\n");
+                if (!runtime::controls::KeyboardMenu().IsOpen())
+                {
+                    pausePressed = true;
+                    std::fprintf(stderr, "[input] Command-comma: START (the Pause menu)\n");
+                }
             }
+            // Anywhere else (the menus): the Settings panel (--controls-panel: Graphics, and the keys), over the paused game.
+            else if (runtime::controls::Screen* controls = runtime::controls::Service(); controls != nullptr && IsControlsShortcut(event))
+                controls->RequestOpen("Command-comma");
             if (IsQuitShortcut(event))
                 CloseStop("Command-Q");
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)  // the in-game submenu's key, when it waits for one
@@ -251,11 +310,50 @@ void RunWindowLoop()
         // FM4 Recomp (kernel/controls_screen.h): the screen ended: bindings reloaded, the game resumed. Keys that went down or up
         // while the panel had the focus read as up from here.
         if (runtime::controls::Screen* controls = runtime::controls::Service(); controls != nullptr && controls->Pump())
+        {
             SDL_ResetKeyboard();
+            if (runtime::settings::Available())  // FM4 Recomp (FM4_HDR): the panel's HDR choice, saved in graphics.conf, applies now
+            {
+                std::string why;
+                const runtime::settings::Graphics saved = runtime::settings::Load(runtime::settings::GraphicsPath(), why);
+                // FM4 Recomp (live resolution): the panel's resolution and edge smoothing too (each false when this run cannot switch it)
+                const bool resolution = RequestInternalRes(runtime::settings::kResolutions[saved.resolution].file);
+                const bool smoothing = SetPostAaLive(runtime::settings::kSmoothings[saved.smoothing].file);
+                std::fprintf(stderr, "[graphics] Settings closed: RESOLUTION %s (%s), EDGE SMOOTHING %s (%s)\n", runtime::settings::kResolutions[saved.resolution].label,
+                             resolution ? "asked for now" : "at the next start", runtime::settings::kSmoothings[saved.smoothing].label, smoothing ? "now" : "at the next start");
+                SetHdrPreference(saved.hdr != 0);
+                if (runtime::settings::ExtendedOffered())
+                    runtime::view::Global().SetPreference(saved.extended != 0);  // Extended View: from the next frame
+                const HdrOutput now = HdrOutputNow();
+                runtime::settings::PublishHdrStatus({true, now.active, now.reason});
+                std::fprintf(stderr, "[graphics] Settings closed: EXTENDED VIEW %s, HDR %s; %s\n", saved.extended != 0 ? "ON" : "OFF", saved.hdr != 0 ? "AUTO" : "OFF",
+                             runtime::settings::HdrStatusLine(runtime::settings::GetHdrStatus()).c_str());
+            }
+        }
         if (runtime::input::LiveEnabled())
         {
             virtual_pad::Poll();
             PollLiveInput();
+        }
+        {  // FM4 Recomp (FM4_HDR): about once a second, whether the display the window is on now can show HDR (the window may have
+           // moved to another display), and what the game shows as a result (the GRAPHICS menu's line and the Settings panel's file)
+            static uint64_t next = 0;
+            static int said = -1;
+            if (const uint64_t now = SDL_GetTicks(); now >= next)
+            {
+                next = now + 1000;
+                const VkExtent2D pixels = WindowPixels();  // Extended View: the window's shape now (a resize, another display)
+                runtime::view::Global().SetWindow(pixels.width, pixels.height);
+                float potential = 1.0f;
+                HdrHeadroom(&potential);
+                const bool supported = potential > 1.01f;
+                SetHdrDisplay(supported);
+                if (said != int(supported))
+                    said = int(supported), std::fprintf(stderr, "[window] the display %s HDR (at most %.2fx standard white)\n",
+                                                        supported ? "supports" : "does not support", potential);
+                const HdrOutput output = HdrOutputNow();
+                runtime::settings::PublishHdrStatus({true, output.active, output.reason});
+            }
         }
         runtime::disc::PumpMainThread();  // FM4 Recomp (Disc 2): a pending swap's dialogs (they may wait for the player; frames are dropped meanwhile)
         PresentHandedOverFrame(kTakeWaitNs);  // bounded: at most kTakeWaitNs without a frame, then the bounded present

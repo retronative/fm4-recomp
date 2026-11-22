@@ -279,6 +279,36 @@ class TitleHooks(unittest.TestCase):
         self.assertEqual(body.count('__imp__sub_00010008(ctx, base);'), 1)
         self.assertNotIn('    return;\n}', body)  # CONTROL: the original is not skipped
 
+    def test_menu_more_rows(self):
+        # A second row of the same menu ([[hook.more]]): the same hook adds it after the first (hand: 'G' 0x0047, 'R' 0x0052, 'A' 0x0041;
+        # row id 10), under its own gate, and the original still runs once; chosen, it goes to its own handler under its own gate.
+        image, text = self.menu_config()
+        text = text.replace('[[hook]]\nname = "chosen"', '[[hook.more]]\nlabel = "GRAPHICS"\nrow = 10\ngate = "home"\n[[hook]]\nname = "chosen"')
+        text += '[[hook.more]]\nrow = 10\nhandler = "OpenGraphics"\ngate = "home"\n'
+        out = self.gen.title_hooks(text, image, 0x10000)
+        body = out[out.index('PPC_FUNC(sub_00010008)'):out.index('PPC_FUNC(sub_00010020)')]
+        self.assertEqual(body.count('static const uint16_t kLabel[]'), 2)
+        self.assertIn('0x0047, 0x0052, 0x0041', body)
+        self.assertLess(body.index('ctx.r4.u64 = 9, ctx.r5.u64 = copy'), body.index('ctx.r4.u64 = 10, ctx.r5.u64 = copy'))
+        self.assertIn('if (on && runtime::controls::Service() != nullptr)', body)
+        self.assertIn('if (on && runtime::settings::Available())', body)
+        self.assertEqual(body.count('__imp__sub_00010008(ctx, base);'), 1)  # CONTROL: the original runs once
+        action = out[out.index('PPC_FUNC(sub_00010020)'):]
+        self.assertIn('(runtime::controls::Service() != nullptr || runtime::settings::Available())', action)
+        self.assertIn('if (chosen == 9 && runtime::controls::Service() != nullptr)', action)
+        self.assertIn('if (chosen == 10 && runtime::settings::Available())', action)
+        self.assertIn('PPC_STORE_U32(ctx.r3.u32 + 2172, 10);', action)
+        self.assertIn('fm4::title::OpenGraphics(ctx, base);', action)
+        self.assertIn('void OpenGraphics(PPCContext& ctx, uint8_t* base);', out)
+        self.assertEqual(action.count('__imp__sub_00010020(ctx, base);'), 1)
+        self.assertIn('int TitleHookCount() { return 2; }', out)  # CONTROL: a further row is not a further hook
+        for bad in (text.replace('row = 10\ngate = "home"\n[[hook]]', 'row = 9\ngate = "home"\n[[hook]]'),  # the first row's id again
+                    text.replace('gate = "home"\n[[hook]]', 'gate = "away"\n[[hook]]'),
+                    text.replace('handler = "OpenGraphics"', 'handler = "x"'),
+                    text.replace('label = "GRAPHICS"', 'label = ""')):
+            with self.assertRaises(SystemExit):
+                self.gen.title_hooks(bad, image, 0x10000)
+
     def test_delegate_symbols_values(self):
         # A delegate hands the call to the runtime's handler with the original; a symbol is a checked function address, a value a
         # number, both defined for runtime/game/title_symbols.h (hand: 0x10010 -> 0x00010010u, value 59 -> 0x0000003Bu).

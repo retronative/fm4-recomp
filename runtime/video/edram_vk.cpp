@@ -15,6 +15,8 @@
 #include "resolve_resident.h"
 #include "guest_writes.h"  // FM4_RESOLVE_HOST_WRITE: GuestRangeHostWrite
 #include "host_samples.h"  // FM4 Recomp (FM4_HOST_MSAA_1X): HostSampleCount, HostMsaa1x
+#include "render_scale.h"  // FM4 Recomp (M9, FM4_INTERNAL_RES): the internal scale
+#include "mem_ledger.h"    // FM4 Recomp (M9, FM4_DIAG_MEMORY)
 #include "kernel/graphics.h"
 #include "kernel/virtual_memory.h"
 #include <cstdio>
@@ -46,7 +48,7 @@ constexpr VkDeviceSize kStagingBytes = 16ull << 20;  // 4 Mi texels: a 2048x2048
 constexpr VkDeviceSize kStagingTotalBytes = 4 * kStagingBytes;
 // Descriptor sets of the pool. Xenia keeps every render target until an explicit ClearCache (X render_target_cache.cc:534-570,
 // :1467); FM4's race-prep frame creates 32 keys (~580 MiB at 8 bytes a sample), so 64 leaves room.
-constexpr uint32_t kMaxTargets = 64;
+constexpr uint32_t kMaxTargets = 96;  // FM4 Recomp (M9): room for the 1x resolve shadows of a scaled run (41 keys in a race)
 
 // ---- The built-in transfer shaders (compiled once at InitializeEdramVk) ------------------------------------------
 
@@ -74,6 +76,9 @@ layout(push_constant) uniform XeTransfer
     uint destMsaa;
     uint x0, y0, width, height;  // the sample dump (kResolveDump): the source rectangle
     uint sourcePitchTiles;       // the source key's pitch in tiles, Key::PitchTiles (X :2956-2965: it splits the source tile index)
+#ifdef XE_MIXED
+    uint destHalves, sourceHalves;  // FM4 Recomp (M9, FM4_INTERNAL_SCALE_PITCH): each side's own scale in halves (TransferPush)
+#endif
 } xe_transfer;
 // FM4 Recomp (alpha, RT format 5): XE_SOURCE_64 / XE_DEST_64 name a 64 bpp side (storage 5; kTransferColor64, kTransferColorToDepth
 // with XE_SOURCE_64, kTransferDepthToColor with XE_DEST_64). A key's pitch
@@ -93,9 +98,27 @@ const uint xeDest64 = 0u;
 uint xe_half = 0u;
 // The pixel size of a tile (80x16 samples at 32 bpp): 1x 80x16, 2x 80x8, 4x 40x8 (X render_target_cache.cc:355-359); FM4 Recomp
 // (alpha, RT format 5): half as wide at 64 bpp (40x16 samples: X vulkan_render_target_cache.cc:2540-2545).
-uvec2 XeTileSize(uint msaa, uint is64)
+// FM4 Recomp (M9, FM4_INTERNAL_RES): XE_HALVES (the internal scale in halves, render_scale.h: 3 = 1.5x, 4 = 2x; the transfer and
+// downsample modules, and a resident conversion of a scaled source) multiplies the tile's host size by halves / 2 (whole: every tile
+// size is even); the MSAA rules then run on host tile pixels unchanged (ShiftGlue 72b7dd6
+// vulkan/render_target_cache.cpp:2567-2600; research/m9/qhd_plan/RECARBON_MAP.md A6; edram_vk_plan.h MapEdramTexel's `halves`), with the guest's host sample
+// counts or, with FM4_HOST_MSAA_1X=1, 1 sample for every key (host_samples.h).
+#ifndef XE_HALVES
+#define XE_HALVES 2u
+#endif
+// FM4 Recomp (M9, opt-in FM4_INTERNAL_SCALE_PITCH; XE_MIXED): the two sides of a transfer may be images of different scales (only
+// full-width keys are scaled): each side's tile by its own halves, and the destination's tile pixel taken to the source's scale
+// before the MSAA rules (edram_vk_plan.cpp MapTransferSource `sourceHalves`). Without XE_MIXED both are XE_HALVES and the text is as before.
+#ifdef XE_MIXED
+#define XE_DEST_HALVES xe_transfer.destHalves
+#define XE_SOURCE_HALVES xe_transfer.sourceHalves
+#else
+#define XE_DEST_HALVES XE_HALVES
+#define XE_SOURCE_HALVES XE_HALVES
+#endif
+uvec2 XeTileSizeAt(uint msaa, uint is64, uint halves)
 {
-    return uvec2((msaa == 2u ? 40u : 80u) >> is64, msaa == 0u ? 16u : 8u);
+    return uvec2((msaa == 2u ? 40u : 80u) >> is64, msaa == 0u ? 16u : 8u) * halves / 2u;
 }
 // FM4 Recomp (alpha, RT format 5): X :2833-2903, the common Y and sample of a 1x/2x source of another sample count (native 2x host
 // samples), for the pairs with one 64 bpp side (the same-bpp chain in XeSourceTexel has it inline).
@@ -129,7 +152,10 @@ ivec3 XeSourceTexel(uvec2 d)
 #else
     uint sm = xe_transfer.sourceMsaa, dm = xe_transfer.destMsaa, ds = xe_transfer.destSample;
 #endif
-    uvec2 tile = d / XeTileSize(dm, xeDest64), p = d % XeTileSize(dm, xeDest64);
+    uvec2 tile = d / XeTileSizeAt(dm, xeDest64, XE_DEST_HALVES), p = d % XeTileSizeAt(dm, xeDest64, XE_DEST_HALVES);
+#ifdef XE_MIXED
+    p = p * XE_SOURCE_HALVES / XE_DEST_HALVES;
+#endif
     uint s = dm == 0u ? 0u : ds;
 #if defined(XE_DEST_64) && !defined(XE_SOURCE_64)
     // FM4 Recomp (alpha, RT format 5): 32 -> 64 bpp (edram_vk_plan.cpp MapTransferSource; X :2607-2685), the low word's texel.
@@ -226,11 +252,11 @@ ivec3 XeSourceTexel(uvec2 d)
 #ifdef XE_SWAP_COLUMNS
     // Colour <-> depth: the 40-sample column swap within the source tile (X :2916-2936), half = 80 >> (1 + source 4x + source 64 bpp)
     // (FM4 Recomp, alpha: X :2912-2913 source_pixel_width_dwords_log2 counts the 64 bpp source too).
-    uint halfTile = (sm == 2u ? 20u : 40u) >> xeSource64;
+    uint halfTile = ((sm == 2u ? 20u : 40u) >> xeSource64) * XE_SOURCE_HALVES / 2u;
     p.x = p.x < halfTile ? p.x + halfTile : p.x - halfTile;
 #endif
     uint t = (tile.y * xe_transfer.pitchTiles + tile.x + xe_transfer.tileOffset) & 2047u;
-    return ivec3(ivec2(uvec2(t % xe_transfer.sourcePitchTiles, t / xe_transfer.sourcePitchTiles) * XeTileSize(sm, xeSource64) + p), int(s));
+    return ivec3(ivec2(uvec2(t % xe_transfer.sourcePitchTiles, t / xe_transfer.sourcePitchTiles) * XeTileSizeAt(sm, xeSource64, XE_SOURCE_HALVES) + p), int(s));
 }
 ivec2 XeSourcePixel(uvec2 d)
 {
@@ -239,6 +265,84 @@ ivec2 XeSourcePixel(uvec2 d)
 int XeSourceSample(uvec2 d)
 {
     return XeSourceTexel(d).z;
+}
+)";
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): a scaled target into its 1x shadow of the same sample count (DownsampleToShadow), one draw per
+// shadow sample (sample mask 1 << destSample, as the transfers). XE_SOURCE_MS: the source is multisampled (the guest's MSAA kept).
+// Colour: shadow sample s is the box filter of sample s over the host pixels the guest pixel covers (render_scale.h DownsampleTaps:
+// two host pixels an axis, covered 2 and 2 halves at 2x, 2 and 1 or 1 and 2 at 1.5x), read and written through the target's own
+// format (the attachment view, not a transfer view), so a guest resolve's mean of a pixel's samples is the mean of all its host
+// samples. Depth: sample s of the host pixel the guest pixel covers whole (WholeHostPixel) and its stencil, unfiltered.
+const char* const kDownsampleColor = R"(
+#ifdef XE_SOURCE_MS
+layout(set = 0, binding = 0) uniform sampler2DMS xe_source;
+#define XE_FETCH(p, s) texelFetch(xe_source, p, s)
+#else
+layout(set = 0, binding = 0) uniform sampler2D xe_source;
+#define XE_FETCH(p, s) texelFetch(xe_source, p, 0)
+#endif
+layout(location = 0) out vec4 xe_color;
+void main()
+{
+    ivec2 lo = ivec2(gl_FragCoord.xy) * int(XE_HALVES), hi = lo + int(XE_HALVES);  // the guest pixel in half host pixels
+    ivec2 first = lo / 2;
+    int s = int(xe_transfer.destSample);
+    vec4 sum = vec4(0.0);
+    const int taps = (int(XE_HALVES) + 1) / 2;  // host pixels a guest pixel touches an axis: 2 at 1.5x and 2x, 3 at 3x (render_scale.h kBoxTaps)
+    for (int j = 0; j < taps; j++)
+        for (int i = 0; i < taps; i++)
+        {
+            ivec2 k = first + ivec2(i, j);
+            ivec2 w = max(min(2 * k + 2, hi) - max(2 * k, lo), ivec2(0));
+            if (w.x * w.y != 0)
+                sum += XE_FETCH(k, s) * float(w.x * w.y);
+        }
+    xe_color = sum / float(XE_HALVES * XE_HALVES);
+}
+)";
+const char* const kDownsampleDepth = R"(
+layout(set = 0, binding = 0) uniform sampler2DMS xe_source_depth;
+layout(set = 0, binding = 1) uniform usampler2DMS xe_source_stencil;
+void main()
+{
+    ivec2 p = (ivec2(gl_FragCoord.xy) * int(XE_HALVES) + 1) / 2;
+    int s = int(xe_transfer.destSample);
+    gl_FragDepth = texelFetch(xe_source_depth, p, s).r;
+    gl_FragStencilRefARB = int(texelFetch(xe_source_stencil, p, s).r);
+}
+)";
+
+// FM4 Recomp (M9, GPU cost; FM4_RESOLVE_FUSED): the 1x words of a resolve from its words per host pixel (the scaled resident image,
+// the rectangle at (0, 0) in both): each guest word is the box filter of its host words (render_scale.h DownsampleTaps), channel by
+// channel in the destination's own layout (8:8:8:8 for texture formats 6 and 50, 10:10:10:2 for 7 and 54: resolve_resident.h
+// ScaledTwinFormat), rounded to nearest. The host words are each host pixel's finished conversion (its samples' mean, bias, swap and
+// packing), so the result is the mean of the same values the display shows, within half a step of converting the mean itself.
+const char* const kWordsDown = R"(
+layout(set = 0, binding = 0) uniform usampler2D xe_words;
+layout(location = 0) out uint xe_word;
+void main()
+{
+    ivec2 lo = ivec2(gl_FragCoord.xy) * int(XE_HALVES), hi = lo + int(XE_HALVES);
+    ivec2 first = lo / 2;
+    const int taps = (int(XE_HALVES) + 1) / 2;
+    bool ten = xe_transfer.destFormat == 7u || xe_transfer.destFormat == 54u;
+    vec4 sum = vec4(0.0);
+    for (int j = 0; j < taps; j++)
+        for (int i = 0; i < taps; i++)
+        {
+            ivec2 k = first + ivec2(i, j);
+            ivec2 w = max(min(2 * k + 2, hi) - max(2 * k, lo), ivec2(0));
+            if (w.x * w.y == 0)
+                continue;
+            uint v = texelFetch(xe_words, k, 0).r;
+            vec4 c = ten ? vec4(float(v & 1023u), float((v >> 10u) & 1023u), float((v >> 20u) & 1023u), float(v >> 30u))
+                         : vec4(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u), float(v >> 24u));
+            sum += c * float(w.x * w.y);
+        }
+    uvec4 m = uvec4(sum / float(XE_HALVES * XE_HALVES) + 0.5);
+    xe_word = ten ? (min(m.r, 1023u) | (min(m.g, 1023u) << 10u) | (min(m.b, 1023u) << 20u) | (min(m.a, 3u) << 30u))
+                  : (min(m.r, 255u) | (min(m.g, 255u) << 8u) | (min(m.b, 255u) << 16u) | (min(m.a, 255u) << 24u));
 }
 )";
 
@@ -846,10 +950,9 @@ uint XeResolveFixed16(float v, uint number)
     }
     return XeResolveUnorm(v, 65535.0);
 }
-void main()
+// The sum of the selected guest samples of host pixel p (the resolve's mean before its division).
+vec4 XeResidentSum(ivec2 p, uint count)
 {
-    ivec2 p = ivec2(uvec2(gl_FragCoord.xy) + uvec2(xe_transfer.x0, xe_transfer.y0));
-    uint count = xe_transfer.destSamples4;
     precise vec4 pixel = vec4(0.0);
     for (uint i = 0u; i < count; i++)
     {
@@ -874,6 +977,46 @@ void main()
 #endif
         pixel = i == 0u ? s : pixel + s;
     }
+    return pixel;
+}
+void main()
+{
+    uint count = xe_transfer.destSamples4;
+#ifdef XE_BOX
+    // FM4 Recomp (M9, opt-in FM4_RESOLVE_FUSED): the source is the scaled target itself and the rectangle is in guest pixels: each
+    // guest sample is the box filter of its host pixels (render_scale.h DownsampleTaps: the weights in quarter host pixels,
+    // XE_HALVES x XE_HALVES of them in all), in one pass instead of a downsample into a 1x shadow and then this conversion.
+    ivec2 lo = ivec2(uvec2(gl_FragCoord.xy) + uvec2(xe_transfer.x0, xe_transfer.y0)) * int(XE_HALVES), hi = lo + int(XE_HALVES);
+    ivec2 first = lo / 2;
+    const int taps = (int(XE_HALVES) + 1) / 2;
+    precise vec4 pixel = vec4(0.0);
+    for (uint n = 0u; n < count; n++)
+    {
+        // Guest sample g of the guest pixel: the box filter of host sample h over its host pixels (the raw texels, as the shadow
+        // held them), then the guest format's packing once, as the 1x conversion applies it to a sample.
+        uint g = (xe_transfer.destSample >> (2u * n)) & 3u;
+        uint h = xe_transfer.sourceMsaa == 2u ? ((g & 1u) << 1u) | ((g >> 1u) & 1u) : xe_transfer.sourceMsaa == 1u ? (g ^ 1u) : 0u;
+        vec4 mean = vec4(0.0);
+        for (int j = 0; j < taps; j++)
+            for (int i = 0; i < taps; i++)
+            {
+                ivec2 k = first + ivec2(i, j);
+                ivec2 w = max(min(2 * k + 2, hi) - max(2 * k, lo), ivec2(0));
+                if (w.x * w.y != 0)
+#ifdef XE_SOURCE_MS
+                    mean += texelFetch(xe_source, k, int(h)) * float(w.x * w.y);
+#else
+                    mean += texelFetch(xe_source, k, 0) * float(w.x * w.y);
+#endif
+            }
+        mean = mean / float(XE_HALVES * XE_HALVES);
+        vec4 s = XeUnpack(XePack(mean, xe_transfer.sourceFormat), xe_transfer.sourceFormat);
+        pixel = n == 0u ? s : pixel + s;
+    }
+#else
+    ivec2 p = ivec2(uvec2(gl_FragCoord.xy) + uvec2(xe_transfer.x0, xe_transfer.y0));
+    precise vec4 pixel = XeResidentSum(p, count);
+#endif
     precise float e = uintBitsToFloat(xe_transfer.stencilBit);
     if (count >= 2u)
         e *= 0.5;
@@ -900,11 +1043,15 @@ struct TransferPush
     uint32_t destSamples4, destSample, sourceFormat, destFormat, stencilBit, pitchTiles, tileOffset;
     uint32_t sourceMsaa, destMsaa, x0, y0, width, height;
     uint32_t sourcePitchTiles;
+    uint32_t destHalves = 2, sourceHalves = 2;  // FM4 Recomp (M9, FM4_INTERNAL_SCALE_PITCH): read by the XE_MIXED transfer modules only
 };
 
 enum class PipelineKind : uint32_t { Color = 0, Depth = 1, StencilBit = 2, DepthToColor = 3, Dump = 4, ColorToDepth = 5, ColorToStencilBit = 6, DumpDepth = 7,
                                      Resident = 8, DepthExport = 9, ColorToDepthExport = 10,  // the two: FM4_TRANSFER_STENCIL_EXPORT
-                                     ResidentDepth = 11 };  // FM4_RESOLVE_RESIDENT_DEPTH
+                                     ResidentDepth = 11,  // FM4_RESOLVE_RESIDENT_DEPTH
+                                     Downsample = 12, DownsampleDepth = 13,
+                                     ResidentBox = 14,
+                                     WordsDown = 15 };  // FM4 Recomp (M9, FM4_RESOLVE_FUSED): kWordsDown  // FM4 Recomp (M9, opt-in FM4_RESOLVE_FUSED): kResolveResident with XE_BOX  // FM4 Recomp (M9, FM4_INTERNAL_RES): kDownsampleColor / kDownsampleDepth
 
 // ---- State ----------------------------------------------------------------------------------------------------
 
@@ -917,7 +1064,15 @@ struct Target
     VkImageView depthView = VK_NULL_HANDLE; // depth aspect, sampled by a depth transfer
     VkImageView stencilView = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t samples = 1, width = 0, height = 0;
+    uint32_t samples = 1, width = 0, height = 0;  // the host image's size (scale times the guest's)
+    uint32_t guestWidth = 0, guestHeight = 0, halves = 2;  // FM4 Recomp (M9, FM4_INTERNAL_RES): the key's guest size and the internal scale in halves
+    // FM4 Recomp (M9, memory): the guest rows the image holds (`height` is their host size). The key's full extent is guestHeight
+    // rows (up to 8192); the image is created with the rows its first use needs and replaced by a taller one when a later use reaches
+    // further (NeedRows: the old rows copied, the new ones zero, exactly what a full-height image would hold). FM4_EDRAM_FULL_TARGETS=1:
+    // always the full extent (the former sizing; the memory comparison's control).
+    uint32_t guestRows = 0, growths = 0;
+    bool shadow = false;      // a scaled key's 1x resolve shadow (the ledger's kind)
+    uint64_t ledger = 0;      // mem_ledger.h id of its memory
     bool depth = false;
     VkDescriptorSet source = VK_NULL_HANDLE;  // this target as a transfer source
     VkFramebuffer framebuffer = VK_NULL_HANDLE;  // over `view`, for the unit's own pass (transfers into it, clears)
@@ -941,6 +1096,18 @@ struct Target
     VkImageAspectFlags Aspects() const { return depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT; }
 };
 
+// FM4 Recomp (M9, memory): the image, views and framebuffers of a target that NeedRows replaced by a taller one. Commands already
+// recorded (and submissions in flight) may still use them, so they are destroyed only at Shutdown, after every submission is confirmed
+// complete, never earlier (GPU lifetime safety). Their descriptor sets stay in the pool.
+struct ReplacedStorage
+{
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE, depthView = VK_NULL_HANDLE, stencilView = VK_NULL_HANDLE, uintView = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE, uintFramebuffer = VK_NULL_HANDLE;
+    uint64_t ledger = 0;
+};
+
 struct Pending  // a read-back resolve of the open submission (one, or several with FM4_RESOLVE_RESIDENT)
 {
     edram::ResolveInfo info;
@@ -962,17 +1129,15 @@ constexpr uint32_t kResidentWidth = 2048, kResidentHeight = 1024;
 // needs 2560x512, a 1280x720 4x one 2560x1440.
 constexpr uint32_t kDumpWidth = 4096, kDumpHeight = 2048;
 
-struct Unit
+// FM4 Recomp (M9, live resolution, step 1): the modules whose text carries the internal scale (Create's `header`: XE_HALVES above
+// 1x, and XE_MIXED with FM4_INTERNAL_SCALE_PITCH), one set per scale in halves (Unit::scaleModules; ModulesFor). They were fields
+// of Unit, compiled for the start scale only; the modules without the scale (the vertex shader, the sample dumps, the 1x resident
+// conversions) stay there. Only the start scale's set exists until something asks for another scale.
+struct ScaleModules
 {
-    VulkanDevice dev;
-    VkPhysicalDeviceLimits limits{};
-    VkSampler sampler = VK_NULL_HANDLE;
-    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
-    VkPipelineLayout layout = VK_NULL_HANDLE;
-    VkDescriptorPool pool = VK_NULL_HANDLE;
-    VkShaderModule vertex = VK_NULL_HANDLE, colorFrom1x = VK_NULL_HANDLE, colorFrom4x = VK_NULL_HANDLE, depthFrom1x = VK_NULL_HANDLE,
+    bool complete = false;  // every module the run needs at this scale compiled (CompileModules returned true)
+    VkShaderModule colorFrom1x = VK_NULL_HANDLE, colorFrom4x = VK_NULL_HANDLE, depthFrom1x = VK_NULL_HANDLE,
                    stencilFrom1x = VK_NULL_HANDLE, depthToColorFrom1x = VK_NULL_HANDLE, depthToColorFromMs = VK_NULL_HANDLE,
-                   dumpFrom1x = VK_NULL_HANDLE, dumpFromMs = VK_NULL_HANDLE, dumpDepth1x = VK_NULL_HANDLE, dumpDepthMs = VK_NULL_HANDLE,
                    depthFromMs = VK_NULL_HANDLE, stencilFromMs = VK_NULL_HANDLE, colorToDepth1x = VK_NULL_HANDLE, colorToDepthMs = VK_NULL_HANDLE,
                    colorToStencil1x = VK_NULL_HANDLE, colorToStencilMs = VK_NULL_HANDLE;
     // The colour transfer with a 32_FLOAT or 16_16 side, [source MS][source uint][dest uint] (the [0/1][0][0] pair is
@@ -986,12 +1151,39 @@ struct Unit
     VkShaderModule depthToColorUint[2] = {}, colorToDepthUint[2] = {}, colorToStencilUint[2] = {};
     // FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key (kTransferDepthToColor XE_DEST_64 + XE_DEST_UINT), [source MS].
     VkShaderModule depthToColor64[2] = {};
-    // The sample dump through a transfer view (kResolveDump XE_SOURCE_UINT), [source MS].
-    VkShaderModule dumpUint[2] = {};
     // FM4_TRANSFER_STENCIL_EXPORT: the one-draw depth transfers, [source MS][sample shading]; compiled only with the extension.
     VkShaderModule depthExport[2][2] = {}, colorToDepthExport[2][2] = {}, colorToDepthExportUint[2][2] = {};
     // FM4 Recomp (alpha): colour -> depth from a 64 bpp source (XE_SOURCE_64 + XE_SOURCE_UINT), [source MS]; the export one [MS][shading].
     VkShaderModule colorToDepth64[2] = {}, colorToStencil64[2] = {}, colorToDepthExport64[2][2] = {};
+    VkShaderModule wordsDown = VK_NULL_HANDLE;  // FM4_RESOLVE_FUSED: kWordsDown (compiled with the switch, above 1x)
+    VkShaderModule residentBox[2] = {};  // FM4 Recomp (M9, FM4_RESOLVE_FUSED): [source MS], compiled above 1x with the switch
+    VkShaderModule downsampleColor[2] = {}, downsampleDepth = VK_NULL_HANDLE;  // FM4 Recomp (M9): compiled above 1x only; colour [source MS]
+};
+
+// FM4 Recomp (M9, live resolution, step 1): the scaled resident image of one scale (Unit::residentHi) and its set as kWordsDown's
+// source (RecordWordsDown; written once: the image and its view live for the run).
+struct HiResident
+{
+    Target image;
+    VkDescriptorSet source = VK_NULL_HANDLE;
+};
+
+struct Unit
+{
+    VulkanDevice dev;
+    VkPhysicalDeviceLimits limits{};
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkShaderModule vertex = VK_NULL_HANDLE,
+                   dumpFrom1x = VK_NULL_HANDLE, dumpFromMs = VK_NULL_HANDLE, dumpDepth1x = VK_NULL_HANDLE, dumpDepthMs = VK_NULL_HANDLE;
+    // FM4 Recomp (M9, live resolution, step 1): by the scale in halves; a map so a set's address is stable once made. `compiler` is
+    // the renderer's (it lives until the renderer's Shutdown, after this unit's), kept for a set first asked for after Create.
+    std::map<uint32_t, ScaleModules> scaleModules;
+    SpirvCompiler* compiler = nullptr;
+    // The sample dump through a transfer view (kResolveDump XE_SOURCE_UINT), [source MS].
+    VkShaderModule dumpUint[2] = {};
     bool stencilExport = false, sampleShading = false;
     Target dump;  // kDumpWidth x kDumpHeight R32_UINT, not an EDRAM key
     VkBuffer staging = VK_NULL_HANDLE;
@@ -1006,6 +1198,7 @@ struct Unit
     size_t handedOff = 0;  // FM4 Recomp (FM4_ASYNC_RETIRE): pending[0, handedOff) are in a completion-worker batch (HandOff)
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): the converted words (kResolveResident) and the last recorded resolve (lastResolve).
     VkShaderModule resident1x = VK_NULL_HANDLE, residentMs = VK_NULL_HANDLE;
+    uint64_t wordsDownResolves = 0;
     // FM4 Recomp (M7 GPU cost, FM4_RESOLVE_COMPUTE): the resident conversion of a multisampled colour source as one compute dispatch
     // (edram_vk_plan.h ResolveComputeSource): its pipeline layout (set 0 the source set, set 1 the resident image as a storage image),
     // the storage set, and the dispatches recorded.
@@ -1019,6 +1212,15 @@ struct Unit
     // FM4 Recomp (M7 CPU cost, FM4_RESOLVE_RESIDENT_1616): kResolveResident reading a 16_16 source through its transfer view, [source MS].
     VkShaderModule residentUint[2] = {};
     Target resident;  // kResidentWidth x kResidentHeight R32_UINT, not an EDRAM key
+    // FM4 Recomp (M9, FM4_INTERNAL_RES with the display image at the internal resolution): twice that size, for a resolve converted
+    // per host pixel from its scaled source (ResidentResolve::hiHalves; RecordResident's `to`); created above 1x only.
+    // FM4 Recomp (M9, live resolution, step 1): by the scale in halves (its size is the scale's; ResidentHi, CreateResidentHi);
+    // only the start scale's exists, as before.
+    std::map<uint32_t, HiResident> residentHi;
+    std::vector<ReplacedStorage> replaced;  // FM4 Recomp (M9, memory): NeedRows' replaced images, destroyed at Shutdown
+    uint64_t growths = 0, replacedReleased = 0;
+    bool lastHi = false;
+    uint64_t hiResolves = 0, hiRefused = 0, fusedResolves = 0;
     Target resident16;  // FM4 Recomp: the same in R16_UINT, for 16 bpp destinations (k_8_8)
     bool lastWords16 = false;  // the last converted resolve's words are in resident16
     ResidentResolve last;
@@ -1026,7 +1228,7 @@ struct Unit
     uint64_t residentResolves = 0, checkedResolves = 0, checkedPixels = 0, checkMismatches = 0;
     uint8_t* guestBase = nullptr;               // main.cpp's writable guest memory (renderer.h Options::guestBase)
     ResolveWriteObserver observer = nullptr;    // guest_writes.h MarkGuestWritten, from the renderer
-    uint64_t transfers = 0, transferDraws = 0, resolves = 0;
+    uint64_t transfers = 0, transferDraws = 0, resolves = 0, downsamples = 0, downsampleDraws = 0;  // downsamples: FM4 Recomp (M9) scaled resolves through a 1x shadow
     uint64_t draws64 = 0;  // FM4 Recomp (alpha, RT format 5): draws bound to a 64 bpp colour key (AcquireTargets)
     uint64_t deferredClears = 0;  // FM4 Recomp (M7 GPU cost): resolve clears kept pending for the next pass (Clear)
     uint64_t deferredClearDraws = 0;  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): clear-class draws kept as pending clears instead of drawn (AcquireTargets)
@@ -1040,6 +1242,9 @@ struct Unit
     // clear colours are few; past the cap a colour is simply not recorded (copied as before).
     std::vector<std::array<float, 4>> exactColours;
     std::map<uint64_t, uint64_t> transferPairs;  // (source key << 32 | destination key) -> count; the first of each is logged
+    // FM4 Recomp (M9, live resolution, step 2): by Key::packed, the pending clears of the targets Rescale destroyed, until MakeTarget
+    // makes the key's target again (guest rectangles, so they need no conversion) or the renderer drops them at the next swap.
+    std::map<uint32_t, std::vector<PendingClear>> carriedClears;
 };
 std::unique_ptr<Unit> unit;
 
@@ -1140,6 +1345,24 @@ bool UintStorage(const Target& t) { return t.uintView != VK_NULL_HANDLE; }
 VkFormat PassFormat(const Target& t) { return UintStorage(t) ? t.uintFormat : t.format; }
 VkFramebuffer PassFramebuffer(const Target& t) { return UintStorage(t) ? t.uintFramebuffer : t.framebuffer; }
 
+// FM4 Recomp (M9, live resolution, step 1): the scale-carrying modules for a unit scale of `halves` (the current internal scale:
+// with FM4_INTERNAL_SCALE_PITCH a 1x key's passes use the same set, their halves come from the push constants), compiled on first
+// request and kept (defined after Module, below). Create compiles the start scale's set, so at a fixed scale this only looks it up.
+const ScaleModules* ModulesFor(uint32_t halves, std::string& error);
+// Whether kWordsDown exists for the current scale (FM4_RESOLVE_FUSED above 1x); never compiles.
+bool WordsDownCompiled()
+{
+    const auto it = unit->scaleModules.find(runtime::video::scale::InternalHalves());
+    return it != unit->scaleModules.end() && it->second.wordsDown != VK_NULL_HANDLE;
+}
+// The scaled resident image of a scale, or null when the unit has none (1x, FM4_INTERNAL_OUTPUT=720p, without FM4_RESOLVE_RESIDENT,
+// or a scale nothing created it for).
+HiResident* ResidentHi(uint32_t halves)
+{
+    const auto it = unit->residentHi.find(halves);
+    return it != unit->residentHi.end() && it->second.image.image != VK_NULL_HANDLE ? &it->second : nullptr;
+}
+
 // `sourceFlags`: bit 0 a multisampled source, bit 1 a storage-14 or storage-4 source read through its transfer view.
 // FM4 Recomp (alpha, RT format 5): bit 3 a 64 bpp source (storage 5, through its transfer view: bit 1 too); a 64 bpp destination is
 // dest.key.Is64bpp(). The pipeline key holds all four flag bits (sample and sample count moved up one bit).
@@ -1148,8 +1371,14 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     const bool sourceMs = (sourceFlags & 1) != 0, sourceUint = (sourceFlags & 2) != 0, destUint = UintStorage(dest);
     const bool sampleShading = (sourceFlags & 4) != 0;  // FM4_TRANSFER_STENCIL_EXPORT: one draw for every destination sample
     const bool source64 = (sourceFlags & 8) != 0, dest64 = !dest.depth && dest.key.Is64bpp();  // FM4 Recomp (alpha, RT format 5)
-    const VkFormat passFormat = PassFormat(dest);
-    const uint64_t key = uint64_t(kind) | uint64_t(sourceFlags & 15) << 4 | uint64_t(sample) << 8 | uint64_t(dest.samples) << 10 | uint64_t(passFormat) << 14;
+    // FM4 Recomp (M9): the downsample into a 1x shadow writes through the target's own format (averaged values, not raw bits).
+    const bool downsample = kind == PipelineKind::Downsample || kind == PipelineKind::DownsampleDepth;
+    const VkFormat passFormat = downsample ? dest.format : PassFormat(dest);
+    // FM4 Recomp (M9, live resolution, step 1): and the unit scale its fragment module was compiled for (bits 48 and up; a VkFormat
+    // is 32 bits at 14), so a pipeline is never taken for another scale's modules. One scale a run: the same pipelines as before.
+    const uint32_t halves = runtime::video::scale::InternalHalves();
+    const uint64_t key = uint64_t(kind) | uint64_t(sourceFlags & 15) << 4 | uint64_t(sample) << 8 | uint64_t(dest.samples) << 10 | uint64_t(passFormat) << 14 |
+                         uint64_t(halves) << 48;
     // FM4 Recomp (alpha, RT format 5): a 64 bpp side only in a colour transfer, and only through its transfer view (ClassifyTransfer
     // refuses the cross-aspect pairs; the sample dump and the resident conversion never see storage 5: DecodeResolve refuses its resolves).
     // FM4 Recomp (alpha, 64 bpp resolve): DecodeResolve now accepts its 1x resolves, which Resolve reads by vkCmdCopyImageToBuffer, not
@@ -1158,7 +1387,7 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
     // FM4 Recomp (alpha, photo mode): and depth -> colour into a 64 bpp destination (ClassifyTransfer).
     const bool colorToDepthKind = kind == PipelineKind::ColorToDepth || kind == PipelineKind::ColorToStencilBit || kind == PipelineKind::ColorToDepthExport;
     const bool depthToColor64 = kind == PipelineKind::DepthToColor && dest64 && !source64;
-    if ((source64 || dest64) &&
+    if (!downsample && (source64 || dest64) &&
         ((kind != PipelineKind::Color && !(colorToDepthKind && source64 && !dest64) && !depthToColor64) || (source64 && !sourceUint) || (dest64 && !destUint)))
         return Fail(error, "a 64 bpp (storage 5) side in an EDRAM pass other than a colour transfer, colour -> depth or depth -> colour through its "
                            "transfer view");
@@ -1177,37 +1406,44 @@ bool Pipeline(PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint3
                                      kind == PipelineKind::ColorToDepthExport || kind == PipelineKind::Resident
                                  ? sourceUint
                                  : false;
-    if ((sourceUint || destUint) && !uintVariant)
+    if (!downsample && (sourceUint || destUint) && !uintVariant)
         return Fail(error, "a transfer-view (storage 14 or 4) side in a transfer that has no uint variant");
-    const VkShaderModule fragment = colorToDepthKind && source64  // FM4 Recomp (alpha)
-                                        ? (kind == PipelineKind::ColorToDepthExport ? unit->colorToDepthExport64[sourceMs][sampleShading]
-                                           : kind == PipelineKind::ColorToDepth   ? unit->colorToDepth64[sourceMs]
-                                                                                  : unit->colorToStencil64[sourceMs])
-                                    : kind == PipelineKind::DepthExport ? unit->depthExport[sourceMs][sampleShading]
+    const ScaleModules* const m = ModulesFor(halves, error);  // FM4 Recomp (M9, live resolution, step 1): the scale's modules
+    if (m == nullptr)
+        return false;
+    const VkShaderModule fragment = downsample ? (kind == PipelineKind::Downsample ? m->downsampleColor[sourceMs] : m->downsampleDepth)  // FM4 Recomp (M9)
+                                    : colorToDepthKind && source64  // FM4 Recomp (alpha)
+                                        ? (kind == PipelineKind::ColorToDepthExport ? m->colorToDepthExport64[sourceMs][sampleShading]
+                                           : kind == PipelineKind::ColorToDepth   ? m->colorToDepth64[sourceMs]
+                                                                                  : m->colorToStencil64[sourceMs])
+                                    : kind == PipelineKind::DepthExport ? m->depthExport[sourceMs][sampleShading]
                                     : kind == PipelineKind::ColorToDepthExport
-                                        ? (uintVariant ? unit->colorToDepthExportUint[sourceMs][sampleShading] : unit->colorToDepthExport[sourceMs][sampleShading])
+                                        ? (uintVariant ? m->colorToDepthExportUint[sourceMs][sampleShading] : m->colorToDepthExport[sourceMs][sampleShading])
                                     : kind == PipelineKind::Color && (source64 || dest64)  // FM4 Recomp (alpha, RT format 5)
-                                        ? unit->colorWide[sourceMs][sourceUint][destUint][source64][dest64]
-                                    : kind == PipelineKind::Color && uintVariant ? unit->colorUint[sourceMs][sourceUint][destUint]
-                                    : depthToColor64 ? unit->depthToColor64[sourceMs]  // FM4 Recomp (alpha, photo mode); before the 16_16 one
-                                    : kind == PipelineKind::DepthToColor && uintVariant ? unit->depthToColorUint[sourceMs]
-                                    : kind == PipelineKind::ColorToDepth && uintVariant ? unit->colorToDepthUint[sourceMs]
-                                    : kind == PipelineKind::ColorToStencilBit && uintVariant ? unit->colorToStencilUint[sourceMs]
+                                        ? m->colorWide[sourceMs][sourceUint][destUint][source64][dest64]
+                                    : kind == PipelineKind::Color && uintVariant ? m->colorUint[sourceMs][sourceUint][destUint]
+                                    : depthToColor64 ? m->depthToColor64[sourceMs]  // FM4 Recomp (alpha, photo mode); before the 16_16 one
+                                    : kind == PipelineKind::DepthToColor && uintVariant ? m->depthToColorUint[sourceMs]
+                                    : kind == PipelineKind::ColorToDepth && uintVariant ? m->colorToDepthUint[sourceMs]
+                                    : kind == PipelineKind::ColorToStencilBit && uintVariant ? m->colorToStencilUint[sourceMs]
                                     : kind == PipelineKind::Dump && uintVariant ? unit->dumpUint[sourceMs]
                                     : kind == PipelineKind::Resident && uintVariant ? unit->residentUint[sourceMs]  // FM4_RESOLVE_RESIDENT_1616
-                                    : kind == PipelineKind::Color ? (sourceMs ? unit->colorFrom4x : unit->colorFrom1x)
-                                    : kind == PipelineKind::Depth             ? (sourceMs ? unit->depthFromMs : unit->depthFrom1x)
-                                    : kind == PipelineKind::DepthToColor      ? (sourceMs ? unit->depthToColorFromMs : unit->depthToColorFrom1x)
+                                    : kind == PipelineKind::Color ? (sourceMs ? m->colorFrom4x : m->colorFrom1x)
+                                    : kind == PipelineKind::Depth             ? (sourceMs ? m->depthFromMs : m->depthFrom1x)
+                                    : kind == PipelineKind::DepthToColor      ? (sourceMs ? m->depthToColorFromMs : m->depthToColorFrom1x)
                                     : kind == PipelineKind::Dump              ? (sourceMs ? unit->dumpFromMs : unit->dumpFrom1x)
                                     : kind == PipelineKind::DumpDepth         ? (sourceMs ? unit->dumpDepthMs : unit->dumpDepth1x)
                                     : kind == PipelineKind::Resident          ? (sourceMs ? unit->residentMs : unit->resident1x)
+                                    : kind == PipelineKind::ResidentBox       ? m->residentBox[sourceMs]
+                                    : kind == PipelineKind::WordsDown         ? m->wordsDown
                                     : kind == PipelineKind::ResidentDepth     ? (sourceMs ? unit->residentDepthMs : unit->residentDepth1x)
-                                    : kind == PipelineKind::ColorToDepth      ? (sourceMs ? unit->colorToDepthMs : unit->colorToDepth1x)
-                                    : kind == PipelineKind::ColorToStencilBit ? (sourceMs ? unit->colorToStencilMs : unit->colorToStencil1x)
-                                                                              : (sourceMs ? unit->stencilFromMs : unit->stencilFrom1x);
+                                    : kind == PipelineKind::ColorToDepth      ? (sourceMs ? m->colorToDepthMs : m->colorToDepth1x)
+                                    : kind == PipelineKind::ColorToStencilBit ? (sourceMs ? m->colorToStencilMs : m->colorToStencil1x)
+                                                                              : (sourceMs ? m->stencilFromMs : m->stencilFrom1x);
     if (fragment == VK_NULL_HANDLE)
         return Fail(error, "EDRAM transfer pipeline: its fragment shader was not compiled (stencil export without VK_EXT_shader_stencil_export?)");
-    const bool writesStencilAll = kind == PipelineKind::DepthExport || kind == PipelineKind::ColorToDepthExport;  // FM4_TRANSFER_STENCIL_EXPORT
+    const bool writesStencilAll = kind == PipelineKind::DepthExport || kind == PipelineKind::ColorToDepthExport ||  // FM4_TRANSFER_STENCIL_EXPORT
+                                  kind == PipelineKind::DownsampleDepth;  // FM4 Recomp (M9)
     const bool writesDepth = kind == PipelineKind::Depth || kind == PipelineKind::ColorToDepth || writesStencilAll;
     const bool writesStencilBit = kind == PipelineKind::StencilBit || kind == PipelineKind::ColorToStencilBit;
     VkPipelineShaderStageCreateInfo stages[2]{};
@@ -1306,63 +1542,76 @@ bool View(VkImage image, VkFormat format, VkImageAspectFlags aspects, VkImageVie
 // left in its rest layout. FM4 Recomp (FM4_HOST_MSAA_1X=1): a 1-sample image for every key, same pixel size (host_samples.h);
 // Target::samples is then 1 and every consumer below follows it (render passes, pipelines, the per-sample draw loops, the
 // non-multisampled shader variants by TransferSourceFlags).
-Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
+// FM4 Recomp (M9, FM4_INTERNAL_RES): halves / 2 times the key's guest size on both axes, held in the target map under `mapKey` (the
+// key itself; a resolve's 1x shadow of a scaled key under ShadowKey).
+// FM4 Recomp (M9, memory): whether every host target holds its key's full extent (the former sizing) or only the rows in use.
+// FM4_EDRAM_FULL_TARGETS=1: the full extent; =0: the rows in use. Unset: the full extent at 1x (the default path stays as it was
+// until the owner approves the change there) and the rows in use above 1x (FM4_INTERNAL_RES, where the full extent costs gigabytes).
+// FM4 Recomp (M9, live resolution, step 1): the variable is read once and the line printed once, at the first call, as before; the
+// unset case follows the current scale at each call (it was the scale at the first call, kept for the run).
+bool FullTargets()
 {
-    if (const auto it = unit->targets.find(k.packed); it != unit->targets.end())
-        return it->second.get();
-    if (std::string why; !edram::SupportedKey(k, why))
-        return Fail(error, why), nullptr;
-    if (unit->targets.size() >= kMaxTargets)
-        return Fail(error, "more than " + std::to_string(kMaxTargets) + " EDRAM host targets (the descriptor pool's size)"), nullptr;
-    auto t = std::make_unique<Target>();
-    t->key = k;
-    t->depth = k.IsDepth();
-    t->format = t->depth ? HostDepthFormat(edram::DepthFormat(k.Format()), false) : HostColorFormat(edram::ColorFormat(k.Format()));
-    // 2x keys are native 2x images (draw_hdr1: was 1); FM4 Recomp (FM4_HOST_MSAA_1X=1): 1 for every key (host_samples.h).
-    t->samples = HostSampleCount(k.MsaaMode() == Msaa::X4 ? 4 : k.MsaaMode() == Msaa::X2 ? 2 : 1, HostMsaa1x());
-    t->width = k.Width(), t->height = k.Height();
-    if (t->format == VK_FORMAT_UNDEFINED)
-        return Fail(error, "no host format for EDRAM key " + std::to_string(k.packed)), nullptr;
-    if (t->width == 0 || t->height == 0 || t->width > unit->limits.maxImageDimension2D || t->height > unit->limits.maxImageDimension2D ||
-        t->width > unit->limits.maxFramebufferWidth || t->height > unit->limits.maxFramebufferHeight)
-        return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": a " + std::to_string(t->width) + "x" + std::to_string(t->height) +
-                               " host target exceeds the device's image or framebuffer limits"),
-               nullptr;
-    const VkImageUsageFlags usage = (t->depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
+    struct Setting
+    {
+        bool set, full;
+    };
+    static const Setting setting = [] {
+        const char* v = std::getenv("FM4_EDRAM_FULL_TARGETS");
+        const bool set = v != nullptr && (v[0] == '0' || v[0] == '1') && v[1] == '\0';
+        const bool full = set ? v[0] == '1' : runtime::video::scale::InternalHalves() == runtime::video::scale::kHalves1x;
+        if (set || !full)
+            std::fprintf(stderr, full ? "[edram] full-extent host targets (FM4_EDRAM_FULL_TARGETS=1): every key's image holds its whole extent\n"
+                                      : "[edram] host targets hold the rows in use (grown on demand; FM4_EDRAM_FULL_TARGETS=1: the full extent)\n");
+        return Setting{set, full};
+    }();
+    return setting.set ? setting.full : runtime::video::scale::InternalHalves() == runtime::video::scale::kHalves1x;
+}
+
+// The guest rows an image is given for a use that reaches row `rows`: whole 16-row steps (one EDRAM tile row at 1x, two at 2x and 4x;
+// a whole number of host rows at every internal scale), at least one step, at most the key's extent.
+uint32_t TargetRows(uint32_t rows, uint32_t full)
+{
+    if (FullTargets() || rows >= full)
+        return full;
+    return std::min(full, std::max(16u, (rows + 15u) & ~15u));
+}
+
+// The image, memory, views, source sets and framebuffers of `raw` at its width x height, zeroed, in its rest layout (MakeTarget and
+// NeedRows). The key's formats and sample count are checked against the device first.
+bool CreateStorage(VkCommandBuffer c, Target* raw, std::string& error)
+{
+    const VkImageUsageFlags usage = (raw->depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) |
                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     // Storage 14 and 4: MUTABLE_FORMAT for the transfer view (X creates these targets with the uint transfer format as a
     // view format, vulkan_render_target_cache.cc:1628-1653 GetColorOwnershipTransferVulkanFormat; edram_vk_plan.h
     // TransferViewFormat).
-    t->uintFormat = t->depth ? VK_FORMAT_UNDEFINED : TransferViewFormat(edram::ColorFormat(k.Format()));
-    const bool uintStorage = t->uintFormat != VK_FORMAT_UNDEFINED;
+    raw->uintFormat = raw->depth ? VK_FORMAT_UNDEFINED : TransferViewFormat(edram::ColorFormat(raw->key.Format()));
+    const bool uintStorage = raw->uintFormat != VK_FORMAT_UNDEFINED;
     const VkImageCreateFlags flags = uintStorage ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     // The image's format, then the transfer view's (an attachment and a sampled image at this sample count).
-    for (const VkFormat format : {t->format, t->uintFormat})
+    for (const VkFormat format : {raw->format, raw->uintFormat})
     {
         if (format == VK_FORMAT_UNDEFINED)
             continue;
         VkImageFormatProperties properties{};
         if (vkGetPhysicalDeviceImageFormatProperties(unit->dev.gpu, format, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, usage, flags, &properties) != VK_SUCCESS ||
-            !(properties.sampleCounts & t->samples) || properties.maxExtent.width < t->width || properties.maxExtent.height < t->height)
-            return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": format " + std::to_string(int(format)) + " with " + std::to_string(t->samples) +
-                                   " sample(s) and attachment, sampled and transfer usage is not supported by the device"),
-                   nullptr;
+            !(properties.sampleCounts & raw->samples) || properties.maxExtent.width < raw->width || properties.maxExtent.height < raw->height)
+            return Fail(error, "EDRAM key " + std::to_string(raw->key.packed) + ": format " + std::to_string(int(format)) + " with " + std::to_string(raw->samples) +
+                                   " sample(s) and attachment, sampled and transfer usage is not supported by the device");
     }
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.flags = flags;
     info.imageType = VK_IMAGE_TYPE_2D;
-    info.format = t->format;
-    info.extent = {t->width, t->height, 1};
+    info.format = raw->format;
+    info.extent = {raw->width, raw->height, 1};
     info.mipLevels = info.arrayLayers = 1;
-    info.samples = VkSampleCountFlagBits(t->samples);
+    info.samples = VkSampleCountFlagBits(raw->samples);
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = usage;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    if (!Ok(vkCreateImage(unit->dev.device, &info, nullptr, &t->image), "vkCreateImage (EDRAM)", error))
-        return nullptr;
-    Target* raw = t.get();
-    unit->targets[k.packed] = std::move(t);  // owned from here, so shutdown destroys whatever was created
+    if (!Ok(vkCreateImage(unit->dev.device, &info, nullptr, &raw->image), "vkCreateImage (EDRAM)", error))
+        return false;
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(unit->dev.device, raw->image, &requirements);
     VkMemoryAllocateInfo allocate{};
@@ -1371,12 +1620,20 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
     allocate.memoryTypeIndex = MemoryType(unit->dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (!Ok(vkAllocateMemory(unit->dev.device, &allocate, nullptr, &raw->memory), "vkAllocateMemory (EDRAM)", error) ||
         !Ok(vkBindImageMemory(unit->dev.device, raw->image, raw->memory, 0), "vkBindImageMemory (EDRAM)", error))
-        return nullptr;
+        return false;
+    {
+        char label[128];
+        std::snprintf(label, sizeof label, "key %06X%s %ux%u x%u format %d (guest rows %u of %u)", raw->key.packed, raw->shadow ? " 1x shadow" : "", raw->width,
+                      raw->height, raw->samples, int(raw->format), raw->guestRows, raw->guestHeight);
+        using runtime::video::mem::Kind;
+        raw->ledger = runtime::video::mem::Global().Add(raw->shadow ? (raw->depth ? Kind::ShadowDepth : Kind::ShadowColor) : raw->depth ? Kind::EdramDepth : Kind::EdramColor,
+                                                        requirements.size, label);
+    }
     if (!View(raw->image, raw->format, raw->Aspects(), raw->view, error))
-        return nullptr;
+        return false;
     if (raw->depth && (!View(raw->image, raw->format, VK_IMAGE_ASPECT_DEPTH_BIT, raw->depthView, error) ||
                        !View(raw->image, raw->format, VK_IMAGE_ASPECT_STENCIL_BIT, raw->stencilView, error)))
-        return nullptr;
+        return false;
     // The target as a transfer source: written once, never updated (the views and layouts are fixed for the run).
     VkDescriptorSetAllocateInfo setInfo{};
     setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1384,7 +1641,7 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
     setInfo.descriptorSetCount = 1;
     setInfo.pSetLayouts = &unit->setLayout;
     if (!Ok(vkAllocateDescriptorSets(unit->dev.device, &setInfo, &raw->source), "vkAllocateDescriptorSets (EDRAM)", error))
-        return nullptr;
+        return false;
     const VkImageLayout sampledLayout = raw->depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     const VkDescriptorImageInfo images[2] = {{unit->sampler, raw->depth ? raw->depthView : raw->view, sampledLayout},
                                              {unit->sampler, raw->stencilView, sampledLayout}};
@@ -1401,7 +1658,7 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
     vkUpdateDescriptorSets(unit->dev.device, raw->depth ? 2 : 1, writes, 0, nullptr);
     VkRenderPass pass = VK_NULL_HANDLE;
     if (!Pass(raw->format, raw->samples, raw->depth, pass, error))
-        return nullptr;
+        return false;
     VkFramebufferCreateInfo fb{};
     fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fb.renderPass = pass;
@@ -1409,14 +1666,14 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
     fb.pAttachments = &raw->view;
     fb.width = raw->width, fb.height = raw->height, fb.layers = 1;
     if (!Ok(vkCreateFramebuffer(unit->dev.device, &fb, nullptr, &raw->framebuffer), "vkCreateFramebuffer (EDRAM)", error))
-        return nullptr;
+        return false;
     if (uintStorage)  // the transfer view: its own source set and framebuffer (the unit's passes on it use that format)
     {
         VkRenderPass uintPass = VK_NULL_HANDLE;
         if (!View(raw->image, raw->uintFormat, VK_IMAGE_ASPECT_COLOR_BIT, raw->uintView, error) ||
             !Ok(vkAllocateDescriptorSets(unit->dev.device, &setInfo, &raw->uintSource), "vkAllocateDescriptorSets (EDRAM uint)", error) ||
             !Pass(raw->uintFormat, raw->samples, false, uintPass, error))
-            return nullptr;
+            return false;
         const VkDescriptorImageInfo uintImage{unit->sampler, raw->uintView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet write = writes[0];
         write.dstSet = raw->uintSource;
@@ -1425,7 +1682,7 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
         fb.renderPass = uintPass;
         fb.pAttachments = &raw->uintView;
         if (!Ok(vkCreateFramebuffer(unit->dev.device, &fb, nullptr, &raw->uintFramebuffer), "vkCreateFramebuffer (EDRAM uint)", error))
-            return nullptr;
+            return false;
     }
     // Zero, then the rest layout.
     Transition(c, *raw, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -1441,8 +1698,229 @@ Target* GetTarget(VkCommandBuffer c, Key k, std::string& error)
         vkCmdClearColorImage(c, raw->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
     }
     Rest(c, *raw);
-    std::fprintf(stderr, "[edram] host target for key %06X: %ux%u, %u sample(s), format %d\n", k.packed, raw->width, raw->height, raw->samples, int(raw->format));
+    return true;
+}
+
+Target* MakeTarget(VkCommandBuffer c, Key k, uint32_t halves, uint32_t mapKey, std::string& error, uint32_t rows)
+{
+    if (const auto it = unit->targets.find(mapKey); it != unit->targets.end())
+        return it->second.get();
+    if (std::string why; !edram::SupportedKey(k, why))
+        return Fail(error, why), nullptr;
+    if (unit->targets.size() >= kMaxTargets)
+        return Fail(error, "more than " + std::to_string(kMaxTargets) + " EDRAM host targets (the descriptor pool's size)"), nullptr;
+    auto t = std::make_unique<Target>();
+    t->key = k;
+    t->depth = k.IsDepth();
+    t->format = t->depth ? HostDepthFormat(edram::DepthFormat(k.Format()), false) : HostColorFormat(edram::ColorFormat(k.Format()));
+    // 2x keys are native 2x images (draw_hdr1: was 1); FM4 Recomp (FM4_HOST_MSAA_1X=1): 1 for every key (host_samples.h).
+    t->samples = HostSampleCount(k.MsaaMode() == Msaa::X4 ? 4 : k.MsaaMode() == Msaa::X2 ? 2 : 1, HostMsaa1x());
+    if (!runtime::video::scale::HostExact(k.Width(), halves) || !runtime::video::scale::HostExact(k.Height(), halves))
+        return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": its " + std::to_string(k.Width()) + "x" + std::to_string(k.Height()) +
+                               " guest size has no whole host size at the internal scale"), nullptr;
+    t->guestWidth = k.Width(), t->guestHeight = k.Height(), t->halves = halves;
+    t->shadow = mapKey != k.packed;
+    // FM4 Recomp (M9, live resolution, step 2): the pending clears Rescale kept aside for this key go to its new target (below), which
+    // must hold their rows first: Clear and the clear-class draws grew the old target before they pushed them, and every pass that
+    // records a pending clear takes the target's rows as given. A rectangle that does not fit the key (never expected: the key is
+    // the same) is left out. Nothing is kept aside without a switch.
+    std::vector<PendingClear> carried;
+    if (const auto kept = mapKey == k.packed ? unit->carriedClears.find(mapKey) : unit->carriedClears.end(); kept != unit->carriedClears.end())
+    {
+        for (const PendingClear& pc : kept->second)
+            if (pc.rect.offset.x >= 0 && pc.rect.offset.y >= 0 && uint32_t(pc.rect.offset.x) + pc.rect.extent.width <= k.Width() &&
+                uint32_t(pc.rect.offset.y) + pc.rect.extent.height <= k.Height())
+            {
+                carried.push_back(pc);
+                rows = std::max(rows, uint32_t(pc.rect.offset.y) + pc.rect.extent.height);
+            }
+        unit->carriedClears.erase(kept);
+    }
+    t->guestRows = TargetRows(rows, k.Height());
+    t->width = runtime::video::scale::HostEdge(k.Width(), halves), t->height = runtime::video::scale::HostEdge(t->guestRows, halves);
+    if (t->format == VK_FORMAT_UNDEFINED)
+        return Fail(error, "no host format for EDRAM key " + std::to_string(k.packed)), nullptr;
+    if (t->width == 0 || t->height == 0 || t->width > unit->limits.maxImageDimension2D || t->height > unit->limits.maxImageDimension2D ||
+        t->width > unit->limits.maxFramebufferWidth || t->height > unit->limits.maxFramebufferHeight)
+        return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": a " + std::to_string(t->width) + "x" + std::to_string(t->height) +
+                               " host target exceeds the device's image or framebuffer limits"),
+               nullptr;
+    Target* raw = t.get();
+    unit->targets[mapKey] = std::move(t);  // owned from here, so shutdown destroys whatever was created
+    if (!CreateStorage(c, raw, error))
+        return nullptr;
+    raw->pendingClears = std::move(carried);  // FM4 Recomp (M9, live resolution, step 2): in their order; empty without a switch
+    if (halves == runtime::video::scale::kHalves1x && mapKey == k.packed)
+        std::fprintf(stderr, "[edram] host target for key %06X: %ux%u, %u sample(s), format %d (rows %u of %u)\n", k.packed, raw->width, raw->height, raw->samples,
+                     int(raw->format), raw->guestRows, raw->guestHeight);
+    else
+        std::fprintf(stderr, "[edram] host target for key %06X%s: %ux%u (guest %ux%u, scale %s), %u sample(s), format %d (rows %u of %u)\n", k.packed,
+                     mapKey == k.packed ? "" : " (1x resolve shadow)", raw->width, raw->height, raw->guestWidth, raw->guestHeight,
+                     runtime::video::scale::HalvesName(halves), raw->samples,
+                     int(raw->format), raw->guestRows, raw->guestHeight);
     return raw;
+}
+
+// `rows`: the guest rows the first use needs (the image is created with them; NeedRows grows it later); UINT32_MAX: the full extent.
+Target* GetTarget(VkCommandBuffer c, Key k, std::string& error, uint32_t rows = 0)
+{
+    // FM4 Recomp (M9, opt-in FM4_INTERNAL_SCALE_PITCH): only full-width keys are scaled (render_scale.h HalvesForPitch).
+    return MakeTarget(c, k, runtime::video::scale::HalvesForPitch(k.PitchTilesAt32bpp(), runtime::video::scale::InternalHalves(), runtime::video::scale::PitchScaled()),
+                      k.packed, error, rows);
+}
+
+// FM4 Recomp (M9, memory): `t` must hold guest rows [0, bottom) before a command reads or writes them. A taller image replaces the
+// present one: zeroed (as every target is at creation), then the present rows copied in (a whole-image vkCmdCopyImage of the same
+// format and sample count, every aspect), so it holds exactly what a full-extent image would. The replaced image and its views go to
+// unit->replaced (destroyed at Shutdown only: recorded commands and submissions in flight may use them); the target object, its key,
+// its pending clears and its place in the map are unchanged, and callers read its handles after this call. Growing a second time
+// at least doubles the rows, so a surface that creeps taller leaves few replaced images behind.
+bool NeedRows(VkCommandBuffer c, Target& t, uint32_t bottom, std::string& error)
+{
+    if (bottom <= t.guestRows)
+        return true;
+    if (bottom > t.guestHeight)
+        return Fail(error, "EDRAM key " + std::to_string(t.key.packed) + ": row " + std::to_string(bottom) + " is past its " + std::to_string(t.guestHeight) + "-row extent");
+    const uint32_t rows = TargetRows(t.growths == 0 ? bottom : std::max(bottom, 2 * t.guestRows), t.guestHeight);
+    const PassActivity activity("edram grow");  // FM4_DIAG_PASS_TIMES label
+    OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    Transition(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const ReplacedStorage old{t.image, t.memory, t.view, t.depthView, t.stencilView, t.uintView, t.framebuffer, t.uintFramebuffer, t.ledger};
+    const uint32_t oldHeight = t.height, oldRows = t.guestRows;
+    unit->replaced.push_back(old);
+    runtime::video::mem::Global().Move(old.ledger, runtime::video::mem::Kind::Retired);
+    t.image = VK_NULL_HANDLE, t.memory = VK_NULL_HANDLE, t.view = t.depthView = t.stencilView = t.uintView = VK_NULL_HANDLE;
+    t.framebuffer = t.uintFramebuffer = VK_NULL_HANDLE, t.source = t.uintSource = VK_NULL_HANDLE, t.ledger = 0;
+    t.layout = VK_IMAGE_LAYOUT_UNDEFINED, t.stages = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, t.access = 0;
+    t.guestRows = rows, t.height = runtime::video::scale::HostEdge(rows, t.halves), t.growths++;
+    if (!CreateStorage(c, &t, error))
+        return false;
+    Transition(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy copy{};
+    copy.srcSubresource = copy.dstSubresource = {t.Aspects(), 0, 0, 1};
+    copy.extent = {t.width, oldHeight, 1};
+    vkCmdCopyImage(c, old.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    Rest(c, t);
+    unit->growths++;
+    std::fprintf(stderr, "[edram] key %06X%s grows from %u to %u of its %u guest rows (%ux%u host; the replaced image is kept until shutdown)\n", t.key.packed,
+                 t.shadow ? " (1x resolve shadow)" : "", oldRows, rows, t.guestHeight, t.width, t.height);
+    return true;
+}
+// The rows of `key`'s layout that hold EDRAM tiles [start, end) (a transfer's source rows).
+uint32_t RangeRows(uint32_t startTiles, uint32_t endTiles, Key key)
+{
+    edram::Rect r[3];
+    const uint32_t n = edram::RangeRectangles(startTiles, endTiles, key, r);
+    uint32_t bottom = 0;
+    for (uint32_t i = 0; i < n; i++)
+        bottom = std::max(bottom, r[i].y + r[i].height);
+    return bottom;
+}
+
+// FM4 Recomp (M9): the map key of a scaled key's 1x resolve shadow (keys are 24 bits).
+constexpr uint32_t ShadowKey(uint32_t packed) { return packed | (1u << 31); }  // bit 31 (a flag, not an address)
+
+// FM4 Recomp (M9): a rectangle of `t` in guest pixels (the EDRAM model's units; pending clears are kept in them) as host pixels.
+VkRect2D HostRect(const Target& t, const VkRect2D& r)
+{
+    const runtime::video::scale::Rect h =
+        runtime::video::scale::HostRect({uint32_t(r.offset.x), uint32_t(r.offset.y), r.extent.width, r.extent.height}, t.halves);
+    return {{int32_t(h.x), int32_t(h.y)}, {h.width, h.height}};
+}
+VkRect2D HostRect(const Target& t, const edram::Rect& r) { return HostRect(t, VkRect2D{{int32_t(r.x), int32_t(r.y)}, {r.width, r.height}}); }
+
+bool Draw3(VkCommandBuffer c, PipelineKind kind, uint32_t sourceFlags, const Target& dest, uint32_t sample, const TransferPush& push,
+           const std::vector<VkRect2D>& rects, std::string& error);  // below (Transfers)
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): rectangle `r` (guest pixels) of the scaled `source` box-downsampled into its 1x shadow (the same
+// key at scale 1: guest-sized, the same host sample count, created on first use), which the resolve then reads in place of the
+// source, so every resolve path sees the samples of a 1x target.
+// A 1-sample source at 2x: one blit of the host rectangle onto the guest one, LINEAR where the format filters (at 2:1 each destination
+// texel's sample point is the shared corner of its 2x2 host pixels, so the filter is their mean: RECARBON_MAP.md A8, ReCarbon px()
+// renderer.cpp:4714-4730 at 66401ea), NEAREST otherwise (depth/stencil, which ReCarbon also takes unfiltered; formats without linear
+// filtering), which picks one host pixel of each guest pixel. A 1-sample depth source at 1.5x: the NEAREST blit too (its sample
+// point, the guest pixel's centre, lies in the host pixel the guest pixel covers whole: render_scale.h WholeHostPixel).
+// A multisampled source (the guest's MSAA kept: host_samples.h; a blit may not read or write one), and a 1-sample colour source at
+// 1.5x (a LINEAR blit there is not the box filter: it would weigh the two host pixels 3:1, not 2:1): a pass on the shadow, one draw
+// per sample (kDownsampleColor: sample s = the box filter of sample s over the guest pixel's host pixels; kDownsampleDepth: sample s
+// of the host pixel it covers whole, with the stencil through VK_EXT_shader_stencil_export).
+Target* DownsampleToShadow(VkCommandBuffer c, Target& source, const edram::Rect& r, std::string& error)
+{
+    Target* shadow = MakeTarget(c, source.key, runtime::video::scale::kHalves1x, ShadowKey(source.key.packed), error, r.y + r.height);
+    if (shadow == nullptr || !NeedRows(c, *shadow, r.y + r.height, error))
+        return nullptr;
+    if (source.samples != shadow->samples)
+        return Fail(error, "the internal-resolution downsample: a shadow with another sample count than its source"), nullptr;
+    const VkRect2D host = HostRect(source, r);
+    static std::set<std::pair<uint32_t, bool>> named;
+    if (source.samples > 1 || (!source.depth && source.halves != 4))  // a LINEAR blit is the box filter at 2:1 only
+    {
+        const ScaleModules* const mods = ModulesFor(runtime::video::scale::InternalHalves(), error);  // FM4 Recomp (M9, live resolution, step 1)
+        if (mods == nullptr)
+            return nullptr;
+        if (source.depth && mods->downsampleDepth == VK_NULL_HANDLE)
+            return Fail(error, "the internal-resolution downsample of a multisampled depth target needs VK_EXT_shader_stencil_export"), nullptr;
+        const PassActivity activity("edram downsample");  // FM4_DIAG_PASS_TIMES label
+        Transition(c, source, source.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        const VkRect2D rect{{int32_t(r.x), int32_t(r.y)}, {r.width, r.height}};
+        VkRenderPassBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        if (!Pass(shadow->format, shadow->samples, shadow->depth, begin.renderPass, error))  // the target's own format, not a transfer view's
+            return nullptr;
+        begin.framebuffer = shadow->framebuffer;
+        begin.renderArea = UnitPassArea(&rect, 1, shadow->width, shadow->height);
+        OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+        UnitPassBegin(c, source.depth ? "downsample depth" : "downsample colour");
+        vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        const VkViewport viewport{0.0f, 0.0f, float(shadow->width), float(shadow->height), 0.0f, 1.0f};
+        vkCmdSetViewport(c, 0, 1, &viewport);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, &source.source, 0, nullptr);
+        TransferPush push{};
+        const std::vector<VkRect2D> rects{rect};
+        const uint64_t drawsBefore = unit->transferDraws;
+        bool ok = true;
+        for (uint32_t sample = 0; ok && sample < shadow->samples; sample++)
+            push.destSample = sample,
+            ok = Draw3(c, source.depth ? PipelineKind::DownsampleDepth : PipelineKind::Downsample, source.samples > 1 ? 1 : 0, *shadow, sample, push, rects, error);
+        unit->downsampleDraws += unit->transferDraws - drawsBefore, unit->transferDraws = drawsBefore;  // not ownership transfers
+        vkCmdEndRenderPass(c);  // ended even on a refusal, so the command buffer stays well formed until the stop
+        UnitPassEnd(c);
+        Rest(c, source);
+        if (!ok)
+            return nullptr;
+        unit->downsamples++;
+        if (named.insert({source.key.packed, false}).second)
+            std::fprintf(stderr, "[edram] internal resolution: first resolve of key %06X: %ux%u host -> %ux%u guest, %u sample(s) (%s into its 1x shadow)\n",
+                         source.key.packed, host.extent.width, host.extent.height, r.width, r.height, source.samples,
+                         source.depth ? "each sample of the host pixel covered whole, with its stencil," : "each sample's box filter over the host pixels");
+        return shadow;
+    }
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(unit->dev.gpu, source.format, &props);
+    const VkFormatFeatureFlags f = props.optimalTilingFeatures;
+    if (!(f & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(f & VK_FORMAT_FEATURE_BLIT_DST_BIT))
+        return Fail(error, "the internal-resolution downsample: format " + std::to_string(int(source.format)) + " cannot be blitted"), nullptr;
+    const bool linear = !source.depth && (f & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0;
+    OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    Transition(c, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    Transition(c, *shadow, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit blit{};
+    blit.srcSubresource = {source.Aspects(), 0, 0, 1};
+    blit.dstSubresource = {shadow->Aspects(), 0, 0, 1};
+    blit.srcOffsets[0] = {host.offset.x, host.offset.y, 0};
+    blit.srcOffsets[1] = {host.offset.x + int32_t(host.extent.width), host.offset.y + int32_t(host.extent.height), 1};
+    blit.dstOffsets[0] = {int32_t(r.x), int32_t(r.y), 0};
+    blit.dstOffsets[1] = {int32_t(r.x + r.width), int32_t(r.y + r.height), 1};
+    vkCmdBlitImage(c, source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shadow->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                   linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    Rest(c, source);
+    Rest(c, *shadow);
+    unit->downsamples++;
+    if (named.insert({source.key.packed, linear}).second)
+        std::fprintf(stderr, "[edram] internal resolution: first resolve of key %06X: %ux%u host -> %ux%u guest (%s blit into its 1x shadow)\n",
+                     source.key.packed, host.extent.width, host.extent.height, r.width, r.height, linear ? "LINEAR, the 2x2 mean" : "NEAREST");
+    return shadow;
 }
 
 // ---- Transfers ----------------------------------------------------------------------------------------------------
@@ -1622,7 +2100,7 @@ bool FlushClears(VkCommandBuffer c, Target& t, std::string& error, const edram::
     const PassActivity activity("edram clear");  // FM4_DIAG_PASS_TIMES label
     std::vector<VkRect2D> rects;
     for (const PendingClear& pc : t.pendingClears)
-        rects.push_back(pc.rect);
+        rects.push_back(HostRect(t, pc.rect));
     VkRenderPassBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     if (!Pass(PassFormat(t), t.samples, t.depth, begin.renderPass, error))
@@ -1636,7 +2114,7 @@ bool FlushClears(VkCommandBuffer c, Target& t, std::string& error, const edram::
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     for (const PendingClear& pc : t.pendingClears)
         {
-            const VkClearRect r{pc.rect, 0, 1};
+            const VkClearRect r{HostRect(t, pc.rect), 0, 1};
             vkCmdClearAttachments(c, 1, &pc.attachment, 1, &r);
         }
     vkCmdEndRenderPass(c);
@@ -1714,7 +2192,9 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
             bool ok = n != 0;
             for (uint32_t i = 0; ok && i < n; i++)
             {
-                ok = r[i].x + r[i].width <= dest.width && r[i].y + r[i].height <= dest.height;
+                ok = r[i].x + r[i].width <= dest.guestWidth && r[i].y + r[i].height <= dest.guestHeight;
+                if (ok && !NeedRows(c, dest, r[i].y + r[i].height, error))  // FM4 Recomp (M9, memory): the pending clear's rows
+                    return false;
                 if (ok && t.exact != 0)  // the request's own colour into the same format (Change: same aspect and format): the source's clear, exactly
                 {
                     pcs[i].attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, pcs[i].attachment.colorAttachment = 0;
@@ -1761,9 +2241,11 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
         std::vector<VkRect2D> rects;
         for (uint32_t i = 0; i < n; i++)
         {
-            if (r[i].x + r[i].width > dest.width || r[i].y + r[i].height > dest.height)
+            if (r[i].x + r[i].width > dest.guestWidth || r[i].y + r[i].height > dest.guestHeight)
                 return Fail(error, "transfer rectangle outside the destination's host target");
-            rects.push_back({{int32_t(r[i].x), int32_t(r[i].y)}, {r[i].width, r[i].height}});
+            if (!NeedRows(c, dest, r[i].y + r[i].height, error))  // FM4 Recomp (M9, memory)
+                return false;
+            rects.push_back(HostRect(dest, {{int32_t(r[i].x), int32_t(r[i].y)}, {r[i].width, r[i].height}}));
         }
         if (rects.empty())
             continue;
@@ -1778,6 +2260,10 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
                 return Fail(error, "ownership transfer from a " + std::to_string(source.samples) + "-sample " + (source.depth ? "depth/stencil" : "colour") +
                                        " target: the device cannot sample that count");
         }
+        // FM4 Recomp (M9, memory): the source rows the shader reads (the same tiles in the source's layout); rows the source never
+        // held are created zero, as a full-extent image had them.
+        if (!NeedRows(c, source, RangeRows(t.startTiles, t.endTiles, source.key), error))
+            return false;
         area.insert(area.end(), rects.begin(), rects.end());
         items.push_back({&t, &source, kind, std::move(rects)});
     }
@@ -1810,7 +2296,7 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
             if (!FlushClears(c, *it.source, error))
                 return false;
     for (const PendingClear& pc : dest.pendingClears)
-        area.push_back(pc.rect);
+        area.push_back(HostRect(dest, pc.rect));
     for (const Item& it : items)
         Transition(c, *it.source, it.source->depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -1827,7 +2313,7 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     for (const PendingClear& pc : dest.pendingClears)
         {
-            const VkClearRect r{pc.rect, 0, 1};
+            const VkClearRect r{HostRect(dest, pc.rect), 0, 1};
             vkCmdClearAttachments(c, 1, &pc.attachment, 1, &r);
         }
     dest.pendingClears.clear();
@@ -1852,6 +2338,7 @@ bool ExecuteTransfers(VkCommandBuffer c, Target& dest, const std::vector<Transfe
         TransferPush push{dest.samples == 4 ? 1u : 0u, 0, source.key.Format(), dest.key.Format(), 0,
                           dest.key.PitchTiles(), (dest.key.Base() - source.key.Base()) & (edram::kTileCount - 1),
                           uint32_t(source.key.MsaaMode()), uint32_t(dest.key.MsaaMode()), 0, 0, 0, 0, source.key.PitchTiles()};
+        push.destHalves = dest.halves, push.sourceHalves = source.halves;  // FM4 Recomp (M9, FM4_INTERNAL_SCALE_PITCH)
         // Pipeline's sourceFlags; FM4 Recomp (FM4_HOST_MSAA_1X): bit 0 by the source IMAGE's sample count (TransferSourceFlags).
         const uint32_t sourceMs = TransferSourceFlags(source.samples, UintStorage(source), !source.depth && source.key.Is64bpp());
         if (kind == TransferKind::Color || kind == TransferKind::DepthToColor)
@@ -1940,10 +2427,21 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
         return refuse("the EDRAM model dropped a target the draw needs (colour and depth at one base)");
     if ((needColor && !CheckTransfers(b.color[0], b.transfers[1], error)) || (needDepth && !CheckTransfers(b.depth, b.transfers[0], error)))
         return refuse(error);
-    Target* color = needColor ? GetTarget(c, b.color[0], error) : nullptr;
-    Target* depth = needDepth ? GetTarget(c, b.depth, error) : nullptr;
+    // FM4 Recomp (M9, memory): the draw's surface rows (RenderTarget::targetHeight, the rows edram::Bind claimed), the same for both
+    // attachments (one framebuffer); a clear draw's rectangle may reach further.
+    uint32_t drawRows = rt.targetHeight;
+    if (clear != nullptr)
+        drawRows = std::max(drawRows, clear->rect.y + clear->rect.height);
+    Target* color = needColor ? GetTarget(c, b.color[0], error, drawRows) : nullptr;
+    Target* depth = needDepth ? GetTarget(c, b.depth, error, drawRows) : nullptr;
     if ((needColor && color == nullptr) || (needDepth && depth == nullptr))
         return refuse(error);
+    for (Target* t : {color, depth})
+        if (t != nullptr)
+            drawRows = std::max(std::min(drawRows, t->guestHeight), t->guestRows);
+    for (Target* t : {color, depth})
+        if (t != nullptr && !NeedRows(c, *t, std::min(drawRows, t->guestHeight), error))
+            return false;
     if ((depth && !ExecuteTransfers(c, *depth, b.transfers[0], error)) || (color && !ExecuteTransfers(c, *color, b.transfers[1], error)))
         return false;  // recorded partially: the renderer stops the run with this error, nothing is submitted
     // FM4 Recomp (alpha, RT format 5): the draws bound to a 64 bpp colour key (storage 5), the evidence of the first validation run: the
@@ -1973,7 +2471,7 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
                 continue;
             if (t->depth ? !clear->depth : !clear->color)
                 return Fail(error, "clear draw: a bound target without a clear value");
-            if (clear->rect.x + clear->rect.width > t->width || clear->rect.y + clear->rect.height > t->height)
+            if (clear->rect.x + clear->rect.width > t->guestWidth || clear->rect.y + clear->rect.height > t->guestHeight)
                 return Fail(error, "clear draw rectangle outside its host target");
             if (!t->depth && UintStorage(*t))
                 return Fail(error, "clear draw into a storage format cleared through the transfer view (" + std::to_string(t->key.Format()) + ")");
@@ -2026,11 +2524,17 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
         for (Target* t : {color, depth})
             if (t != nullptr && !t->pendingClears.empty())
             {
-                out.clears.insert(out.clears.end(), t->pendingClears.begin(), t->pendingClears.end());
+                for (const PendingClear& pc : t->pendingClears)  // FM4 Recomp (M9): host rectangles for the renderer
+                    out.clears.push_back({pc.attachment, HostRect(*t, pc.rect)});
                 t->pendingClears.clear();
             }
     const Target& any = color ? *color : *depth;
     out.width = any.width, out.height = any.height, out.samples = any.samples;
+    out.guestWidth = any.guestWidth, out.guestHeight = any.guestHeight, out.halves = any.halves;
+    // FM4 Recomp (M9, memory): the viewport spans the key's full extent, or, when that is taller than the device's viewport limit
+    // (an 80x8192 key at 3x), the rows the image holds: FoldViewport maps to whichever rows `viewRows` names, the same transform.
+    out.viewRows = runtime::video::scale::HostEdge(any.guestHeight, any.halves) <= unit->limits.maxViewportDimensions[1] ? any.guestHeight : any.guestRows;
+    out.viewHeight = runtime::video::scale::HostEdge(out.viewRows, any.halves);
     if (color)
         out.color = color->view, out.format = color->format;
     if (depth)
@@ -2048,9 +2552,10 @@ bool AcquireTargets(VkCommandBuffer c, const RenderTarget& rt, bool needColor, b
 // opened its own full-target render pass (~21 a race frame).
 bool Clear(VkCommandBuffer c, Target& t, const edram::Rect& rect, uint32_t value, uint32_t valueLo, std::string& error)
 {
-    (void)c;
-    if (rect.x + rect.width > t.width || rect.y + rect.height > t.height)
+    if (rect.x + rect.width > t.guestWidth || rect.y + rect.height > t.guestHeight)
         return Fail(error, "resolve clear rectangle outside its host target");
+    if (!NeedRows(c, t, rect.y + rect.height, error))  // FM4 Recomp (M9, memory)
+        return false;
     PendingClear pc;
     if (t.depth)
     {
@@ -2166,10 +2671,102 @@ bool ResolveCompute()
 
 // FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): the converted words of rectangle `r` of `source` (kResolveResident) into
 // the resident image at (0, 0), left in TRANSFER_SRC_OPTIMAL for the texture unit's copies (TextureHooks::adoptResolve).
-bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const edram::ResolveInfo& info, const edram::Rect& r, std::string& error)
+// FM4 Recomp (M9, GPU cost; opt-in FM4_RESOLVE_FUSED=1, above 1x): a resolve whose 1x words the GPU converts (and writes back from:
+// FM4_RESOLVE_GPU_WORDS) is converted straight from the scaled target, each guest pixel the box filter of its host pixels
+// (kResolveResident XE_BOX), instead of first downsampling the rectangle into a 1x shadow (one draw per sample) and converting that.
+// The profile (FM4_DIAG_PASS_TIMES, QHD): "downsample colour" 3.1 ms a menu frame and 0.9 ms a race frame. The words can differ from
+// the shadow path's by a rounding step (the shadow stored each sample's mean in the target's format first); every other resolve
+// (depth, a read-back from samples, a 16_16 source) keeps the shadow.
+// FM4 Recomp (M9, live resolution, step 1): the variable is read once and its line printed once, at the first call, as before
+// (FusedAsked: the line names the scale of that moment); whether it applies is then computed for a scale at each call, with the
+// same terms in the same order (it was computed once and kept).
+bool FusedAsked()
+{
+    static const bool wanted = [] {
+        const char* v = std::getenv("FM4_RESOLVE_FUSED");
+        const bool asked = v != nullptr && v[0] == '1' && v[1] == '\0';
+        const bool enabled = asked && runtime::video::scale::InternalHalves() > runtime::video::scale::kHalves1x && ResolveResident() && ResolveGpuWords();
+        if (asked)
+            std::fprintf(stderr, enabled ? "[edram] fused scaled resolves on (FM4_RESOLVE_FUSED=1): a GPU-converted resolve reads the scaled target directly (no 1x shadow pass)\n"
+                                         : "[edram] FM4_RESOLVE_FUSED=1 ignored: it needs FM4_INTERNAL_RES above 720p, FM4_RESOLVE_RESIDENT=1 and FM4_RESOLVE_GPU_WORDS=1\n");
+        return asked;
+    }();
+    return wanted;
+}
+bool FusedResolveAt(uint32_t halves)
+{
+    return FusedAsked() && halves > runtime::video::scale::kHalves1x && ResolveResident() && ResolveGpuWords();
+}
+bool FusedResolve()
+{
+    return FusedAsked() && runtime::video::scale::InternalHalves() > runtime::video::scale::kHalves1x && ResolveResident() && ResolveGpuWords();
+}
+
+// FM4 Recomp (M9, FM4_RESOLVE_FUSED): the 1x words of a width x height resolve into the resident image from the scaled resident image
+// (kWordsDown), both rectangles at (0, 0); the scaled image returns to TRANSFER_SRC_OPTIMAL for the adoptions' copies, the 1x image is
+// left in it as RecordResident leaves it.
+// FM4 Recomp (M9, live resolution, step 1): `hi` is the scaled resident image of the resolve's scale (ResidentHi).
+bool RecordWordsDown(VkCommandBuffer c, HiResident& hi, uint32_t destFormat, uint32_t width, uint32_t height, std::string& error)
 {
     const PassActivity activity("resolve resident");  // FM4_DIAG_PASS_TIMES label
-    Target& dest = info.destBytesLog2 == 1 ? unit->resident16 : unit->resident;  // FM4 Recomp: k_8_8 words are 16 bits
+    Target& source = hi.image;
+    Target& dest = unit->resident;
+    if (hi.source == VK_NULL_HANDLE)  // written once: the image and its view live for the run
+    {
+        VkDescriptorSetAllocateInfo setInfo{};
+        setInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        setInfo.descriptorPool = unit->pool;
+        setInfo.descriptorSetCount = 1;
+        setInfo.pSetLayouts = &unit->setLayout;
+        if (!Ok(vkAllocateDescriptorSets(unit->dev.device, &setInfo, &hi.source), "vkAllocateDescriptorSets (scaled resident words)", error))
+            return false;
+        const VkDescriptorImageInfo image{unit->sampler, source.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = hi.source;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(unit->dev.device, 1, &write, 0, nullptr);
+    }
+    Transition(c, source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    Transition(c, dest, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+               VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderPassBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    if (!Pass(dest.format, 1, false, begin.renderPass, error))
+        return false;
+    begin.framebuffer = dest.framebuffer;
+    begin.renderArea = {{0, 0}, {width, height}};
+    OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
+    char unitKind[64];  // FM4_DIAG_PASS_TIMES label
+    std::snprintf(unitKind, sizeof unitKind, "resident from scaled words %ux%u", width, height);
+    UnitPassBegin(c, unitKind);
+    vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, &hi.source, 0, nullptr);
+    const VkViewport viewport{0.0f, 0.0f, float(dest.width), float(dest.height), 0.0f, 1.0f};
+    vkCmdSetViewport(c, 0, 1, &viewport);
+    TransferPush push{};
+    push.destFormat = destFormat;
+    const bool ok = Draw3(c, PipelineKind::WordsDown, 0, dest, 0, push, {VkRect2D{{0, 0}, {width, height}}}, error);
+    vkCmdEndRenderPass(c);
+    UnitPassEnd(c);
+    if (!ok)
+        return false;
+    Transition(c, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    Transition(c, dest, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    unit->residentResolves++, unit->wordsDownResolves++;
+    return true;
+}
+
+// FM4 Recomp (M9): `to` (the scaled resident image) with `source` the scaled target and `r` its host rectangle converts per host pixel.
+// `box` (FM4_RESOLVE_FUSED): `source` is the scaled target and `r` the guest rectangle; each guest pixel is its host pixels' box filter.
+bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const edram::ResolveInfo& info, const edram::Rect& r, std::string& error,
+                    Target* to = nullptr, bool box = false)
+{
+    const PassActivity activity("resolve resident");  // FM4_DIAG_PASS_TIMES label
+    Target& dest = to != nullptr ? *to : info.destBytesLog2 == 1 ? unit->resident16 : unit->resident;  // FM4 Recomp: k_8_8 words are 16 bits
     uint32_t indices[4] = {}, count = 0, packed = 0;
     if (!ResolveSamples(info, indices, count))
         return Fail(error, "resident resolve: a selected sample the source does not have");
@@ -2188,7 +2785,9 @@ bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const e
     // FM4_RESOLVE_COMPUTE: a multisampled colour source into the 32-bit resident image, by one dispatch (above).
     const TransferPush push{count, packed, storage, info.destFormat, biasBits, info.destSwap ? 1u : 0u, info.destNumber, uint32_t(info.msaa), 0, r.x, r.y, r.width, r.height, 0};
     const VkPipeline compute = uintSource ? unit->residentComputeUintMs : unit->residentComputeMs;
-    if (ResolveCompute() && compute != VK_NULL_HANDLE && !source.depth && source.samples > 1 && &dest == &unit->resident)
+    if (box && (source.depth || uintSource))
+        return Fail(error, "fused resident resolve: a depth or transfer-view source");
+    if (!box && ResolveCompute() && compute != VK_NULL_HANDLE && !source.depth && source.samples > 1 && &dest == &unit->resident)
     {
         static std::set<std::tuple<uint32_t, uint32_t, uint32_t, bool>> named;  // once per shape: which resolves take the dispatch
         if (named.insert({r.width, r.height, source.samples, uintSource}).second)
@@ -2224,7 +2823,7 @@ bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const e
     begin.renderArea = {{0, 0}, {r.width, r.height}};
     OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE)
     char unitKind[64];  // FM4_DIAG_PASS_TIMES label
-    std::snprintf(unitKind, sizeof unitKind, "resident %ux%u x%u", r.width, r.height, 1u << uint32_t(info.msaa));
+    std::snprintf(unitKind, sizeof unitKind, "resident%s %ux%u x%u", to != nullptr ? " scaled" : box ? " fused" : "", r.width, r.height, 1u << uint32_t(info.msaa));
     UnitPassBegin(c, unitKind);
     vkCmdBeginRenderPass(c, &begin, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, unit->layout, 0, 1, uintSource ? &source.uintSource : &source.source, 0, nullptr);
@@ -2236,7 +2835,7 @@ bool RecordResident(VkCommandBuffer c, Target& source, uint32_t storage, const e
     // host sample (kResolveResident's loop still runs `count` times: the mean of `count` equal values, the CPU path's arithmetic on the
     // dump's equal words, ResolveConvertPixel).
     const uint32_t sourceFlags = TransferSourceFlags(source.samples, uintSource, !source.depth && source.key.Is64bpp());
-    const bool ok = Draw3(c, source.depth ? PipelineKind::ResidentDepth : PipelineKind::Resident, sourceFlags, dest, 0, push,
+    const bool ok = Draw3(c, box ? PipelineKind::ResidentBox : source.depth ? PipelineKind::ResidentDepth : PipelineKind::Resident, sourceFlags, dest, 0, push,
                           {VkRect2D{{0, 0}, {r.width, r.height}}}, error);
     vkCmdEndRenderPass(c);
     UnitPassEnd(c);
@@ -2270,6 +2869,7 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
 {
     (void)d, (void)draw;
     unit->lastValid = false;
+    unit->lastHi = false;
     // FM4 Recomp (FM4_RESOLVE_RESIDENT): several read-back resolves per submission while the staging has room (resolveRoom).
     if (!unit->pending.empty() && !ResolveResident())
         return Fail(error, "a second resolve in one submission (the renderer flushes the slot after each resolve)");
@@ -2352,8 +2952,15 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         DiagConsume(plan.copySource, std::string(depthCopy ? "resolve copy of depth " : "resolve copy of colour ") + std::to_string(info.x1 - info.x0) + "x" +
                                          std::to_string(info.y1 - info.y0));  // FM4_DIAG_TRANSFERS=2
         const edram::Rect& r = plan.copyRect;
-        if (r.x + r.width > source->width || r.y + r.height > source->height)
+        if (r.x + r.width > source->guestWidth || r.y + r.height > source->guestHeight)
             return Fail(error, "resolve rectangle outside the source's host target");
+        if (!NeedRows(c, *source, r.y + r.height, error))  // FM4 Recomp (M9, memory)
+            return false;
+        // FM4 Recomp (M9, FM4_INTERNAL_RES): a scaled source is resolved from its 1x shadow (DownsampleToShadow); every path below then
+        // reads guest-sized texels as at 1x, so guest memory, the resident image and the checks get 1x data.
+        // FM4 Recomp (M9, FM4_RESOLVE_FUSED): decided below, once the resolve's GPU conversion is known; `source` is the scaled target
+        // until then (the decisions read only its key's properties, the same for the shadow).
+        Target* const scaled = source->halves > runtime::video::scale::kHalves1x ? source : nullptr;
         // FM4 Recomp (FM4_RESOLVE_GPU_WORDS): a resolve the GPU converts below is read back from those words instead.
         std::string unconvertible;
         // FM4 Recomp (M7 CPU cost): a 16_16 source (storage 4) only with FM4_RESOLVE_RESIDENT_1616 (kResolveResident XE_SOURCE_UINT).
@@ -2376,6 +2983,10 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         const bool residentCopy = !residentWords && !residentDepth && ResolveResident() && !ResolveResidentCheck() && !depthCopy && fast && storage == 14 &&
                                   info.destFormat == 36 && info.destBytesLog2 == 2 && r.width == info.x1 - info.x0 && r.height == info.y1 - info.y0 &&
                                   r.width <= kResidentWidth && r.height <= kResidentHeight && source->format == VK_FORMAT_R32_SFLOAT;
+        const bool fused = scaled != nullptr && FusedResolve() && residentWords && gpuWords && !ResolveResidentCheck() && !UintStorage(*scaled);
+        if (scaled != nullptr && !fused && (source = DownsampleToShadow(c, *source, r, error)) == nullptr)
+            return false;
+        unit->fusedResolves += fused ? 1 : 0;
         if (!residentWords && !residentCopy && !residentDepth && ResolveResident())  // FM4_DIAG_CONSUMER (diagnostic): each resolve shape without GPU words, once
             if (const char* v = std::getenv("FM4_DIAG_CONSUMER"); v != nullptr && v[0] != '0')
             {
@@ -2422,7 +3033,31 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         }
         else if (residentWords || residentDepth)
         {
-            if (!RecordResident(c, *source, storage, info, r, error))
+            // FM4 Recomp (M9): whether this resolve is also converted per host pixel (below); with FM4_RESOLVE_FUSED that conversion
+            // comes first and the 1x words are its box filter (RecordWordsDown), instead of a second conversion from the samples.
+            bool hiWanted = false;
+            HiResident* hiResident = nullptr;  // FM4 Recomp (M9, live resolution, step 1): the scaled source's scale's (ResidentHi)
+            edram::Rect hr{};
+            if (residentWords && scaled != nullptr && (hiResident = ResidentHi(scaled->halves)) != nullptr && info.destBytesLog2 == 2 && ScaledTwinFormat(info.destFormat) &&
+                !ResolveResidentCheck())
+            {
+                using runtime::video::scale::HostEdge, runtime::video::scale::HostExact;
+                const uint32_t h = scaled->halves;
+                hr = {HostEdge(r.x, h), HostEdge(r.y, h), HostEdge(r.width, h), HostEdge(r.height, h)};
+                hiWanted = HostExact(r.x, h) && HostExact(r.y, h) && HostExact(r.width, h) && HostExact(r.height, h) && hr.width <= hiResident->image.width &&
+                           hr.height <= hiResident->image.height;
+                if (!hiWanted && unit->hiRefused++ == 0)
+                    std::fprintf(stderr, "[edram] internal resolution: a %ux%u resolve at (%u, %u) has no whole host rectangle: its texture and front buffer "
+                                         "words stay 1x (first time; counted)\n", r.width, r.height, r.x, r.y);
+            }
+            const bool fromScaledWords = fused && hiWanted && WordsDownCompiled();
+            if (fromScaledWords)
+            {
+                if (!RecordResident(c, *scaled, storage, info, hr, error, &hiResident->image) || !RecordWordsDown(c, *hiResident, info.destFormat, r.width, r.height, error))
+                    return false;
+                unit->lastHi = true, unit->hiResolves++;
+            }
+            else if (!RecordResident(c, *source, storage, info, r, error, nullptr, fused))
                 return false;
             converted = true;
             unit->lastWords16 = info.destBytesLog2 == 1;
@@ -2449,6 +3084,16 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
                 OutsideRenderPass(c);  // FM4 Recomp (FM4_PASS_MERGE): RecordResident ended any open pass; explicit for the site check
                 vkCmdCopyImageToBuffer(c, info.destBytesLog2 == 1 ? unit->resident16.image : unit->resident.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        unit->staging, 1, &words);
+            }
+            // FM4 Recomp (M9, FM4_INTERNAL_RES): the same resolve once more per host pixel, from the scaled target itself, into the scaled
+            // resident image: the words of the texture twins and of the scaled front buffer (the display image at the internal
+            // resolution). Decided above (hiWanted: 32 bpp colour, a rectangle whose four edges are whole host pixels); already done
+            // when the 1x words came from it.
+            if (hiWanted && !fromScaledWords)
+            {
+                if (!RecordResident(c, *scaled, storage, info, hr, error, &hiResident->image))
+                    return false;
+                unit->lastHi = true, unit->hiResolves++;
             }
         }
         VkBufferMemoryBarrier host{};
@@ -2498,6 +3143,7 @@ bool Resolve(VkCommandBuffer c, const uint8_t* base, const DrawState& d, uint64_
         l.textureBase = regs.copyDestBase, l.destFormat = info.destFormat, l.destPitch = info.destPitch, l.destEndian = info.destEndian;
         l.x0 = info.x0, l.y0 = info.y0, l.width = info.x1 - info.x0, l.height = info.y1 - info.y0;
         l.bytesLog2 = info.destBytesLog2;
+        l.hiHalves = unit->lastHi ? runtime::video::scale::InternalHalves() : 0;  // FM4 Recomp (M9)
         unit->lastValid = true;
     }
     unit->resolves++;
@@ -2662,6 +3308,42 @@ bool LastResolve(ResidentResolve& out, VkImage& words)
     return true;
 }
 
+// FM4 Recomp (M9, memory; FM4_EDRAM_RELEASE_REPLACED, render_hooks.h releaseReplaced): the replaced images, their views and
+// framebuffers, destroyed now (the caller guarantees every submission is complete). Their source descriptor sets stay in the pool,
+// never bound again (the targets' sets were written anew for the taller image).
+size_t ReleaseReplaced(void (*forgetView)(VkImageView))
+{
+    if (!unit || unit->replaced.empty())
+        return 0;
+    const VkDevice device = unit->dev.device;
+    for (ReplacedStorage& o : unit->replaced)
+    {
+        if (forgetView != nullptr)
+            forgetView(o.view);
+        vkDestroyFramebuffer(device, o.framebuffer, nullptr);
+        vkDestroyFramebuffer(device, o.uintFramebuffer, nullptr);
+        vkDestroyImageView(device, o.uintView, nullptr);
+        vkDestroyImageView(device, o.stencilView, nullptr);
+        vkDestroyImageView(device, o.depthView, nullptr);
+        vkDestroyImageView(device, o.view, nullptr);
+        vkDestroyImage(device, o.image, nullptr);
+        vkFreeMemory(device, o.memory, nullptr);
+        runtime::video::mem::Global().Release(o.ledger);
+    }
+    const size_t n = unit->replaced.size();
+    unit->replacedReleased += n;
+    unit->replaced.clear();
+    return n;
+}
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): the last resolve's words per host pixel (ResidentResolve::hiHalves), or null.
+// FM4 Recomp (M9, live resolution, step 1): the scaled resident image of that resolve's scale (hiHalves is set with lastHi).
+VkImage LastResolveHi()
+{
+    const HiResident* const hi = unit->lastValid && unit->lastHi ? ResidentHi(unit->last.hiHalves) : nullptr;
+    return hi != nullptr ? hi->image.image : VK_NULL_HANDLE;
+}
+
 bool ResolveRoom() { return unit->stagingUsed + 2 * kStagingBytes <= kStagingTotalBytes; }
 
 void Shutdown()
@@ -2669,6 +3351,14 @@ void Shutdown()
     if (!unit)
         return;
     const VkDevice device = unit->dev.device;
+    if (unit->downsamples != 0)  // FM4 Recomp (M9, FM4_INTERNAL_RES)
+        std::fprintf(stderr, "[edram] internal resolution: %llu resolve(s) downsampled through a 1x shadow (%llu per-sample draw(s) for multisampled ones); "
+                             "%llu also converted per host pixel (scaled textures and front buffer), %llu kept 1x for a rectangle with no whole host size\n",
+                     (unsigned long long)unit->downsamples, (unsigned long long)unit->downsampleDraws, (unsigned long long)unit->hiResolves,
+                     (unsigned long long)unit->hiRefused);
+    if (unit->fusedResolves != 0)
+        std::fprintf(stderr, "[edram] fused scaled resolves: %llu (%llu with their 1x words from the scaled words)\n", (unsigned long long)unit->fusedResolves,
+                     (unsigned long long)unit->wordsDownResolves);
     std::fprintf(stderr, "[edram] shutdown: %zu host target(s), %llu transfer(s) in %llu draw(s), %llu resolve(s), %llu deferred clear(s), %llu clear draw(s) deferred\n",
                  unit->targets.size(), (unsigned long long)unit->transfers, (unsigned long long)unit->transferDraws, (unsigned long long)unit->resolves,
                  (unsigned long long)unit->deferredClears, (unsigned long long)unit->deferredClearDraws);  // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): the last
@@ -2702,6 +3392,22 @@ void Shutdown()
         vkDestroyImage(device, t->image, nullptr);
         vkFreeMemory(device, t->memory, nullptr);
     }
+    if (unit->growths != 0)
+        std::fprintf(stderr, "[edram] host targets grew %llu time(s); %llu replaced image(s) released earlier, %zu kept until now\n", (unsigned long long)unit->growths,
+                     (unsigned long long)unit->replacedReleased, unit->replaced.size());
+    for (ReplacedStorage& o : unit->replaced)  // FM4 Recomp (M9, memory): every submission is confirmed complete (the caller's rule)
+    {
+        vkDestroyFramebuffer(device, o.framebuffer, nullptr);
+        vkDestroyFramebuffer(device, o.uintFramebuffer, nullptr);
+        vkDestroyImageView(device, o.uintView, nullptr);
+        vkDestroyImageView(device, o.stencilView, nullptr);
+        vkDestroyImageView(device, o.depthView, nullptr);
+        vkDestroyImageView(device, o.view, nullptr);
+        vkDestroyImage(device, o.image, nullptr);
+        vkFreeMemory(device, o.memory, nullptr);
+        runtime::video::mem::Global().Release(o.ledger);
+    }
+    unit->replaced.clear();
     for (auto& [key, p] : unit->passes)
         vkDestroyRenderPass(device, p, nullptr);
     vkDestroyDescriptorPool(device, unit->pool, nullptr);  // frees the sets
@@ -2713,41 +3419,62 @@ void Shutdown()
     vkDestroyPipelineLayout(device, unit->layout, nullptr);
     vkDestroyDescriptorSetLayout(device, unit->setLayout, nullptr);
     vkDestroySampler(device, unit->sampler, nullptr);
-    for (Target* t : {&unit->dump, &unit->resident, &unit->resident16})
+    // FM4 Recomp (M9, live resolution, step 1): the scaled resident image of every scale that has one (the start scale's, above 1x).
+    std::vector<Target*> unitImages{&unit->dump, &unit->resident, &unit->resident16};  // null-safe
+    for (auto& [halves, hi] : unit->residentHi)
+        unitImages.push_back(&hi.image);
+    for (Target* t : unitImages)
     {
         vkDestroyFramebuffer(device, t->framebuffer, nullptr);
         vkDestroyImageView(device, t->view, nullptr);
         vkDestroyImage(device, t->image, nullptr);
         vkFreeMemory(device, t->memory, nullptr);
     }
-    for (VkShaderModule m : {unit->vertex, unit->colorFrom1x, unit->colorFrom4x, unit->depthFrom1x, unit->stencilFrom1x, unit->depthToColorFrom1x, unit->depthToColorFromMs,
-                             unit->dumpFrom1x, unit->dumpFromMs, unit->dumpDepth1x, unit->dumpDepthMs, unit->depthFromMs, unit->stencilFromMs, unit->colorToDepth1x, unit->colorToDepthMs,
-                             unit->colorToStencil1x, unit->colorToStencilMs, unit->colorUint[0][0][1], unit->colorUint[0][1][0],
-                             unit->colorUint[0][1][1], unit->colorUint[1][0][1], unit->colorUint[1][1][0], unit->colorUint[1][1][1],
-                             unit->depthToColorUint[0], unit->depthToColorUint[1], unit->colorToDepthUint[0], unit->colorToDepthUint[1],
-                             unit->colorToStencilUint[0], unit->colorToStencilUint[1], unit->dumpUint[0], unit->dumpUint[1], unit->resident1x, unit->residentMs, unit->residentDepth1x, unit->residentDepthMs,
-                             unit->residentUint[0], unit->residentUint[1],
-                             unit->depthExport[0][0], unit->depthExport[0][1], unit->depthExport[1][0], unit->depthExport[1][1], unit->colorToDepthExport[0][0],
-                             unit->colorToDepthExport[0][1], unit->colorToDepthExport[1][0], unit->colorToDepthExport[1][1], unit->colorToDepthExportUint[0][0],
-                             unit->colorToDepthExportUint[0][1], unit->colorToDepthExportUint[1][0], unit->colorToDepthExportUint[1][1],
-                             unit->colorToDepth64[0], unit->colorToDepth64[1], unit->colorToStencil64[0], unit->colorToStencil64[1], unit->colorToDepthExport64[0][0],
-                             unit->colorToDepthExport64[0][1], unit->colorToDepthExport64[1][0], unit->colorToDepthExport64[1][1],
-                             unit->depthToColor64[0], unit->depthToColor64[1]})  // FM4 Recomp (alpha, photo mode)
-        vkDestroyShaderModule(device, m, nullptr);  // a VK_NULL_HANDLE (an export module without the extension) is allowed
-    for (auto& bySourceUint : unit->colorWide)  // FM4 Recomp (alpha, RT format 5): the uncompiled entries are VK_NULL_HANDLE
-        for (auto& byDestUint : bySourceUint)
-            for (auto& bySource64 : byDestUint)
-                for (auto& byDest64 : bySource64)
-                    for (VkShaderModule m : byDest64)
-                        vkDestroyShaderModule(device, m, nullptr);
+    for (VkShaderModule m : {unit->vertex, unit->dumpFrom1x, unit->dumpFromMs, unit->dumpDepth1x, unit->dumpDepthMs, unit->dumpUint[0], unit->dumpUint[1],
+                             unit->resident1x, unit->residentMs, unit->residentDepth1x, unit->residentDepthMs, unit->residentUint[0], unit->residentUint[1]})
+        vkDestroyShaderModule(device, m, nullptr);  // a VK_NULL_HANDLE (a module the run did not ask for) is allowed
+    // FM4 Recomp (M9, live resolution, step 1): the scale-carrying modules of every scale compiled (ScaleModules; the start scale's).
+    // colorUint[0][0][0] and [1][0][0] are colorFrom1x and colorFrom4x again: not destroyed twice.
+    for (auto& [halves, s] : unit->scaleModules)
+    {
+        for (VkShaderModule m : {s.colorFrom1x, s.colorFrom4x, s.depthFrom1x, s.stencilFrom1x, s.depthToColorFrom1x, s.depthToColorFromMs,
+                                 s.depthFromMs, s.stencilFromMs, s.colorToDepth1x, s.colorToDepthMs,
+                                 s.colorToStencil1x, s.colorToStencilMs, s.colorUint[0][0][1], s.colorUint[0][1][0],
+                                 s.colorUint[0][1][1], s.colorUint[1][0][1], s.colorUint[1][1][0], s.colorUint[1][1][1],
+                                 s.depthToColorUint[0], s.depthToColorUint[1], s.colorToDepthUint[0], s.colorToDepthUint[1],
+                                 s.colorToStencilUint[0], s.colorToStencilUint[1], s.residentBox[0], s.residentBox[1], s.wordsDown,
+                                 s.depthExport[0][0], s.depthExport[0][1], s.depthExport[1][0], s.depthExport[1][1], s.colorToDepthExport[0][0],
+                                 s.colorToDepthExport[0][1], s.colorToDepthExport[1][0], s.colorToDepthExport[1][1], s.colorToDepthExportUint[0][0],
+                                 s.colorToDepthExportUint[0][1], s.colorToDepthExportUint[1][0], s.colorToDepthExportUint[1][1],
+                                 s.colorToDepth64[0], s.colorToDepth64[1], s.colorToStencil64[0], s.colorToStencil64[1], s.colorToDepthExport64[0][0],
+                                 s.colorToDepthExport64[0][1], s.colorToDepthExport64[1][0], s.colorToDepthExport64[1][1],
+                                 s.depthToColor64[0], s.depthToColor64[1],  // FM4 Recomp (alpha, photo mode)
+                                 s.downsampleColor[0], s.downsampleColor[1], s.downsampleDepth})  // FM4 Recomp (M9)
+            vkDestroyShaderModule(device, m, nullptr);  // a VK_NULL_HANDLE (an export module without the extension) is allowed
+        for (auto& bySourceUint : s.colorWide)  // FM4 Recomp (alpha, RT format 5): the uncompiled entries are VK_NULL_HANDLE
+            for (auto& byDestUint : bySourceUint)
+                for (auto& bySource64 : byDestUint)
+                    for (auto& byDest64 : bySource64)
+                        for (VkShaderModule m : byDest64)
+                            vkDestroyShaderModule(device, m, nullptr);
+    }
     vkDestroyBuffer(device, unit->staging, nullptr);
     vkFreeMemory(device, unit->stagingMemory, nullptr);  // implicitly unmapped
     transferSkipStats = nullptr;  // FM4_TRANSFER_SKIP_UNWRITTEN: it points into the unit
     unit.reset();
 }
 
+// FM4 Recomp (M9, live resolution, step 2): defined below, after the unit's image and module creation.
+bool PrepareScale(uint32_t halves, std::string& error);
+bool RescaleReady();
+void Rescale(uint32_t toHalves, void (*forgetView)(VkImageView), RescaleCounts& counts);
+size_t DropCarriedClears();
+
 const EdramHooks kHooks{AcquireTargets, Resolve, Retired, Shutdown, LastResolve, ResolveRoom, DiagTransfers() ? &DiagTally : nullptr,  // FM4_DIAG_TRANSFERS
-                        HandOff, WriteBackHandedOff, Forget};  // FM4 Recomp (FM4_ASYNC_RETIRE)
+                        HandOff, WriteBackHandedOff, Forget,  // FM4 Recomp (FM4_ASYNC_RETIRE)
+                        LastResolveHi,                        // FM4 Recomp (M9, FM4_INTERNAL_RES)
+                        ReleaseReplaced,                      // FM4 Recomp (M9, memory)
+                        PrepareScale, RescaleReady, Rescale, DropCarriedClears};  // FM4 Recomp (M9, live resolution, step 2)
 
 bool Module(SpirvCompiler& compiler, bool pixel, const std::string& glsl, VkShaderModule& out, std::string& error)
 {
@@ -2760,6 +3487,314 @@ bool Module(SpirvCompiler& compiler, bool pixel, const std::string& glsl, VkShad
     info.codeSize = spirv.size() * 4;
     info.pCode = spirv.data();
     return Ok(vkCreateShaderModule(unit->dev.device, &info, nullptr, &out), "vkCreateShaderModule (EDRAM)", error);
+}
+
+// FM4 Recomp (M9, live resolution, step 1): one of the unit's own images (this was the body of Create's loop over them): the sample
+// dump, the resident words images, or with `hiHalves` (a scale in halves, not 0) the scaled resident image of that scale, sized by it.
+bool CreateUnitImage(Target& d, uint32_t hiHalves, std::string& error)
+{
+    const VkDevice device = unit->dev.device;
+    Target* const t = &d;
+    d.format = t == &unit->resident16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT, d.samples = 1;
+    d.width = t == &unit->dump ? kDumpWidth : kResidentWidth, d.height = t == &unit->dump ? kDumpHeight : kResidentHeight;
+    if (hiHalves != 0)  // room for a full resident rectangle at the internal scale
+        d.width = runtime::video::scale::HostEdge(d.width, hiHalves), d.height = runtime::video::scale::HostEdge(d.height, hiHalves);
+    VkImageCreateInfo image{};
+    image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image.imageType = VK_IMAGE_TYPE_2D;
+    image.format = d.format;
+    image.extent = {d.width, d.height, 1};
+    image.mipLevels = image.arrayLayers = 1;
+    image.samples = VK_SAMPLE_COUNT_1_BIT;
+    image.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // TRANSFER_DST: the resident image also takes a fast 32_FLOAT resolve by vkCmdCopyImage (the validation layer named the missing flag).
+    image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                  (t == &unit->resident && ResolveCompute() ? VK_IMAGE_USAGE_STORAGE_BIT : 0) |  // FM4_RESOLVE_COMPUTE: its storage view
+                  (hiHalves != 0 && FusedResolveAt(hiHalves) ? VK_IMAGE_USAGE_SAMPLED_BIT : 0);     // FM4_RESOLVE_FUSED: kWordsDown samples it
+    if (!Ok(vkCreateImage(device, &image, nullptr, &d.image), "vkCreateImage (EDRAM dump)", error))
+        return false;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device, d.image, &req);
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = req.size;
+    alloc.memoryTypeIndex = MemoryType(unit->dev, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkRenderPass pass = VK_NULL_HANDLE;
+    d.ledger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::EdramUnit, req.size,  // the id: FM4 Recomp (M9, live resolution, step 2)
+                                      t == &unit->dump ? "sample dump image" : hiHalves != 0 ? "scaled resident words image" : t == &unit->resident16 ? "resident words image (16 bpp)" : "resident words image");
+    if (!Ok(vkAllocateMemory(device, &alloc, nullptr, &d.memory), "vkAllocateMemory (EDRAM dump)", error) ||
+        !Ok(vkBindImageMemory(device, d.image, d.memory, 0), "vkBindImageMemory (EDRAM dump)", error) ||
+        !View(d.image, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.view, error) || !Pass(d.format, 1, false, pass, error))
+        return false;
+    VkFramebufferCreateInfo fb{};
+    fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fb.renderPass = pass;
+    fb.attachmentCount = 1;
+    fb.pAttachments = &d.view;
+    fb.width = d.width, fb.height = d.height, fb.layers = 1;
+    if (!Ok(vkCreateFramebuffer(device, &fb, nullptr, &d.framebuffer), "vkCreateFramebuffer (EDRAM dump)", error))
+        return false;
+    return true;
+}
+
+// FM4 Recomp (M9, live resolution, step 1): the scaled resident image of a scale (Unit::residentHi), unless it exists. Create makes
+// the start scale's, as before; nothing else asks yet.
+// FM4 Recomp (M9, live resolution, step 2): one of the unit's own images destroyed: only with no command recorded or in flight that
+// uses it (a creation that failed part-way; Rescale, after every submission is confirmed complete).
+void DestroyUnitImage(Target& d)
+{
+    const VkDevice device = unit->dev.device;
+    vkDestroyFramebuffer(device, d.framebuffer, nullptr);  // each null-safe
+    vkDestroyImageView(device, d.view, nullptr);
+    vkDestroyImage(device, d.image, nullptr);
+    vkFreeMemory(device, d.memory, nullptr);
+    runtime::video::mem::Global().Release(d.ledger);
+    d = Target{};
+}
+
+bool CreateResidentHi(uint32_t halves, std::string& error)
+{
+    if (ResidentHi(halves) != nullptr)
+        return true;
+    if (CreateUnitImage(unit->residentHi[halves].image, halves, error))
+        return true;
+    // FM4 Recomp (M9, live resolution, step 2): a creation that failed part-way leaves no entry (ResidentHi would otherwise give an
+    // image without its view or framebuffer); nothing used its pieces.
+    DestroyUnitImage(unit->residentHi[halves].image);
+    unit->residentHi.erase(halves);
+    return false;
+}
+
+// FM4 Recomp (M9, live resolution, step 2; render_hooks.h EdramHooks::prepareScale): nothing is destroyed. Every key that has a
+// host target must have one at `halves` too (a whole host size, within the device's limits, at the rows it holds now), so the
+// switch is refused here rather than stopped by MakeTarget some draws later; then the scale's modules and scaled resident image.
+bool PrepareScale(uint32_t halves, std::string& error)
+{
+    using runtime::video::scale::HostEdge, runtime::video::scale::HostExact;
+    if (!runtime::video::scale::HalvesAccepted(halves))
+        return Fail(error, "EDRAM: " + std::to_string(halves) + " halves is not an internal scale");
+    for (const auto& [mapKey, t] : unit->targets)
+    {
+        if (t->shadow)
+            continue;
+        const Key k = t->key;
+        const uint32_t h = runtime::video::scale::HalvesForPitch(k.PitchTilesAt32bpp(), halves, runtime::video::scale::PitchScaled());
+        if (!HostExact(k.Width(), h) || !HostExact(k.Height(), h))
+            return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": its " + std::to_string(k.Width()) + "x" + std::to_string(k.Height()) +
+                                   " guest size has no whole host size at that scale");
+        const uint32_t width = HostEdge(k.Width(), h), height = HostEdge(t->guestRows, h);
+        if (width > unit->limits.maxImageDimension2D || height > unit->limits.maxImageDimension2D || width > unit->limits.maxFramebufferWidth ||
+            height > unit->limits.maxFramebufferHeight)
+            return Fail(error, "EDRAM key " + std::to_string(k.packed) + ": a " + std::to_string(width) + "x" + std::to_string(height) +
+                                   " host target exceeds the device's image or framebuffer limits");
+    }
+    if (ModulesFor(halves, error) == nullptr)
+        return false;
+    return !(ResolveResident() && runtime::video::scale::OutputScaledAt(halves)) || CreateResidentHi(halves, error);
+}
+
+bool RescaleReady() { return unit->pending.empty() && unit->handedOff == 0; }
+
+// FM4 Recomp (M9, live resolution, step 2; render_hooks.h EdramHooks::rescale). The caller guarantees that every submission is
+// confirmed complete and that no command buffer is being recorded, so nothing recorded or in flight names a target, a shadow, an
+// outgrown image, one of their descriptor sets or a scaled resident image: all of them may be destroyed here.
+//   - Targets and shadows go through unit->replaced and ReleaseReplaced, the path NeedRows' outgrown images already take, so the
+//     renderer forgets its framebuffers over each view first.
+//   - The descriptor pool held only the targets' source sets and the scaled resident images' (HiResident::source): it is reset,
+//     and those are written again at their next use (RecordWordsDown).
+//   - The ownership map described what the destroyed images held; the new images are zero, as at start, so the map returns to its
+//     start state (no owner: no transfer can name a key without a host target, CheckTransfers; no recorded constant: no value
+//     transfer of a constant the new image does not hold; no shadow).
+//   - A key's pending clears are the guest's clears for the frame that follows (a resolve's clear, a clear-class draw). They are
+//     kept aside as guest rectangles and given to the key's next target at its creation (MakeTarget, which makes it tall enough),
+//     where every later pass treats them as it treats any pending clear: recorded before the first draw or transfer into the
+//     target, or flushed before a read of their tiles. The key no longer owns the tiles under them, which no pass relies on: the
+//     flush selection is by rectangle and tiles read, never by owner, and a shadow can name the key at a tile only after a transfer
+//     out of the key there, before which the clears over that tile were flushed (the live-resolution design, step 2).
+void Rescale(uint32_t toHalves, void (*forgetView)(VkImageView), RescaleCounts& counts)
+{
+    counts = {};
+    counts.outgrown = uint32_t(unit->replaced.size());
+    for (auto& [mapKey, t] : unit->targets)
+    {
+        (t->shadow ? counts.shadows : counts.targets)++;
+        if (!t->shadow && !t->pendingClears.empty())
+        {
+            counts.carriedClears += uint32_t(t->pendingClears.size());
+            unit->carriedClears[mapKey] = std::move(t->pendingClears);
+        }
+        unit->replaced.push_back({t->image, t->memory, t->view, t->depthView, t->stencilView, t->uintView, t->framebuffer, t->uintFramebuffer, t->ledger});
+    }
+    unit->targets.clear();
+    ReleaseReplaced(forgetView);
+    vkResetDescriptorPool(unit->dev.device, unit->pool, 0);  // VK_SUCCESS is its only result
+    for (auto it = unit->residentHi.begin(); it != unit->residentHi.end();)
+    {
+        it->second.source = VK_NULL_HANDLE;  // freed by the reset
+        if (it->first != toHalves)
+        {
+            DestroyUnitImage(it->second.image);
+            it = unit->residentHi.erase(it);
+            counts.residentImages++;
+        }
+        else
+            ++it;
+    }
+    unit->lastValid = false, unit->lastHi = false;  // the last resolve's words belong to the scale that ended
+    unit->ownership.Reset();
+}
+
+size_t DropCarriedClears()
+{
+    size_t dropped = 0;
+    for (const auto& [key, clears] : unit->carriedClears)
+        dropped += clears.size();
+    unit->carriedClears.clear();
+    return dropped;
+}
+
+// FM4 Recomp (M9, live resolution, step 1): the modules of a unit scale of `halves` into `set`; with `first` (Create) also the
+// unit's modules that do not carry the scale, each at its place in the former order (this was Create's text, compiled once for the
+// start scale: `unit->` became `set.` for the scale-carrying modules, FusedResolve() became FusedResolveAt(halves), and the others
+// are skipped without `first`). The texts are byte for byte the former ones for the same scale (the SPIR-V cache's keys).
+bool CompileModules(SpirvCompiler& compiler, uint32_t halves, bool first, ScaleModules& set, std::string& error)
+{
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): `header` (every transfer module) carries XE_HALVES above 1x; `plain` (the dump and resident
+    // resolve modules, which read a 1x shadow) never does. At 1x both are "#version 450".
+    const uint32_t scale = halves > runtime::video::scale::kHalves1x ? halves : 1;
+    const std::string plain = "#version 450\n",
+                      header = plain + (scale > 1 ? "#define XE_HALVES " + std::to_string(scale) + "u\n" : std::string()) +
+                               (scale > 1 && runtime::video::scale::PitchScaled() ? "#define XE_MIXED 1\n" : ""),
+                      ms = "#define XE_SOURCE_MS 1\n", swap = "#define XE_SWAP_COLUMNS 1\n", bit = "#define XE_STENCIL_BIT 1\n";
+    if ((first && !Module(compiler, false, kTransferVertex, unit->vertex, error)) ||
+        !Module(compiler, true, header + kTransferCommon + kTransferPacking + kTransferColor, set.colorFrom1x, error) ||
+        !Module(compiler, true, header + ms + kTransferCommon + kTransferPacking + kTransferColor, set.colorFrom4x, error) ||
+        !Module(compiler, true, header + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepth, set.depthFrom1x, error) ||
+        !Module(compiler, true, header + kTransferCommon + kTransferStencilBit, set.stencilFrom1x, error) ||
+        !Module(compiler, true, header + swap + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor, set.depthToColorFrom1x, error) ||
+        !Module(compiler, true, header + ms + swap + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor, set.depthToColorFromMs, error) ||
+        (first && !Module(compiler, true, plain + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpFrom1x, error)) ||
+        (first && !Module(compiler, true, plain + ms + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpFromMs, error)) ||
+        (first && !Module(compiler, true, plain + kTransferCommon + kDepthPacking + kDumpTexel + kResolveDumpDepth, unit->dumpDepth1x, error)) ||
+        (first && !Module(compiler, true, plain + ms + kTransferCommon + kDepthPacking + kDumpTexel + kResolveDumpDepth, unit->dumpDepthMs, error)) ||
+        !Module(compiler, true, header + ms + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepth, set.depthFromMs, error) ||
+        !Module(compiler, true, header + ms + kTransferCommon + kTransferStencilBit, set.stencilFromMs, error) ||
+        !Module(compiler, true, header + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, set.colorToDepth1x, error) ||
+        !Module(compiler, true, header + ms + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, set.colorToDepthMs, error) ||
+        !Module(compiler, true, header + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, set.colorToStencil1x, error) ||
+        !Module(compiler, true, header + ms + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, set.colorToStencilMs, error))
+        return false;
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): the multisampled downsample into a 1x shadow (DownsampleToShadow); the depth one needs the
+    // stencil export (without it a multisampled depth resolve of a scaled run is refused there).
+    if (scale > 1 && (!Module(compiler, true, header + kTransferCommon + kDownsampleColor, set.downsampleColor[0], error) ||
+                      !Module(compiler, true, header + "#define XE_SOURCE_MS 1\n" + kTransferCommon + kDownsampleColor, set.downsampleColor[1], error) ||
+                      (unit->dev.stencilExport &&
+                       !Module(compiler, true, header + "#extension GL_ARB_shader_stencil_export : require\n" + kTransferCommon + kDownsampleDepth,
+                               set.downsampleDepth, error))))
+        return false;
+    if (unit->dev.stencilExport)  // FM4_TRANSFER_STENCIL_EXPORT: [source MS][sample shading]
+    {
+        const std::string ext = "#extension GL_ARB_shader_stencil_export : require\n", shading = "#define XE_SAMPLE_SHADING 1\n",
+                          uintSource = "#define XE_SOURCE_UINT 1\n";
+        for (uint32_t m = 0; m < 2; m++)
+            for (uint32_t sh = 0; sh < 2; sh++)
+            {
+                const std::string defines = header + ext + (m ? ms : "") + (sh ? shading : "");
+                if (!Module(compiler, true, defines + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepthStencilExport, set.depthExport[m][sh], error) ||
+                    !Module(compiler, true, defines + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
+                            set.colorToDepthExport[m][sh], error) ||
+                    !Module(compiler, true, defines + swap + uintSource + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
+                            set.colorToDepthExportUint[m][sh], error) ||
+                    !Module(compiler, true, defines + swap + uintSource + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking + kDepthUnpacking +
+                                                kTransferColorToDepthStencilExport,
+                            set.colorToDepthExport64[m][sh], error))  // FM4 Recomp (alpha): a 64 bpp source
+                    return false;
+            }
+    }
+    // The colour transfers with a 32_FLOAT or 16_16 side (kTransferColor's XE_SOURCE_UINT / XE_DEST_UINT; [0/1][0][0] are colorFrom1x/4x).
+    set.colorUint[0][0][0] = set.colorFrom1x, set.colorUint[1][0][0] = set.colorFrom4x;
+    for (uint32_t m = 0; m < 2; m++)
+        for (uint32_t su = 0; su < 2; su++)
+            for (uint32_t du = 0; du < 2; du++)
+                if ((su || du) && !Module(compiler, true,
+                                          header + (m ? ms : "") + (su ? "#define XE_SOURCE_UINT 1\n" : "") + (du ? "#define XE_DEST_UINT 1\n" : "") +
+                                              kTransferCommon + kTransferPacking + kTransferColor,
+                                          set.colorUint[m][su][du], error))
+                    return false;
+    // FM4 Recomp (alpha, RT format 5): the colour transfers with a 64 bpp side (kTransferColor64), [MS][su][du][s64][d64]: a 64 bpp
+    // source is always read through its R16G16B16A16_UINT view (su), a 64 bpp destination always written through it (du).
+    for (uint32_t m = 0; m < 2; m++)
+        for (uint32_t su = 0; su < 2; su++)
+            for (uint32_t du = 0; du < 2; du++)
+                for (uint32_t s64 = 0; s64 < 2; s64++)
+                    for (uint32_t d64 = 0; d64 < 2; d64++)
+                        if ((s64 || d64) && (su || !s64) && (du || !d64) &&
+                            !Module(compiler, true,
+                                    header + (m ? ms : "") + (su ? "#define XE_SOURCE_UINT 1\n" : "") + (du ? "#define XE_DEST_UINT 1\n" : "") +
+                                        (s64 ? "#define XE_SOURCE_64 1\n" : "") + (d64 ? "#define XE_DEST_64 1\n" : "") + kTransferCommon +
+                                        kTransferPacking + kTransferColor64,
+                                    set.colorWide[m][su][du][s64][d64], error))
+                            return false;
+    // The cross-aspect transfers through a 16_16 transfer view (kTransferDepthToColor XE_DEST_UINT, kTransferColorToDepth
+    // XE_SOURCE_UINT), 1x and multisampled sources.
+    const std::string sourceUint = "#define XE_SOURCE_UINT 1\n", destUint = "#define XE_DEST_UINT 1\n";
+    for (uint32_t m = 0; m < 2; m++)
+        if (!Module(compiler, true, header + (m ? ms : "") + swap + destUint + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor,
+                    set.depthToColorUint[m], error) ||
+            !Module(compiler, true,
+                    header + (m ? ms : "") + swap + destUint + "#define XE_DEST_64 1\n" + kTransferCommon + kTransferPacking + kDepthPacking +
+                        kTransferDepthToColor,
+                    set.depthToColor64[m], error) ||  // FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key
+            !Module(compiler, true, header + (m ? ms : "") + swap + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,
+                    set.colorToDepthUint[m], error) ||
+            !Module(compiler, true, header + (m ? ms : "") + swap + bit + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,
+                    set.colorToStencilUint[m], error) ||
+            !Module(compiler, true, header + (m ? ms : "") + swap + sourceUint + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking + kDepthUnpacking +
+                                        kTransferColorToDepth,
+                    set.colorToDepth64[m], error) ||  // FM4 Recomp (alpha): colour -> depth from a 64 bpp source
+            !Module(compiler, true, header + (m ? ms : "") + swap + bit + sourceUint + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking +
+                                        kDepthUnpacking + kTransferColorToDepth,
+                    set.colorToStencil64[m], error) ||
+            (first && !Module(compiler, true, plain + (m ? ms : "") + sourceUint + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpUint[m], error)))
+            return false;
+    // FM4 Recomp (FM4_RESOLVE_RESIDENT): compiled only when the run asks for it.
+    if (ResolveResident() && ResolveResidentDepth() &&
+        ((first && !Module(compiler, true, plain + kTransferCommon + kDepthPacking + kResolveResidentDepth, unit->residentDepth1x, error)) ||
+         (first && !Module(compiler, true, plain + ms + kTransferCommon + kDepthPacking + kResolveResidentDepth, unit->residentDepthMs, error))))
+        return false;
+    if (ResolveResident() && FusedResolveAt(halves) && !Module(compiler, true, header + kTransferCommon + kWordsDown, set.wordsDown, error))
+        return false;
+    if (ResolveResident() && FusedResolveAt(halves) &&
+        (!Module(compiler, true, header + "#define XE_BOX 1\n" + kTransferCommon + kTransferPacking + kResolveResident, set.residentBox[0], error) ||
+         !Module(compiler, true, header + "#define XE_BOX 1\n" + ms + kTransferCommon + kTransferPacking + kResolveResident, set.residentBox[1], error)))
+        return false;
+    if (ResolveResident() && ((first && !Module(compiler, true, plain + kTransferCommon + kTransferPacking + kResolveResident, unit->resident1x, error)) ||
+                              (first && !Module(compiler, true, plain + ms + kTransferCommon + kTransferPacking + kResolveResident, unit->residentMs, error))))
+        return false;
+    // FM4 Recomp (M7 CPU cost, FM4_RESOLVE_RESIDENT_1616): the conversion of a 16_16 source read through its transfer view, [source MS].
+    if (ResolveResident() && ResolveResident1616())
+        for (uint32_t m = 0; m < 2; m++)
+            if ((first && !Module(compiler, true, plain + (m ? ms : "") + sourceUint + kTransferCommon + kTransferPacking + kResolveResident, unit->residentUint[m], error)))
+                return false;
+    return true;
+}
+
+// FM4 Recomp (M9, live resolution, step 1): ModulesFor (declared above Pipeline). A set whose compilation failed is not retried.
+const ScaleModules* ModulesFor(uint32_t halves, std::string& error)
+{
+    if (const auto it = unit->scaleModules.find(halves); it != unit->scaleModules.end())
+    {
+        if (!it->second.complete)
+            return Fail(error, "EDRAM: the transfer modules for an internal scale of " + std::to_string(halves) + " halves failed to compile earlier"), nullptr;
+        return &it->second;
+    }
+    if (unit->compiler == nullptr)
+        return Fail(error, "EDRAM: no compiler for the transfer modules of an internal scale of " + std::to_string(halves) + " halves"), nullptr;
+    ScaleModules& set = unit->scaleModules[halves];
+    if (!CompileModules(*unit->compiler, halves, false, set, error))
+        return nullptr;
+    set.complete = true;
+    return &set;
 }
 
 bool Create(SpirvCompiler& compiler, std::string& error)
@@ -2835,154 +3870,34 @@ bool Create(SpirvCompiler& compiler, std::string& error)
     if (!Ok(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &unit->layout), "vkCreatePipelineLayout (EDRAM)", error))
         return false;
     // Two sets per target at most (a storage-14 target's R32_UINT source set), two samplers per set.
-    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * kMaxTargets};
+    // FM4 Recomp (M9, memory): four times that, for the sets of images NeedRows replaced (they stay allocated until shutdown).
+    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * kMaxTargets};
     VkDescriptorPoolCreateInfo pool{};
     pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = 2 * kMaxTargets;
+    pool.maxSets = 8 * kMaxTargets;
     pool.poolSizeCount = 1;
     pool.pPoolSizes = &size;
     if (!Ok(vkCreateDescriptorPool(device, &pool, nullptr, &unit->pool), "vkCreateDescriptorPool (EDRAM)", error))
         return false;
-    const std::string header = "#version 450\n", ms = "#define XE_SOURCE_MS 1\n", swap = "#define XE_SWAP_COLUMNS 1\n",
-                      bit = "#define XE_STENCIL_BIT 1\n";
-    if (!Module(compiler, false, kTransferVertex, unit->vertex, error) ||
-        !Module(compiler, true, header + kTransferCommon + kTransferPacking + kTransferColor, unit->colorFrom1x, error) ||
-        !Module(compiler, true, header + ms + kTransferCommon + kTransferPacking + kTransferColor, unit->colorFrom4x, error) ||
-        !Module(compiler, true, header + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepth, unit->depthFrom1x, error) ||
-        !Module(compiler, true, header + kTransferCommon + kTransferStencilBit, unit->stencilFrom1x, error) ||
-        !Module(compiler, true, header + swap + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor, unit->depthToColorFrom1x, error) ||
-        !Module(compiler, true, header + ms + swap + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor, unit->depthToColorFromMs, error) ||
-        !Module(compiler, true, header + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpFrom1x, error) ||
-        !Module(compiler, true, header + ms + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpFromMs, error) ||
-        !Module(compiler, true, header + kTransferCommon + kDepthPacking + kDumpTexel + kResolveDumpDepth, unit->dumpDepth1x, error) ||
-        !Module(compiler, true, header + ms + kTransferCommon + kDepthPacking + kDumpTexel + kResolveDumpDepth, unit->dumpDepthMs, error) ||
-        !Module(compiler, true, header + ms + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepth, unit->depthFromMs, error) ||
-        !Module(compiler, true, header + ms + kTransferCommon + kTransferStencilBit, unit->stencilFromMs, error) ||
-        !Module(compiler, true, header + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToDepth1x, error) ||
-        !Module(compiler, true, header + ms + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToDepthMs, error) ||
-        !Module(compiler, true, header + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToStencil1x, error) ||
-        !Module(compiler, true, header + ms + swap + bit + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth, unit->colorToStencilMs, error))
-        return false;
-    if (unit->dev.stencilExport)  // FM4_TRANSFER_STENCIL_EXPORT: [source MS][sample shading]
+    // FM4 Recomp (M9, live resolution, step 1): the start scale's modules, with the unit's scale-free ones (CompileModules: the
+    // former text of this place, in the same order); another scale's set is compiled when first asked for (ModulesFor).
+    unit->compiler = &compiler;
     {
-        const std::string ext = "#extension GL_ARB_shader_stencil_export : require\n", shading = "#define XE_SAMPLE_SHADING 1\n",
-                          uintSource = "#define XE_SOURCE_UINT 1\n";
-        for (uint32_t m = 0; m < 2; m++)
-            for (uint32_t sh = 0; sh < 2; sh++)
-            {
-                const std::string defines = header + ext + (m ? ms : "") + (sh ? shading : "");
-                if (!Module(compiler, true, defines + kTransferCommon + kDepthPacking + kDepthUnpacking + kTransferDepthStencilExport, unit->depthExport[m][sh], error) ||
-                    !Module(compiler, true, defines + swap + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
-                            unit->colorToDepthExport[m][sh], error) ||
-                    !Module(compiler, true, defines + swap + uintSource + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepthStencilExport,
-                            unit->colorToDepthExportUint[m][sh], error) ||
-                    !Module(compiler, true, defines + swap + uintSource + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking + kDepthUnpacking +
-                                                kTransferColorToDepthStencilExport,
-                            unit->colorToDepthExport64[m][sh], error))  // FM4 Recomp (alpha): a 64 bpp source
-                    return false;
-            }
-    }
-    // The colour transfers with a 32_FLOAT or 16_16 side (kTransferColor's XE_SOURCE_UINT / XE_DEST_UINT; [0/1][0][0] are colorFrom1x/4x).
-    unit->colorUint[0][0][0] = unit->colorFrom1x, unit->colorUint[1][0][0] = unit->colorFrom4x;
-    for (uint32_t m = 0; m < 2; m++)
-        for (uint32_t su = 0; su < 2; su++)
-            for (uint32_t du = 0; du < 2; du++)
-                if ((su || du) && !Module(compiler, true,
-                                          header + (m ? ms : "") + (su ? "#define XE_SOURCE_UINT 1\n" : "") + (du ? "#define XE_DEST_UINT 1\n" : "") +
-                                              kTransferCommon + kTransferPacking + kTransferColor,
-                                          unit->colorUint[m][su][du], error))
-                    return false;
-    // FM4 Recomp (alpha, RT format 5): the colour transfers with a 64 bpp side (kTransferColor64), [MS][su][du][s64][d64]: a 64 bpp
-    // source is always read through its R16G16B16A16_UINT view (su), a 64 bpp destination always written through it (du).
-    for (uint32_t m = 0; m < 2; m++)
-        for (uint32_t su = 0; su < 2; su++)
-            for (uint32_t du = 0; du < 2; du++)
-                for (uint32_t s64 = 0; s64 < 2; s64++)
-                    for (uint32_t d64 = 0; d64 < 2; d64++)
-                        if ((s64 || d64) && (su || !s64) && (du || !d64) &&
-                            !Module(compiler, true,
-                                    header + (m ? ms : "") + (su ? "#define XE_SOURCE_UINT 1\n" : "") + (du ? "#define XE_DEST_UINT 1\n" : "") +
-                                        (s64 ? "#define XE_SOURCE_64 1\n" : "") + (d64 ? "#define XE_DEST_64 1\n" : "") + kTransferCommon +
-                                        kTransferPacking + kTransferColor64,
-                                    unit->colorWide[m][su][du][s64][d64], error))
-                            return false;
-    // The cross-aspect transfers through a 16_16 transfer view (kTransferDepthToColor XE_DEST_UINT, kTransferColorToDepth
-    // XE_SOURCE_UINT), 1x and multisampled sources.
-    const std::string sourceUint = "#define XE_SOURCE_UINT 1\n", destUint = "#define XE_DEST_UINT 1\n";
-    for (uint32_t m = 0; m < 2; m++)
-        if (!Module(compiler, true, header + (m ? ms : "") + swap + destUint + kTransferCommon + kTransferPacking + kDepthPacking + kTransferDepthToColor,
-                    unit->depthToColorUint[m], error) ||
-            !Module(compiler, true,
-                    header + (m ? ms : "") + swap + destUint + "#define XE_DEST_64 1\n" + kTransferCommon + kTransferPacking + kDepthPacking +
-                        kTransferDepthToColor,
-                    unit->depthToColor64[m], error) ||  // FM4 Recomp (alpha, photo mode): depth -> colour into a 64 bpp key
-            !Module(compiler, true, header + (m ? ms : "") + swap + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,
-                    unit->colorToDepthUint[m], error) ||
-            !Module(compiler, true, header + (m ? ms : "") + swap + bit + sourceUint + kTransferCommon + kTransferPacking + kDepthUnpacking + kTransferColorToDepth,
-                    unit->colorToStencilUint[m], error) ||
-            !Module(compiler, true, header + (m ? ms : "") + swap + sourceUint + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking + kDepthUnpacking +
-                                        kTransferColorToDepth,
-                    unit->colorToDepth64[m], error) ||  // FM4 Recomp (alpha): colour -> depth from a 64 bpp source
-            !Module(compiler, true, header + (m ? ms : "") + swap + bit + sourceUint + "#define XE_SOURCE_64 1\n" + kTransferCommon + kTransferPacking +
-                                        kDepthUnpacking + kTransferColorToDepth,
-                    unit->colorToStencil64[m], error) ||
-            !Module(compiler, true, header + (m ? ms : "") + sourceUint + kTransferCommon + kTransferPacking + kDumpTexel + kResolveDump, unit->dumpUint[m], error))
+        const uint32_t halves = runtime::video::scale::InternalHalves();
+        ScaleModules& set = unit->scaleModules[halves];
+        if (!CompileModules(compiler, halves, true, set, error))
             return false;
-    // FM4 Recomp (FM4_RESOLVE_RESIDENT): compiled only when the run asks for it.
-    if (ResolveResident() && ResolveResidentDepth() &&
-        (!Module(compiler, true, header + kTransferCommon + kDepthPacking + kResolveResidentDepth, unit->residentDepth1x, error) ||
-         !Module(compiler, true, header + ms + kTransferCommon + kDepthPacking + kResolveResidentDepth, unit->residentDepthMs, error)))
-        return false;
-    if (ResolveResident() && (!Module(compiler, true, header + kTransferCommon + kTransferPacking + kResolveResident, unit->resident1x, error) ||
-                              !Module(compiler, true, header + ms + kTransferCommon + kTransferPacking + kResolveResident, unit->residentMs, error)))
-        return false;
-    // FM4 Recomp (M7 CPU cost, FM4_RESOLVE_RESIDENT_1616): the conversion of a 16_16 source read through its transfer view, [source MS].
-    if (ResolveResident() && ResolveResident1616())
-        for (uint32_t m = 0; m < 2; m++)
-            if (!Module(compiler, true, header + (m ? ms : "") + sourceUint + kTransferCommon + kTransferPacking + kResolveResident, unit->residentUint[m], error))
-                return false;
+        set.complete = true;
+    }
     // The sample dump image (kResolveDump): R32_UINT, rendered then copied to the staging buffer; held for the run. FM4 Recomp: the
     // resident image (kResolveResident; FM4_RESOLVE_RESIDENT only) the same way, at kResidentWidth x kResidentHeight.
+    const bool hiWords = ResolveResident() && runtime::video::scale::OutputScaled();  // FM4 Recomp (M9): the scaled resident image
     for (Target* t : {&unit->dump, ResolveResident() ? &unit->resident : nullptr, ResolveResident() ? &unit->resident16 : nullptr})
-    {
-        if (t == nullptr)
-            continue;
-        Target& d = *t;
-        d.format = t == &unit->resident16 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT, d.samples = 1;
-        d.width = t == &unit->dump ? kDumpWidth : kResidentWidth, d.height = t == &unit->dump ? kDumpHeight : kResidentHeight;
-        VkImageCreateInfo image{};
-        image.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        image.imageType = VK_IMAGE_TYPE_2D;
-        image.format = d.format;
-        image.extent = {d.width, d.height, 1};
-        image.mipLevels = image.arrayLayers = 1;
-        image.samples = VK_SAMPLE_COUNT_1_BIT;
-        image.tiling = VK_IMAGE_TILING_OPTIMAL;
-        // TRANSFER_DST: the resident image also takes a fast 32_FLOAT resolve by vkCmdCopyImage (the validation layer named the missing flag).
-        image.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                      (t == &unit->resident && ResolveCompute() ? VK_IMAGE_USAGE_STORAGE_BIT : 0);  // FM4_RESOLVE_COMPUTE: its storage view
-        if (!Ok(vkCreateImage(device, &image, nullptr, &d.image), "vkCreateImage (EDRAM dump)", error))
+        if (t != nullptr && !CreateUnitImage(*t, 0, error))
             return false;
-        VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(device, d.image, &req);
-        VkMemoryAllocateInfo alloc{};
-        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc.allocationSize = req.size;
-        alloc.memoryTypeIndex = MemoryType(unit->dev, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        VkRenderPass pass = VK_NULL_HANDLE;
-        if (!Ok(vkAllocateMemory(device, &alloc, nullptr, &d.memory), "vkAllocateMemory (EDRAM dump)", error) ||
-            !Ok(vkBindImageMemory(device, d.image, d.memory, 0), "vkBindImageMemory (EDRAM dump)", error) ||
-            !View(d.image, d.format, VK_IMAGE_ASPECT_COLOR_BIT, d.view, error) || !Pass(d.format, 1, false, pass, error))
-            return false;
-        VkFramebufferCreateInfo fb{};
-        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fb.renderPass = pass;
-        fb.attachmentCount = 1;
-        fb.pAttachments = &d.view;
-        fb.width = d.width, fb.height = d.height, fb.layers = 1;
-        if (!Ok(vkCreateFramebuffer(device, &fb, nullptr, &d.framebuffer), "vkCreateFramebuffer (EDRAM dump)", error))
-            return false;
-    }
+    // FM4 Recomp (M9, live resolution, step 1): the scaled resident image is per scale (the start scale's here, after the others as before).
+    if (hiWords && !CreateResidentHi(runtime::video::scale::InternalHalves(), error))
+        return false;
     // FM4 Recomp (FM4_RESOLVE_COMPUTE): the compute resolve's layouts, the resident image's storage set and the pipeline (multisampled
     // colour sources: XE_SOURCE_MS). The device must store R32_UINT from a compute shader (a Vulkan-required format: checked anyway).
     if (ResolveCompute())
@@ -3078,6 +3993,7 @@ bool Create(SpirvCompiler& compiler, std::string& error)
     allocate.allocationSize = requirements.size;
     allocate.memoryTypeIndex =
         MemoryType(unit->dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    runtime::video::mem::Global().Add(runtime::video::mem::Kind::Staging, allocate.allocationSize, "EDRAM resolve read-back staging buffer");
     return Ok(vkAllocateMemory(device, &allocate, nullptr, &unit->stagingMemory), "vkAllocateMemory (EDRAM staging)", error) &&
            Ok(vkBindBufferMemory(device, unit->staging, unit->stagingMemory, 0), "vkBindBufferMemory (EDRAM staging)", error) &&
            Ok(vkMapMemory(device, unit->stagingMemory, 0, kStagingTotalBytes, 0, &unit->stagingMapped), "vkMapMemory (EDRAM staging)", error);
@@ -3113,9 +4029,9 @@ bool RecordDepthSelfCheck(VkCommandBuffer c, std::string& error)
     // (the new one) over tiles 1024-1055 (two rows of 16), every sample of both dumped through the depth resolve's dump.
     const Key k1 = Key::Depth(1024, 16, Msaa::X1, edram::DepthFormat::D24FS8), k4 = Key::Depth(1024, 16, Msaa::X4, edram::DepthFormat::D24FS8),
               k2 = Key::Depth(1024, 16, Msaa::X2, edram::DepthFormat::D24FS8);
-    Target* t1 = GetTarget(c, k1, error);
-    Target* t4 = t1 ? GetTarget(c, k4, error) : nullptr;
-    Target* t2 = t4 ? GetTarget(c, k2, error) : nullptr;
+    Target* t1 = GetTarget(c, k1, error, UINT32_MAX);
+    Target* t4 = t1 ? GetTarget(c, k4, error, UINT32_MAX) : nullptr;
+    Target* t2 = t4 ? GetTarget(c, k2, error, UINT32_MAX) : nullptr;
     if (t2 == nullptr)
         return false;
     if (t1->width != kDepthSelfCheckWidth || t4->width != kDepthSelfCheckWidth / 2 || t2->width != kDepthSelfCheckWidth)
@@ -3146,7 +4062,7 @@ bool RecordDepthSelfCheck(VkCommandBuffer c, std::string& error)
     // FM4 Recomp: depth between formats: the 1x kD24FS8 key into the 1x kD24S8 key at the same
     // tiles, dumped as kD24S8, then back into the kD24FS8 key, dumped as kD24FS8 (edram_vk_plan.h ConvertDepthFormat).
     const Key k1s = Key::Depth(1024, 16, Msaa::X1, edram::DepthFormat::D24S8);
-    Target* t1s = GetTarget(c, k1s, error);
+    Target* t1s = GetTarget(c, k1s, error, UINT32_MAX);
     if (t1s == nullptr)
         return false;
     if (!ExecuteTransfers(c, *t1s, {{1024, 1056, k1}}, error) ||

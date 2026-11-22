@@ -50,6 +50,10 @@ struct ResidentResolve
     uint32_t destFormat = 0, destPitch = 0, destEndian = 0;
     uint32_t x0 = 0, y0 = 0, width = 0, height = 0;  // the texel rectangle at textureBase
     uint32_t bytesLog2 = 2;  // FM4 Recomp: 2 for 32 bpp words, 1 for k_8_8's 16 bpp words
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): above 1x, the internal scale in halves (render_scale.h) when the resolve was also converted
+    // at host resolution (EdramHooks::lastResolveHi: the same words per host pixel, the rectangle HostEdge of each side at (0, 0));
+    // 0 when it was not.
+    uint32_t hiHalves = 0;
 };
 
 // The converting resolves the GPU path implements: storage 0 (8_8_8_8), 2 (2_10_10_10), 3 (2_10_10_10_FLOAT, 7e3) into
@@ -82,6 +86,11 @@ inline bool ResidentFormatPair(uint32_t destFormat, uint32_t textureFormat)
     const auto group = [](uint32_t f) { return f == 6 || f == 50 ? 1 : f == 7 || f == 54 ? 2 : f == 10 ? 3 : f == 36 ? 4 : f == 25 ? 5 : 0; };
     return group(destFormat) != 0 && group(destFormat) == group(textureFormat);
 }
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): the texture formats that may have a scaled twin and take a resolve's words per host pixel: the
+// raw 32 bpp colour formats (k_8_8_8_8 6 / 50, k_2_10_10_10 7 / 54), which blit and filter. One rule for the resolve that makes the
+// scaled words (its destination format), the image created as a blit source, and the twin.
+constexpr bool ScaledTwinFormat(uint32_t format) { return format == 6 || format == 7 || format == 50 || format == 54; }
 
 // Whether a texture image (its key fields and level count) takes the resolve's words verbatim, and at which texel (`x`, `y`)
 // the rectangle's corner lands. A resolve whose RB_COPY_DEST_BASE lies inside a tiled 32 bpp texture (FM4's race HDR bands:

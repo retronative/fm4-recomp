@@ -69,6 +69,13 @@ struct RendererHooks
     // write-back, the read pointer's write-back), so that a store over a range unretired GPU work reads flushes and waits here,
     // outside the signal handler. Nullable.
     void (*beforeCpWrite)(uint32_t physical, uint32_t bytes);
+    // FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1; runtime/video/zpd_report.h, adapted from ReCarbon): an EVENT_WRITE_ZPD whose
+    // report is at `physical` (RB_SAMPLE_COUNT_ADDR). 0: occlusion queries are not counted (the fixed result, as before). 1: counted,
+    // and this report is not a query's END (a BEGIN: its zeros are stored as before). Otherwise an END's token: its passed-sample
+    // count is zpdCount(token), known once every part recorded before the event has retired, which is when the report's stores
+    // land (the deferred queue) or now when nothing is open. Both nullable together.
+    uint32_t (*zpassDone)(uint32_t physical) = nullptr;  // null (the default): not counted, the fixed report
+    uint32_t (*zpdCount)(uint32_t token) = nullptr;
 };
 // FM4 Recomp (FM4_GUEST_MEMORY_GPU): whether the calling thread is the command processor's (async-signal-safe: pthread_self).
 bool OnCommandProcessorThread();

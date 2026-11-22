@@ -16,6 +16,7 @@
 #include "render_targets_vk.h"
 #include "resolve_resident.h"  // FM4 Recomp (M7 CPU cost): the pure resident-pair answers (header-only; the flag readers are not called)
 #include "texture_untile.h"  // TiledOffset2D (the 16 bpp hand table's slip check, TestResolveWords16ToGuest)
+#include <set>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -173,6 +174,106 @@ void TestDepthToColor()
     float c[4];
     UnpackTransferColor(0xF000005Au, 3, c);
     CHECK(c[0] == 90.0f / 512.0f && c[1] == 0.0f && c[2] == 8.0f && c[3] == 1.0f);
+}
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES with the guest's MSAA kept): the transfer mapping on images `scale` times the guest size. A tile is
+// scale times as many host pixels on both axes (ShiftGlue 72b7dd6 vulkan/render_target_cache.cpp:2567; X draw_resolution_scale) and
+// X's MSAA rules (:2804-2898) run on the scaled tile pixel. Expected values by hand from those rules.
+void TestScaledTexelMap()
+{
+    // MapEdramTexel's last argument is the internal scale in halves (render_scale.h): 2 = 1x, 3 = 1.5x, 4 = 2x.
+    const Key c1 = Key::Color(0, 16, Msaa::X1, ColorFormat::k8_8_8_8), c2 = Key::Color(0, 16, Msaa::X2, ColorFormat::k8_8_8_8),
+              c4 = Key::Color(0, 16, Msaa::X4, ColorFormat::k8_8_8_8), d4 = Key::Depth(0, 16, Msaa::X4, DepthFormat::D24FS8);
+    auto is = [](SourceTexel t, uint32_t x, uint32_t y, uint32_t s) { return t.x == x && t.y == y && t.sample == s; };
+    // 4x -> 1x at 2x: a 1x tile is 160x32 host pixels, a 4x tile 80x16; sample = (x & 1) | (y & 1) << 1, pixel >> 1.
+    CHECK(is(MapEdramTexel(0, 0, 0, c4, c1, 4), 0, 0, 0));
+    CHECK(is(MapEdramTexel(1, 0, 0, c4, c1, 4), 0, 0, 1));
+    CHECK(is(MapEdramTexel(3, 3, 0, c4, c1, 4), 1, 1, 3));
+    CHECK(is(MapEdramTexel(159, 31, 0, c4, c1, 4), 79, 15, 3));  // the last pixel of tile 0
+    CHECK(is(MapEdramTexel(160, 32, 0, c4, c1, 4), 80, 16, 0));  // tile 17 = row 1, column 1 on both sides
+    // 1x -> 4x at 2x: x = x << 1 | (s & 1), y = y << 1 | (s >> 1).
+    CHECK(is(MapEdramTexel(0, 0, 3, c1, c4, 4), 1, 1, 0));
+    CHECK(is(MapEdramTexel(79, 15, 3, c1, c4, 4), 159, 31, 0));
+    CHECK(is(MapEdramTexel(80, 16, 0, c1, c4, 4), 160, 32, 0));
+    // Depth 4x -> colour 4x at 2x: the column swap by half a scaled tile, (80 >> 2) * 2 = 40 host pixels; the 4x tile is 80 wide.
+    CHECK(is(MapEdramTexel(0, 0, 0, d4, c4, 4), 40, 0, 0));
+    CHECK(is(MapEdramTexel(40, 0, 2, d4, c4, 4), 0, 0, 2));
+    CHECK(is(MapEdramTexel(79, 0, 0, d4, c4, 4), 39, 0, 0));
+    CHECK(is(MapEdramTexel(80, 0, 0, d4, c4, 4), 120, 0, 0));    // tile 1: 80 + 40
+    CONTROL(is(MapEdramTexel(0, 0, 0, d4, c4, 4), 20, 0, 0));    // the unscaled half tile
+    CONTROL(is(MapEdramTexel(80, 0, 0, d4, c4, 4), 100, 0, 0));  // the unscaled tile width (tile 2 at 1x: 80 + 20)
+    CHECK(is(MapEdramTexel(80, 0, 0, d4, c4, 2), 100, 0, 0));    // and 1x is the former mapping
+    CHECK(is(MapEdramTexel(80, 0, 0, d4, c4), 100, 0, 0));       // the default is 1x
+    // 1.5x (3 halves): a 1x tile is 120x24 host pixels, a 4x tile 60x12, a 2x tile 120x12.
+    // 4x -> 1x: the same rule on host tile pixels; the last pixel of tile 0 is (119, 23) <- (59, 11) sample 3; tile 17 starts at
+    // (120, 24) on the 1x side and (60, 12) on the 4x side.
+    CHECK(is(MapEdramTexel(0, 0, 0, c4, c1, 3), 0, 0, 0));
+    CHECK(is(MapEdramTexel(3, 3, 0, c4, c1, 3), 1, 1, 3));
+    CHECK(is(MapEdramTexel(119, 23, 0, c4, c1, 3), 59, 11, 3));
+    CHECK(is(MapEdramTexel(120, 24, 0, c4, c1, 3), 60, 12, 0));
+    CONTROL(is(MapEdramTexel(120, 24, 0, c4, c1, 3), 60, 12, 1));  // the same tile's second sample is host pixel 121
+    CHECK(is(MapEdramTexel(121, 24, 0, c4, c1, 3), 60, 12, 1));
+    // 1x -> 4x at 1.5x: (59, 11) sample 3 <- (119, 23); tile 17 (60, 12) sample 0 <- (120, 24).
+    CHECK(is(MapEdramTexel(59, 11, 3, c1, c4, 3), 119, 23, 0));
+    CHECK(is(MapEdramTexel(60, 12, 0, c1, c4, 3), 120, 24, 0));
+    // Depth 4x -> colour 4x at 1.5x: the half tile is (80 >> 2) * 3 / 2 = 30 host pixels, the tile 60.
+    CHECK(is(MapEdramTexel(0, 0, 0, d4, c4, 3), 30, 0, 0));
+    CHECK(is(MapEdramTexel(30, 0, 2, d4, c4, 3), 0, 0, 2));
+    CHECK(is(MapEdramTexel(59, 0, 0, d4, c4, 3), 29, 0, 0));
+    CHECK(is(MapEdramTexel(60, 0, 0, d4, c4, 3), 90, 0, 0));     // tile 1: 60 + 30
+    CONTROL(is(MapEdramTexel(60, 0, 0, d4, c4, 3), 100, 0, 0));  // the 2x and 1x answers are not it
+    // Every pair over 2x2 tiles at 1.5x, 2x and 3x (3, 4 and 6 halves): distinct source host samples inside the same tiles, and the
+    // reverse transfer returns each destination sample (a bijection, so a transfer and its return lose nothing).
+    const Key keys[] = {c1, c2, c4, d4};
+    bool distinct = true, inside = true, back = true;
+    for (uint32_t halves : {3u, 4u, 6u})
+        for (const Key& src : keys)
+            for (const Key& dst : keys)
+            {
+                const uint32_t dn = dst.MsaaMode() == Msaa::X4 ? 4 : dst.MsaaMode() == Msaa::X2 ? 2 : 1;
+                const uint32_t dtw = (80u >> (dst.MsaaMode() == Msaa::X4 ? 1 : 0)) * halves / 2, dth = (16u >> (dst.MsaaMode() == Msaa::X1 ? 0 : 1)) * halves / 2;
+                const uint32_t stw = (80u >> (src.MsaaMode() == Msaa::X4 ? 1 : 0)) * halves / 2, sth = (16u >> (src.MsaaMode() == Msaa::X1 ? 0 : 1)) * halves / 2;
+                std::set<uint64_t> seen;
+                for (uint32_t y = 0; y < 2 * dth; y++)
+                    for (uint32_t x = 0; x < 2 * dtw; x++)
+                        for (uint32_t ds = 0; ds < dn; ds++)
+                        {
+                            const SourceTexel t = MapEdramTexel(x, y, ds, src, dst, halves);
+                            distinct = distinct && seen.insert(uint64_t(t.x) << 40 | uint64_t(t.y) << 8 | t.sample).second;
+                            inside = inside && t.x / stw == x / dtw && t.y / sth == y / dth;
+                            const SourceTexel r = MapEdramTexel(t.x, t.y, t.sample, dst, src, halves);
+                            back = back && r.x == x && r.y == y && r.sample == ds;
+                        }
+            }
+    CHECK(distinct);
+    CHECK(inside);
+    CHECK(back);
+    // FM4_INTERNAL_SCALE_PITCH: the two images at different scales (the last argument is the source's halves). The destination's
+    // tile pixel is taken to the source's scale first, floor(p * sourceHalves / destHalves), then mapped as at the source's scale.
+    // A 1x-scale 1-sample destination (tile 80x16) reading a 2x-scale 1-sample source (tile 160x32): pixel (3, 2) -> (6, 4); the
+    // second tile of the second row, (81, 17) = tile (1, 1) pixel (1, 1) -> source (160 + 2, 32 + 2).
+    CHECK(is(MapEdramTexel(3, 2, 0, c1, c1, 2, 4), 6, 4, 0));
+    CHECK(is(MapEdramTexel(81, 17, 0, c1, c1, 2, 4), 162, 34, 0));
+    // A 2x-scale destination (tile 160x32) reading a 1x-scale source (tile 80x16): the four host pixels of a guest pixel read the
+    // one source pixel: (6, 4), (7, 4), (6, 5), (7, 5) -> (3, 2); (161, 33) = tile (1, 1) pixel (1, 1) -> (80 + 0, 16 + 0).
+    CHECK(is(MapEdramTexel(6, 4, 0, c1, c1, 4, 2), 3, 2, 0));
+    CHECK(is(MapEdramTexel(7, 5, 0, c1, c1, 4, 2), 3, 2, 0));
+    CHECK(is(MapEdramTexel(161, 33, 0, c1, c1, 4, 2), 80, 16, 0));
+    CONTROL(is(MapEdramTexel(161, 33, 0, c1, c1, 4, 2), 161, 33, 0));  // the same-scale answer
+    // A 1x-scale 1-sample destination reading a 2x-scale 4x source (its tile 80x16 host pixels): pixel (3, 2) -> (6, 4) at the
+    // source's scale, then 4x -> 1x: sample (6 & 1) | (4 & 1) << 1 = 0 of pixel (3, 2).
+    CHECK(is(MapEdramTexel(3, 2, 0, c4, c1, 2, 4), 3, 2, 0));
+    // 1.5x destination, 1x source: tile 120x24; pixel (4, 3) -> floor(4 * 2 / 3), floor(3 * 2 / 3) = (2, 2).
+    CHECK(is(MapEdramTexel(4, 3, 0, c1, c1, 3, 2), 2, 2, 0));
+    // Equal scales, given twice, are the one-scale mapping.
+    bool same = true;
+    for (uint32_t y = 0; y < 40; y++)
+        for (uint32_t x = 0; x < 200; x++)
+        {
+            const SourceTexel a = MapEdramTexel(x, y, 0, c4, c1, 4, 4), b = MapEdramTexel(x, y, 0, c4, c1, 4);
+            same = same && a.x == b.x && a.y == b.y && a.sample == b.sample;
+        }
+    CHECK(same);
 }
 
 void TestTexelMap()
@@ -2625,6 +2726,7 @@ int main()
     TestDepthToColor();
     TestColorToDepth();
     TestTexelMap();
+    TestScaledTexelMap();  // FM4 Recomp (M9)
     Test7e3();
     TestPack();
     TestClears();

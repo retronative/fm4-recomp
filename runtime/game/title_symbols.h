@@ -40,6 +40,7 @@ extern const uint32_t kBindingCollection;      // binding vtable: the rows (bind
 extern const uint32_t kBindingRefresh;         // binding vtable: redraw (binding)
 extern const uint32_t kListSender;             // list + this: the sender of its focus events
 extern const uint32_t kItemSetValue;           // row vtable: (row, value, 0)
+extern const uint32_t kItemValue;              // row + this: the index of its selected option
 extern const uint32_t kItemVtable;             // a CDataSrcDataItem's vtable
 extern const uint32_t kItemSize;               // its size
 extern const uint32_t kCollectionSize;         // a CDataItemCollection's size
@@ -54,6 +55,11 @@ extern const uint32_t kPreRaceInfoHidden;      // Pre-Race screen + this: the sa
 extern const uint32_t kPreRaceHideScreenInfoEvent;  // its HIDE_SCREEN_INFO event id's data address
 extern const uint32_t kHelpBarName;            // the data address of "COMPONENT_HELP_BUTTON_BAR"
 // The resource heap and the resource manager's request queues (release_wait.cpp).
+extern const uint32_t kMainViewSetup;          // the per-view setup (Extended View: the two callers of the viewport aspect getter are in it)
+extern const uint32_t kAspectForCamera;        // kMainViewSetup + this: the return address of the getter call for the camera's aspect
+extern const uint32_t kFovForCamera;           // kMainViewSetup + this: the return address of the field-of-view getter call for the camera
+extern const uint32_t kFovForRecord;           // kMainViewSetup + this: the return address of the field-of-view getter call for the record
+extern const uint32_t kAspectForRecord;        // kMainViewSetup + this: the return address of the getter call for the view's record
 extern const uint32_t kResourceHeap;           // the data address of the track resource heap object
 extern const uint32_t kResourceManagerPointer; // the data address of the resource manager pointer
 extern const uint32_t kRequestThreads;         // resource manager: the number of per-thread request queues

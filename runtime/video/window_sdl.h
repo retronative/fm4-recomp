@@ -55,6 +55,11 @@ void Dispatch(EventAction action, const char* what, Close close, Resized resized
 const SurfaceRequest* OpenWindow();
 // The window's size in pixels now (SDL_GetWindowSizeInPixels; main thread).
 VkExtent2D WindowPixels();
+// FM4 Recomp (M9, FM4_HDR): the headroom of the screen the window is on, now, in multiples of SDR white (NSScreen
+// maximumExtendedDynamicRangeColorComponentValue: 1 on a standard-range display or while nothing asks for EDR; it follows the
+// brightness setting), as SpeedBreaker reads it every frame (platform/apple/macos_window.mm:190-208 at ea7311a). `potential`: the
+// most the screen could give (maximumPotential...). Main thread.
+float HdrHeadroom(float* potential = nullptr);
 // Main thread, after the guest thread started. Never returns. FM4 Recomp (Disc 2): each turn also pumps a pending disc
 // swap's dialogs (kernel/disc_swap.h PumpMainThread); FM4 Recomp (in-game Keyboard Controls): Command-comma opens the screen and
 // each turn pumps it (kernel/controls_screen.h).

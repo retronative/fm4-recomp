@@ -27,6 +27,7 @@
 // (window_present.cpp) after the swap's submission retired and its capture was written; the next swap waits (bounded)
 // only while the presenter is blitting from it. The one VkQueue is shared with the presenter: every submission here
 // takes the queue lock first (bounded; uncontended in the other modes).
+#include "thread_qos.h"
 #include "renderer.h"
 #include "diag_trigger.h"
 #include "capture_store.h"
@@ -35,7 +36,17 @@
 #include "draw_state.h"
 #include "edram_vk.h"
 #include "front_buffer.h"
+#include "render_scale.h"  // FM4 Recomp (M9, FM4_INTERNAL_RES)
+#include "mem_ledger.h"    // FM4 Recomp (M9, FM4_DIAG_MEMORY)
 #include "gpu_present.h"  // FM4 Recomp (M7): FM4_GPU_PRESENT
+#include "post_aa.h"  // FM4 Recomp (M9): FM4_POST_AA
+#include "hdr_output.h"  // FM4 Recomp (M9): FM4_HDR
+#include "diag_hdr.h"    // FM4 Recomp (M9 diagnostic): FM4_DIAG_HDR_TOGGLE
+#include "diag_res_switch.h"  // FM4 Recomp (M9 diagnostic): FM4_DIAG_RES_CYCLE
+#include "diag_draw_list.h"  // FM4 Recomp (M9 diagnostic): FM4_DIAG_DRAW_LIST
+#include "kernel/extended_view.h"  // FM4 Recomp (M9): Extended View
+#include "zpd_report.h"  // FM4 Recomp (M9): FM4_OCCLUSION_QUERIES
+#include "keep_busy.h"  // FM4 Recomp (M9 experiment): FM4_GPU_KEEP_BUSY
 #include "gpu_guard.h"
 #include "async_submit.h"
 #include "async_retire.h"  // FM4 Recomp (M7): FM4_ASYNC_RETIRE
@@ -70,6 +81,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <cstdarg>  // FM4_OCCLUSION_QUERIES: ZpdLog
 #include <cstddef>  // offsetof (FM4_PUSH_TEMPLATE)
 #include <cstdio>
 #include <cstdlib>
@@ -109,6 +121,7 @@ struct Transient
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
+    uint64_t ledger = 0;  // FM4 Recomp (M9, FM4_DIAG_MEMORY): mem_ledger.h id
 };
 
 Options options;
@@ -129,6 +142,12 @@ struct Slot
     // FM4 Recomp (FM4_GPU_TIMESTAMPS=1, diagnostic): a timestamp at the start and the end of the slot's submission.
     VkQueryPool timestamps = VK_NULL_HANDLE;
     bool timed = false, stamped = false;
+    // FM4 Recomp (M9, FM4_OCCLUSION_QUERIES; the Zpd unit below): the slot's occlusion queries, the counting segments recorded
+    // into its open command buffer, and how many queries the command buffer must reset before it uses any (all of them at first).
+    struct ZpdSegment { uint64_t id; uint32_t query, num, den; };
+    VkQueryPool zpdPool = VK_NULL_HANDLE;
+    std::vector<ZpdSegment> zpdSegments;
+    uint32_t zpdUsed = 0, zpdToReset = 0;
     struct ErrorDword
     {
         uint64_t offset, draw;
@@ -164,9 +183,183 @@ struct Slot
     // texture binding's view and sampler); with dynamic buffer bindings a set does not depend on the draw's ring offsets.
     std::unordered_map<std::string, VkDescriptorSet> descriptorCache;
 } slots[kSlots];
+
+// FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1): the game's occlusion queries (EVENT_WRITE_ZPD) counted on the GPU instead of
+// answered with Xenia's fixed 1000 samples (OBSERVED, research/m9/glare: FM4 sizes the sun's flare by that count, so the fixed
+// answer gives a large flare whether or not the sun is hidden). The design and the bookkeeping are ReCarbon's (runtime/gpu/
+// renderer.cpp ZpassDone / ZpdBeginSegment / ZpdHarvest and zpd_report.h, GPL-3.0-or-later, commit 66401ea), fitted to this
+// renderer's slots and parts:
+//   - A query bracket is open from its BEGIN report's ZPD to its END report's. While one is open every draw is counted in a
+//     segment: one precise occlusion query, begun right before the draw inside its render pass and ended at the pass's end, at any
+//     ZPD, or when the weight of a host sample changes (the target's MSAA or internal scale), so no query spans a pass, a command
+//     buffer or a bracket's edge. A draw that only tests depth is drawn for its count (draw_state.h countedOnly).
+//   - A slot's queries are reset at the start of its command buffer and read once its submission is confirmed complete (after
+//     GpuGuard::Retire; never a wait, never while in flight), into a ring of finished segments.
+//   - An END's count is the sum of its bracket's segments in guest samples. The command processor stores the report through its
+//     deferred queue, whose entries land only after every part recorded before them has retired: the count is read then
+//     (ZpdCount), so the game never sees a count before the GPU finished the query. Nothing waits for a query.
+// Valid GPU work only: every query is reset before its use, begun and ended inside one subpass, and its pool destroyed with the
+// slot after every submission is confirmed complete. Command-processor thread only.
+struct ZpdUnit
+{
+    static constexpr uint32_t kQueries = 256;  // a command buffer's segments; draws past them are not counted (named once)
+    struct End { uint32_t token = 0; uint32_t address = 0; uint64_t s0 = 0, s1 = 0; bool known = false; uint32_t count = 0; };
+    static constexpr uint32_t kEnds = 256;     // pending END reports (FM4: two a frame)
+    bool on = false;
+    int32_t query = -1;                 // the active segment's query in zpdSlot's pool, or -1
+    uint32_t querySlot = 0, num = 0, den = 0;
+    VkCommandBuffer commands = VK_NULL_HANDLE;  // the command buffer (and so the pass) the active segment was begun in
+    uint64_t nextSegment = 1;
+    uint32_t nextToken = 2;             // 0 and 1 are the hook's "not counted" and "not an END"
+    zpd::BracketBook open;
+    std::unique_ptr<zpd::ResultRing> results;
+    End ends[kEnds];
+    // The [zpd] line's tallies since the last one.
+    uint64_t zpds = 0, begins = 0, endReports = 0, segments = 0, draws = 0, countedOnly = 0, untested = 0, unmatched = 0, dropped = 0, overflow = 0,
+             unavailable = 0, lost = 0, stored = 0, nonZero = 0, lastCount = 0, maxCount = 0;
+    long logLines = 0;                  // FM4_DIAG_ZPD_QUERY_LOG=<lines>: each BEGIN, counted draw, segment and END
+} zpdUnit;
+__attribute__((format(printf, 1, 2))) void ZpdLog(const char* format, ...)
+{
+    if (zpdUnit.logLines <= 0)
+        return;
+    zpdUnit.logLines--;
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof line, format, args);
+    va_end(args);
+    std::fprintf(stderr, "[zpd] %s\n", line);
+}
+// Ends the active segment, inside the pass it was begun in (callers: the pass's end, a ZPD, a change of weight).
+void ZpdEndSegment()
+{
+    if (zpdUnit.query < 0)
+        return;
+    vkCmdEndQuery(zpdUnit.commands, slots[zpdUnit.querySlot].zpdPool, uint32_t(zpdUnit.query));
+    zpdUnit.query = -1, zpdUnit.commands = VK_NULL_HANDLE;
+}
+// Before a counted draw, inside its pass on command buffer `c` of slot `s`: the active segment goes on while the weight is the same.
+void ZpdBeginSegment(VkCommandBuffer c, uint32_t s, zpd::Weight weight)
+{
+    if (zpdUnit.query >= 0 && (weight.num != zpdUnit.num || weight.den != zpdUnit.den || c != zpdUnit.commands))
+        ZpdEndSegment();
+    if (zpdUnit.query >= 0)
+        return;
+    Slot& slot = slots[s];
+    if (slot.zpdUsed >= ZpdUnit::kQueries)
+    {
+        if (zpdUnit.overflow++ == 0)
+            std::fprintf(stderr, "[zpd] %u counting segments in one command buffer: draws past them are not counted (named once)\n", ZpdUnit::kQueries);
+        return;
+    }
+    const uint32_t q = slot.zpdUsed++;
+    vkCmdBeginQuery(c, slot.zpdPool, q, VK_QUERY_CONTROL_PRECISE_BIT);
+    zpdUnit.query = int32_t(q), zpdUnit.querySlot = s, zpdUnit.commands = c, zpdUnit.num = weight.num, zpdUnit.den = weight.den;
+    slot.zpdSegments.push_back({zpdUnit.nextSegment++, q, weight.num, weight.den});
+    zpdUnit.segments++;
+}
+// Slot `s`'s submission is confirmed complete (or the slot was never submitted): its segments' counts into the ring. No wait.
+void ZpdHarvest(uint32_t s)
+{
+    Slot& slot = slots[s];
+    if (slot.zpdSegments.empty())
+        return;
+    static uint64_t results[ZpdUnit::kQueries * 2];  // value, availability
+    const uint32_t n = slot.zpdUsed;
+    const VkResult r = vkGetQueryPoolResults(dev.device, slot.zpdPool, 0, n, size_t(n) * 16, results, 16, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    for (const Slot::ZpdSegment& g : slot.zpdSegments)
+    {
+        const bool available = (r == VK_SUCCESS || r == VK_NOT_READY) && results[2 * g.query + 1] != 0;
+        const uint64_t raw = available ? results[2 * g.query] : 0;
+        zpdUnit.unavailable += available ? 0 : 1;
+        const uint64_t guest = zpd::Normalize(raw, g.num, g.den);
+        zpdUnit.results->Put(g.id, guest, raw);
+        ZpdLog("segment %llu: %s%llu host samples x %u/%u = %llu", (unsigned long long)g.id, available ? "" : "not available, ", (unsigned long long)raw, g.num,
+               g.den, (unsigned long long)guest);
+    }
+    slot.zpdSegments.clear();
+}
 VkImage display = VK_NULL_HANDLE;
 VkDeviceMemory displayMemory = VK_NULL_HANDLE;
+// FM4 Recomp (M9, FM4_INTERNAL_RES; render_scale.h OutputScaled): the display image's size, the video mode's (kDisplayWidth x
+// kDisplayHeight) or that times the internal scale (CreateResources), and then a second image of the video mode's size: a swap
+// that has only 1x front-buffer words is uploaded there and enlarged into the display image (counted: upscaledPresents).
+uint32_t displayWidth = 1280, displayHeight = 720;
+VkImage display1x = VK_NULL_HANDLE;
+VkDeviceMemory display1xMemory = VK_NULL_HANDLE;
+uint64_t scaledPresents = 0, upscaledPresents = 0;
+// FM4 Recomp (M9, opt-in FM4_POST_AA=1; post_aa.h, adapted from ReCarbon's FXAA-style pass): with the pass on, a swap's picture is
+// uploaded into `source` (the display image's format and size) and one compute pass writes the display image from it, so the
+// readback, the captures and the window's presenter read the display image exactly as without it. Lifetime: every object is made
+// once (CreateResources: the image; InitPostAa: the rest, the descriptor set written once from its own pool, before any command
+// uses it) and destroyed only in Shutdown, after every submission is confirmed complete. Off (the default): none of it exists and
+// the display image's usage is unchanged.
+// FM4_GRAPHICS_LIVE=1 (play.sh; the in-game GRAPHICS menu applies edge smoothing at once): the objects are made at the start whatever
+// FM4_POST_AA says, and `level` (0 off, 1 soft, 2 standard, 3 strong; SetPostAaLive, any thread) is read once per presented swap, so
+// turning the pass on or off or changing its strength creates and destroys nothing while the game runs.
+// FM4_DIAG_POST_AA_PAIR=1 (diagnostic): a kept capture (FM4_CAPTURE_KEEP_EVERY) also writes the same swap before the pass (pre_N.png).
+struct PostAaUnit
+{
+    bool asked = false, on = false, pair = false, live = false;
+    const char* refused = nullptr;  // why the device cannot run it (CreateResources), or null
+    runtime::video::postaa::Tuning tuning = runtime::video::postaa::kStandard;  // FM4_POST_AA=soft | on | strong
+    VkImage source = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView sourceView = VK_NULL_HANDLE, displayView = VK_NULL_HANDLE;
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    uint64_t passes = 0;
+} postAa;
+std::atomic<int> postAaLevel{0};  // the pass at the next swap: 0 off, 1 soft, 2 standard, 3 strong (fixed without FM4_GRAPHICS_LIVE)
+Transient postAaPre;  // FM4_DIAG_POST_AA_PAIR: the pre-pass readback (persistent, as `readback`)
+
+// FM4 Recomp (M9, opt-in FM4_HDR; hdr_output.h, adapted from SpeedBreaker): the presented picture in linear light with its highlights
+// expanded into the display's headroom, for the window's HDR swapchain. One 16-bit float image of the display image's size and one
+// small state buffer, created once (InitHdr, before any command buffer uses them) and destroyed at Shutdown; the pass runs in the
+// swap's present part after the readback, so the display image, every capture and the standard-range path are untouched.
+// Without a window the pass runs only with FM4_HDR_HEADROOM (an assumed headroom): a validated offscreen run of the same commands,
+// whose result is read back and summarised at each kept capture.
+struct HdrUnit
+{
+    bool asked = false, on = false, offscreen = false;
+    bool live = false;                  // FM4_GRAPHICS_LIVE: the preference may change while the game runs
+    float lastPeak = 1.0f;              // the last pass's base peak (1: the standard picture)
+    double createMs = 0.0;
+    float strength = runtime::video::hdr::kStrengthDefault, assumed = 0.0f, budget = runtime::video::hdr::kLocalBudget;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    Transient state, result;  // the limiter's state and cell field; offscreen: the image read back at a kept capture
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    uint64_t passes = 0;
+} hdrUnit;
+std::atomic<float> hdrHeadroom{1.0f};  // SetHdrHeadroom (the window's thread)
+std::atomic<bool> hdrWanted{false};    // SetHdrPreference (any thread): Auto (HDR where the display and this run can show it) or Off
+std::atomic<bool> hdrUsable{false};    // this run's checks passed: the pass's objects are made at the first swap that uses them
+std::atomic<bool> hdrDisplay{false};   // SetHdrDisplay (the window's thread): the display the window is on can show HDR
+std::atomic<const char*> hdrUnavailable{nullptr};  // why this run cannot show HDR at all (set once)
 Transient readback;  // persistent: read on the CPU only after the slot's completion is confirmed
+// FM4 Recomp (M9, live resolution, step 2; opt-in with FM4_GRAPHICS_LIVE=1): the internal resolution changed while the game runs.
+// RequestInternalRes (any thread) only latches the scale asked for; Present serves it on the command processor's thread at a swap,
+// when nothing is recorded or in flight (ServeResolutionRequest), by making everything of the new size first and only then
+// destroying what the old size had (SwitchResolution). A request that cannot be served is refused with one line and the scale
+// stays. Without a request nothing here runs: a run at one scale is as it was.
+std::atomic<uint32_t> resRequested{0};  // the scale asked for, in halves (render_scale.h); 0: none
+uint32_t resAttempts = 0;               // swaps at which the pending request found the renderer not idle (command processor's thread)
+bool resClearsCarried = false;          // the EDRAM unit holds pending clears a switch kept aside (dropped at the next swap)
+uint64_t resSwitches = 0, resRefusals = 0;
+constexpr uint32_t kResAttempts = 120;  // then the request is refused (two seconds of swaps at 60 a second)
+// mem_ledger.h ids of the display chain's images (FM4_DIAG_MEMORY), kept so a switch releases what it destroys.
+uint64_t displayLedger = 0, postAaLedger = 0, hdrLedger = 0;
 uint64_t transientsDestroyed = 0, drawsSinceSwap = 0, shadersSinceSwap = 0;
 uint64_t noWriteSinceSwap = 0, resolvesSinceSwap = 0, ringFlushesSinceSwap = 0, drawNumber = 0;
 uint64_t fetchUncheckedSinceSwap = 0, fetchCheckedSinceSwap = 0, fetchProofReasonSinceSwap[5] = {};
@@ -622,6 +815,12 @@ bool VertexReuseVerify()  // FM4_VERTEX_REUSE_VERIFY=1 (diagnostic): every reuse
 }
 uint64_t cpIdleAt = 0, selfWaitsAt = 0, immediateWaitsAt = 0, memWaitsAt = 0, syncedWaitsAt = 0, memWaitNsAt = 0, immediateInterruptsAt = 0, graceSyncsAt = 0;
 uint64_t currentSwap = 0;  // the last swap Present saw (diagnostics)
+// FM4 Recomp (M9, Extended View; kernel/extended_view.h), the command processor's thread: the factor of the frame being drawn (1:
+// none), set at each swap for the draws that follow it, and how many of its draws were narrowed.
+float extendedFrameFactor = 1.0f;
+uint64_t extendedNarrowedSinceSwap = 0;
+float hdrHudGain = 1.0f;  // FM4_HDR: the HUD draws' colour gain for the frames from the last swap (1: none; hdr_output.h HudGain)
+float extendedShownFactor = 1.0f;  // the frame being presented: its stretch, given to the presenter while it is not presenting
 
 // FM4 Recomp (FM4_DIAG_CONSUMER=1, diagnostic): what a "resolve consumer" flush waited for; each distinct one is logged once (at
 // most 64): a vertex window or index buffer over a pending range, or a texture (its six fetch-constant words) that is not resident.
@@ -714,6 +913,7 @@ void EndOpenPass(VkCommandBuffer c)
     }
     if (c != openPass.commands)
         Stop(StopCode::Setup, "renderer: a render pass is open on another command buffer than the one recorded into");
+    ZpdEndSegment();  // FM4_OCCLUSION_QUERIES: a counting segment never outlives its pass
     vkCmdEndRenderPass(c);
     if (openPass.timing >= 0)  // FM4_DIAG_PASS_TIMES
     {
@@ -794,6 +994,22 @@ struct FramebufferKey
 };
 std::unordered_map<FramebufferKey, VkFramebuffer, FramebufferKey::Hasher> framebuffers;
 
+// FM4 Recomp (M9, memory; opt-in FM4_EDRAM_RELEASE_REPLACED=1): the framebuffers over an EDRAM view that is about to be destroyed
+// (EdramHooks::releaseReplaced calls this for each replaced target's view) go first, so no cached framebuffer names a dead view (a
+// later view could get the same handle). Only at the points where every submission is confirmed complete (EvictIdleTextures').
+void ForgetFramebuffersOf(VkImageView view);
+bool ReleaseReplacedTargets()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_EDRAM_RELEASE_REPLACED");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[edram] replaced host targets are destroyed once every submission is confirmed complete (FM4_EDRAM_RELEASE_REPLACED=1), not at shutdown\n");
+        return enabled;
+    }();
+    return on;
+}
+
 void Check(VkResult result, const char* what)
 {
     if (result != VK_SUCCESS)
@@ -834,6 +1050,7 @@ public:
     {
         vkDestroyBuffer(dev.device, t.buffer, nullptr);
         vkFreeMemory(dev.device, t.memory, nullptr);  // implicitly unmapped
+        runtime::video::mem::Global().Release(t.ledger);
         t = Transient{};
         transientsDestroyed++;
     }
@@ -878,6 +1095,7 @@ uint64_t reapedPartsSinceSwap = 0, earlyStoresSinceSwap = 0, asyncPresentsSinceS
 std::optional<GpuGuard<Transient, kSlots>> guard;
 std::optional<CaptureStore<kCaptureRecords>> captures;
 std::optional<CaptureStore<kKeepRecords>> kept;  // FM4_CAPTURE_KEEP_EVERY
+std::optional<CaptureStore<kKeepRecords>> keptPre;  // FM4_DIAG_POST_AA_PAIR (diagnostic): the kept swaps before the post AA pass
 // FM4 Recomp: PNG captures are off by default (the per-frame ring cost ~5 ms of command-processor time a
 // swap: PWL gamma, RGB conversion, PNG). Opt-ins for rendering investigations: FM4_CAPTURE_RING=1 (the last kCaptureRecords
 // swaps), FM4_CAPTURE_KEEP_EVERY=<n> (every n-th swap kept), FM4_CAPTURE_FRAMES=<swap>[,<swap>...] (exactly those). The
@@ -983,7 +1201,7 @@ void RequireRetireJob(uint32_t s)
         Stop(StopCode::Unimplemented, "renderer: %s", error.c_str());
 }
 
-Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
+Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage, runtime::video::mem::Kind kind = runtime::video::mem::Kind::Present, const char* label = "present buffer")
 {
     Transient b;
     VkBufferCreateInfo info{};
@@ -999,13 +1217,14 @@ Transient MakeBuffer(VkDeviceSize size, VkBufferUsageFlags usage)
     allocate.memoryTypeIndex =
         MemoryType(dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     Check(vkAllocateMemory(dev.device, &allocate, nullptr, &b.memory), "vkAllocateMemory");
+    b.ledger = runtime::video::mem::Global().Add(kind, allocate.allocationSize, label);
     Check(vkBindBufferMemory(dev.device, b.buffer, b.memory, 0), "vkBindBufferMemory");
     Check(vkMapMemory(dev.device, b.memory, 0, size, 0, &b.mapped), "vkMapMemory");
     return b;
 }
 
 void ImageBarrier(VkCommandBuffer c, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
-                  VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+                  VkPipelineStageFlags dstStage, VkAccessFlags dstAccess, VkImage image = VK_NULL_HANDLE)  // `image`: the display image unless given
 {
     VkImageMemoryBarrier b{};
     b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1014,7 +1233,7 @@ void ImageBarrier(VkCommandBuffer c, VkImageLayout from, VkImageLayout to, VkPip
     b.srcAccessMask = srcAccess;
     b.dstAccessMask = dstAccess;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = display;
+    b.image = image != VK_NULL_HANDLE ? image : display;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     const PassActivity activity("present");  // FM4_DIAG_PASS_TIMES label
     EndOpenPass(c);  // FM4_PASS_MERGE
@@ -1048,6 +1267,29 @@ struct GpuPresentUnit
     VkDescriptorSet sets[FrontWordsTracker::kEntries] = {};
     Transient words[FrontWordsTracker::kEntries];  // one front buffer's resolve words each (tracker entry i)
     Transient lut, out;                             // BuildPwlLut's tables; the display words
+    // FM4 Recomp (M9, FM4_INTERNAL_RES, the display image at the internal resolution): the same per host pixel (the resolves'
+    // scaled words, EdramHooks::lastResolveHi), their sets, and per entry the front-buffer rows whose latest resolve had them: the
+    // swap is presented at the internal resolution only when every row has (otherwise from the 1x words, enlarged).
+    // The scaled words do not go through guest memory, so they need not wait for the tracker's rule that a set of bands retires
+    // together (FM4's menus resolve the front buffer in three bands that retire apart: the tracker then presents on the CPU, which at
+    // 1x is the same picture, but here would be 720p enlarged). Each band is followed on its own instead: until its part retires it
+    // must be the newest pending write over its bytes; once it has, nothing may have written those bytes since (the write watch).
+    struct HiBand
+    {
+        uint32_t row = 0, rows = 0;
+        uint64_t serial = 0, sequence = 0;
+        bool landed = false;
+    };
+    struct HiFront
+    {
+        FrontShape shape;
+        uint32_t endian = 0;
+        std::vector<HiBand> bands;
+    };
+    Transient hiWords[FrontWordsTracker::kEntries];
+    VkDescriptorSet hiSets[FrontWordsTracker::kEntries] = {};
+    HiFront hiFront[FrontWordsTracker::kEntries];
+    uint64_t hiCopies = 0;
     FrontWordsTracker tracker;
     uint64_t presented = 0, cpu = 0, copies = 0, checked = 0, mismatches = 0;
     std::map<std::string, uint64_t> fallbacks;  // reason -> swaps presented on the CPU for it
@@ -1060,6 +1302,10 @@ void ReportGpuPresent(const char* when)
     std::string reasons;
     for (const auto& [why, n] : u.fallbacks)
         reasons += (reasons.empty() ? "" : "; ") + std::to_string(n) + " " + why;
+    if (runtime::video::scale::OutputScaled())  // FM4 Recomp (M9): how many display images were truly at the internal resolution
+        std::fprintf(stderr, "[renderer] display image %ux%u %s: %llu swap(s) from the scaled front buffer, %llu from the 1x front buffer enlarged; "
+                             "%llu scaled front-buffer word copies at resolves\n", displayWidth, displayHeight, when, (unsigned long long)scaledPresents,
+                     (unsigned long long)upscaledPresents, (unsigned long long)u.hiCopies);
     std::fprintf(stderr, "[gpu] GPU present %s: %llu swap(s) from the GPU, %llu on the CPU (%s); %llu front-buffer word copies at resolves; check: %llu swap(s), "
                          "%llu word mismatch(es)%s\n", when, (unsigned long long)u.presented, (unsigned long long)u.cpu, reasons.empty() ? "none" : reasons.c_str(),
                  (unsigned long long)u.copies, (unsigned long long)u.checked, (unsigned long long)u.mismatches,
@@ -1080,11 +1326,66 @@ void DestroyGpuPresent()
     for (Transient& t : u.words)
         if (t.buffer != VK_NULL_HANDLE)
             backend.Destroy(t);
+    for (Transient& t : u.hiWords)  // FM4 Recomp (M9)
+        if (t.buffer != VK_NULL_HANDLE)
+            backend.Destroy(t);
     if (u.lut.buffer != VK_NULL_HANDLE)
         backend.Destroy(u.lut);
     if (u.out.buffer != VK_NULL_HANDLE)
         backend.Destroy(u.out);
     u = GpuPresentUnit{};
+}
+
+// FM4 Recomp (M9, memory; opt-in FM4_PRESENT_LAZY=1): a tracked front buffer's word buffers (1x, and scaled with the display image at
+// the internal resolution) and its two descriptor sets are made when its first resolve band is adopted, not all three entries at
+// start: FM4 presents one front buffer, so two entries' buffers (3.7 MB each at 1x, 14.7 MB more at QHD, 33 MB at 4K) were never
+// used. A set is written before any command uses it (the entry's first copy and present come after this call).
+bool PresentLazy()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_PRESENT_LAZY");
+        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\0';
+        if (enabled)
+            std::fprintf(stderr, "[gpu] GPU present: a front buffer's word buffers are made at its first resolve (FM4_PRESENT_LAZY=1)\n");
+        return enabled;
+    }();
+    return on;
+}
+// A front buffer's set (the 1x one or the scaled one): its words, the ramp's tables, and the display words over the same byte count.
+// Only while no recorded or pending command uses the set (its first writing, or a switch of the internal resolution).
+void WriteFrontSet(VkDescriptorSet set, VkBuffer words, VkDeviceSize bytes)
+{
+    const GpuPresentUnit& u = gpuPresent;
+    const VkDescriptorBufferInfo buffers[3] = {{words, 0, bytes}, {u.lut.buffer, 0, kGpuPresentLutWords * 4}, {u.out.buffer, 0, bytes}};
+    VkWriteDescriptorSet writes[3] = {};
+    for (uint32_t b = 0; b < 3; b++)
+    {
+        writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[b].dstSet = set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[b].pBufferInfo = &buffers[b];
+    }
+    vkUpdateDescriptorSets(dev.device, 3, writes, 0, nullptr);
+}
+// FM4 Recomp (M9, live resolution, step 2): the 1x words and the scaled words are each made when missing (they were made together,
+// and only when the 1x words were missing): after a change of the internal resolution an entry can have its 1x words and no
+// scaled ones. At one scale the two are still made by the same call, the 1x ones first.
+void MakeFrontBuffers(size_t i)
+{
+    GpuPresentUnit& u = gpuPresent;
+    const VkDeviceSize frameBytes = VkDeviceSize(kDisplayWidth) * kDisplayHeight * 4, displayBytes = VkDeviceSize(displayWidth) * displayHeight * 4;
+    if (u.words[i].buffer == VK_NULL_HANDLE)
+    {
+        u.words[i] = MakeBuffer(frameBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);  // stops (9) on an allocation failure
+        WriteFrontSet(u.sets[i], u.words[i].buffer, frameBytes);
+    }
+    if (runtime::video::scale::OutputScaled() && u.hiWords[i].buffer == VK_NULL_HANDLE)
+    {
+        u.hiWords[i] = MakeBuffer(displayBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        WriteFrontSet(u.hiSets[i], u.hiWords[i].buffer, displayBytes);
+    }
 }
 
 // Initialize, after the compiler and the EDRAM unit: the pipeline and buffers, or one line naming why every swap stays on the CPU.
@@ -1099,7 +1400,7 @@ void InitGpuPresent()
     vkGetPhysicalDeviceQueueFamilyProperties(dev.gpu, &families, family.data());
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(dev.gpu, &properties);
-    const uint32_t groups = (kDisplayWidth * kDisplayHeight + kGpuPresentGroupSize - 1) / kGpuPresentGroupSize;
+    const uint32_t groups = (displayWidth * displayHeight + kGpuPresentGroupSize - 1) / kGpuPresentGroupSize;  // the display image's (FM4 Recomp, M9)
     const char* why = options.mode != Mode::Present && options.mode != Mode::Window ? "not a present or window run"
                       : edramHooks == nullptr || edramHooks->lastResolve == nullptr ? "no EDRAM unit"
                       : !ResolveResident()                                           ? "it needs FM4_RESOLVE_RESIDENT=1 (with FM4_RESOLVE_DEFER=1): the resolve's GPU words"
@@ -1133,10 +1434,10 @@ void InitGpuPresent()
         shader.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         shader.codeSize = spirv.size() * 4;
         shader.pCode = spirv.data();
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 * uint32_t(FrontWordsTracker::kEntries)};
+        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6 * uint32_t(FrontWordsTracker::kEntries)};  // FM4 Recomp (M9): and the scaled sets
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.maxSets = uint32_t(FrontWordsTracker::kEntries);
+        poolInfo.maxSets = 2 * uint32_t(FrontWordsTracker::kEntries);
         poolInfo.poolSizeCount = 1;
         poolInfo.pPoolSizes = &size;
         if (vkCreateDescriptorSetLayout(dev.device, &set, nullptr, &u.setLayout) != VK_SUCCESS ||
@@ -1162,7 +1463,8 @@ void InitGpuPresent()
             allocate.descriptorSetCount = uint32_t(FrontWordsTracker::kEntries);
             allocate.pSetLayouts = layouts;
             if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &u.pipeline) != VK_SUCCESS ||
-                vkAllocateDescriptorSets(dev.device, &allocate, u.sets) != VK_SUCCESS)
+                vkAllocateDescriptorSets(dev.device, &allocate, u.sets) != VK_SUCCESS ||
+                (runtime::video::scale::OutputScaled() && vkAllocateDescriptorSets(dev.device, &allocate, u.hiSets) != VK_SUCCESS))
                 why = "the compute pipeline or its descriptor sets could not be created";
         }
         vkDestroyShaderModule(dev.device, module, nullptr);  // null-safe; not needed once the pipeline exists
@@ -1173,30 +1475,24 @@ void InitGpuPresent()
         std::fprintf(stderr, "[gpu] FM4_GPU_PRESENT=1 ignored: %s%s%s; every swap is presented on the CPU\n", why, error.empty() ? "" : ": ", error.c_str());
         return;
     }
-    const VkDeviceSize frameBytes = VkDeviceSize(kDisplayWidth) * kDisplayHeight * 4;
-    for (Transient& t : u.words)  // MakeBuffer stops (9) on an allocation failure, as for every renderer buffer
-        t = MakeBuffer(frameBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     u.lut = MakeBuffer(kGpuPresentLutWords * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    u.out = MakeBuffer(frameBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-    for (size_t i = 0; i < FrontWordsTracker::kEntries; i++)
-    {
-        const VkDescriptorBufferInfo buffers[3] = {{u.words[i].buffer, 0, frameBytes}, {u.lut.buffer, 0, kGpuPresentLutWords * 4}, {u.out.buffer, 0, frameBytes}};
-        VkWriteDescriptorSet writes[3] = {};
-        for (uint32_t b = 0; b < 3; b++)
-        {
-            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[b].dstSet = u.sets[i];
-            writes[b].dstBinding = b;
-            writes[b].descriptorCount = 1;
-            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[b].pBufferInfo = &buffers[b];
-        }
-        vkUpdateDescriptorSets(dev.device, 3, writes, 0, nullptr);
-    }
+    // FM4 Recomp (M9): the display words at the display image's size; the 1x words fill their first frame's bytes.
+    u.out = MakeBuffer(VkDeviceSize(displayWidth) * displayHeight * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    for (size_t i = 0; !PresentLazy() && i < FrontWordsTracker::kEntries; i++)
+        MakeFrontBuffers(i);
     u.on = true;
     std::fprintf(stderr, "[gpu] GPU present on (FM4_GPU_PRESENT=1): a front buffer resolves wrote whole (or in bands of rows) is presented from their GPU words (one compute "
                          "pass with the gamma ramp, %zu front buffers tracked); any other swap on the CPU, named%s\n",
                  FrontWordsTracker::kEntries, GpuPresentCheck() ? "; FM4_GPU_PRESENT_CHECK=1: every GPU-presented swap compared with the CPU path" : "");
+}
+
+// FM4 Recomp (M9): the guest bytes of a band of rows of a tiled 32 bpp front buffer. A band that starts on a 32-row tile boundary is
+// whole 32x32 tiles, row-major: (row / 32) tile rows in, each TilesPerRow x 4 KB (gpu_present.h FrontResolveBand's layout); any other
+// band is taken as the whole front buffer (wider than needed, never narrower).
+uint32_t HiBandBase(const FrontShape& s, const GpuPresentUnit::HiBand& b) { return b.row % 32 == 0 ? s.base + (b.row / 32) * TilesPerRow(s.pitch) * 4096 : s.base; }
+uint32_t HiBandBytes(const FrontShape& s, const GpuPresentUnit::HiBand& b)
+{
+    return b.row % 32 == 0 ? std::min(FrontBytes(s) - (b.row / 32) * TilesPerRow(s.pitch) * 4096, ((b.rows + 31) / 32) * TilesPerRow(s.pitch) * 4096) : FrontBytes(s);
 }
 
 // After every confirmed retire (RetireSlot, RetireUpTo, RetireParts, after GuestWritesRetired*): the front buffers whose resolve
@@ -1206,6 +1502,43 @@ void GpuPresentRetired(uint64_t through)
     if (!gpuPresent.on)
         return;
     gpuPresent.tracker.OnRetired(through, [](uint32_t physical, uint32_t bytes, uint64_t& sequence) { return WatchGuestRange(physical, bytes, sequence); });
+    // FM4 Recomp (M9): a scaled band whose part retired is watched from now on; one that cannot be watched is forgotten.
+    for (GpuPresentUnit::HiFront& f : gpuPresent.hiFront)
+        for (size_t b = 0; b < f.bands.size();)
+        {
+            GpuPresentUnit::HiBand& band = f.bands[b];
+            if (band.landed || band.serial > through)
+                b++;
+            else if (WatchGuestRange(HiBandBase(f.shape, band), HiBandBytes(f.shape, band), band.sequence))
+                band.landed = true, b++;
+            else
+                f.bands.erase(f.bands.begin() + long(b));
+        }
+}
+
+// FM4 Recomp (M9): the tracker entry holding front buffer `f`'s scaled words for every row, each band still the picture's last writer
+// (pending and newest, or landed and unwritten since), or -1: the swap is its 1x image enlarged.
+int ScaledFrontEntry(const FrontBuffer& fb)
+{
+    if (!gpuPresent.on || !runtime::video::scale::OutputScaled())
+        return -1;
+    const FrontShape s = FrontShapeOf(fb);
+    for (size_t i = 0; i < FrontWordsTracker::kEntries; i++)
+    {
+        const GpuPresentUnit::HiFront& f = gpuPresent.hiFront[i];
+        if (!(f.shape == s) || f.bands.empty())
+            continue;
+        uint32_t covered = 0;
+        bool current = true;
+        for (const GpuPresentUnit::HiBand& band : f.bands)
+        {
+            covered += band.rows;  // bands never overlap (GpuPresentAdopt removes the ones a new band covers)
+            const uint32_t base = HiBandBase(f.shape, band), bytes = HiBandBytes(f.shape, band);
+            current = current && (band.landed ? GuestRangeUnwritten(base, bytes, band.sequence) : GuestWritesPendingSerial(base, bytes) == band.serial);
+        }
+        return current && covered == s.height ? int(i) : -1;
+    }
+    return -1;
 }
 
 void ComputeBarrier(VkCommandBuffer c, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
@@ -1220,7 +1553,9 @@ void ComputeBarrier(VkCommandBuffer c, VkPipelineStageFlags srcStage, VkAccessFl
 // The resolve adoption site (Draw, DrawKind::Resolve; `c` is the command buffer being recorded, checked there): a resolve over a
 // tracked front buffer drops its words or, when it writes a band of whole rows (or all of it), copies its words (the EDRAM unit's
 // image, TRANSFER_SRC_OPTIMAL, the rectangle at 0,0) into the entry's buffer at the band's first row.
-void GpuPresentAdopt(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
+// FM4 Recomp (M9, FM4_INTERNAL_RES): `hiWords` (the same resolve per host pixel, or null) goes into the entry's scaled buffer at the
+// band's scaled row, and the band's rows are marked as having scaled words (or not).
+void GpuPresentAdopt(VkCommandBuffer c, const ResidentResolve& r, VkImage words, VkImage hiWords)
 {
     if (!gpuPresent.on)
         return;
@@ -1228,6 +1563,7 @@ void GpuPresentAdopt(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
     if (t.entry < 0)
         return;
     EndOpenPass(c);  // FM4_PASS_MERGE (the resolve ended any pass; explicit)
+    MakeFrontBuffers(size_t(t.entry));  // FM4_PRESENT_LAZY: the entry's buffers at its first band (nothing otherwise)
     // Write after read: a present pass earlier in submission order may still read this entry's buffer (an execution dependency).
     ComputeBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     VkBufferImageCopy copy{};
@@ -1236,6 +1572,30 @@ void GpuPresentAdopt(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
     copy.imageExtent = {r.width, r.height, 1};  // bufferRowLength 0: tightly packed rows; row + height <= the front buffer's height
     vkCmdCopyImageToBuffer(c, words, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gpuPresent.words[size_t(t.entry)].buffer, 1, &copy);
     gpuPresent.copies++;
+    if (!runtime::video::scale::OutputScaled())
+        return;
+    using runtime::video::scale::HostEdge, runtime::video::scale::HostExact;
+    const uint32_t h = r.hiHalves;
+    const bool hi = hiWords != VK_NULL_HANDLE && h > runtime::video::scale::kHalves1x && r.width == kDisplayWidth && HostEdge(r.width, h) == displayWidth &&
+                    HostExact(t.row, h) && HostExact(r.height, h) && t.row + r.height <= kDisplayHeight;
+    // The bands this resolve covers are superseded (with or without scaled words); with them, it becomes the rows' band.
+    GpuPresentUnit::HiFront& front = gpuPresent.hiFront[size_t(t.entry)];
+    if (!(front.shape == gpuPresent.tracker.At(size_t(t.entry)).shape) || (!front.bands.empty() && front.endian != r.destEndian))
+        front.bands.clear();
+    front.shape = gpuPresent.tracker.At(size_t(t.entry)).shape;
+    front.bands.erase(std::remove_if(front.bands.begin(), front.bands.end(),
+                                     [&](const GpuPresentUnit::HiBand& b) { return b.row < t.row + r.height && t.row < b.row + b.rows; }),
+                      front.bands.end());
+    if (!hi)
+        return;
+    front.endian = r.destEndian;
+    front.bands.push_back({t.row, r.height, currentPartSerial, 0, false});
+    VkBufferImageCopy scaled{};
+    scaled.bufferOffset = VkDeviceSize(HostEdge(t.row, h)) * displayWidth * 4;
+    scaled.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    scaled.imageExtent = {displayWidth, HostEdge(r.height, h), 1};
+    vkCmdCopyImageToBuffer(c, hiWords, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gpuPresent.hiWords[size_t(t.entry)].buffer, 1, &scaled);
+    gpuPresent.hiCopies++;
 }
 
 // At a swap that produces the display image: the tracked entry whose words are the front buffer's bytes now, or -1 (named, counted).
@@ -1262,8 +1622,10 @@ int GpuPresentChoose(const FrontBuffer& f, uint64_t swap)
 }
 
 // Entry `i`'s words -> the display words (gpuPresent.out), left visible to transfer reads. Outside any render pass.
-void RecordGpuPresent(VkCommandBuffer c, size_t i, const uint32_t (&lut)[3][1024], bool swapRedBlue)
+// FM4 Recomp (M9): `scaled`: from the entry's scaled words, displayWidth x displayHeight of them.
+void RecordGpuPresent(VkCommandBuffer c, size_t i, const uint32_t (&lut)[3][1024], bool swapRedBlue, bool scaled)
 {
+    const uint32_t endian = scaled ? gpuPresent.hiFront[i].endian : gpuPresent.tracker.At(i).endian;
     GpuPresentUnit& u = gpuPresent;
     EndOpenPass(c);  // FM4_PASS_MERGE
     // Write after read: the previous present's dispatch read the tables (an execution dependency).
@@ -1273,9 +1635,9 @@ void RecordGpuPresent(VkCommandBuffer c, size_t i, const uint32_t (&lut)[3][1024
     // previous transfer read (the last present's copy into the display image) before this pass writes them.
     ComputeBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    const GpuPresentPush push{kDisplayWidth * kDisplayHeight, u.tracker.At(i).endian, swapRedBlue ? 1u : 0u};
+    const GpuPresentPush push{scaled ? displayWidth * displayHeight : kDisplayWidth * kDisplayHeight, endian, swapRedBlue ? 1u : 0u};
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeline);
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.layout, 0, 1, &u.sets[i], 0, nullptr);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.layout, 0, 1, scaled ? &u.hiSets[i] : &u.sets[i], 0, nullptr);
     vkCmdPushConstants(c, u.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
     vkCmdDispatch(c, (push.count + kGpuPresentGroupSize - 1) / kGpuPresentGroupSize, 1, 1);
     ComputeBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1315,6 +1677,14 @@ VkCommandBuffer BeginSlot(uint32_t s)
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     Check(vkBeginCommandBuffer(slots[s].commands, &begin), "vkBeginCommandBuffer");
+    if (slots[s].zpdPool != VK_NULL_HANDLE)  // FM4_OCCLUSION_QUERIES: the slot is idle, so its last counts are in; its queries start reset
+    {
+        ZpdHarvest(s);
+        // every query the previous command buffer used (all of them the first time), before this one uses any
+        if (const uint32_t reset = std::max(slots[s].zpdToReset, slots[s].zpdUsed))
+            vkCmdResetQueryPool(slots[s].commands, slots[s].zpdPool, 0, reset);
+        slots[s].zpdUsed = 0, slots[s].zpdToReset = 0;
+    }
     return slots[s].commands;
 }
 
@@ -1362,7 +1732,7 @@ void RetireSlot(uint32_t s)
         Stop(StopCode::Setup, "renderer: slot %u is retired, but it is not the first submission of its work", s);
     const auto retireStart = std::chrono::steady_clock::now();
     for (const uint32_t k : submitted)  // FM4_SUBMIT_SPLIT: every part, in submission order (each a bounded wait)
-        Require(guard->Retire(k)), RequireRetireJob(k);  // FM4_ASYNC_RETIRE: the worker's verdict, its write-backs done
+        Require(guard->Retire(k)), RequireRetireJob(k), ZpdHarvest(k);  // FM4_ASYNC_RETIRE: the worker's verdict, its write-backs done; FM4_OCCLUSION_QUERIES: its counts, before the deferred stores land
     if (drain::Enabled())
         drain::RetireObserved();  // FM4_DIAG_DRAIN (diagnostic): the last part's retire seen by the command processor
     retireFenceNsSinceSwap += NsSince(retireStart);
@@ -1692,6 +2062,7 @@ bool RetireUpTo(uint64_t serial, FlushCause cause)
     while (!submitted.empty() && submittedSerials.front() <= serial)
     {
         Require(guard->Retire(submitted.front()));
+        ZpdHarvest(submitted.front());  // FM4_OCCLUSION_QUERIES
         RequireRetireJob(submitted.front());  // FM4_ASYNC_RETIRE
         submitted.erase(submitted.begin());
         submittedSerials.erase(submittedSerials.begin());
@@ -1732,6 +2103,7 @@ uint64_t RetireParts(uint64_t serial, bool wait)
             break;
         Require(guard->Retire(k));
         RequireRetireJob(k);
+        ZpdHarvest(k);  // FM4_OCCLUSION_QUERIES: before the stores of this part land (ReapRetired, RetireSlot)
         through = submittedSerials.front();
         submitted.erase(submitted.begin());
         submittedSerials.erase(submittedSerials.begin());
@@ -1784,6 +2156,185 @@ bool AsyncRetireOn() { return retireBackend.has_value(); }
 
 namespace {
 
+// FM4 Recomp (M9, FM4_POST_AA): everything but the source image (CreateResources). A refusal is named and every swap is presented
+// without the pass; nothing made here was used by a command then.
+void DestroyPostAa()
+{
+    PostAaUnit& u = postAa;
+    vkDestroyPipeline(dev.device, u.pipeline, nullptr);  // each null-safe
+    vkDestroyPipelineLayout(dev.device, u.layout, nullptr);
+    vkDestroyDescriptorSetLayout(dev.device, u.setLayout, nullptr);
+    vkDestroyDescriptorPool(dev.device, u.pool, nullptr);  // frees its set
+    vkDestroySampler(dev.device, u.sampler, nullptr);
+    vkDestroyImageView(dev.device, u.sourceView, nullptr);
+    vkDestroyImageView(dev.device, u.displayView, nullptr);
+    u.pipeline = VK_NULL_HANDLE, u.layout = VK_NULL_HANDLE, u.setLayout = VK_NULL_HANDLE, u.pool = VK_NULL_HANDLE, u.sampler = VK_NULL_HANDLE;
+    u.sourceView = u.displayView = VK_NULL_HANDLE, u.set = VK_NULL_HANDLE;
+    u.on = false;
+}
+void InitPostAa()
+{
+    PostAaUnit& u = postAa;
+    if (!u.asked)
+        return;
+    namespace aa = runtime::video::postaa;
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(dev.gpu, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> family(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(dev.gpu, &families, family.data());
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(dev.gpu, &properties);
+    const char* why = u.refused != nullptr ? u.refused
+                      : dev.queueFamily >= families || !(family[dev.queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT) ? "the queue has no compute"
+                      : properties.limits.maxComputeWorkGroupCount[0] < aa::Groups(displayWidth) ||
+                                properties.limits.maxComputeWorkGroupCount[1] < aa::Groups(displayHeight) ? "too many workgroups for one dispatch"
+                      : !compiler ? "no shader compiler"
+                                  : nullptr;
+    std::string error, warnings;
+    std::vector<uint32_t> spirv;
+    if (why == nullptr && !compiler->CompileCompute(aa::Glsl(), spirv, warnings, error))
+        why = "the pass's shader did not compile";
+    if (why == nullptr)
+    {
+        const VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo set{};
+        set.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set.bindingCount = 2;
+        set.pBindings = bindings;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(aa::Push)};
+        VkPipelineLayoutCreateInfo layout{};
+        layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &u.setLayout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        VkShaderModuleCreateInfo shader{};
+        shader.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shader.codeSize = spirv.size() * 4;
+        shader.pCode = spirv.data();
+        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}};
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = sizes;
+        VkSamplerCreateInfo sampler{};  // linear, clamped, the one mip level
+        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+        sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sampler.addressModeU = sampler.addressModeV = sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VkImageViewCreateInfo view{};
+        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkShaderModule module = VK_NULL_HANDLE;
+        view.image = u.source;
+        bool ok = vkCreateImageView(dev.device, &view, nullptr, &u.sourceView) == VK_SUCCESS;
+        view.image = display;
+        ok = ok && vkCreateImageView(dev.device, &view, nullptr, &u.displayView) == VK_SUCCESS &&
+             vkCreateSampler(dev.device, &sampler, nullptr, &u.sampler) == VK_SUCCESS &&
+             vkCreateDescriptorSetLayout(dev.device, &set, nullptr, &u.setLayout) == VK_SUCCESS &&
+             vkCreatePipelineLayout(dev.device, &layout, nullptr, &u.layout) == VK_SUCCESS &&
+             vkCreateShaderModule(dev.device, &shader, nullptr, &module) == VK_SUCCESS &&
+             vkCreateDescriptorPool(dev.device, &poolInfo, nullptr, &u.pool) == VK_SUCCESS;
+        if (ok)
+        {
+            VkComputePipelineCreateInfo pipeline{};
+            pipeline.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipeline.stage.module = module;
+            pipeline.stage.pName = "main";
+            pipeline.layout = u.layout;
+            VkDescriptorSetAllocateInfo allocate{};
+            allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocate.descriptorPool = u.pool;
+            allocate.descriptorSetCount = 1;
+            allocate.pSetLayouts = &u.setLayout;
+            ok = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &u.pipeline) == VK_SUCCESS &&
+                 vkAllocateDescriptorSets(dev.device, &allocate, &u.set) == VK_SUCCESS;
+        }
+        vkDestroyShaderModule(dev.device, module, nullptr);  // null-safe; not needed once the pipeline exists
+        if (!ok)
+            why = "a Vulkan object of the pass could not be created";
+    }
+    if (why != nullptr)
+    {
+        DestroyPostAa();
+        std::fprintf(stderr, "[renderer] FM4_POST_AA ignored: %s%s%s; every swap is presented without the pass\n", why, error.empty() ? "" : ": ", error.c_str());
+        return;
+    }
+    const VkDescriptorImageInfo in{u.sampler, u.sourceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, out{VK_NULL_HANDLE, u.displayView, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet writes[2] = {};
+    for (uint32_t b = 0; b < 2; b++)
+    {
+        writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[b].dstSet = u.set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[b].pImageInfo = b == 0 ? &in : &out;
+    }
+    vkUpdateDescriptorSets(dev.device, 2, writes, 0, nullptr);
+    u.on = true;
+    if (u.live)
+        std::fprintf(stderr, "[renderer] post-process anti-aliasing can be switched while the game runs (FM4_GRAPHICS_LIVE=1): now %s\n",
+                     postAaLevel.load() == 0 ? "off" : u.tuning.name);
+    if (postAaLevel.load() != 0)
+    std::fprintf(stderr, "[renderer] post-process anti-aliasing on (FM4_POST_AA): one FXAA-style compute pass over the %ux%u display image at every "
+                         "presented swap, after the game's own MSAA resolve (adapted from ReCarbon); strength %s (contrast minimum %.4f, relative %.3f, sub-pixel "
+                         "weight %.2f)%s\n", displayWidth, displayHeight, u.tuning.name, u.tuning.edgeMin, u.tuning.edgeRelative, u.tuning.subpixel,
+                 u.pair ? "; FM4_DIAG_POST_AA_PAIR=1: a kept capture also writes the swap before the pass (pre_N.png)" : "");
+}
+
+// The swap's picture is in the pass's source image (TRANSFER_DST_OPTIMAL, written by a transfer): the pass writes the display image
+// from it and leaves the display image as an upload would (TRANSFER_DST_OPTIMAL, for RecordReadback). `pre`: also the source's
+// readback (FM4_DIAG_POST_AA_PAIR, a kept swap). `timed`: recorded into slot 0 (FM4_DIAG_PASS_TIMES may time it).
+void RecordPostAa(VkCommandBuffer c, bool pre, bool timed, const runtime::video::postaa::Tuning& tuning)
+{
+    PostAaUnit& u = postAa;
+    const PassActivity activity("post aa");  // FM4_DIAG_PASS_TIMES label
+    if (pre)
+    {
+        ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, u.source);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {displayWidth, displayHeight, 1};
+        vkCmdCopyImageToBuffer(c, u.source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, postAaPre.buffer, 1, &copy);
+        VkBufferMemoryBarrier host{};
+        host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        host.buffer = postAaPre.buffer;
+        host.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
+        ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, u.source);
+    }
+    else
+        ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, u.source);
+    // The display image's old contents are not kept: the pass writes every texel.
+    ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_SHADER_WRITE_BIT);
+    const runtime::video::postaa::Push push = runtime::video::postaa::MakePush(displayWidth, displayHeight, tuning);
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeline);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.layout, 0, 1, &u.set, 0, nullptr);
+    vkCmdPushConstants(c, u.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+    if (timed)  // FM4_DIAG_PASS_TIMES (diagnostic): the pass's own GPU time, as a unit pass named "post aa" (slot 0's queries only)
+        BeginUnitPass(c, "post aa");
+    vkCmdDispatch(c, runtime::video::postaa::Groups(displayWidth), runtime::video::postaa::Groups(displayHeight), 1);
+    if (timed)
+        EndUnitPass(c);
+    ImageBarrier(c, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    u.passes++;
+}
+
 // The display image (already in TRANSFER_DST_OPTIMAL after `written`) -> the readback buffer, made
 // visible to the host. Leaves the display image in TRANSFER_SRC_OPTIMAL (the window's presenter blits from it).
 void RecordReadback(VkCommandBuffer c)
@@ -1792,7 +2343,7 @@ void RecordReadback(VkCommandBuffer c)
                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {kDisplayWidth, kDisplayHeight, 1};
+    copy.imageExtent = {displayWidth, displayHeight, 1};
     vkCmdCopyImageToBuffer(c, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &copy);
     VkBufferMemoryBarrier host{};
     host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1802,6 +2353,308 @@ void RecordReadback(VkCommandBuffer c)
     host.buffer = readback.buffer;
     host.size = VK_WHOLE_SIZE;
     vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
+}
+
+// FM4 Recomp (M9, FM4_HDR): the unit's objects, each null-safe. Only with nothing of the unit in flight (Shutdown; a refusal in InitHdr).
+void DestroyHdr()
+{
+    HdrUnit& u = hdrUnit;
+    vkDestroyPipeline(dev.device, u.pipeline, nullptr);
+    vkDestroyPipelineLayout(dev.device, u.layout, nullptr);
+    vkDestroyDescriptorSetLayout(dev.device, u.setLayout, nullptr);
+    vkDestroyDescriptorPool(dev.device, u.pool, nullptr);  // frees its set
+    vkDestroyImageView(dev.device, u.view, nullptr);
+    vkDestroyImage(dev.device, u.image, nullptr);
+    vkFreeMemory(dev.device, u.memory, nullptr);
+    if (u.state.buffer != VK_NULL_HANDLE)
+        backend.Destroy(u.state);
+    if (u.result.buffer != VK_NULL_HANDLE)
+        backend.Destroy(u.result);
+    const bool asked = u.asked;
+    u = HdrUnit{};
+    u.asked = asked;
+}
+
+void CreateHdr(uint64_t swap);
+
+// After the shader compiler exists and before the presenter: FM4_HDR's switches (fail closed), then the unit, or a named refusal
+// (the run goes on in standard range).
+void InitHdr()
+{
+    HdrUnit& u = hdrUnit;
+    namespace h = runtime::video::hdr;
+    std::string error;
+    float headroom = 0.0f;
+    if (!h::Parse(std::getenv("FM4_HDR"), u.asked, error) ||
+        !h::ParseNumber("FM4_HDR_STRENGTH", std::getenv("FM4_HDR_STRENGTH"), h::kStrengthMin, h::kStrengthMax, h::kStrengthDefault, u.strength, error) ||
+        !h::ParseNumber("FM4_HDR_HEADROOM", std::getenv("FM4_HDR_HEADROOM"), 1.0f, 16.0f, 0.0f, headroom, error) ||
+        !h::ParseNumber("FM4_HDR_LOCAL_BUDGET", std::getenv("FM4_HDR_LOCAL_BUDGET"), 0.0f, 4.0f, h::kLocalBudget, u.budget, error))
+        Stop(StopCode::Setup, "renderer: %s", error.c_str());
+    const char* liveAsked = std::getenv("FM4_GRAPHICS_LIVE");
+    u.live = liveAsked != nullptr && liveAsked[0] == '1' && liveAsked[1] == '\0';
+    u.assumed = headroom;
+    u.offscreen = options.mode == Mode::Present;
+    hdrWanted = u.asked;  // the preference, whatever this run can do (HdrOutputNow gives the reason when it cannot)
+    if (!u.asked && !(u.live && (options.mode == Mode::Window || u.assumed != 0.0f)))
+    {
+        if (u.live && options.mode != Mode::Window)  // a run without a window can never present HDR: the menu then says so, not "restart"
+            hdrUnavailable = "no window";
+        return;
+    }
+    VkFormatProperties linearLight{}, encoded{};
+    vkGetPhysicalDeviceFormatProperties(dev.gpu, VK_FORMAT_R16G16B16A16_SFLOAT, &linearLight);
+    vkGetPhysicalDeviceFormatProperties(dev.gpu, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &encoded);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(dev.gpu, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> family(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(dev.gpu, &families, family.data());
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(dev.gpu, &properties);
+    const char* why = options.mode != Mode::Window && options.mode != Mode::Present ? "not a window or present run"
+                      : u.offscreen && u.assumed == 0.0f ? "no window (an offscreen run of the pass needs FM4_HDR_HEADROOM)"
+                      : options.mode == Mode::Window && !dev.swapchainColorspace ? "VK_EXT_swapchain_colorspace is not available"
+                      : (linearLight.optimalTilingFeatures & needed) != needed ? "R16G16B16A16_SFLOAT cannot be blitted and stored to on this device"
+                      : !(encoded.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) ? "the display image's format cannot be a blit source"
+                      : dev.queueFamily >= families || !(family[dev.queueFamily].queueFlags & VK_QUEUE_COMPUTE_BIT) ? "the queue has no compute"
+                      : properties.limits.maxComputeWorkGroupCount[0] < h::Groups(displayWidth) ||
+                                properties.limits.maxComputeWorkGroupCount[1] < h::Groups(displayHeight) ? "too many workgroups for one dispatch"
+                      : !compiler ? "no shader compiler"
+                                  : nullptr;
+    if (why != nullptr)
+    {
+        hdrUnavailable = why;
+        std::fprintf(stderr, "[renderer] %s: %s; standard range\n", u.asked ? "FM4_HDR ignored" : "HDR output cannot be switched on in this run", why);
+        return;
+    }
+    hdrUsable = true;
+    std::fprintf(stderr, "[renderer] HDR output: the preference is %s%s; HDR is used where the display supports it, standard range otherwise\n",
+                 u.asked ? "Auto" : "Off", u.live ? " and can change while the game runs (FM4_GRAPHICS_LIVE=1)" : "");
+}
+
+// Whether the picture is expanded now: the preference is Auto, this run can, and (in a window) the display can.
+bool HdrEffective()
+{
+    return hdrWanted.load(std::memory_order_relaxed) && hdrUsable.load(std::memory_order_relaxed) &&
+           (hdrUnit.offscreen || hdrDisplay.load(std::memory_order_relaxed));
+}
+
+// The pass's objects, once: at Initialize when HDR is on from the start, otherwise on the command processor's thread at the first
+// swap that wants it (nothing of the unit exists before, so nothing is in flight). A failure leaves this run in standard range.
+void CreateHdr(uint64_t swap)
+{
+    HdrUnit& u = hdrUnit;
+    namespace h = runtime::video::hdr;
+    const auto started = std::chrono::steady_clock::now();
+    const char* why = nullptr;
+    std::string error, warnings;
+    std::vector<uint32_t> spirv;
+    if (!compiler->CompileCompute(h::Glsl(), spirv, warnings, error))
+        why = "the pass's shader did not compile";
+    if (why == nullptr)
+    {
+        VkImageCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        info.imageType = VK_IMAGE_TYPE_2D;
+        info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        info.extent = {displayWidth, displayHeight, 1};
+        info.mipLevels = info.arrayLayers = 1;
+        info.samples = VK_SAMPLE_COUNT_1_BIT;
+        info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        Check(vkCreateImage(dev.device, &info, nullptr, &u.image), "vkCreateImage (HDR)");
+        VkMemoryRequirements need;
+        vkGetImageMemoryRequirements(dev.device, u.image, &need);
+        VkMemoryAllocateInfo memory{};
+        memory.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memory.allocationSize = need.size;
+        memory.memoryTypeIndex = MemoryType(dev, need.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(vkAllocateMemory(dev.device, &memory, nullptr, &u.memory), "vkAllocateMemory (HDR)");
+        Check(vkBindImageMemory(dev.device, u.image, u.memory, 0), "vkBindImageMemory (HDR)");
+        hdrLedger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Display, need.size, "HDR image (FM4_HDR)");
+        const VkDeviceSize stateBytes = 16 + VkDeviceSize(h::kCells) * 8 + VkDeviceSize(h::kCells) * 4;  // the shader's State block (std430)
+        u.state = MakeBuffer(stateBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(u.state.mapped, 0, size_t(stateBytes));  // before any use: the limiter starts from a dark frame
+        if (u.offscreen)
+            u.result = MakeBuffer(VkDeviceSize(displayWidth) * displayHeight * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const VkDescriptorSetLayoutBinding bindings[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo set{};
+        set.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        set.bindingCount = 2;
+        set.pBindings = bindings;
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(h::Push)};
+        VkPipelineLayoutCreateInfo layout{};
+        layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layout.setLayoutCount = 1;
+        layout.pSetLayouts = &u.setLayout;
+        layout.pushConstantRangeCount = 1;
+        layout.pPushConstantRanges = &push;
+        VkShaderModuleCreateInfo shader{};
+        shader.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        shader.codeSize = spirv.size() * 4;
+        shader.pCode = spirv.data();
+        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = sizes;
+        VkImageViewCreateInfo view{};
+        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        view.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        view.image = u.image;
+        VkShaderModule module = VK_NULL_HANDLE;
+        bool ok = vkCreateImageView(dev.device, &view, nullptr, &u.view) == VK_SUCCESS &&
+                  vkCreateDescriptorSetLayout(dev.device, &set, nullptr, &u.setLayout) == VK_SUCCESS &&
+                  vkCreatePipelineLayout(dev.device, &layout, nullptr, &u.layout) == VK_SUCCESS &&
+                  vkCreateShaderModule(dev.device, &shader, nullptr, &module) == VK_SUCCESS &&
+                  vkCreateDescriptorPool(dev.device, &poolInfo, nullptr, &u.pool) == VK_SUCCESS;
+        if (ok)
+        {
+            VkComputePipelineCreateInfo pipeline{};
+            pipeline.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pipeline.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            pipeline.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipeline.stage.module = module;
+            pipeline.stage.pName = "main";
+            pipeline.layout = u.layout;
+            VkDescriptorSetAllocateInfo allocate{};
+            allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocate.descriptorPool = u.pool;
+            allocate.descriptorSetCount = 1;
+            allocate.pSetLayouts = &u.setLayout;
+            ok = vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &u.pipeline) == VK_SUCCESS &&
+                 vkAllocateDescriptorSets(dev.device, &allocate, &u.set) == VK_SUCCESS;
+        }
+        vkDestroyShaderModule(dev.device, module, nullptr);  // null-safe; not needed once the pipeline exists
+        if (!ok)
+            why = "a Vulkan object of the pass could not be created";
+    }
+    if (why != nullptr)
+    {
+        const HdrUnit kept = u;
+        DestroyHdr();  // nothing of it was ever recorded
+        u.live = kept.live, u.offscreen = kept.offscreen, u.assumed = kept.assumed, u.strength = kept.strength, u.budget = kept.budget;
+        hdrUsable = false;
+        hdrUnavailable = why;
+        std::fprintf(stderr, "[renderer] FM4_HDR ignored: %s%s%s; standard range\n", why, error.empty() ? "" : ": ", error.c_str());
+        return;
+    }
+    const VkDescriptorImageInfo image{VK_NULL_HANDLE, u.view, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorBufferInfo state{u.state.buffer, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet writes[2] = {};
+    for (uint32_t b = 0; b < 2; b++)
+    {
+        writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[b].dstSet = u.set;
+        writes[b].dstBinding = b;
+        writes[b].descriptorCount = 1;
+        writes[b].descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[b].pImageInfo = b == 0 ? &image : nullptr;
+        writes[b].pBufferInfo = b == 1 ? &state : nullptr;
+    }
+    vkUpdateDescriptorSets(dev.device, 2, writes, 0, nullptr);
+    u.on = true;
+    u.createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    if (swap != 0)
+        std::fprintf(stderr, "[renderer] HDR output switched on at swap %llu: the pass's objects created in %.1f ms\n", (unsigned long long)swap, u.createMs);
+    std::fprintf(stderr, "[renderer] HDR output asked (FM4_HDR): the %ux%u picture decoded to linear light, highlights expanded up to %.2fx SDR white "
+                         "(FM4_HDR_STRENGTH) within the display's headroom, local budget %.2f (adapted from SpeedBreaker)%s\n", displayWidth, displayHeight,
+                 u.strength, u.budget, u.offscreen ? "; no window: an assumed headroom (FM4_HDR_HEADROOM), the result summarised at each kept capture" : "");
+}
+
+// The display image is in TRANSFER_SRC_OPTIMAL (RecordReadback): its encoded values are blitted into the unit's image, which the
+// three steps of the pass turn into linear light in place; the image is left in TRANSFER_SRC_OPTIMAL for the window's presenter.
+// `readBack` (offscreen): also into the result buffer, made visible to the host.
+void RecordHdr(VkCommandBuffer c, bool readBack)
+{
+    HdrUnit& u = hdrUnit;
+    namespace h = runtime::video::hdr;
+    ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_WRITE_BIT, u.image);
+    VkImageBlit blit{};
+    blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = blit.dstOffsets[1] = {int32_t(displayWidth), int32_t(displayHeight), 1};
+    vkCmdBlitImage(c, display, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, u.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+    ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, u.image);
+    // Not in effect (the preference Off, or the window on a display without HDR): a peak of 1, the standard picture in linear
+    // light, through the same image and swapchain.
+    const float headroom = u.assumed != 0.0f ? u.assumed : hdrHeadroom.load(std::memory_order_relaxed);
+    u.lastPeak = HdrEffective() ? h::PeakForHeadroom(headroom, u.strength) : 1.0f;
+    h::Push push{int32_t(displayWidth), int32_t(displayHeight), 0, u.lastPeak, u.budget};
+    vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.pipeline);
+    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, u.layout, 0, 1, &u.set, 0, nullptr);
+    VkMemoryBarrier between{};  // a step reads what the step before wrote (the state buffer; the image only in the last step)
+    between.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    between.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    between.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    const uint32_t groups[3][2] = {{h::Groups(h::kCellsX), h::Groups(h::kCellsY)}, {1, 1}, {h::Groups(displayWidth), h::Groups(displayHeight)}};
+    for (int step = 0; step < 3; step++)
+    {
+        if (step != 0)
+            vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &between, 0, nullptr, 0, nullptr);
+        push.step = step;
+        vkCmdPushConstants(c, u.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+        vkCmdDispatch(c, groups[step][0], groups[step][1], 1);
+    }
+    ImageBarrier(c, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, u.image);
+    if (readBack)
+    {
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {displayWidth, displayHeight, 1};
+        vkCmdCopyImageToBuffer(c, u.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, u.result.buffer, 1, &copy);
+        VkBufferMemoryBarrier host[2] = {};
+        for (int i = 0; i < 2; i++)
+        {
+            host[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            host[i].srcAccessMask = i == 0 ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT;
+            host[i].dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            host[i].srcQueueFamilyIndex = host[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            host[i].buffer = i == 0 ? u.result.buffer : u.state.buffer;
+            host[i].size = VK_WHOLE_SIZE;
+        }
+        vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 2, host, 0, nullptr);
+    }
+    u.passes++;
+}
+
+// Offscreen (FM4_HDR_HEADROOM): the read-back result of a kept swap, after its submission retired, as one line: the limiter's
+// state, and the picture's luma (Rec.709, linear, 1.0 = SDR white). Evidence for a comparison with the capture's own values.
+void HdrSummary(uint64_t swap)
+{
+    const HdrUnit& u = hdrUnit;
+    const auto half = [](uint16_t v) {  // IEEE 754 binary16
+        const int exponent = (v >> 10) & 0x1F, mantissa = v & 0x3FF;
+        const float magnitude = exponent == 0 ? std::ldexp(float(mantissa), -24) : exponent == 31 ? (mantissa ? NAN : INFINITY)
+                                                                                                  : std::ldexp(float(mantissa | 0x400), exponent - 25);
+        return (v & 0x8000) ? -magnitude : magnitude;
+    };
+    const uint16_t* texel = static_cast<const uint16_t*>(u.result.mapped);
+    const float* state = static_cast<const float*>(u.state.mapped);
+    const size_t pixels = size_t(displayWidth) * displayHeight;
+    double sum = 0.0;
+    float highest = 0.0f;
+    size_t above = 0, bad = 0;
+    for (size_t i = 0; i < pixels; i++)
+    {
+        const float luma = runtime::video::hdr::Luma709(half(texel[4 * i]), half(texel[4 * i + 1]), half(texel[4 * i + 2]));
+        if (!std::isfinite(luma) || luma < 0.0f)
+        {
+            bad++;
+            continue;
+        }
+        sum += luma, highest = std::max(highest, luma), above += luma > 1.0f ? 1 : 0;
+    }
+    std::fprintf(stderr, "[hdr] swap %llu: headroom %.2f (assumed), base peak %.3f, frame average %.4f, frame peak %.3f; luma mean %.5f, highest %.4f, "
+                         "%.3f %% of the picture above SDR white, %zu invalid value(s)\n", (unsigned long long)swap, u.assumed,
+                 u.lastPeak, state[0], state[1], sum / double(pixels), highest, 100.0 * double(above) / double(pixels), bad);
 }
 
 // RecordReadback, then ends the recording.
@@ -1833,15 +2686,15 @@ void Capture(uint64_t id, const char* what)
     if (!toRing && !toKept)
         return;  // captures off (the default): no conversion or PNG work for this swap (Present skipped the image as well)
     const uint32_t* pixels = static_cast<const uint32_t*>(readback.mapped);
-    std::vector<uint8_t> rgb(size_t(kDisplayWidth) * kDisplayHeight * 3);
-    for (size_t i = 0; i < size_t(kDisplayWidth) * kDisplayHeight; i++)
+    std::vector<uint8_t> rgb(size_t(displayWidth) * displayHeight * 3);  // the display image's size (FM4 Recomp, M9: the internal resolution)
+    for (size_t i = 0; i < size_t(displayWidth) * displayHeight; i++)
     {
         const uint32_t v = pixels[i];
         rgb[3 * i] = uint8_t((v & 0x3FF) >> 2), rgb[3 * i + 1] = uint8_t(((v >> 10) & 0x3FF) >> 2), rgb[3 * i + 2] = uint8_t(((v >> 20) & 0x3FF) >> 2);
     }
-    const std::vector<uint8_t> png = EncodePngRgb8(kDisplayWidth, kDisplayHeight, rgb);
+    const std::vector<uint8_t> png = EncodePngRgb8(displayWidth, displayHeight, rgb);
     if (png.empty())  // the encoder refused its input (png.h: a size mismatch or an empty image); never a 0-byte capture
-        Stop(StopCode::Setup, "renderer: capture %llu: the PNG encoder refused %zu RGB bytes for %ux%u", (unsigned long long)id, rgb.size(), kDisplayWidth, kDisplayHeight);
+        Stop(StopCode::Setup, "renderer: capture %llu: the PNG encoder refused %zu RGB bytes for %ux%u", (unsigned long long)id, rgb.size(), displayWidth, displayHeight);
     std::string error;
     if (toRing)
     {
@@ -1868,6 +2721,26 @@ void Capture(uint64_t id, const char* what)
             }, error))
             Stop(StopCode::Setup, "renderer: kept capture of %s: %s", what, error.c_str());
         std::fprintf(stderr, "[gpu] %s kept: %s\n", what, kept->PathOf(id).c_str());
+        if (postAa.on && postAa.pair)  // FM4_DIAG_POST_AA_PAIR (diagnostic): the same swap before the pass, beside it
+        {
+            if (!keptPre)
+                keptPre.emplace(options.captureDir, "pre_", kKeepBytes);
+            const uint32_t* before = static_cast<const uint32_t*>(postAaPre.mapped);
+            for (size_t i = 0; i < size_t(displayWidth) * displayHeight; i++)
+            {
+                const uint32_t v = before[i];
+                rgb[3 * i] = uint8_t((v & 0x3FF) >> 2), rgb[3 * i + 1] = uint8_t(((v >> 10) & 0x3FF) >> 2), rgb[3 * i + 2] = uint8_t(((v >> 20) & 0x3FF) >> 2);
+            }
+            const std::vector<uint8_t> pre = EncodePngRgb8(displayWidth, displayHeight, rgb);
+            if (pre.empty() || !keptPre->Add(id, pre.size(), [&](const std::string& path) {
+                    FILE* f = std::fopen(path.c_str(), "wb");
+                    if (f == nullptr)
+                        return false;
+                    const bool written = std::fwrite(pre.data(), 1, pre.size(), f) == pre.size();
+                    return std::fclose(f) == 0 && written;
+                }, error))
+                Stop(StopCode::Setup, "renderer: kept pre-pass capture of %s: %s", what, error.c_str());
+        }
     }
 }
 
@@ -1907,13 +2780,13 @@ void ApplyDisplayGamma(const uint8_t* base, uint32_t* pixels, size_t count, uint
         *rampOut = v.ramp;
 }
 
-void CreateResources()
+// FM4 Recomp (M9, live resolution, step 1): the 1x display image (display1x: a swap without scaled words is uploaded there and
+// enlarged into the display image), unless it exists. Its size is the video mode's at every scale, so one serves them all; this was
+// CreateResources' text, where it is still called only when the display image is at the internal resolution (above 1x at start).
+void CreateDisplay1x()
 {
-    VkFormatProperties format;
-    vkGetPhysicalDeviceFormatProperties(dev.gpu, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &format);
-    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((format.optimalTilingFeatures & needed) != needed)
-        Stop(StopCode::Setup, "renderer: A2B10G10R10_UNORM images cannot be transfer sources and destinations");
+    if (display1x != VK_NULL_HANDLE)
+        return;
     VkImageCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     info.imageType = VK_IMAGE_TYPE_2D;
@@ -1923,7 +2796,82 @@ void CreateResources()
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    Check(vkCreateImage(dev.device, &info, nullptr, &display1x), "vkCreateImage (1x display)");
+    VkMemoryRequirements requirements;
+    vkGetImageMemoryRequirements(dev.device, display1x, &requirements);
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = MemoryType(dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    Check(vkAllocateMemory(dev.device, &allocate, nullptr, &display1xMemory), "vkAllocateMemory (1x display)");
+    Check(vkBindImageMemory(dev.device, display1x, display1xMemory, 0), "vkBindImageMemory (1x display)");
+    runtime::video::mem::Global().Add(runtime::video::mem::Kind::Display, requirements.size, "1x display image (a swap without scaled words)");
+}
+
+void CreateResources()
+{
+    VkFormatProperties format;
+    vkGetPhysicalDeviceFormatProperties(dev.gpu, VK_FORMAT_A2B10G10R10_UNORM_PACK32, &format);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    if ((format.optimalTilingFeatures & needed) != needed)
+        Stop(StopCode::Setup, "renderer: A2B10G10R10_UNORM images cannot be transfer sources and destinations");
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): the display image at the internal resolution (unless FM4_INTERNAL_OUTPUT=720p), and then the
+    // 1x image a swap without scaled words is enlarged from (a LINEAR blit: the format must allow it, checked here, never assumed).
+    const bool scaledOut = runtime::video::scale::InternalHalves() > runtime::video::scale::kHalves1x && runtime::video::scale::OutputScaled();
+    if (scaledOut)
+    {
+        displayWidth = runtime::video::scale::HostEdge(kDisplayWidth, runtime::video::scale::InternalHalves());
+        displayHeight = runtime::video::scale::HostEdge(kDisplayHeight, runtime::video::scale::InternalHalves());
+        const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if ((format.optimalTilingFeatures & blit) != blit)
+            Stop(StopCode::Setup, "renderer: A2B10G10R10_UNORM images cannot be blitted with a linear filter (FM4_INTERNAL_RES needs it for a swap without "
+                                  "scaled words; FM4_INTERNAL_OUTPUT=720p keeps the display image 1280x720)");
+    }
+    {  // FM4 Recomp (M9, FM4_POST_AA; post_aa.h): asked for, and whether this device and run can (never assumed; InitPostAa names a refusal)
+        std::string error;
+        if (!runtime::video::postaa::Parse(std::getenv("FM4_POST_AA"), postAa.asked, error, &postAa.tuning))
+            Stop(StopCode::Setup, "renderer: %s", error.c_str());
+        postAaLevel = !postAa.asked ? 0 : std::strcmp(postAa.tuning.name, "soft") == 0 ? 1 : std::strcmp(postAa.tuning.name, "strong") == 0 ? 3 : 2;
+        const char* live = std::getenv("FM4_GRAPHICS_LIVE");
+        const char* pairAsked = std::getenv("FM4_DIAG_POST_AA_PAIR");  // the diagnostic pairs every kept swap: not with a pass that can go off
+        postAa.live = live != nullptr && live[0] == '1' && live[1] == '\0' && !(pairAsked != nullptr && pairAsked[0] == '1');
+        postAa.asked = postAa.asked || postAa.live;
+        const VkFormatFeatureFlags pass = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        if (postAa.asked)
+            postAa.refused = options.mode != Mode::Present && options.mode != Mode::Window ? "not a present or window run"
+                             : !dev.storageImageExtendedFormats ? "the device lacks shaderStorageImageExtendedFormats (the pass stores rgb10_a2)"
+                             : (format.optimalTilingFeatures & pass) != pass ? "A2B10G10R10_UNORM images cannot be storage images and sampled with a linear filter"
+                                                                             : nullptr;
+        const char* pair = std::getenv("FM4_DIAG_POST_AA_PAIR");
+        postAa.pair = postAa.asked && postAa.refused == nullptr && pair != nullptr && pair[0] == '1' && pair[1] == '\0';
+    }
+    const bool postAaImages = postAa.asked && postAa.refused == nullptr;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    info.extent = {displayWidth, displayHeight, 1};
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (postAaImages)  // FM4_POST_AA: the pass's source, then the display image as its destination
+    {
+        info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (postAa.pair ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+        Check(vkCreateImage(dev.device, &info, nullptr, &postAa.source), "vkCreateImage (post AA source)");
+        VkMemoryRequirements need;
+        vkGetImageMemoryRequirements(dev.device, postAa.source, &need);
+        VkMemoryAllocateInfo memory{};
+        memory.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        memory.allocationSize = need.size;
+        memory.memoryTypeIndex = MemoryType(dev, need.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        Check(vkAllocateMemory(dev.device, &memory, nullptr, &postAa.memory), "vkAllocateMemory (post AA source)");
+        Check(vkBindImageMemory(dev.device, postAa.source, postAa.memory, 0), "vkBindImageMemory (post AA source)");
+        postAaLedger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Display, need.size, "post AA source image (FM4_POST_AA)");
+        info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    }
     Check(vkCreateImage(dev.device, &info, nullptr, &display), "vkCreateImage");
+    info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // the 1x display image below: as ever
     VkMemoryRequirements requirements;
     vkGetImageMemoryRequirements(dev.device, display, &requirements);
     VkMemoryAllocateInfo allocate{};
@@ -1932,7 +2880,12 @@ void CreateResources()
     allocate.memoryTypeIndex = MemoryType(dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     Check(vkAllocateMemory(dev.device, &allocate, nullptr, &displayMemory), "vkAllocateMemory");
     Check(vkBindImageMemory(dev.device, display, displayMemory, 0), "vkBindImageMemory");
-    readback = MakeBuffer(VkDeviceSize(kDisplayWidth) * kDisplayHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    displayLedger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Display, requirements.size, "display image");
+    if (scaledOut)
+        CreateDisplay1x();  // FM4 Recomp (M9, live resolution, step 1): the same image, from its own function
+    readback = MakeBuffer(VkDeviceSize(displayWidth) * displayHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (postAa.pair)  // FM4_DIAG_POST_AA_PAIR (diagnostic)
+        postAaPre = MakeBuffer(VkDeviceSize(displayWidth) * displayHeight * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     // The ring alignments are the device's (never assumed; MoltenVK reports Metal's).
     VkPhysicalDeviceProperties properties;
     vkGetPhysicalDeviceProperties(dev.gpu, &properties);
@@ -1945,7 +2898,7 @@ void CreateResources()
     {
         if (VertexReuse() && uint64_t(properties.limits.maxStorageBufferRange) >= bytes)
         {
-            vertexCacheBuffer = MakeBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            vertexCacheBuffer = MakeBuffer(bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, runtime::video::mem::Kind::VertexCache, "vertex cache buffer");
             vertexCache.emplace(bytes, kVertexCacheChunkBytes, 256);
             if (!vertexCache->Valid())
                 Stop(StopCode::Setup, "renderer: the vertex cache's layout (%llu bytes, %llu-byte chunks) is not valid", (unsigned long long)bytes,
@@ -2012,6 +2965,15 @@ void CreateResources()
         VkFenceCreateInfo fence{};
         fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         Check(vkCreateFence(dev.device, &fence, nullptr, &s.fence), "vkCreateFence");
+        if (dev.occlusionQueryPrecise)  // FM4_OCCLUSION_QUERIES: every slot records draws or may (the part slots, the present slot)
+        {
+            VkQueryPoolCreateInfo occlusion{};
+            occlusion.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            occlusion.queryType = VK_QUERY_TYPE_OCCLUSION;
+            occlusion.queryCount = ZpdUnit::kQueries;
+            Check(vkCreateQueryPool(dev.device, &occlusion, nullptr, &s.zpdPool), "vkCreateQueryPool (occlusion)");
+            s.zpdToReset = ZpdUnit::kQueries, s.zpdUsed = 0, s.zpdSegments.clear();
+        }
         if (&s != &slots[0])
             continue;  // FM4_SUBMIT_SPLIT: a part slot has a command buffer and a fence only
         if (timestampPeriodNs > 0)  // FM4_GPU_TIMESTAMPS (diagnostic)
@@ -2031,7 +2993,7 @@ void CreateResources()
         // Unit 8: the ring (uniform, storage and index data) and the descriptor pool, persistent per slot.
         // Unit 7: also the staging source of texture uploads (vkCmdCopyBufferToImage, texture_vk.cpp).
         s.ring = MakeBuffer(RingBytes(), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, runtime::video::mem::Kind::Ring, "slot upload ring");
         s.allocator.emplace(RingBytes(), uniformAlign, storageAlign);
         const VkDescriptorPoolSize sizes[] = {
             {descriptorCacheOn ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 3 * kDrawsPerSlot},
@@ -2052,6 +3014,8 @@ void CreateResources()
 // (destroying it would free memory the GPU may still use): the run stops with it reported.
 void Shutdown()
 {
+    if (runtime::video::mem::Wanted())  // FM4_DIAG_MEMORY (diagnostic): before anything is destroyed
+        std::fputs(runtime::video::mem::Global().Report("at shutdown", 14).c_str(), stderr);
     if (const size_t kept = guard->Shutdown(); kept != 0)
         Stop(StopCode::GpuStranded, "renderer: %zu resource(s) kept at shutdown (completion unknown); the device is not destroyed", kept);
     if (retireBackend)  // FM4_ASYNC_RETIRE: every part retired above; join the worker before the submitter, the EDRAM unit and the device go
@@ -2088,6 +3052,7 @@ void Shutdown()
         backend.Destroy(s.ring);
         vkDestroyFence(dev.device, s.fence, nullptr);
         vkDestroyQueryPool(dev.device, s.timestamps, nullptr);  // FM4_GPU_TIMESTAMPS: every submission confirmed complete (above)
+        vkDestroyQueryPool(dev.device, s.zpdPool, nullptr), s.zpdPool = VK_NULL_HANDLE, s.zpdSegments.clear();  // FM4_OCCLUSION_QUERIES: as above
         if (&s == &slots[0])
             vkDestroyQueryPool(dev.device, passQueries, nullptr), passQueries = VK_NULL_HANDLE;  // FM4_DIAG_PASS_TIMES
         s.timestamps = VK_NULL_HANDLE, s.timed = s.stamped = false;
@@ -2099,12 +3064,34 @@ void Shutdown()
     }
     backend.Destroy(readback);
     DestroyGpuPresent();  // FM4 Recomp (FM4_GPU_PRESENT): every submission confirmed complete above
+    if (hdrUnit.asked || hdrUnit.live)  // FM4 Recomp (M9, FM4_HDR): the same guarantee
+    {
+        if (hdrUnit.passes != 0)
+            std::fprintf(stderr, "[renderer] HDR output: %llu pass(es)\n", (unsigned long long)hdrUnit.passes);
+        DestroyHdr();
+    }
+    if (postAa.asked)  // FM4 Recomp (M9, FM4_POST_AA): the same guarantee
+    {
+        if (postAa.on)
+            std::fprintf(stderr, "[renderer] post-process anti-aliasing: %llu pass(es)\n", (unsigned long long)postAa.passes);
+        DestroyPostAa();
+        vkDestroyImage(dev.device, postAa.source, nullptr);  // null-safe
+        vkFreeMemory(dev.device, postAa.memory, nullptr);
+        if (postAaPre.buffer != VK_NULL_HANDLE)
+            backend.Destroy(postAaPre);
+        postAa = PostAaUnit{};
+    }
     if (vertexCacheBuffer.buffer != VK_NULL_HANDLE)  // FM4 Recomp (M7, vertex reuse across submissions; L1): every submission confirmed above
         backend.Destroy(vertexCacheBuffer);
     vertexCache.reset();
     ShutdownGuestMemoryGpu(dev);  // FM4 Recomp (M7, FM4_GUEST_MEMORY_GPU): every submission confirmed above; the host view stays mapped
     vkDestroyImage(dev.device, display, nullptr);
     vkFreeMemory(dev.device, displayMemory, nullptr);
+    vkDestroyImage(dev.device, display1x, nullptr);  // null-safe (FM4 Recomp, M9)
+    vkFreeMemory(dev.device, display1xMemory, nullptr);
+    display1x = VK_NULL_HANDLE, display1xMemory = VK_NULL_HANDLE;
+    if (!runtime::video::keepbusy::Shutdown())  // FM4_GPU_KEEP_BUSY: its own device, before the instance goes
+        Stop(StopCode::GpuStranded, "renderer: the keep-busy experiment's submission never completed (completion unknown); nothing is destroyed");
     DestroyVulkanDevice(dev);
     enabled = false;
 }
@@ -2166,6 +3153,18 @@ uint32_t ReadGuestIndex(const void* context, uint32_t i)
 
 // The framebuffer of a render pass over the EDRAM unit's views (one per distinct set for the run; the
 // views live for the run, render_hooks.h).
+void ForgetFramebuffersOf(VkImageView view)
+{
+    for (auto it = framebuffers.begin(); it != framebuffers.end();)
+        if (it->first.color == view || it->first.depth == view)
+        {
+            vkDestroyFramebuffer(dev.device, it->second, nullptr);
+            it = framebuffers.erase(it);
+        }
+        else
+            ++it;
+}
+
 VkFramebuffer Framebuffer(VkRenderPass pass, const HostTargets& t, bool color, bool depth)
 {
     const FramebufferKey key{pass, color ? t.color : VK_NULL_HANDLE, depth ? t.depth : VK_NULL_HANDLE, t.width, t.height};
@@ -2205,6 +3204,91 @@ uint64_t Allocate(Slot& s, uint64_t draw, uint64_t bytes, bool uniform, const ch
 }  // namespace
 
 gpu::SubmissionGate& Submissions() { return gate; }
+// FM4 Recomp (FM4_GRAPHICS_LIVE, the in-game GRAPHICS menu): edge smoothing from the next presented swap (FM4_POST_AA's spellings).
+// False when it cannot be switched in this run (no FM4_GRAPHICS_LIVE, the pass refused by the device, an unknown spelling): the
+// caller then says the change applies at the next start.
+void SetHdrHeadroom(float headroom)
+{
+    static float logged = -1.0f;
+    static int lines = 0;
+    hdrHeadroom.store(headroom, std::memory_order_relaxed);
+    if (std::fabs(headroom - logged) >= 0.05f && lines < 20)
+    {
+        lines++, logged = headroom;
+        std::fprintf(stderr, "[renderer] HDR output: the display's headroom is %.2fx SDR white, the picture's peak %.2fx%s\n", headroom,
+                     runtime::video::hdr::PeakForHeadroom(headroom, hdrUnit.strength), lines == 20 ? " (no further lines)" : "");
+    }
+}
+
+void SetHdrPreference(bool automatic)
+{
+    if (hdrWanted.exchange(automatic) != automatic)
+        std::fprintf(stderr, "[renderer] HDR preference %s\n", automatic ? "Auto" : "Off");
+}
+
+void SetHdrDisplay(bool supported) { hdrDisplay.store(supported, std::memory_order_relaxed); }
+
+HdrOutput HdrOutputNow()
+{
+    if (!hdrWanted.load())
+        return {false, "HDR is off"};
+    if (hdrUnavailable.load() != nullptr)
+        return {false, "HDR is not available on this system"};
+    if (!hdrUsable.load())  // this run was started without HDR and cannot change (no FM4_GRAPHICS_LIVE)
+        return {false, "restart required"};
+    if (!hdrUnit.offscreen && !hdrDisplay.load())
+        return {false, "this display does not support HDR"};
+    return {true, ""};
+}
+
+bool SetPostAaLive(const char* spelling)
+{
+    bool on = false;
+    std::string error;
+    runtime::video::postaa::Tuning tuning = runtime::video::postaa::kStandard;
+    if (!postAa.live || !postAa.on || !runtime::video::postaa::Parse(spelling, on, error, &tuning))
+        return false;
+    const int level = !on ? 0 : std::strcmp(tuning.name, "soft") == 0 ? 1 : std::strcmp(tuning.name, "strong") == 0 ? 3 : 2;
+    if (postAaLevel.exchange(level) != level)
+        std::fprintf(stderr, "[renderer] post-process anti-aliasing: %s from the next presented swap (the GRAPHICS menu)\n", on ? tuning.name : "off");
+    return true;
+}
+
+// FM4 Recomp (M9, live resolution, step 2; renderer.h). Only latches the request: Present serves it (ServeResolutionRequest).
+bool RequestInternalRes(const char* spelling)
+{
+    uint32_t halves = 0;
+    std::string error;
+    if (!enabled || spelling == nullptr || *spelling == '\0' || !runtime::video::scale::ParseInternalRes(spelling, halves, error))
+        return false;
+    // Whether this run can switch at all; read once, after Initialize (`enabled`), and said once when it cannot.
+    static const bool live = [] {
+        const auto set = [](const char* name) { const char* v = std::getenv(name); return v != nullptr && v[0] == '1' && v[1] == '\0'; };
+        const char* why = !set("FM4_GRAPHICS_LIVE") ? "FM4_GRAPHICS_LIVE is not 1"
+                          : options.mode != Mode::Present && options.mode != Mode::Window ? "not a present or window run"
+                          : !runtime::video::scale::OutputNative() ? "FM4_INTERNAL_OUTPUT=720p keeps the display image 1280x720"
+                          : set("FM4_DIAG_POST_AA_PAIR") ? "FM4_DIAG_POST_AA_PAIR reads the picture before the pass at one size"
+                          : set("FM4_GPU_PRESENT_CHECK") ? "FM4_GPU_PRESENT_CHECK compares 1280x720 words"
+                                                         : nullptr;
+        if (why != nullptr)
+            std::fprintf(stderr, "[renderer] resolution: it cannot be changed while this run goes on (%s); a change applies at the next start\n", why);
+        return why == nullptr;
+    }();
+    if (!live)
+        return false;
+    const uint32_t before = resRequested.exchange(halves, std::memory_order_relaxed);
+    if (before != halves && halves != runtime::video::scale::InternalHalvesQuiet())
+        std::fprintf(stderr, "[renderer] resolution: %s asked for (now %s): at the next swap with nothing in flight\n", runtime::video::scale::HalvesSpelling(halves),
+                     runtime::video::scale::HalvesSpelling(runtime::video::scale::InternalHalvesQuiet()));
+    return true;
+}
+const char* InternalResNow() { return runtime::video::scale::HalvesSpelling(runtime::video::scale::InternalHalvesQuiet()); }
+bool InternalResPending()
+{
+    const uint32_t asked = resRequested.load(std::memory_order_relaxed);
+    return asked != 0 && asked != runtime::video::scale::InternalHalvesQuiet();
+}
+
 bool Enabled() { return enabled; }
 void SetEdramHooks(const EdramHooks* hooks) { edramHooks = hooks; }
 void SetTextureHooks(const TextureHooks* hooks) { textures = hooks; }
@@ -2262,6 +3346,7 @@ bool Initialize(const Options& o)
         };
         hooks.onWorkerStart = [] {
             pthread_setname_np("fm4 gpu retire");  // FM4 Recomp: thread_cpu.h roles
+            runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default)
             runtime::gpu::SetCompletionWorkerThread();
         };
         retireBackend.emplace(submitter, kSlots, gpu::FenceTimeoutNs(timeout.ms), PresenterWaitBoundNs(0), std::move(hooks));
@@ -2346,16 +3431,487 @@ bool Initialize(const Options& o)
         SetEdramHooks(hooks);
     }
     InitGpuPresent();  // FM4 Recomp (FM4_GPU_PRESENT): after the compiler and the EDRAM unit; nothing unless asked
+    InitPostAa();      // FM4 Recomp (M9, FM4_POST_AA): after the compiler; nothing unless asked
+    InitHdr();         // FM4 Recomp (M9, FM4_HDR): the same
+    {  // FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1): the outcome named once
+        const char* v = std::getenv("FM4_OCCLUSION_QUERIES");
+        const bool asked = v != nullptr && v[0] == '1' && v[1] == '\0';
+        zpdUnit = ZpdUnit{};
+        zpdUnit.on = asked && dev.occlusionQueryPrecise;
+        if (zpdUnit.on)
+        {
+            zpdUnit.results = std::make_unique<zpd::ResultRing>();
+            if (const char* lines = std::getenv("FM4_DIAG_ZPD_QUERY_LOG"))
+                zpdUnit.logLines = std::min(std::strtol(lines, nullptr, 10), 1000000L);
+            std::fprintf(stderr, "[zpd] occlusion queries counted on the GPU (FM4_OCCLUSION_QUERIES=1): precise Vulkan queries, %u a command buffer; an END's "
+                                 "report is stored after the GPU finished its query\n", ZpdUnit::kQueries);
+        }
+        else if (asked)
+            std::fprintf(stderr, "[zpd] FM4_OCCLUSION_QUERIES=1, but this device has no precise occlusion queries: not counted (the fixed result, as without it)\n");
+    }
+    runtime::video::keepbusy::Initialize(dev, *compiler, o.gpuStopPath, guard->FenceTimeoutNs(), [] { return gate.Load().inFlight == 0; });  // FM4 Recomp (M9 experiment, FM4_GPU_KEEP_BUSY): nothing unless asked
     if (o.mode == Mode::Window)  // on the main thread (main.cpp): the swapchain, the presenter's slot and guard
-        InitializePresenter({&dev, display, {kDisplayWidth, kDisplayHeight}, &gate, o.gpuStopPath, guard->FenceTimeoutNs(), &queueLock});
+    {
+        InitializePresenter({&dev, display, {displayWidth, displayHeight}, VK_NULL_HANDLE, &gate, o.gpuStopPath,
+                             guard->FenceTimeoutNs(), &queueLock});
+    }
     enabled = true;
     return true;
 }
 
+namespace {
+
+// ---- FM4 Recomp (M9, live resolution, step 2): the switch ------------------------------------------------------------------
+// The creators below return false where Initialize's stop (Check, MakeBuffer): a switch that cannot make something is refused and
+// the run goes on at its scale. Whatever a failed call made was used by no command and is destroyed before it returns.
+bool TryImage(VkFormat format, uint32_t width, uint32_t height, VkImageUsageFlags usage, const char* label, VkImage& image, VkDeviceMemory& memory,
+              uint64_t& ledger)
+{
+    image = VK_NULL_HANDLE, memory = VK_NULL_HANDLE;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {width, height, 1};
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = usage;
+    if (vkCreateImage(dev.device, &info, nullptr, &image) != VK_SUCCESS)
+        return image = VK_NULL_HANDLE, false;
+    VkMemoryRequirements need;
+    vkGetImageMemoryRequirements(dev.device, image, &need);
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = need.size;
+    allocate.memoryTypeIndex = MemoryType(dev, need.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(dev.device, &allocate, nullptr, &memory) != VK_SUCCESS)
+        memory = VK_NULL_HANDLE;
+    if (memory == VK_NULL_HANDLE || vkBindImageMemory(dev.device, image, memory, 0) != VK_SUCCESS)
+    {
+        vkDestroyImage(dev.device, image, nullptr);
+        vkFreeMemory(dev.device, memory, nullptr);  // null-safe
+        return image = VK_NULL_HANDLE, memory = VK_NULL_HANDLE, false;
+    }
+    ledger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Display, need.size, label);
+    return true;
+}
+bool TryView(VkImage image, VkFormat format, VkImageView& view)
+{
+    VkImageViewCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.format = format;
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    info.image = image;
+    if (vkCreateImageView(dev.device, &info, nullptr, &view) != VK_SUCCESS)
+        return view = VK_NULL_HANDLE, false;
+    return true;
+}
+bool TryBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Transient& b)  // MakeBuffer's buffer (host-visible, mapped), without its stops
+{
+    b = Transient{};
+    VkBufferCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size;
+    info.usage = usage;
+    if (vkCreateBuffer(dev.device, &info, nullptr, &b.buffer) != VK_SUCCESS)
+        return b = Transient{}, false;
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(dev.device, b.buffer, &requirements);
+    VkMemoryAllocateInfo allocate{};
+    allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate.allocationSize = requirements.size;
+    allocate.memoryTypeIndex = MemoryType(dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(dev.device, &allocate, nullptr, &b.memory) != VK_SUCCESS)
+        b.memory = VK_NULL_HANDLE;
+    if (b.memory == VK_NULL_HANDLE || vkBindBufferMemory(dev.device, b.buffer, b.memory, 0) != VK_SUCCESS ||
+        vkMapMemory(dev.device, b.memory, 0, size, 0, &b.mapped) != VK_SUCCESS)
+    {
+        vkDestroyBuffer(dev.device, b.buffer, nullptr);
+        vkFreeMemory(dev.device, b.memory, nullptr);  // null-safe; implicitly unmapped
+        return b = Transient{}, false;
+    }
+    b.ledger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Present, allocate.allocationSize, "present buffer");
+    return true;
+}
+
+// Everything of the display image's size, made for the new size before anything of the old size is touched.
+struct ResChain
+{
+    VkImage display = VK_NULL_HANDLE, aaSource = VK_NULL_HANDLE, hdrImage = VK_NULL_HANDLE;
+    VkDeviceMemory displayMemory = VK_NULL_HANDLE, aaMemory = VK_NULL_HANDLE, hdrMemory = VK_NULL_HANDLE;
+    uint64_t displayLedger = 0, aaLedger = 0, hdrLedger = 0;
+    VkImageView aaSourceView = VK_NULL_HANDLE, aaDisplayView = VK_NULL_HANDLE, hdrView = VK_NULL_HANDLE;
+    Transient readback, out, hdrResult, hiWords[FrontWordsTracker::kEntries];
+};
+// A chain no command ever used (the switch was refused after part of it was made).
+void DestroyResChain(ResChain& n)
+{
+    for (VkImageView v : {n.aaSourceView, n.aaDisplayView, n.hdrView})
+        vkDestroyImageView(dev.device, v, nullptr);  // each null-safe
+    for (VkImage i : {n.display, n.aaSource, n.hdrImage})
+        vkDestroyImage(dev.device, i, nullptr);
+    for (VkDeviceMemory m : {n.displayMemory, n.aaMemory, n.hdrMemory})
+        vkFreeMemory(dev.device, m, nullptr);
+    for (uint64_t id : {n.displayLedger, n.aaLedger, n.hdrLedger})
+        runtime::video::mem::Global().Release(id);  // 0: nothing
+    for (Transient* t : {&n.readback, &n.out, &n.hdrResult})
+        if (t->buffer != VK_NULL_HANDLE)
+            backend.Destroy(*t);
+    for (Transient& t : n.hiWords)
+        if (t.buffer != VK_NULL_HANDLE)
+            backend.Destroy(t);
+    n = ResChain{};
+}
+
+// The internal resolution from `from` to `to` (halves, render_scale.h), at swap `swap`. The caller (ServeResolutionRequest) has
+// established the safe point: the command processor's thread; no command buffer open and no render pass; every submission of every
+// slot confirmed complete (so no recorded or pending command names any object below); no guest write pending; in a window, the
+// hand-over's write is held (the presenter is not reading the display image, its own submission is retired, and it cannot take a
+// frame before this thread offers one).
+//   1. Refuse what the device cannot do at the new size (the checks Initialize makes at the start size).
+//   2. Make everything of the new size (the chain; the 1x display image and the scaled sets if this run never had them; the EDRAM
+//      unit's modules and scaled resident image). Any failure: what was made is destroyed unused, false with `why`, nothing changed.
+//   3. Destroy what has the old size, in the units' order: EDRAM targets (the renderer's framebuffers over them first), texture
+//      twins, the scaled front-buffer words, then the display chain's old objects. Nothing can fail from here.
+//   4. Install: the scale, the size, the new objects, the descriptor sets that named an old one, the presenter's image and extent.
+// What is lost: the contents of the EDRAM host targets (zero until drawn; each key's pending clears are kept), the scaled twins and
+// the scaled front-buffer words (this swap, and each texture until its next resolve, come from the 1x words, which are untouched).
+bool SwitchResolution(uint64_t swap, uint32_t from, uint32_t to, bool windowed, std::string& why)
+{
+    namespace sc = runtime::video::scale;
+    namespace aa = runtime::video::postaa;
+    namespace h = runtime::video::hdr;
+    const auto started = std::chrono::steady_clock::now();
+    const bool scaled = sc::OutputScaledAt(to);
+    const uint32_t width = scaled ? sc::HostEdge(kDisplayWidth, to) : kDisplayWidth, height = scaled ? sc::HostEdge(kDisplayHeight, to) : kDisplayHeight;
+    const VkDeviceSize frameBytes = VkDeviceSize(kDisplayWidth) * kDisplayHeight * 4, displayBytes = VkDeviceSize(width) * height * 4;
+    const VkFormat encoded = VK_FORMAT_A2B10G10R10_UNORM_PACK32, linear = VK_FORMAT_R16G16B16A16_SFLOAT;
+    const bool aaImages = postAa.source != VK_NULL_HANDLE, hdrImages = hdrUnit.image != VK_NULL_HANDLE;
+
+    // 1. The device at the new size.
+    VkFormatProperties format;
+    vkGetPhysicalDeviceFormatProperties(dev.gpu, encoded, &format);
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(dev.gpu, &properties);
+    const VkPhysicalDeviceLimits& limits = properties.limits;
+    const VkFormatFeatureFlags blit = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const char* refusal =
+        scaled && (format.optimalTilingFeatures & blit) != blit ? "A2B10G10R10_UNORM images cannot be blitted with a linear filter (a swap without scaled words)"
+        : width > limits.maxImageDimension2D || height > limits.maxImageDimension2D ? "the display image would exceed the device's image size"
+        : gpuPresent.on && limits.maxComputeWorkGroupCount[0] < (width * height + kGpuPresentGroupSize - 1) / kGpuPresentGroupSize
+            ? "too many workgroups for the GPU present's dispatch"
+        : postAa.on && (limits.maxComputeWorkGroupCount[0] < aa::Groups(width) || limits.maxComputeWorkGroupCount[1] < aa::Groups(height))
+            ? "too many workgroups for the anti-aliasing pass's dispatch"
+        : (hdrImages || hdrUsable.load()) && (limits.maxComputeWorkGroupCount[0] < h::Groups(width) || limits.maxComputeWorkGroupCount[1] < h::Groups(height))
+            ? "too many workgroups for the HDR pass's dispatch"
+            : nullptr;
+    if (refusal != nullptr)
+        return why = refusal, false;
+
+    // 2. Everything of the new size. The usages are CreateResources', InitGpuPresent's and CreateHdr's.
+    ResChain n;
+    const VkImageUsageFlags transfer = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    bool ok = TryImage(encoded, width, height, aaImages ? transfer | VK_IMAGE_USAGE_STORAGE_BIT : transfer, "display image", n.display, n.displayMemory, n.displayLedger) &&
+              TryBuffer(displayBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, n.readback);
+    if (aaImages)
+    {
+        ok = ok && TryImage(encoded, width, height, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | (postAa.pair ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0),
+                            "post AA source image (FM4_POST_AA)", n.aaSource, n.aaMemory, n.aaLedger);
+        if (postAa.on)  // the pass's views and set exist (InitPostAa did not refuse it)
+            ok = ok && TryView(n.aaSource, encoded, n.aaSourceView) && TryView(n.display, encoded, n.aaDisplayView);
+    }
+    if (gpuPresent.on)
+    {
+        ok = ok && TryBuffer(displayBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, n.out);
+        for (size_t i = 0; scaled && i < FrontWordsTracker::kEntries; i++)  // an entry that has its 1x words gets scaled ones (as MakeFrontBuffers pairs them)
+            if (gpuPresent.words[i].buffer != VK_NULL_HANDLE)
+                ok = ok && TryBuffer(displayBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, n.hiWords[i]);
+        if (ok && scaled && gpuPresent.hiSets[0] == VK_NULL_HANDLE)  // a run started with the display image at 1280x720: the pool has their room (InitGpuPresent)
+        {
+            VkDescriptorSetLayout layouts[FrontWordsTracker::kEntries];
+            for (VkDescriptorSetLayout& l : layouts)
+                l = gpuPresent.setLayout;
+            VkDescriptorSetAllocateInfo allocate{};
+            allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocate.descriptorPool = gpuPresent.pool;
+            allocate.descriptorSetCount = uint32_t(FrontWordsTracker::kEntries);
+            allocate.pSetLayouts = layouts;
+            ok = vkAllocateDescriptorSets(dev.device, &allocate, gpuPresent.hiSets) == VK_SUCCESS;  // kept if the switch is refused below: unwritten, never bound
+            if (!ok)
+                for (VkDescriptorSet& s : gpuPresent.hiSets)
+                    s = VK_NULL_HANDLE;
+        }
+    }
+    if (hdrImages)
+    {
+        ok = ok && TryImage(linear, width, height, transfer | VK_IMAGE_USAGE_STORAGE_BIT, "HDR image (FM4_HDR)", n.hdrImage, n.hdrMemory, n.hdrLedger) &&
+             TryView(n.hdrImage, linear, n.hdrView);
+        if (hdrUnit.result.buffer != VK_NULL_HANDLE)  // offscreen: the image read back at a kept capture
+            ok = ok && TryBuffer(VkDeviceSize(width) * height * 8, VK_BUFFER_USAGE_TRANSFER_DST_BIT, n.hdrResult);
+    }
+    if (ok && scaled && display1x == VK_NULL_HANDLE)  // CreateDisplay1x's image, without its stops; kept once made, whatever follows
+    {
+        uint64_t ledger = 0;
+        ok = TryImage(encoded, kDisplayWidth, kDisplayHeight, transfer, "1x display image (a swap without scaled words)", display1x, display1xMemory, ledger);
+    }
+    if (!ok)
+        why = "an image, a buffer or a descriptor set of the new size could not be created";
+    else if (std::string error; edramHooks != nullptr && !edramHooks->prepareScale(to, error))
+        ok = false, why = error;
+    if (!ok)
+    {
+        DestroyResChain(n);
+        return false;
+    }
+
+    // 3. What has the old size. Every submission is confirmed complete and nothing is being recorded (the caller's checks).
+    RescaleCounts counts;
+    if (edramHooks != nullptr)
+    {
+        edramHooks->rescale(to, ForgetFramebuffersOf, counts);
+        resClearsCarried = counts.carriedClears != 0;
+    }
+    const size_t twins = DestroyTextureTwins();
+    size_t scaledWords = 0;
+    if (gpuPresent.on)
+    {
+        for (size_t i = 0; i < FrontWordsTracker::kEntries; i++)
+        {
+            if (gpuPresent.hiWords[i].buffer != VK_NULL_HANDLE)
+                backend.Destroy(gpuPresent.hiWords[i]), scaledWords++;
+            gpuPresent.hiWords[i] = n.hiWords[i];
+            gpuPresent.hiFront[i].bands.clear();  // no row has scaled words: this swap is its 1x words (ScaledFrontEntry)
+        }
+        backend.Destroy(gpuPresent.out);
+        gpuPresent.out = n.out;
+    }
+    vkDestroyImage(dev.device, display, nullptr);
+    vkFreeMemory(dev.device, displayMemory, nullptr);
+    runtime::video::mem::Global().Release(displayLedger);
+    display = n.display, displayMemory = n.displayMemory, displayLedger = n.displayLedger;
+    backend.Destroy(readback);
+    readback = n.readback;
+    if (aaImages)
+    {
+        vkDestroyImageView(dev.device, postAa.sourceView, nullptr);  // null-safe (the pass refused: no views)
+        vkDestroyImageView(dev.device, postAa.displayView, nullptr);
+        vkDestroyImage(dev.device, postAa.source, nullptr);
+        vkFreeMemory(dev.device, postAa.memory, nullptr);
+        runtime::video::mem::Global().Release(postAaLedger);
+        postAa.source = n.aaSource, postAa.memory = n.aaMemory, postAaLedger = n.aaLedger;
+        postAa.sourceView = n.aaSourceView, postAa.displayView = n.aaDisplayView;
+    }
+    if (hdrImages)
+    {
+        vkDestroyImageView(dev.device, hdrUnit.view, nullptr);
+        vkDestroyImage(dev.device, hdrUnit.image, nullptr);
+        vkFreeMemory(dev.device, hdrUnit.memory, nullptr);
+        runtime::video::mem::Global().Release(hdrLedger);
+        if (hdrUnit.result.buffer != VK_NULL_HANDLE)
+            backend.Destroy(hdrUnit.result);
+        hdrUnit.image = n.hdrImage, hdrUnit.memory = n.hdrMemory, hdrUnit.view = n.hdrView, hdrLedger = n.hdrLedger;
+        hdrUnit.result = n.hdrResult;
+    }
+
+    // 4. The new scale and size, and every descriptor set that named an object of the old size (none is in use by any command).
+    sc::SetInternalHalves(to);
+    displayWidth = width, displayHeight = height;
+    if (gpuPresent.on)
+        for (size_t i = 0; i < FrontWordsTracker::kEntries; i++)
+        {
+            if (gpuPresent.words[i].buffer != VK_NULL_HANDLE)
+                WriteFrontSet(gpuPresent.sets[i], gpuPresent.words[i].buffer, frameBytes);  // it binds the display words (`out`)
+            if (gpuPresent.hiWords[i].buffer != VK_NULL_HANDLE)
+                WriteFrontSet(gpuPresent.hiSets[i], gpuPresent.hiWords[i].buffer, displayBytes);
+        }
+    if (aaImages && postAa.on)  // InitPostAa's writes, with the new views
+    {
+        const VkDescriptorImageInfo in{postAa.sampler, postAa.sourceView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}, out{VK_NULL_HANDLE, postAa.displayView, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet writes[2] = {};
+        for (uint32_t b = 0; b < 2; b++)
+        {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = postAa.set;
+            writes[b].dstBinding = b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = b == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[b].pImageInfo = b == 0 ? &in : &out;
+        }
+        vkUpdateDescriptorSets(dev.device, 2, writes, 0, nullptr);
+    }
+    if (hdrImages && hdrUnit.set != VK_NULL_HANDLE)  // CreateHdr's write of the image; the limiter's state buffer and its binding stay
+    {
+        const VkDescriptorImageInfo image{VK_NULL_HANDLE, hdrUnit.view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = hdrUnit.set;
+        write.dstBinding = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        write.pImageInfo = &image;
+        vkUpdateDescriptorSets(dev.device, 1, &write, 0, nullptr);
+    }
+    // The variant memo's key has no scale (draw_record.h VariantMemoKey) while the variants it names do (XE_HALVES): emptied, the
+    // next draws choose again. The variants and pipelines themselves are keyed by their defines and stay.
+    variantMemo.Clear();
+    // FM4_OCCLUSION_QUERIES: a bracket open here would sum segments weighted for two scales. Present dropped the brackets of the
+    // frame that ended (a bracket never spans a swap); kept explicit: the game gets no count for a query a switch interrupts.
+    if (zpdUnit.on)
+        zpdUnit.dropped += zpdUnit.open.DropBefore(UINT64_MAX);
+    // The presenter is not presenting and cannot take a frame before this thread offers one (the caller's BeginWrite).
+    if (windowed)
+    {
+        SetPresenterDisplay(display, {width, height});
+        if (hdrImages)
+            SetPresenterHdr(hdrUnit.image);  // it was given the old image when the unit was made (Present)
+    }
+    resSwitches++;
+    std::fprintf(stderr, "[renderer] resolution switched at swap %llu: %s -> %s (%ux%u) in %.1f ms; EDRAM: %u host target(s), %u resolve shadow(s) and %u outgrown "
+                         "image(s) destroyed, %u pending clear(s) carried, %u scaled resident image(s) destroyed; %zu texture twin(s) and %zu scaled front-buffer "
+                         "word buffer(s) destroyed; made again: the display image%s%s%s, the readback%s; this swap is presented from its 1x words (switch %llu)\n",
+                 (unsigned long long)swap, sc::HalvesSpelling(from), sc::HalvesSpelling(to), width, height,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), counts.targets, counts.shadows, counts.outgrown,
+                 counts.carriedClears, counts.residentImages, twins, scaledWords, aaImages ? ", the anti-aliasing pass's source" : "",
+                 hdrImages ? ", the HDR image" : "", gpuPresent.on ? ", the display words" : "", windowed ? " (the window's presenter given the new image)" : "",
+                 (unsigned long long)resSwitches);
+    return true;
+}
+
+// Present, after the frame's FlushSlot: the pending request, if any. Not ready (something recorded, submitted or pending, or the
+// window's presenter still reading the display image): tried again at the next swap, kResAttempts times, then refused.
+void ServeResolutionRequest(uint64_t swap, bool windowed)
+{
+    namespace sc = runtime::video::scale;
+    uint32_t want = resRequested.load(std::memory_order_relaxed);
+    const uint32_t now = sc::InternalHalves();
+    // A newer request (another thread, meanwhile) stays latched: only the one served is cleared.
+    const auto done = [&] { resRequested.compare_exchange_strong(want, 0, std::memory_order_relaxed), resAttempts = 0; };
+    if (want == 0 || want == now)
+        return done();
+    const auto refuse = [&](const char* reason) {
+        resRefusals++;
+        std::fprintf(stderr, "[renderer] resolution: the change to %s at swap %llu is refused (%s); it stays %s (refusal %llu)\n", sc::HalvesSpelling(want),
+                     (unsigned long long)swap, reason, sc::HalvesSpelling(now), (unsigned long long)resRefusals);
+        done();
+    };
+    // The safe point. The frame's parts were retired by Present's FlushSlot; an earlier swap's present part (FM4_ASYNC_RETIRE) here.
+    if (retireBackend)
+        RetireParts(UINT64_MAX, true);
+    bool idle = submitted.empty() && openPass.commands == VK_NULL_HANDLE && !GuestWritesPending();
+    for (uint32_t k = 0; k < kSlots; k++)
+        idle = idle && !slots[k].open && guard->SlotState(k) == gpu::SubmissionLifetime<Transient>::State::Idle;
+    const char* notReady = !idle ? "a command buffer is open, a submission is not confirmed complete or a guest write is pending"
+                           : edramHooks != nullptr && !edramHooks->rescaleReady() ? "a resolve's read-back is still pending"
+                                                                                  : nullptr;
+    // In a window the display image is replaced: never while the presenter blits from it (the bounded wait Present makes anyway;
+    // its own call later finds the hand-over idle). A frame the window had not taken is withdrawn, as at any swap.
+    if (notReady == nullptr && windowed &&
+        HandOver().BeginWrite(PresenterWaitBoundNs(guard->FenceTimeoutNs())) == window::FrameHandOver::Write::TimedOut)
+        notReady = "the window's presenter still reads the display image";
+    if (notReady != nullptr)
+    {
+        if (++resAttempts >= kResAttempts)
+            refuse(notReady);
+        return;
+    }
+    std::string why;
+    if (SwitchResolution(swap, now, want, windowed, why))
+        done();
+    else
+        refuse(why.c_str());
+}
+
+}  // namespace
+
 void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap)
 {
     currentSwap = swap;
+    {  // FM4 Recomp (M9, Extended View; kernel/extended_view.h): the factor for the frames from here, latched between frames
+        static const float forced = [] {  // FM4_DIAG_ASPECT_FACTOR (diagnostic): a factor without a window, 1..2
+            const char* v = std::getenv("FM4_DIAG_ASPECT_FACTOR");
+            const float f = v != nullptr ? std::strtof(v, nullptr) : 0.0f;
+            if (f >= runtime::view::kMinFactor && f <= runtime::view::kMaxFactor)
+                runtime::view::Global().Force(f), std::fprintf(stderr, "[diag aspect] FM4_DIAG_ASPECT_FACTOR=%s: the main view is shaped by %.4f whatever the window (DIAGNOSTIC)\n", v, f);
+            return f;
+        }();
+        (void)forced;
+        // FM4_DIAG_ASPECT_CYCLE=<factor>[,<factor>...] (diagnostic; each 1..2) with FM4_DIAG_ASPECT_WINDOW=<swaps> (default 240): the forced
+        // factor changes at every window, as a window resized or the setting switched would change it, in one bounded offscreen run.
+        static const std::vector<float> cycle = [] {
+            std::vector<float> factors;
+            for (const char* at = std::getenv("FM4_DIAG_ASPECT_CYCLE"); at != nullptr && *at;)
+            {
+                char* end = nullptr;
+                const float f = std::strtof(at, &end);
+                if (end == at || f < runtime::view::kMinFactor || f > runtime::view::kMaxFactor)
+                    break;
+                factors.push_back(f);
+                at = *end == ',' ? end + 1 : end;
+            }
+            if (!factors.empty())
+                std::fprintf(stderr, "[diag aspect] FM4_DIAG_ASPECT_CYCLE: %zu factor(s) in turn (DIAGNOSTIC)\n", factors.size());
+            return factors;
+        }();
+        static const uint64_t cycleWindow = [] { const char* v = std::getenv("FM4_DIAG_ASPECT_WINDOW"); const uint64_t n = v ? std::strtoull(v, nullptr, 10) : 0; return n ? n : uint64_t(240); }();
+        if (!cycle.empty())
+            runtime::view::Global().Force(cycle[size_t((swap / cycleWindow) % cycle.size())]);
+        static const bool preference = [] {  // FM4_EXTENDED_VIEW=on (play.sh, from graphics.conf): the preference at the start; off otherwise
+            const char* v = std::getenv("FM4_EXTENDED_VIEW");
+            if (v != nullptr && *v != '\0' && std::strcmp(v, "off") != 0 && std::strcmp(v, "on") != 0)
+                Stop(StopCode::Setup, "renderer: FM4_EXTENDED_VIEW '%s' is not off or on", v);
+            const bool on = v != nullptr && std::strcmp(v, "on") == 0;
+            if (on)
+                runtime::view::Global().SetPreference(true);
+            return on;
+        }();
+        (void)preference;
+        if (runtime::view::Global().Latch())
+            std::fprintf(stderr, "[renderer] Extended View: factor %.4f from swap %llu\n", runtime::view::Global().Factor(), (unsigned long long)swap);
+        // The frame that ends here was drawn with extendedFrameFactor: it is shown stretched by it. The next frame's factor: the
+        // latched one while the game widens a main view (its hook was called in the last half second), 1 otherwise.
+        const float shown = extendedFrameFactor, next = runtime::view::Global().Effective(runtime::gpu::VblankCount());
+        extendedShownFactor = shown;
+        static uint64_t lines = 0;
+        if (next != shown && lines++ < 40)
+            std::fprintf(stderr, "[renderer] Extended View: frames from swap %llu are %s (the frame before: %llu HUD and menu draw(s) narrowed)\n",
+                         (unsigned long long)(swap + 1), next > 1.0f ? "wider, their HUD and menus narrowed" : next < 1.0f ? "taller, their HUD and menus narrowed" : "16:9",
+                         (unsigned long long)extendedNarrowedSinceSwap);
+        extendedFrameFactor = next, extendedNarrowedSinceSwap = 0;
+    }
+    {  // FM4 Recomp (M9, FM4_HDR): the HUD's gain for the frames from here: only while the picture is expanded, by the base peak in steps
+        const float headroom = hdrUnit.assumed != 0.0f ? hdrUnit.assumed : hdrHeadroom.load(std::memory_order_relaxed);
+        const float gain = hdrUnit.on && HdrEffective()
+                               ? runtime::video::hdr::HudGain(runtime::video::hdr::HudGainPeak(runtime::video::hdr::PeakForHeadroom(headroom, hdrUnit.strength)))
+                               : 1.0f;
+        static int lines = 0;
+        if (gain != hdrHudGain && lines++ < 30)
+            std::fprintf(stderr, "[renderer] HDR output: the HUD's and menus' draws are scaled by %.4f from swap %llu (their white is standard white after the expansion)\n",
+                         double(gain), (unsigned long long)(swap + 1));
+        hdrHudGain = gain;
+    }
     renderSwap = swap;
+    if (zpdUnit.on)  // FM4_OCCLUSION_QUERIES: a bracket never spans a swap (its END was not issued); the tallies every 600 swaps
+    {
+        if (swap != 0)
+            zpdUnit.dropped += zpdUnit.open.DropBefore(swap);
+        if (swap % 600 == 0)
+        {
+            ZpdUnit& z = zpdUnit;
+            std::fprintf(stderr, "[zpd] swaps to %llu: %llu ZPD(s), %llu BEGIN(s), %llu END(s), %llu report(s) stored (%llu with samples; last %llu, highest %llu guest samples), "
+                                 "%llu counted draw(s) (%llu drawn only for the count) in %llu segment(s); not counted: %llu untested draw(s); %llu END(s) without a BEGIN, "
+                                 "%llu bracket(s) dropped, %llu segment(s) lost, %llu not available, %llu past a command buffer's queries\n",
+                         (unsigned long long)swap, (unsigned long long)z.zpds, (unsigned long long)z.begins, (unsigned long long)z.endReports,
+                         (unsigned long long)z.stored, (unsigned long long)z.nonZero, (unsigned long long)z.lastCount, (unsigned long long)z.maxCount,
+                         (unsigned long long)z.draws, (unsigned long long)z.countedOnly, (unsigned long long)z.segments, (unsigned long long)z.untested,
+                         (unsigned long long)z.unmatched, (unsigned long long)z.dropped, (unsigned long long)z.lost, (unsigned long long)z.unavailable,
+                         (unsigned long long)z.overflow);
+            z.zpds = z.begins = z.endReports = z.stored = z.nonZero = z.draws = z.countedOnly = z.segments = z.maxCount = 0;
+            z.unmatched = z.dropped = z.lost = z.unavailable = 0;
+        }
+    }
+    runtime::video::keepbusy::OnSwap(swap);  // FM4_GPU_KEEP_BUSY_CYCLE: the experiment's OFF/ON switches
     if (vertexWatches.size() > 65536)  // FM4_VERTEX_REUSE / FM4_INDEX_REUSE hot-range bookkeeping, bounded
         vertexWatches.clear();
     if (hotIndices.size() > 65536)
@@ -2378,12 +3934,30 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     // resolves already flushed their own work). Bounded waits only, in unit 4's one slot.
     FlushSlot(0, FlushCause::Swap);
     const bool windowed = options.mode == Mode::Window;
+    // FM4 Recomp (M9, live resolution, step 2): a change of the internal resolution asked for while the game runs is made here, after
+    // the frame's work completed and before anything below decides how this swap is presented (those decisions name buffers of the
+    // display image's size). Nothing without a request.
+    if (const char* next = runtime::video::diag::ResCycleAt(swap); next != nullptr)  // FM4_DIAG_RES_CYCLE (diagnostic)
+        if (!RequestInternalRes(next))
+            std::fprintf(stderr, "[diag res] swap %llu: the request for %s was not taken (this run cannot switch)\n", (unsigned long long)swap, next);
+    if (resClearsCarried)  // the swap after a switch: a pending clear no target took back in a whole frame is dropped, never applied later
+    {
+        resClearsCarried = false;
+        if (const size_t dropped = edramHooks != nullptr ? edramHooks->dropCarriedClears() : 0; dropped != 0)
+            std::fprintf(stderr, "[renderer] resolution: %zu pending clear(s) carried over the switch were not taken back by swap %llu and are dropped\n",
+                         dropped, (unsigned long long)swap);
+    }
+    if (resRequested.load(std::memory_order_relaxed) != 0)
+        ServeResolutionRequest(swap, windowed);
     // FM4 Recomp (M7 CPU cost; the PWL gamma is capture-only work): the detiled,
     // gamma-corrected display image is consumed only by a capture or the window. Without either, Present keeps every check (the
     // GPU_STOP check, the front-buffer decode, FlushSlot's bounded completion of the frame, the DC_LUTA_CONTROL stop and the ramp
     // log) and skips the staging buffer, the 3.7 MB detile, the PWL pass over 921,600 pixels and the second submission with its
     // fence wait (~3.5 ms of command-processor time a swap).
-    const bool image = windowed || FrontBufferCaptured(swap);
+    // FM4_DIAG_PRESENT_ALWAYS=1 (diagnostic): an offscreen run makes the display image at every swap, as a window does, so the
+    // present path's GPU time shows in offscreen measurements (no PNG is written for it).
+    static const bool presentAlways = [] { const char* v = std::getenv("FM4_DIAG_PRESENT_ALWAYS"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
+    const bool image = windowed || FrontBufferCaptured(swap) || presentAlways;
     // FM4 Recomp (FM4_ASYNC_RETIRE): a windowed swap that is not captured records its present part (upload, readback copy) into an
     // idle part slot and does not wait for it: the completion worker hands the frame to the window once the part completed
     // (async_retire.h A2). The frame's own parts were retired by the drain above (the front buffer is read on the CPU); the next
@@ -2392,12 +3966,18 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     // detile now (after the drain above), or -1: today's CPU path. FM4_GPU_PRESENT_CHECK keeps a GPU-presented swap synchronous so its
     // readback can be compared after the retire.
     const int gpuFront = image ? GpuPresentChoose(f, swap) : -1;
-    const bool gpuCheck = gpuFront >= 0 && GpuPresentCheck();
+    // FM4 Recomp (M9): not with the display image at the internal resolution (the check compares 1280x720 words).
+    const bool gpuCheck = gpuFront >= 0 && GpuPresentCheck() && !runtime::video::scale::OutputScaled();
+    // FM4 Recomp (M9): the entry whose scaled words are the whole picture (ScaledFrontEntry), whatever the 1x words' state.
+    const int scaledEntry = image ? ScaledFrontEntry(f) : -1;
+    const bool onGpu = gpuFront >= 0 || scaledEntry >= 0;
     const bool presentAsync = retireBackend && windowed && !FrontBufferCaptured(swap) && !gpuCheck;
     if (retireBackend && windowed)
         RetireParts(UINT64_MAX, true);  // an earlier present part when no draw opened the slot since: its hand-over happens before BeginWrite
     if (presentAsync)
     {
+        if (ReleaseReplacedTargets() && edramHooks != nullptr && edramHooks->releaseReplaced != nullptr)
+            edramHooks->releaseReplaced(ForgetFramebuffersOf);  // FM4 Recomp (M9, memory): the same completion guarantee as the eviction below
         EvictIdleTextures();  // every submission is confirmed complete; the present part samples no texture
     diag::TriggerAtRetire(swap, [](const std::string& c) {  // FM4_DIAG_TRIGGER (diagnostic): a live session's probe
         if (c == "stale-textures")
@@ -2419,7 +3999,7 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     Transient staging;
     runtime::gpu::gamma::Ramp ramp;
     uint32_t lut[3][1024];
-    if (gpuFront < 0)
+    if (!onGpu)
     {
     staging = MakeBuffer(VkDeviceSize(width) * height * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     uint32_t* linear = static_cast<uint32_t*>(staging.mapped);
@@ -2439,6 +4019,8 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
         if (HandOver().BeginWrite(PresenterWaitBoundNs(guard->FenceTimeoutNs())) == window::FrameHandOver::Write::TimedOut)
             Stop(StopCode::Setup, "renderer: swap %llu: the window's presenter still reads the display image after %llu ms", (unsigned long long)swap,
                  (unsigned long long)(PresenterWaitBoundNs(guard->FenceTimeoutNs()) / 1000000));
+    if (windowed)
+        SetPresenterStretch(extendedShownFactor);  // Extended View: this frame's shape in the window
     uint32_t presentSlot = 0;
     if (presentAsync)  // FM4_ASYNC_RETIRE: an idle part slot (command buffer and fence only; slot 0's ring and pool stay untouched)
     {
@@ -2450,17 +4032,74 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
             Stop(StopCode::Setup, "renderer: swap %llu: no idle part slot for the present after the frame's drain", (unsigned long long)swap);
     }
     const VkCommandBuffer c = presentAsync ? BeginSlot(presentSlot) : OpenSlot(0);  // a fresh recording: the frame's draws completed above
-    if (gpuFront < 0 && !guard->Hold(presentSlot, staging))
+    if (!onGpu && !guard->Hold(presentSlot, staging))
         Stop(StopCode::Setup, "renderer: the staging buffer cannot be held (slot not idle)");
-    if (gpuFront >= 0)  // FM4_GPU_PRESENT: the display words on the GPU (gpu_present.h), copied into the display image as the staging is
-        RecordGpuPresent(c, size_t(gpuFront), lut, f.swapRedBlue);
-    ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): with the display image at the internal resolution, the swap is the scaled front buffer when
+    // every row's latest resolve gave scaled words; otherwise its 1x words (the GPU's or the CPU's) enlarged, counted and named.
+    const bool scaledOut = runtime::video::scale::OutputScaled();
+    const bool scaledFront = scaledOut && scaledEntry >= 0;
+    if (onGpu)  // FM4_GPU_PRESENT: the display words on the GPU (gpu_present.h), copied into the display image as the staging is
+        RecordGpuPresent(c, size_t(scaledFront ? scaledEntry : gpuFront), lut, f.swapRedBlue, scaledFront);
+    if (scaledOut)
+    {
+        if ((scaledFront ? scaledPresents : upscaledPresents)++ == 0)
+            std::fprintf(stderr, "[renderer] display image %ux%u: swap %llu %s (first time; counted from now on)\n", displayWidth, displayHeight,
+                         (unsigned long long)swap,
+                         scaledFront ? "from the scaled front buffer"
+                         : gpuFront >= 0 ? "from the 1x front buffer enlarged: its resolves' scaled words do not cover it, or it was written since"
+                                         : "from the 1x front buffer enlarged: no resolve words (presented on the CPU)");
+    }
+    // FM4 Recomp (M9, FM4_POST_AA): the picture goes into the pass's source image; the pass then writes the display image.
+    const int aaLevel = postAa.on ? postAaLevel.load() : 0;
+    const VkImage target = aaLevel != 0 ? postAa.source : display;
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {width, height, 1};
-    vkCmdCopyBufferToImage(c, gpuFront < 0 ? staging.buffer : gpuPresent.out.buffer, display, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    if (scaledOut && !scaledFront)
+    {
+        ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, display1x);
+        copy.imageExtent = {width, height, 1};
+        vkCmdCopyBufferToImage(c, !onGpu ? staging.buffer : gpuPresent.out.buffer, display1x, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        ImageBarrier(c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, display1x);
+        ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, target);
+        VkImageBlit blit{};
+        blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+        blit.dstOffsets[1] = {int32_t(displayWidth), int32_t(displayHeight), 1};
+        vkCmdBlitImage(c, display1x, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    else
+    {
+    ImageBarrier(c, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, target);
+    copy.imageExtent = {scaledFront ? displayWidth : width, scaledFront ? displayHeight : height, 1};
+    vkCmdCopyBufferToImage(c, !onGpu ? staging.buffer : gpuPresent.out.buffer, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+    if (aaLevel != 0)
+        RecordPostAa(c, postAa.pair && KeepSwap(swap), !presentAsync,
+                     aaLevel == 1 ? runtime::video::postaa::kSoft : aaLevel == 3 ? runtime::video::postaa::kStrong : runtime::video::postaa::kStandard);
     RecordReadback(c);
+    if (const uint64_t every = runtime::video::diag::HdrToggleEvery(); every != 0 && swap % every == 0)  // FM4_DIAG_HDR_TOGGLE (diagnostic)
+        SetHdrPreference(!hdrWanted.load());
+    // FM4 Recomp (M9, FM4_HDR switched on while the game runs): the pass's objects at the first swap that wants them; in a window
+    // the presenter then rebuilds its swapchain once (this thread holds the hand-over's write: it is not presenting).
+    if (!hdrUnit.on && HdrEffective())
+    {
+        CreateHdr(swap);
+        if (hdrUnit.on && windowed)
+            SetPresenterHdr(hdrUnit.image);
+    }
+    if (hdrUnit.on && windowed && PresenterHdrRefused())  // no HDR swapchain for this window: standard range from here (objects kept)
+    {
+        hdrUnit.on = false, hdrUsable = false;
+        hdrUnavailable = "the window's surface offers no HDR format";
+        std::fprintf(stderr, "[renderer] HDR output off at swap %llu: %s; standard range\n", (unsigned long long)swap, hdrUnavailable.load());
+    }
+    const bool hdrRead = hdrUnit.on && hdrUnit.offscreen && KeepSwap(swap);
+    if (hdrUnit.on)  // FM4 Recomp (M9, FM4_HDR): the linear-light picture for the HDR swapchain (offscreen: wherever the display image is made)
+        RecordHdr(c, hdrRead);
     if (presentAsync)  // FM4_ASYNC_RETIRE: not timed (FM4_GPU_TIMESTAMPS measures slot 0's parts), not waited for
     {
         Check(vkEndCommandBuffer(c), "vkEndCommandBuffer");
@@ -2482,6 +4121,8 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     flushNsSinceSwap[size_t(FlushCause::Swap)] += NsSince(presentStart);
     if (!presentAsync)  // FM4_ASYNC_RETIRE: evicted before the present part was recorded
     {
+        if (ReleaseReplacedTargets() && edramHooks != nullptr && edramHooks->releaseReplaced != nullptr)
+            edramHooks->releaseReplaced(ForgetFramebuffersOf);  // FM4 Recomp (M9, memory): the same completion guarantee as the eviction below
         EvictIdleTextures();  // FM4 Recomp: every submission confirmed complete just above (GPU safety: no in-flight use)
     diag::TriggerAtRetire(swap, [](const std::string& c) {  // FM4_DIAG_TRIGGER (diagnostic): a live session's probe
         if (c == "stale-textures")
@@ -2493,6 +4134,10 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
     });
     }
     Capture(swap, "front buffer");  // FM4_ASYNC_RETIRE: never captured (presentAsync), so the readback buffer is not read
+    if (hdrUnit.on && hdrUnit.offscreen && KeepSwap(swap))  // FM4_HDR without a window: the pass's result, read back above
+        HdrSummary(swap);
+    if (runtime::video::mem::Wanted() && KeepSwap(swap))  // FM4_DIAG_MEMORY (diagnostic): the allocations at each kept capture (a matched scene)
+        std::fputs(runtime::video::mem::Global().Report("swap " + std::to_string(swap), 14).c_str(), stderr);
     if (windowed && !presentAsync && !HandOver().Offer(swap))  // the main thread blits it to the swapchain and presents (window_present.cpp)
         Stop(StopCode::Setup, "renderer: swap %llu: the window hand-over was not idle after BeginWrite (contract breach)", (unsigned long long)swap);
     std::fprintf(stderr, "[gpu] swap %llu presented %s; since the last swap: %llu draw(s) rendered, %llu no-write draw(s) %s, %llu resolve(s), "
@@ -2839,6 +4484,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     DrawInputs in;
     in.read = ReadRegisterHook;
     in.context = base;
+    const bool zpdCounting = zpdUnit.on && !zpdUnit.open.Empty();  // FM4_OCCLUSION_QUERIES: an occlusion query counts this draw
+    in.countNoWrite = zpdCounting;
     static const bool bulkConstants = [] {  // opt-in FM4_BULK_CONSTANTS=1 (draw_state.h DrawInputs::registers)
         const char* v = std::getenv("FM4_BULK_CONSTANTS");
         const bool on = v != nullptr && v[0] == '1' && v[1] == '\0';
@@ -2904,8 +4551,10 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
             if (edramHooks->lastResolve(last, words))
             {
                 RequireRecording(commands, "resolve adoption");
-                textures->adoptResolve(commands, last, words);
-                GpuPresentAdopt(commands, last, words);  // FM4_GPU_PRESENT: a front buffer's words (gpu_present.h), the same command buffer
+                // FM4 Recomp (M9, FM4_INTERNAL_RES): the same resolve per host pixel, when the EDRAM unit converted it (or null).
+                const VkImage hiWords = edramHooks->lastResolveHi != nullptr ? edramHooks->lastResolveHi() : VK_NULL_HANDLE;
+                textures->adoptResolve(commands, last, words, hiWords);
+                GpuPresentAdopt(commands, last, words, hiWords);  // FM4_GPU_PRESENT: a front buffer's words (gpu_present.h), the same command buffer
             }
         }
         // Every resolve completes before the next draw records: that draw's texture loads read guest memory on
@@ -2922,6 +4571,9 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
             Stop(StopCode::Unimplemented, "renderer: draw %llu: %s of %u indices writes neither colour nor depth nor stencil (kNoWriteDraws = Stop)",
                  (unsigned long long)draw, PrimitiveTypeName(d.primitiveType), d.indices.count);
         noWriteSinceSwap++;
+        if (zpdCounting && zpdUnit.untested++ == 0)  // FM4_OCCLUSION_QUERIES: nothing to draw it into
+            std::fprintf(stderr, "[zpd] draw %llu inside an occlusion query writes nothing and tests no depth: not counted (named once)\n",
+                         (unsigned long long)draw);
         return;
     case DrawKind::Draw: case DrawKind::DepthOnly:
         break;
@@ -3016,9 +4668,18 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // variants the full path chose for it, without building or hashing define text. A traced draw (FM4_TRACE_PS prints its defines)
     // always takes the full path; FM4_DIAG_ALPHA_QUANT turns the memo off (VariantMemoMode). =2 takes the full path every draw and
     // stops when a held entry disagrees with it.
+    // FM4 Recomp (M9, Extended View; kernel/extended_view.h): while the game widens its main view, the HUD's and menus' draws take
+    // the vertex shader's XE_OVERLAY_PIN variant (narrowed about the centre, edge vertices kept at the edge). Never from the memo.
+    const bool overlay = runtime::view::IsOverlayDraw(d.target.colorFormat, d.target.pitch, d.primitiveType, d.blend.enabled);
+    // (the variant only for a draw whose viewport is the whole 1280x720 frame: its vertices are then in the frame's own space)
+    const bool overlayFullFrame = d.viewport.scale[0] == 640.0f && d.viewport.scale[1] == -360.0f && d.viewport.offset[0] == 640.0f && d.viewport.offset[1] == 360.0f;
+    const bool overlayPin = extendedFrameFactor != 1.0f && overlay && overlayFullFrame;
+    // FM4 Recomp (M9, FM4_HDR; hdr_output.h HudGain): while HDR is in effect the same draws take the pixel shader's XE_OVERLAY_GAIN
+    // variant, so the HUD's white is standard white after the expansion.
+    const bool overlayGain = hdrHudGain < 1.0f && overlay;
     static VariantMemoKey memoKey;  // one command-processor thread (the static scratch rule above)
     const int memoMode = VariantMemoMode();
-    const bool memoKeyed = memoMode != 0 && !TracePsBindWanted(draw) && VariantMemoKeyFor(d, *vs, *ps, uncheckedDefine, memoKey);
+    const bool memoKeyed = !overlayPin && !overlayGain && memoMode != 0 && !TracePsBindWanted(draw) && VariantMemoKeyFor(d, *vs, *ps, uncheckedDefine, memoKey);
     const VariantMemo::Entry* memoHit = memoKeyed ? variantMemo.Find(memoKey) : nullptr;
     ShaderVariant* vsVariant = nullptr;
     ShaderVariant* psVariant = nullptr;
@@ -3029,6 +4690,14 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         RequireDraw(draw, VariantsFromDrawState(d, *vs, *ps, vsDefines, psDefines));
         if (uncheckedDefine)
             vsDefines.Add("XE_FETCH_UNCHECKED");
+        if (overlayPin)
+            vsDefines.Add("XE_OVERLAY_PIN");
+        if (overlayGain)
+        {
+            char gain[32];
+            std::snprintf(gain, sizeof gain, "XE_OVERLAY_GAIN %.4f", double(hdrHudGain));
+            psDefines.Add(gain);
+        }
         DiagAlphaQuantize(ps->hash, psDefines);  // FM4_DIAG_ALPHA_QUANT (diagnostic, diag_alpha.h): nothing unless set
         vsVariant = shaders->Variant(*vs, vsDefines, error);
         if (vsVariant == nullptr)
@@ -3452,7 +5121,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // scissor over a 360-row 4x surface whose host image is 1024 rows: the host scissor stops at
     // the claimed rows, never past the image.
     const uint32_t scissorBottom = std::max(target.targetHeight, d.scissor.y);
-    if (targets.width < d.scissor.x + d.scissor.width || targets.height < scissorBottom || targets.width == 0 || targets.height == 0)
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): in guest pixels (the host images are targets.halves / 2 times the guest size).
+    if (targets.guestWidth < d.scissor.x + d.scissor.width || targets.guestHeight < scissorBottom || targets.width == 0 || targets.height == 0)
         Stop(StopCode::Unimplemented, "renderer: draw %llu: the %ux%u host target does not cover the scissor (%u, %u, %ux%u; rows to %u)",
              (unsigned long long)draw, targets.width, targets.height, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, scissorBottom);
     const VkFramebuffer framebuffer = Framebuffer(pipeline.renderPass, targets, key.colorUsed != 0, key.depthUsed != 0);
@@ -3617,7 +5287,68 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     const uint64_t indexAt = Allocate(slot, draw, indexBytes, false, "indices");
     const uint64_t errorAt = Allocate(slot, draw, kErrorsBytes, false, "XeErrors");
     uint8_t* ring = static_cast<uint8_t*>(slot.ring.mapped);
-    const HostViewport hv = FoldViewport(d.viewport, targets.width, targets.height);  // FM4 Recomp (M7 CPU cost): once; the VkViewport below reads it too
+    // FM4 Recomp (M9): clip space from guest pixels, so the window offset and the +0.5 pixel centre scale with the geometry (ReCarbon
+    // renderer.cpp:8214-8233, :8966 at 66401ea); the VkViewport below covers the host image.
+    HostViewport hv = FoldViewport(d.viewport, targets.guestWidth, targets.viewRows);  // FM4 Recomp (M7 CPU cost): once; the VkViewport below reads it too
+    // FM4 Recomp (M9, Extended View; kernel/extended_view.h): the HUD's and menus' draws stay a centred 16:9 block once the picture
+    // is stretched. A draw over the whole frame gives the frame's place in the target (its centre in clip space, its first column
+    // and row) and takes the pinned variant chosen above with the two stretches; a draw in a viewport of its own (the track map)
+    // is moved and narrowed about the frame's centre; scissors follow the same rule.
+    uint32_t scissorX = d.scissor.x, scissorWidth = d.scissor.width, scissorY = d.scissor.y, scissorHeight = scissorBottom - d.scissor.y;
+    if (extendedFrameFactor != 1.0f && d.target.colorFormat == runtime::view::kFinalColourFormat && d.target.pitch == runtime::view::kFrameWidth)
+    {
+        static float centreX = 0.0f, centreY = 0.0f;  // the frame in this target, from its last whole-frame draw (the scene's copy at least)
+        static uint32_t frameX = 0, frameY = 0;
+        if (overlayFullFrame)
+        {
+            centreX = hv.offset[0], centreY = hv.offset[1];
+            frameX = uint32_t(std::max(0.0f, std::round((hv.offset[0] + 1.0f) * 0.5f * float(targets.guestWidth) - 640.0f)));
+            frameY = uint32_t(std::max(0.0f, std::round((hv.offset[1] + 1.0f) * 0.5f * float(targets.viewRows) - 360.0f)));
+        }
+        if (overlay)
+        {
+            const float wide = runtime::view::Wide(extendedFrameFactor), tall = runtime::view::Tall(extendedFrameFactor);
+            if (overlayPin)
+                hv.offset[3] = wide, hv.scale[3] = tall;  // xe_viewport_offset.w / _scale.w: the XE_OVERLAY_PIN variant's stretches
+            else
+                runtime::view::NarrowAbout(hv.scale[0], hv.offset[0], centreX, wide), runtime::view::NarrowAbout(hv.scale[1], hv.offset[1], centreY, tall);
+            runtime::view::NarrowScissor(scissorX, scissorWidth, frameX, runtime::view::kFrameWidth, wide);
+            runtime::view::NarrowScissor(scissorY, scissorHeight, frameY, 720, tall);
+            extendedNarrowedSinceSwap++;
+        }
+    }
+    if (runtime::video::diag::DrawListSwap(currentSwap + 1))  // FM4_DIAG_DRAW_LIST (diagnostic): the draws issued since the last swap
+        std::fprintf(stderr, "[diag draws] swap %llu draw %llu: vs %016llx ps %016llx prim %u count %u; target format %u (raw %u) msaa %u, %ux%u; "
+                             "viewport xy/w %d scale %g,%g offset %g,%g -> clip scale %g,%g offset %g,%g; scissor %u,%u %ux%u; colour mask %X blend %d\n",
+                     (unsigned long long)(currentSwap + 1), (unsigned long long)draw, (unsigned long long)vs->hash, (unsigned long long)ps->hash, d.primitiveType,
+                     d.indices.count, d.target.colorFormat, d.target.colorFormatRaw, d.target.msaa, targets.guestWidth, targets.viewRows,
+                     int(d.viewport.xyDividedByW), d.viewport.scale[0], d.viewport.scale[1], d.viewport.offset[0], d.viewport.offset[1], hv.scale[0], hv.scale[1],
+                     hv.offset[0], hv.offset[1], d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height, d.colorWriteMask, int(d.blend.enabled));
+    if (runtime::video::diag::DrawListSwap(currentSwap + 1) && d.target.colorFormat == runtime::view::kFinalColourFormat && !d.vertexSlots.empty() &&
+        d.vertexSlots[0].valid && d.vertexSlots[0].stride != 0)  // the same diagnostic: a final-target draw's first vertices (slot 0's first two floats)
+    {
+        const VertexSlot& s0 = d.vertexSlots[0];
+        char verts[320] = "";
+        size_t n = 0;
+        for (uint32_t v = 0; v < 6 && v < d.indices.count && n + 40 < sizeof verts; v++)
+        {
+            float xy[2] = {0, 0};
+            for (uint32_t k = 0; k < 2 && k < s0.stride; k++)
+            {
+                uint32_t guest = 0, w = 0;
+                if (v * s0.stride + k >= s0.sizeWords || !runtime::PhysicalToGuest(s0.physical + (v * s0.stride + k) * 4, guest))
+                    break;
+                std::memcpy(&w, base + guest, 4);
+                if (s0.endian == 2) w = __builtin_bswap32(w);
+                else if (s0.endian == 1) w = (w & 0xFF00FF00u) >> 8 | (w & 0x00FF00FFu) << 8;
+                std::memcpy(&xy[k], &w, 4);
+            }
+            n += size_t(std::snprintf(verts + n, sizeof verts - n, " (%g,%g)", xy[0], xy[1]));
+        }
+        std::fprintf(stderr, "[diag draws] swap %llu draw %llu vertices: indexed %d, %u slot(s), slot 0 stride %u words endian %u, %u words:%s\n",
+                     (unsigned long long)(currentSwap + 1), (unsigned long long)draw, int(d.indices.indexed), unsigned(d.vertexSlots.size()), s0.stride, s0.endian,
+                     s0.sizeWords, verts);
+    }
     FillXeSystem(windows, hv, d.systemFlags, ring + systemAt);
     if (!sameConstants)
     {
@@ -3820,7 +5551,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     pass.renderArea = {{0, 0}, {targets.width, targets.height}};
     // FM4 Recomp (M7 GPU cost): the targets' pending resolve clears (render_hooks.h PendingClear) are recorded first in this pass;
     // the render area (FM4_PASS_AREA) must cover their rows as well as the draw's.
-    uint32_t touchedBottom = scissorBottom;
+    uint32_t touchedBottom = runtime::video::scale::HostEdge(scissorBottom, targets.halves);  // host rows (FM4 Recomp, M9; the pending clears are host rectangles)
     for (const PendingClear& pc : targets.clears)
         touchedBottom = std::max(touchedBottom, uint32_t(std::max(0, pc.rect.offset.y)) + pc.rect.extent.height);
     const uint32_t areaRows = PassArea() ? std::min(targets.height, (touchedBottom + 31) & ~31u) : targets.height;
@@ -3918,9 +5649,15 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     }
     else
         vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layouts.pipeline, 0, 1, &set, 0, nullptr);
-    const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.height), hv.zMin, hv.zMax};
+    const VkViewport viewport{0.0f, 0.0f, float(targets.width), float(targets.viewHeight), hv.zMin, hv.zMax};  // the key's full extent (FM4 Recomp, M9, memory)
     vkCmdSetViewport(c, 0, 1, &viewport);
-    const VkRect2D scissor{{int32_t(d.scissor.x), int32_t(d.scissor.y)}, {d.scissor.width, scissorBottom - d.scissor.y}};
+    // FM4 Recomp (M9): the guest scissor in host pixels, edge by edge (render_scale.h HostRect).
+    const runtime::video::scale::Rect hs =
+        runtime::video::scale::HostRect({scissorX, scissorY, scissorWidth, scissorHeight}, targets.halves);
+    const VkRect2D scissor{{int32_t(hs.x), int32_t(hs.y)}, {hs.width, hs.height}};
+    if (hs.height != 0 && hs.y + hs.height > targets.height)  // FM4 Recomp (M9, memory): the image holds the surface's rows (acquireTargets)
+        Stop(StopCode::Unimplemented, "renderer: draw %llu: the scissor's host rows %u-%u reach past the %u rows the host target holds",
+             (unsigned long long)draw, hs.y, hs.y + hs.height, targets.height);
     vkCmdSetScissor(c, 0, 1, &scissor);
     if (TracePsBindWanted(draw))  // FM4 Recomp (M7 CPU cost): the 12 register reads and the defines text (1-3 allocations) only for a traced draw
     {
@@ -3954,6 +5691,17 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     vkCmdSetBlendConstants(c, d.blend.constant);
     const HostDepthBias bias = DepthBiasFor(d);  // the pipeline enables depth bias only with a depth attachment and an offset
     vkCmdSetDepthBias(c, bias.constant, 0.0f, bias.slope);
+    if (zpdCounting)  // FM4_OCCLUSION_QUERIES: counted in a segment of this pass, weighted by the target's MSAA and internal scale
+    {
+        const uint64_t before = zpdUnit.nextSegment;
+        ZpdBeginSegment(c, recording, zpd::HostSampleWeight(target.samples, targets.samples, targets.halves));
+        zpdUnit.draws++, zpdUnit.countedOnly += d.countedOnly ? 1 : 0;
+        ZpdLog("swap %llu draw %llu vs_%016llx ps_%016llx%s: %s %llu, x %u/%u, %ux%u x%u host target, colour mask %X, depth control %08X, scissor %ux%u@%d,%d",
+               (unsigned long long)currentSwap, (unsigned long long)draw, (unsigned long long)vs->hash, (unsigned long long)ps->hash,
+               d.countedOnly ? " (drawn for the count only)" : "", zpdUnit.query < 0 ? "NOT counted, after segment" : zpdUnit.nextSegment != before ? "new segment" : "segment",
+               (unsigned long long)(zpdUnit.nextSegment - 1), zpdUnit.num, zpdUnit.den, targets.width, targets.height, targets.samples, d.colorWriteMask,
+               runtime::gpu::ReadRegister(base, 0x2200), scissor.extent.width, scissor.extent.height, scissor.offset.x, scissor.offset.y);
+    }
     switch (indices.kind)
     {
     case HostIndices::Kind::Direct: case HostIndices::Kind::RectList:
@@ -3965,7 +5713,7 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
         break;
     }
     if (!PassMerge())
-        vkCmdEndRenderPass(c);
+        ZpdEndSegment(), vkCmdEndRenderPass(c);
     drawsSinceSwap++;
 }
 
@@ -3980,6 +5728,70 @@ bool DeferFences()
         return enabled;
     }();
     return on;
+}
+
+// FM4 Recomp (M9, FM4_OCCLUSION_QUERIES; command_processor.h RendererHooks::zpassDone): an EVENT_WRITE_ZPD at `physical`.
+uint32_t ZpassDone(uint32_t physical)
+{
+    if (!enabled || !zpdUnit.on)
+        return 0;
+    ZpdEndSegment();  // inside the open pass: no segment spans a bracket's edge
+    zpdUnit.zpds++;
+    switch (zpd::Classify(physical))
+    {
+    case zpd::Kind::Begin:
+    {
+        zpd::Bracket old;
+        const auto opened = zpdUnit.open.Open(physical, zpdUnit.nextSegment, currentSwap, &old);
+        zpdUnit.begins++;
+        if (opened != zpd::BracketBook::Opened::New)
+            zpdUnit.dropped++;
+        ZpdLog("swap %llu BEGIN %08X: segments from %llu, %u open%s", (unsigned long long)currentSwap, physical, (unsigned long long)zpdUnit.nextSegment,
+               zpdUnit.open.Size(), opened == zpd::BracketBook::Opened::New ? "" : " (an open bracket was replaced or dropped)");
+        return 1;
+    }
+    case zpd::Kind::End:
+    {
+        ZpdUnit::End end{zpdUnit.nextToken, physical, zpdUnit.nextSegment, zpdUnit.nextSegment, false, 0};
+        zpdUnit.nextToken = zpdUnit.nextToken == UINT32_MAX ? 2 : zpdUnit.nextToken + 1;
+        zpd::Bracket closed;
+        if (zpdUnit.open.Close(physical, &closed))
+            end.s0 = closed.s0;
+        else
+            zpdUnit.unmatched++;  // an END without its BEGIN: zero samples
+        zpdUnit.ends[end.token % ZpdUnit::kEnds] = end;
+        zpdUnit.endReports++;
+        ZpdLog("swap %llu END %08X: segments %llu..%llu, token %u", (unsigned long long)currentSwap, physical, (unsigned long long)end.s0,
+               (unsigned long long)end.s1, end.token);
+        return end.token;
+    }
+    default:
+        Stop(StopCode::Unimplemented, "renderer: EVENT_WRITE_ZPD with its report at %08X, neither a BEGIN (+0x20) nor an END (+0x00) of a 64-byte block (FM4_OCCLUSION_QUERIES)",
+             physical);
+    }
+}
+
+// The count of the END `token` (RendererHooks::zpdCount): called when the report's store lands, after every part recorded before
+// the END has retired (their segments are in the ring; ZpdHarvest). A segment the ring no longer holds counts 0 and is tallied.
+uint32_t ZpdCount(uint32_t token)
+{
+    ZpdUnit::End& end = zpdUnit.ends[token % ZpdUnit::kEnds];
+    if (end.token != token)
+    {
+        zpdUnit.lost++;
+        return 0;
+    }
+    if (end.known)  // the report's second dword of the count (Total_A, then ZPass_A): the same value
+        return end.count;
+    uint32_t lost = 0;
+    uint64_t raw = 0;
+    const uint32_t count = zpd::EndCount(zpdUnit.results->Sum(end.s0, end.s1, lost, &raw));
+    zpdUnit.lost += lost, zpdUnit.stored++, zpdUnit.nonZero += count != 0 ? 1 : 0, zpdUnit.lastCount = count;
+    zpdUnit.maxCount = std::max<uint64_t>(zpdUnit.maxCount, count);
+    ZpdLog("END %08X token %u: segments %llu..%llu, %llu host samples: %u guest samples stored%s", end.address, token, (unsigned long long)end.s0,
+           (unsigned long long)end.s1, (unsigned long long)raw, count, lost ? " (segments lost)" : "");
+    end.known = true, end.count = count;
+    return count;
 }
 
 bool DeferStore(uint32_t physical)
@@ -4087,6 +5899,7 @@ void QuiesceForStop()
 {
     if (!gate.BeginStop())
         return;  // another stop drains
+    runtime::video::keepbusy::Quiesce();  // FM4_GPU_KEEP_BUSY: its submission in flight completes, no further one
     const uint64_t limit = (guard ? guard->FenceTimeoutNs() : gpu::FenceTimeoutNs(gpu::kFenceTimeoutDefaultMs)) + 1000000000ull;
     const auto outcome = gate.AwaitIdle(limit, NowNs, [] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
     const gpu::SubmissionGate::View v = gate.Load();

@@ -146,6 +146,9 @@ struct ShaderTranslation
     // stacked), 2 needs dimension 2 (3D), 3 a cube map; a stacked 2D texture fetched as 3D (a 2D
     // array on the host) is not supported and must be refused.
     std::vector<uint32_t> textureDimensions;
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): 1 for a slot some fetch reads with a texel offset (the emitted coordinate divides the
+    // offset by textureSize: the host must then bind an image of the guest's size, never a scaled twin), in textureSlots order.
+    std::vector<uint8_t> textureOffsets;
     std::vector<uint32_t> boolConstants;     // distinct bool constants (0-255) tested by
                                              // conditional execs and conditional jumps,
                                              // ascending (see bindings 2/3)

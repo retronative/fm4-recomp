@@ -11,6 +11,8 @@
 #include "shader_cache.h"
 #include "diag_compile.h"  // FM4 Recomp: compile time beside a long swap (diagnostic)
 #include "spirv_disk_cache.h"  // FM4 Recomp (M7 stability): FM4_SPIRV_CACHE
+#include "render_scale.h"  // FM4 Recomp (M9): ScaleFragCoordReads
+#include <algorithm>
 #include <glslang/build_info.h>
 #include <filesystem>
 #include "kernel/shader_hash.h"
@@ -235,6 +237,9 @@ std::string VariantGlsl(const std::string& glsl, const ShaderVariantDefines& def
     std::string text = glsl;
     const size_t eol = text.find('\n');
     text.insert(eol == std::string::npos ? text.size() : eol + 1, defines.Joined());
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): render_scale.h ScaleFragCoordReads for an XE_HALVES variant (never at 1x).
+    if (std::find_if(defines.lines.begin(), defines.lines.end(), [](const std::string& l) { return l.rfind("XE_HALVES ", 0) == 0; }) != defines.lines.end())
+        runtime::video::scale::ScaleFragCoordReads(text);
     return text;
 }
 

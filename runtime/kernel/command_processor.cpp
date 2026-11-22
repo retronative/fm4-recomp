@@ -3,10 +3,12 @@
 //
 // The headless command processor (command_processor.h). Line references are to Xenia 67f16c4
 // src/xenia/gpu/pm4_command_processor_implement.h unless named otherwise.
+#include "thread_qos.h"
 #include "command_processor.h"
 #include "deferred_store_parts.h"
 #include "graphics.h"
 #include "cp_trace.h"
+#include "diag_zpd.h"
 #include "imports.h"
 #include "virtual_memory.h"
 #include <atomic>
@@ -129,7 +131,9 @@ void StoreGpu(uint8_t* base, uint32_t address, uint32_t value)
 // the GPU work recorded before it is complete, after that work's resolve write-backs, in packet order: the CPU never sees a fence
 // before the data it covers (ReCarbon runtime/gpu/command_processor.cpp QueueStore, :168-180, :833-880). Queued while
 // the renderer has open work; once queued, every later store queues too (order).
-struct DeferredStore { uint32_t address, value; bool interrupt = false; };  // interrupt: `value` is the CPU mask
+// FM4 Recomp (FM4_OCCLUSION_QUERIES): `zpd` nonzero: the value is that occlusion query END's count (RendererHooks::zpdCount), read
+// when the store lands, as little-endian bytes (the report's order).
+struct DeferredStore { uint32_t address, value; bool interrupt = false; uint32_t zpd = 0; };  // interrupt: `value` is the CPU mask
 std::vector<DeferredStore> deferredStores;
 uint8_t* deferredBase = nullptr;
 StorePartition storeParts;  // FM4 Recomp (FM4_ASYNC_RETIRE; deferred_store_parts.h): the submission part each queued entry follows
@@ -229,6 +233,19 @@ void CpStore(uint8_t* base, uint32_t address, uint32_t value)
         return;
     }
     StoreGpu(base, address, value);
+}
+// FM4 Recomp (FM4_OCCLUSION_QUERIES): a dword of an occlusion query END's report whose value is the query's count. Queued like any
+// stream store (it then lands after every part recorded before the event has retired, when the count is known); with nothing open
+// every part has retired already and the count is stored now. The bytes are little-endian (xe_gpu_depth_sample_counts).
+uint32_t ZpdValue(uint32_t token) { return __builtin_bswap32(renderer->zpdCount(token)); }
+void CpStoreZpd(uint8_t* base, uint32_t address, uint32_t token)
+{
+    if (!deferredStores.empty() || (renderer->deferStore && renderer->deferStore(address & ~3u)))
+    {
+        deferredStores.push_back({address, 0, false, token}), deferredBase = base, storeParts.Queued();
+        return;
+    }
+    StoreGpu(base, address, ZpdValue(token));
 }
 // The packets whose only CPU-visible effect is such a store: no sync before them when stores are deferred.
 // FM4 Recomp (opt-in FM4_DEFER_EVENTS=1, with FM4_DEFER_FENCES): EVENT_WRITE_EXT's extents and EVENT_WRITE_ZPD's sample counts go
@@ -740,16 +757,34 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 return counts[4 * word] == 0xFF && counts[4 * word + 1] == 0xFF && counts[4 * word + 2] == 0xFE && counts[4 * word + 3] == 0xED;
             };
             const bool end = (finished(4) && finished(5)) || (finished(2) && finished(3));
+            // FM4 Recomp (M9, opt-in FM4_OCCLUSION_QUERIES=1): the renderer counts the query on the GPU. The report is stored as before
+            // (the same eight dwords in the same order, zeros except Total_A and ZPass_A of an END); only an END's count is the
+            // renderer's, and an END is told by the report's place in its block (zpd_report.h Classify), not by D3D's marker, which
+            // only the last tile's END carries.
+            if (const uint32_t token = renderer && renderer->zpassDone ? renderer->zpassDone(address & 0x1FFFFFFCu) : 0)
+            {
+                if (!DeferEvents())
+                    Stop(StopCode::Setup, "GPU: FM4_OCCLUSION_QUERIES=1 needs FM4_DEFER_EVENTS=1 (the report's stores land at GPU completion)");
+                for (uint32_t word = 0; word < 8; word++)
+                    if (token != 1 && (word == 0 || word == 4))
+                        CpStoreZpd(base, ((address & 0x1FFFFFFCu) + 4 * word) | 2, token);
+                    else
+                        CpStore(base, ((address & 0x1FFFFFFCu) + 4 * word) | 2, 0u);
+                break;
+            }
+            diag::ZpdLog(state.swaps, address, end, counts);  // FM4_DIAG_ZPD_LOG (diag_zpd.h)
+            const uint32_t passed = diag::ZpdSamples(state.swaps, end, 1000);  // 1000 unless FM4_DIAG_ZPD_SAMPLES (diag_zpd.h)
             if (DeferEvents())  // the same bytes as big-endian dwords: 1000 little-endian is E8 03 00 00
             {
                 for (uint32_t word = 0; word < 8; word++)
-                    CpStore(base, ((address & 0x1FFFFFFCu) + 4 * word) | 2, end && (word == 0 || word == 4) ? 0xE8030000u : 0u);
+                    CpStore(base, ((address & 0x1FFFFFFCu) + 4 * word) | 2, end && (word == 0 || word == 4) ? __builtin_bswap32(passed) : 0u);
                 break;
             }
             std::memset(counts, 0, 32);
             if (end)
                 for (const uint32_t word : {4u, 0u})  // ZPass_A, Total_A, little-endian
-                    counts[4 * word] = 1000 & 0xFF, counts[4 * word + 1] = 1000 >> 8;
+                    for (uint32_t byte = 0; byte < 4; byte++)
+                        counts[4 * word + byte] = uint8_t(passed >> (8 * byte));
             static bool named = false;
             if (!named)
                 named = true, std::fprintf(stderr, "[gpu] occlusion queries (EVENT_WRITE_ZPD): Xenia's fixed result, 1000 samples passed (APPROXIMATE)\n");
@@ -785,7 +820,7 @@ void ApplyDeferredStores()
     storeParts.TakenAll();
     for (const DeferredStore& d : queued)
         if (!d.interrupt)
-            StoreGpu(deferredBase, d.address, d.value);
+            StoreGpu(deferredBase, d.address, d.zpd ? ZpdValue(d.zpd) : d.value);
         else
             RaiseInterrupts(d.value);
 }
@@ -794,7 +829,7 @@ void MarkDeferredStoresPart(uint64_t serial) { storeParts.Submitted(serial); }
 size_t ApplyDeferredStoresThrough(uint64_t serial, bool (*canStore)(uint32_t physical))
 {
     return ApplyStoresThrough(deferredStores, storeParts, serial, [&](const DeferredStore& d) { return canStore == nullptr || canStore(d.address & 0x1FFFFFFCu); },
-                              [](const DeferredStore& d) { StoreGpu(deferredBase, d.address, d.value); });
+                              [](const DeferredStore& d) { StoreGpu(deferredBase, d.address, d.zpd ? ZpdValue(d.zpd) : d.value); });
 }
 void SetReapHook(void (*reap)()) { reapRetired = reap; }
 uint64_t CpIdleNs() { return cpIdleNs.load(); }
@@ -842,6 +877,7 @@ void InitializeRing(uint8_t* base, uint32_t physical, uint32_t sizeLog2)
     ringStart = PhysicalToGuest(physical);
     std::thread([base] {
         pthread_setname_np("fm4 gpu cp");  // FM4 Recomp: thread_cpu.h roles
+        runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default)
         cpThread.store(reinterpret_cast<uintptr_t>(pthread_self()), std::memory_order_release);
         for (;;)
         {

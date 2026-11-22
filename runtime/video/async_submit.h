@@ -18,6 +18,7 @@
 //   - Stop() drains the queue and joins the worker; the renderer calls it after GpuGuard::Shutdown and before the device goes.
 // Header only, std only: tests/runtime/test_gpu_guard.cpp drives it with a mock backend (CPU only).
 #pragma once
+#include "thread_qos.h"
 #include "gpu_guard.h"
 #include <chrono>
 #include <condition_variable>
@@ -111,6 +112,7 @@ private:
     }
     void Run()
     {
+        runtime::ApplyThreadQos();  // FM4_THREAD_QOS (experiment, off by default): the thread that submits to the queue
         for (;;)
         {
             uint32_t slot;

@@ -29,7 +29,7 @@ its header, with the source file and FM4 Recomp's changes.
 | Project | Copyright | Licence | Where |
 |---|---|---|---|
 | Earlier FM4 runtime code | Copyright (C) 2026 ForzaRecomp contributors | GPL-3.0-or-later | `bin/fm4recomp`: much of `runtime/kernel/`, `runtime/gpu/`, `runtime/shader/` and the runtime's entry files; `recomp/indirect.h`; `bin/fm4_validation_control` |
-| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h` and `runtime/kernel/input_live.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
+| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h`, `post_aa.h`, `zpd_report.h`, `hdr_output.h` and `runtime/kernel/input_live.h`, `rumble.h`, `extended_view.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
 | **reFrozen** | Copyright (C) 2026 reFrozen contributors | GPL-3.0-or-later | The release scripts `scripts/release/make_app.sh` and `make_dmg.py` (not in the app) |
 
 ## Programs shipped beside FM4 Recomp

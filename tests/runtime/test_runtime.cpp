@@ -32,8 +32,10 @@
 #include "kernel/imports.h"
 #include "kernel/input_script.h"
 #include "kernel/input_live.h"
+#include "kernel/rumble.h"
 #include "kernel/key_bindings.h"
 #include "kernel/controls_menu.h"
+#include "kernel/graphics_menu.h"
 #include "kernel/controls_screen.h"
 #include "kernel/keyboard_ui.h"
 namespace runtime { uint32_t ArmedTimerCountForTests(); }  // kernel/imports_timer.cpp (test hook)
@@ -43,6 +45,7 @@ namespace runtime { uint32_t ArmedTimerCountForTests(); }  // kernel/imports_tim
 #include "kernel/objects.h"
 #include "kernel/threads.h"
 #include <atomic>
+#include <cerrno>
 #include <functional>
 #include <TinySHA1.hpp>
 #include "kernel/disc_swap.h"
@@ -1164,6 +1167,172 @@ int main(int, char** argv)
                    "B cancels first, then closes; Close reports the change; the A that opened it selects no row");
             std::remove(file.c_str());
         }
+        {
+            // FM4 Recomp: the in-game GRAPHICS submenu's logic (kernel/graphics_menu.h). The file's texts are the app's, by hand from
+            // app/setup/GraphicsSettings.swift serialized() (tests/app/test_graphics_settings.swift holds the same literals): the
+            // comment, internal_resolution and anti_aliasing (Standard is `on`); the defaults are Full HD (1) and Standard (2).
+            namespace settings = runtime::settings;
+            const std::string header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n";
+            Expect(settings::Serialize({}) == header + "internal_resolution = fhd\nanti_aliasing = on\n" &&
+                       settings::Serialize({0, 0}) == header + "internal_resolution = 720p\nanti_aliasing = off\n" &&
+                       settings::Serialize({2, 2}) == header + "internal_resolution = qhd\nanti_aliasing = on\n" &&
+                       settings::Serialize({2, 1}) == header + "internal_resolution = qhd\nanti_aliasing = soft\n" &&
+                       settings::Serialize({3, 3}) == header + "internal_resolution = 4k\nanti_aliasing = strong\n",
+                   "graphics menu: the file is the Graphics panel's, byte for byte (both lines, off written)");
+            bool round = true;
+            for (size_t r = 0; r < settings::kResolutionCount; r++)
+                for (size_t s = 0; s < settings::kSmoothingCount; s++)
+                {
+                    settings::Graphics g;
+                    std::string e;
+                    round = round && settings::Parse(settings::Serialize({r, s}), g, e) && g == settings::Graphics{r, s};
+                }
+            settings::Graphics g;
+            std::string e1, e2, e3, e4, e5, e6;
+            const bool offAccepted = settings::Parse("anti_aliasing = off\n", g, e1) && g == settings::Graphics{1, 0} && settings::Parse("", g, e1) && g == settings::Graphics{1, 2} &&
+                                     settings::Parse("  # c\n\n anti_aliasing=on \r\ninternal_resolution\t=\t4k", g, e1) && g == settings::Graphics{3, 2};
+            g = {1, 1};
+            const bool refused = !settings::Parse("anti_aliasing = ON\n", g, e1) && e1 == "line 1: unknown anti_aliasing 'ON' (off, soft, on or strong)" &&
+                                 !settings::Parse("internal_resolution = 1440p\n", g, e2) && e2 == "line 1: unknown resolution '1440p' (720p, fhd, qhd or 4k)" &&
+                                 !settings::Parse("\nscale = 2\n", g, e3) && e3 == "line 2: unknown setting 'scale'" &&
+                                 !settings::Parse("anti_aliasing = on\nanti_aliasing = off\n", g, e4) && e4 == "line 2: anti_aliasing is set twice" &&
+                                 !settings::Parse("internal_resolution = qhd\ninternal_resolution = qhd\n", g, e5) && e5 == "line 2: internal_resolution is set twice" &&
+                                 !settings::Parse("qhd\n", g, e6) && e6 == "line 1: expected '<setting> = <value>', not 'qhd'" && g == settings::Graphics{1, 1};
+            Expect(round && offAccepted && refused,
+                   "graphics menu: every choice round-trips; off, comments and spaces accepted; other spellings, settings and repeats refused "
+                   "with the app's messages, the result untouched");
+            // The menu on a file: none -> FULL HD, STANDARD; RESOLUTION to QHD (2) and EDGE SMOOTHING to STRONG (3) are saved at once; a
+            // second menu reads them; out of range and unchanged values change nothing; the default of EDGE SMOOTHING is STANDARD.
+            const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
+            const std::string file = dir + "/menu graphics.conf";
+            std::remove(file.c_str());
+            const auto text = [&] {
+                std::ifstream in(file, std::ios::binary);
+                return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            };
+            settings::Menu menu(file);
+            const bool fresh = menu.Current() == settings::Graphics{} && menu.Notice().empty() && access(file.c_str(), F_OK) != 0 &&
+                               std::string(settings::Menu::Label(0)) == "RESOLUTION" && std::string(settings::Menu::Label(1)) == "EDGE SMOOTHING" &&
+                               settings::Menu::Count(0) == 4 && settings::Menu::Count(1) == 4 && settings::Menu::Count(2) == 2 && settings::Menu::Count(3) == 2 && settings::Menu::Count(4) == 0 &&
+                               std::string(settings::Menu::ValueLabel(0, 1)) == "FULL HD" && std::string(settings::Menu::ValueLabel(1, 2)) == "STANDARD";
+            const bool qhd = menu.Set(0, 2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n" &&
+                             menu.Notice() == "RESOLUTION QHD SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS.";
+            const bool strong = menu.Set(1, 3) && text() == header + "internal_resolution = qhd\nanti_aliasing = strong\n" && menu.Value(0) == 2 && menu.Value(1) == 3;
+            const bool nothing = !menu.Set(0, 4) && !menu.Set(1, 3) && !menu.Set(2, 0) && text() == header + "internal_resolution = qhd\nanti_aliasing = strong\n";
+            const settings::Menu again(file);
+            const bool reread = again.Current() == settings::Graphics{2, 3};
+            const bool back = menu.Default(1) && !menu.Default(1) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n" && menu.Default(0) && menu.Value(0) == 1 && access((file + ".writing").c_str(), F_OK) != 0;
+            // An invalid file is the defaults (as play.sh starts), and the next change replaces it; a folder that does not exist: not
+            // saved, the value kept, and the line says so.
+            { std::ofstream bad(file, std::ios::binary); bad << "internal_resolution = 8k\n"; }
+            std::string why;
+            const bool invalidFile = settings::Load(file, why) == settings::Graphics{} && why == "graphics.conf line 1: unknown resolution '8k' (720p, fhd, qhd or 4k)";
+            settings::Menu over(file);
+            const bool replaced = over.Current() == settings::Graphics{} && over.Set(1, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = soft\n";
+            settings::Menu nowhere(dir + "/no such folder/graphics.conf");
+            const bool notSaved = !nowhere.Set(0, 2) && nowhere.Value(0) == 1 && nowhere.Notice().rfind("NOT SAVED: CANNOT WRITE ", 0) == 0;
+            Expect(fresh && qhd && strong && nothing && reread && back && invalidFile && replaced && notSaved,
+                   "graphics menu: no file is FULL HD and STANDARD; each change is saved at once and read back; nothing else changes the file; "
+                   "an invalid file is replaced by the next change; a failed save keeps the value and says so");
+            // A change the running game takes at once (applyLive answers true for EDGE SMOOTHING only): the line says so; the other
+            // row, and a menu without the callback (above), say it applies at the next start. The callback is asked only after a save.
+            std::remove(file.c_str());
+            size_t asked = 0, askedRow = 9, askedValue = 9;
+            settings::Menu live(file, [&](size_t row, size_t value) { asked++, askedRow = row, askedValue = value; return row == settings::Menu::kSmoothingRow; });
+            const bool appliedNow = live.Set(1, 3) && live.Notice() == "EDGE SMOOTHING STRONG APPLIED AND SAVED." && asked == 1 && askedRow == 1 && askedValue == 3 &&
+                                    text() == header + "internal_resolution = fhd\nanti_aliasing = strong\n";
+            const bool nextStart = live.Set(0, 2) && live.Notice() == "RESOLUTION QHD SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." && asked == 2 && !live.Set(0, 2) && asked == 2;
+            settings::Menu liveNowhere(dir + "/no such folder/graphics.conf", [&](size_t, size_t) { asked++; return true; });
+            const bool notAsked = !liveNowhere.Set(1, 0) && asked == 2;
+            Expect(appliedNow && nextStart && notAsked,
+                   "graphics menu: a change the running game takes is APPLIED AND SAVED; another applies at the next start; nothing is applied unless saved");
+            // HDR (row 2; graphics.conf `hdr = auto`): the preference, OFF by default and then not written (the file is what it was
+            // before the setting existed); AUTO is saved at once as the third line, kept by other changes and read back; X's default is
+            // OFF. What is active is not the file's: the line after a change and the row's description say it from the running
+            // game's status (HDR ACTIVE, or SDR ACTIVE with the reason); without a running game's answer the line asks for a restart.
+            std::remove(file.c_str());
+            settings::SetHdrStatus({});
+            settings::Menu hdr(file, [&](size_t row, size_t) { return row == settings::Menu::kSmoothingRow; });
+            const bool hdrRow = settings::Menu::kRows == 4 && std::string(settings::Menu::Label(2)) == "HDR" && hdr.Value(2) == 0 &&
+                                std::string(settings::Menu::ValueLabel(2, 0)) == "OFF" && std::string(settings::Menu::ValueLabel(2, 1)) == "AUTO" &&
+                                std::string(settings::Menu::ValueLabel(2, 2)).empty() && settings::Serialize({1, 2, 1}) == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
+                                settings::Serialize({1, 2, 0}) == header + "internal_resolution = fhd\nanti_aliasing = on\n";
+            const std::string plain = settings::Menu::Description(2);
+            const bool hdrAuto = hdr.Set(2, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
+                                 hdr.Notice() == "HDR AUTO SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." && !hdr.Set(2, 1) && !hdr.Set(2, 2);
+            const bool hdrKept = hdr.Set(0, 2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\n" &&
+                                 settings::Menu(file).Current() == settings::Graphics{2, 2, 1};
+            const bool hdrOff = hdr.Default(2) && !hdr.Default(2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n";
+            settings::Graphics parsed;
+            std::string h1, h2, h3;
+            const bool hdrParse = settings::Parse("hdr = auto\n", parsed, h1) && parsed == settings::Graphics{1, 2, 1} && settings::Parse("hdr=off\r\n", parsed, h1) &&
+                                  parsed == settings::Graphics{} && !settings::Parse("hdr = on\n", parsed, h1) && h1 == "line 1: unknown hdr 'on' (off or auto)" &&
+                                  !settings::Parse("hdr = AUTO\n", parsed, h2) && h2 == "line 1: unknown hdr 'AUTO' (off or auto)" &&
+                                  !settings::Parse("hdr = auto\nhdr = off\n", parsed, h3) && h3 == "line 2: hdr is set twice";
+            Expect(hdrRow && hdrAuto && hdrKept && hdrOff && hdrParse && plain.find("AUTO USES HDR ONLY WHERE THE DISPLAY SUPPORTS IT") != std::string::npos &&
+                       plain.find("NOW:") == std::string::npos,
+                   "graphics menu HDR: a third row, OFF by default and not written; AUTO is the file's third line, kept by other changes and read back; its "
+                   "default is OFF; hdr parses off and auto only (CONTROL: on, AUTO, twice)");
+            // The running game's answer: the callback takes the preference and publishes what is active; the line and the description
+            // follow that status, never the preference alone.
+            std::remove(file.c_str());
+            settings::HdrStatus next;
+            settings::Menu liveHdr(file, [&](size_t row, size_t) { if (row == settings::Menu::kHdrRow) settings::SetHdrStatus(next); return true; });
+            next = {true, true, ""};
+            const bool active = liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. HDR ACTIVE." &&
+                                std::string(settings::Menu::Description(2)).find("NOW: HDR ACTIVE.") != std::string::npos;
+            next = {true, false, "HDR is off"};
+            const bool off = liveHdr.Set(2, 0) && liveHdr.Notice() == "HDR OFF SAVED. SDR ACTIVE: HDR IS OFF." && text() == header + "internal_resolution = fhd\nanti_aliasing = on\n";
+            next = {true, false, "this display does not support HDR"};
+            const bool noDisplay = liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. SDR ACTIVE: THIS DISPLAY DOES NOT SUPPORT HDR." &&
+                                   text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
+                                   std::string(settings::Menu::Description(2)).find("NOW: SDR ACTIVE: THIS DISPLAY DOES NOT SUPPORT HDR.") != std::string::npos;
+            next = {true, false, "HDR is not available on this system"};
+            const bool noSystem = liveHdr.Set(2, 0) && liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. SDR ACTIVE: HDR IS NOT AVAILABLE ON THIS SYSTEM.";
+            const bool otherRows = liveHdr.Set(1, 3) && liveHdr.Notice() == "EDGE SMOOTHING STRONG APPLIED AND SAVED.";
+            // The status file's text (the Settings panel reads it) and the published change.
+            const bool statusText = settings::HdrStatusText({true, true, ""}) == "active = hdr\n" &&
+                                    settings::HdrStatusText({true, false, "this display does not support HDR"}) == "active = sdr\nreason = this display does not support HDR\n" &&
+                                    settings::HdrStatusText({}).empty() && settings::HdrStatusLine({}).empty();
+            settings::SetHdrStatus({});
+            const bool published = settings::PublishHdrStatus({true, true, ""}) && !settings::PublishHdrStatus({true, true, ""}) &&
+                                   settings::PublishHdrStatus({true, false, "HDR is off"}) && settings::GetHdrStatus() == settings::HdrStatus{true, false, "HDR is off"};
+            settings::SetHdrStatus({});
+            // EXTENDED VIEW (row 3; graphics.conf `extended_view = on`): OFF by default and not written; ON is a line after hdr; a
+            // run that takes it says APPLIED AND SAVED, one without its hook RESTART REQUIRED; X's default is OFF.
+            std::remove(file.c_str());
+            settings::SetExtendedOffered(false);
+            const bool hidden = settings::Menu::Rows() == 3;  // not offered (0.2.0): three rows; the file's line still parses and is kept
+            settings::SetExtendedOffered(true);
+            const bool shown = settings::Menu::Rows() == 4;
+            bool armed = true;
+            size_t viewAsked = 0;
+            settings::Menu wide(file, [&](size_t row, size_t) { viewAsked += row == settings::Menu::kExtendedRow ? 1 : 0; return armed; });
+            const bool viewRow = std::string(settings::Menu::Label(3)) == "EXTENDED VIEW" && wide.Value(3) == 0 && std::string(settings::Menu::ValueLabel(3, 0)) == "OFF" &&
+                                 std::string(settings::Menu::ValueLabel(3, 1)) == "ON" && std::string(settings::Menu::Description(3)).find("NOT 16:9") != std::string::npos;
+            const bool viewOn = wide.Set(3, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nextended_view = on\n" &&
+                                wide.Notice() == "EXTENDED VIEW ON APPLIED AND SAVED." && viewAsked == 1 && !wide.Set(3, 1) && !wide.Set(3, 2);
+            next = {true, false, "HDR is off"};
+            const bool viewWithHdr = wide.Set(2, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\nextended_view = on\n" &&
+                                     settings::Menu(file).Current() == settings::Graphics{1, 2, 1, 1};
+            armed = false;
+            const bool viewOff = wide.Default(3) && wide.Notice() == "EXTENDED VIEW OFF SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." &&
+                                 text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n";
+            settings::Graphics view;
+            std::string v1, v2;
+            const bool viewParse = settings::Parse("extended_view = on\n", view, v1) && view == settings::Graphics{1, 2, 0, 1} &&
+                                   !settings::Parse("extended_view = wide\n", view, v1) && v1 == "line 1: unknown extended_view 'wide' (off or on)" &&
+                                   !settings::Parse("extended_view = on\nextended_view = on\n", view, v2) && v2 == "line 2: extended_view is set twice";
+            settings::SetHdrStatus({});
+            settings::SetExtendedOffered(false);
+            Expect(hidden && shown && viewRow && viewOn && viewWithHdr && viewOff && viewParse,
+                   "graphics menu EXTENDED VIEW: a fourth row only when offered (three rows otherwise), OFF by default and not written; ON is saved after hdr and read back; applied at once when the "
+                   "run can, otherwise at the next start (CONTROL: wide, twice)");
+            Expect(active && off && noDisplay && noSystem && otherRows && statusText && published,
+                   "graphics menu HDR state: the line after a change and the description say HDR ACTIVE or SDR ACTIVE with the reason (off, the display, "
+                   "the system) from the running game's status, whatever the preference; the status text; a status is published once per change");
+            std::remove(file.c_str());
+        }
         // The scripted gamepad (kernel/input_script.h; FM4_INPUT_SCRIPT). Without a script (this process never loads one)
         // the other input imports are the generated strict stubs (3).
         Expect(!input::ScriptLoaded() && ExitCodeOf([&] { PPCContext c{}; c.r3.u32 = 0, c.r4.u32 = 1, c.r5.u32 = padState; imp("XamInputGetCapabilities")(c, base); }) == int(StopCode::Import) &&
@@ -1212,6 +1381,16 @@ int main(int, char** argv)
             const bool e2 = !input::ParseScript("10 A\n10 B\n", bad, error) && error == "line 2: vblank is not above the previous line's '10'";
             const bool e3 = !input::ParseScript("1 A\n\n3 FOO A\n", bad, error) && error == "line 3: unknown button 'FOO'";
             Expect(e1 && e2 && e3, "input script: errors name the line: non-numeric vblank, non-increasing vblank, unknown button");
+            // The stick directions (X_INPUT_GAMEPAD thumbs LX, LY, RX, RY, +Y up; Xenia hid/input.h:57-72): full deflection, by hand.
+            input::Script sticks;
+            const bool sticksParsed = input::ParseScript("10 RS_RIGHT RT\n20 LS_LEFT LS_UP RS_DOWN\n30 A\n", sticks, error) && sticks.events.size() == 3;
+            input::Poller stickPoller(sticks);
+            const input::Report s10 = stickPoller.Poll(10), s20 = stickPoller.Poll(25), s30 = stickPoller.Poll(30);
+            Expect(sticksParsed && s10.thumbs[0] == 0 && s10.thumbs[1] == 0 && s10.thumbs[2] == 32767 && s10.thumbs[3] == 0 && s10.rightTrigger == 0xFF &&
+                       s20.thumbs[0] == -32768 && s20.thumbs[1] == 32767 && s20.thumbs[2] == 0 && s20.thumbs[3] == -32768 && s20.buttons == 0 &&
+                       s30.thumbs[0] == 0 && s30.thumbs[1] == 0 && s30.thumbs[2] == 0 && s30.thumbs[3] == 0 && s30.buttons == input::kA &&
+                       !input::ParseScript("1 RS_SIDEWAYS\n", bad, error) && error == "line 1: unknown button 'RS_SIDEWAYS'",
+                   "input script: LS_* / RS_* push a stick fully along its axis for that line only; an unknown direction is refused");
         }
         {
             // FM4 Recomp (M7 harness): "100 A / 200 B / @race / 0 RT / 50" — the race list counts from RaceStarted. Before it the
@@ -1330,6 +1509,15 @@ int main(int, char** argv)
                 Expect(setState(0, vibration) == 0 && setState(1, vibration) == 0x48F && setState(4, vibration) == ((1u << 31) | (7u << 16) | 0x48F) &&
                            setState(0, 0) == 0xA0,
                        "XamInputSetState with a script: user 0 accepts (0); user 1 48F; user 4 the HRESULT 8007048F; null A0");
+                // FM4 Recomp (kernel/rumble.h): user 0's request is kept for the window loop: bytes FF FF 80 00 are left FFFF, right
+                // 8000 (hid/input.h:74-78); the refused calls above (users 1 and 4, null) did not change it; the next request replaces it.
+                const input::RumbleRequest kept = input::GameRumble();
+                StoreBigEndian32(base, vibration, 0x00010000);
+                const bool replaced = setState(0, vibration) == 0 && input::GameRumble() == input::RumbleRequest{1, 0};
+                StoreBigEndian32(base, vibration, 0x12345678);
+                const bool refusedKeep = setState(1, vibration) == 0x48F && input::GameRumble() == input::RumbleRequest{1, 0};
+                Expect(kept == input::RumbleRequest{0xFFFF, 0x8000} && replaced && refusedKeep,
+                       "XamInputSetState keeps user 0's motor speeds for the controller (left FFFF, right 8000; then 0001, 0000); another user's are not taken");
                 _exit(failures - before);
             });
             Expect(childFailures == 0, "the scripted-pad import checks (child process) all pass");
@@ -3091,6 +3279,43 @@ int main(int, char** argv)
                                        hostText() == std::string("hXY\0\0\0", 6);
                 Expect(allocated && ExitCodeOf([&] { (void)setAllocation(h, 2); }) == int(StopCode::Unimplemented),
                        "NtSetInformationFile(allocation): at or above the size success {0, 8}, file unchanged; below it stops (7)");
+                // FM4 Recomp (after the owner's report of 2026-11-20, a session with ~500 MB free on the Mac): a nearly full host volume,
+                // simulated (FM4_TEST_HOST_AVAILABLE_BYTES, content.h; the drive is not filled). By hand (content.h ContentFree =
+                // min(20 GiB - stored, host available - 2 GiB reserve)): 524288000 available (500 MB, below the reserve) -> 0 free.
+                // Then, on the 6-byte file "hXY\0\0\0": XamContentGetDeviceData reports {total 0x5_0000_0000, free 0}; one byte
+                // appended (growth 1 > 0) DISK_FULL (C000007F), io {C000007F, 0}, the file unchanged; "AB" written in place (growth 0)
+                // succeeds -> "ABY\0\0\0" (a save of unchanged size, as the profile's, keeps working); the length to 7 DISK_FULL with
+                // io {C000007F, 8}, unchanged, and to 5 succeeds -> "ABY\0\0". 2147483652 available (the reserve + 4) -> 4 free:
+                // "wxyz" appended (growth 4) succeeds -> 9 bytes, then "12345" appended (growth 5 > 4) DISK_FULL, the 9 bytes
+                // unchanged. A value that is no decimal number stops (9). STATUS_DISK_FULL = C000007F (NT ntstatus.h; Win32
+                // ERROR_DISK_FULL 112); Xenia checks no free space (xfile.cc:239-268 XFile::Write).
+                {
+                    const uint32_t lowData = ArenaAlloc(base, 0x50);
+                    auto lowDeviceData = [&] { PPCContext c{}; c.r3.u32 = 1, c.r4.u32 = lowData; imp("XamContentGetDeviceData")(c, base); return c.r3.u32; };
+                    setenv("FM4_TEST_HOST_AVAILABLE_BYTES", "524288000", 1);
+                    const bool noneFree = ContentFreeBytes() == 0 && lowDeviceData() == 0 && be64(lowData + 8) == 0x500000000ull && be64(lowData + 16) == 0;
+                    const bool appendRefused = write(h, "z", 6) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 0 &&
+                                               hostText() == std::string("hXY\0\0\0", 6);
+                    const bool inPlace = write(h, "AB", 0) == 0 && be32(ioStatus) == 0 && be32(ioStatus + 4) == 2 && hostText() == std::string("ABY\0\0\0", 6);
+                    const bool growRefused = setLength(h, 7) == 0xC000007F && be32(ioStatus) == 0xC000007F && be32(ioStatus + 4) == 8 &&
+                                             hostText() == std::string("ABY\0\0\0", 6);
+                    const bool cutAllowed = setLength(h, 5) == 0 && hostText() == std::string("ABY\0\0", 5);
+                    setenv("FM4_TEST_HOST_AVAILABLE_BYTES", "2147483652", 1);
+                    const bool fourFree = ContentFreeBytes() == 4 && lowDeviceData() == 0 && be64(lowData + 16) == 4;
+                    const bool fits = write(h, "wxyz", 5) == 0 && be32(ioStatus + 4) == 4 && hostText() == std::string("ABY\0\0wxyz", 9);
+                    const bool oneTooMany = write(h, "12345", 9) == 0xC000007F && be32(ioStatus + 4) == 0 && hostText() == std::string("ABY\0\0wxyz", 9);
+                    setenv("FM4_TEST_HOST_AVAILABLE_BYTES", "lots", 1);
+                    const bool malformed = ExitCodeOf([&] { (void)ContentFreeBytes(); }) == int(StopCode::Setup);
+                    unsetenv("FM4_TEST_HOST_AVAILABLE_BYTES");
+                    Expect(noneFree && appendRefused && inPlace && growRefused && cutAllowed && fourFree && fits && oneTooMany && malformed,
+                           "a nearly full host volume (FM4_TEST_HOST_AVAILABLE_BYTES): below the 2 GiB reserve 0 bytes free: device data free 0, a "
+                           "growing write and a longer length DISK_FULL with the file unchanged, an in-place write and a cut succeed; reserve + 4: "
+                           "4 bytes fit, 5 do not; a malformed value stops (9)");
+                    // The host errno that means "volume full" (POSIX write(2)/ftruncate(2)/mkdir(2): ENOSPC, EDQUOT) and ones that do not.
+                    Expect(HostVolumeFull(ENOSPC) && HostVolumeFull(EDQUOT) && !HostVolumeFull(0) && !HostVolumeFull(EACCES) && !HostVolumeFull(EIO) &&
+                               !HostVolumeFull(EFBIG),
+                           "HostVolumeFull: ENOSPC and EDQUOT only");
+                }
                 // FileDispositionInformation (13, 1 byte) then NtClose: a marked saved-content file is removed from the host when
                 // the handle closes (NT; Xenia ignores the mark), io {0, 0}; 0 bytes INFO_LENGTH_MISMATCH; a disc file stops (7).
                 auto dispose = [&](uint32_t handle, uint8_t flag, uint32_t infoLength = 1) {

@@ -48,6 +48,10 @@ uint64_t ContentFree(uint64_t used, uint64_t hostAvailable);
 // ContentFree of what is stored and the user-data volume's available bytes (statvfs f_bavail * f_frsize). Writes that
 // would grow stored content past it fail with STATUS_DISK_FULL (imports_io.cpp), so a full host disk refuses cleanly.
 uint64_t ContentFreeBytes();
+// The user-data volume's available bytes as ContentFreeBytes takes them. FM4 Recomp (test only,
+// FM4_TEST_HOST_AVAILABLE_BYTES=<decimal bytes>): that value instead of statvfs's, so a nearly full Mac is simulated without
+// filling the drive; anything but a decimal number stops (9).
+uint64_t HostAvailableBytes();
 // FM4 Recomp (Disc 2): installed packages. FM4's own installer copies a Disc 2 package byte for byte (a raw STFS file)
 // to <user-data>/content/1/<type>/<file name>, through the writable root InstallRoot mounts. Such a file counts as stored
 // content only when complete (stfs.h Package::Complete: a copy cut short is shorter), and is then listed by ListContent

@@ -205,24 +205,29 @@ SourceTexel MapCrossAspectTexel(uint32_t destX, uint32_t destY, uint32_t destSam
     return MapEdramTexel(destX, destY, destSample, source, dest);
 }
 
-SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest)
+SourceTexel MapEdramTexel(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest, uint32_t halves, uint32_t sourceHalves)
 {
-    return MapTransferSource(destX, destY, destSample, source, dest).first;
+    return MapTransferSource(destX, destY, destSample, source, dest, halves, sourceHalves).first;
 }
 
 // FM4 Recomp (alpha, RT format 5): MapEdramTexel generalized to 64 bpp keys (edram_vk_plan.h MapTransferSource). For two 32 bpp keys
 // every step is the former MapEdramTexel's (PitchTiles() is PitchTilesAt32bpp() there, the tile sizes have no 64 bpp shift, and the
 // same-bpp branch is MapTransferTexel).
-TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest)
+TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSample, Key source, Key dest, uint32_t halves, uint32_t sourceHalves)
 {
+    const uint32_t sh = sourceHalves == 0 ? halves : sourceHalves;  // FM4 Recomp (M9, FM4_INTERNAL_SCALE_PITCH): the source image's scale
     const Msaa sm = source.MsaaMode(), dm = dest.MsaaMode();
     const bool s64 = source.Is64bpp(), d64 = dest.Is64bpp();
     // X :2540-2545: a tile is 80 samples wide at 32 bpp, 40 at 64 bpp (>> dest_is_64bpp), halved again at 4x; :2550-2554 its height.
-    const uint32_t dtw = edram::kTileWidthSamples >> (edram::SamplesXLog2(dm) + (d64 ? 1 : 0)), dth = edram::kTileHeightSamples >> edram::SamplesYLog2(dm);
-    const uint32_t stw = edram::kTileWidthSamples >> (edram::SamplesXLog2(sm) + (s64 ? 1 : 0)), sth = edram::kTileHeightSamples >> edram::SamplesYLog2(sm);
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): a tile is halves / 2 times as many host pixels on both axes (ShiftGlue 72b7dd6
+    // vulkan/render_target_cache.cpp:2567; X draw_resolution_scale); the MSAA rules below then run on the scaled tile pixel unchanged.
+    // Every tile size (80, 40, 20 x 16, 8) and the half tile (40, 20, 10) is even, so they stay whole at 3 halves (1.5x).
+    const uint32_t dtw = (edram::kTileWidthSamples >> (edram::SamplesXLog2(dm) + (d64 ? 1 : 0))) * halves / 2, dth = (edram::kTileHeightSamples >> edram::SamplesYLog2(dm)) * halves / 2;
+    const uint32_t stw = (edram::kTileWidthSamples >> (edram::SamplesXLog2(sm) + (s64 ? 1 : 0))) * sh / 2, sth = (edram::kTileHeightSamples >> edram::SamplesYLog2(sm)) * sh / 2;
     // X :2516-2577: the destination's tile (split by its pitch, X :4823 and :5223 GetPitchTiles, doubled at 64 bpp) and the pixel in it.
     const uint32_t destTile = (destY / dth) * dest.PitchTiles() + destX / dtw;
-    const uint32_t px = destX % dtw, py = destY % dth;
+    // The tile pixel at the source's scale (the same value when the two scales are equal).
+    const uint32_t px = (destX % dtw) * sh / halves, py = (destY % dth) * sh / halves;
     TransferSource r;
     if (s64 == d64)
         r.first = MapTransferTexel(px, py, destSample, sm, dm);  // X :2778-2831 "Same bit count", with the common Y below folded in
@@ -288,7 +293,7 @@ TransferSource MapTransferSource(uint32_t destX, uint32_t destY, uint32_t destSa
     }
     if (source.IsDepth() != dest.IsDepth())  // X :2916-2936: only between colour and depth (a 64 bpp side: at the source's width, :2912-2913)
     {
-        const uint32_t half = edram::kTileWidthSamples >> (1 + edram::SamplesXLog2(sm) + (s64 ? 1 : 0));  // X :2912-2920
+        const uint32_t half = (edram::kTileWidthSamples >> (1 + edram::SamplesXLog2(sm) + (s64 ? 1 : 0))) * sh / 2;  // X :2912-2920; FM4 Recomp (M9): scaled
         r.first.x = r.first.x < half ? r.first.x + half : r.first.x - half;                              // X :2921-2935
     }
     const uint32_t sourceTile = (destTile + dest.Base() - source.Base()) & (edram::kTileCount - 1);  // X :2938-2954

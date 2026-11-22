@@ -15,6 +15,8 @@
 #include "diag_watch_stale.h"  // FM4_WRITE_WATCH_VERIFY=1 (diagnostic)
 #include "texture_dump.h"
 #include "texture_upload.h"
+#include "render_scale.h"  // FM4 Recomp (M9, FM4_INTERNAL_RES)
+#include "mem_ledger.h"    // FM4 Recomp (M9, FM4_DIAG_MEMORY)
 #include "resolve_resident.h"
 #include "texture_untile_gpu.h"
 #include "guest_memory_vk.h"
@@ -81,6 +83,17 @@ struct HostImage
     // known through the watch), and the sequence right after the mark: AdoptResolve's "in step" test without a hash.
     bool cleanAtMark = false;
     uint64_t markSequence = 0;
+    // FM4 Recomp (M9, FM4_INTERNAL_RES with the display image at the internal resolution): the scaled twin of a single-level 2D image
+    // that resolves write (hiHalves / 2 times its size, the same format; created at the first scaled adoption). hiValid: it holds the
+    // same picture as `image` (every write to `image` since was an adoption that also wrote the twin; an upload from guest memory or
+    // an adoption without scaled words clears it), so a draw samples it instead (Bind).
+    VkImage hiImage = VK_NULL_HANDLE;
+    VkDeviceMemory hiMemory = VK_NULL_HANDLE;
+    uint64_t hiBytes = 0;
+    uint32_t hiHalves = 0;
+    uint64_t ledger = 0, hiLedger = 0;  // FM4 Recomp (M9, FM4_DIAG_MEMORY): mem_ledger.h ids
+    bool hiInitialized = false, hiValid = false;
+    bool blitSource = false;  // FM4 Recomp (M9, live resolution, step 1): created with TRANSFER_SRC (TwinCapable at its creation; Image)
 };
 
 // FM4 Recomp (opt-in FM4_WRITE_WATCH=1; ReCarbon
@@ -219,6 +232,8 @@ struct Unit
     uint64_t watchSkipsSince = 0, watchSkippedBytesSince = 0, watchFaultsAt = 0, watchProtectsAt = 0, watchProtectNsSince = 0, watchFaultNsAt = 0;  // FM4 Recomp: FM4_WRITE_WATCH
     std::unordered_map<TextureKey, HostImage, TextureKeyHash> images;
     std::unordered_map<ViewKey, VkImageView, ViewKeyHash> views;
+    std::unordered_map<ViewKey, VkImageView, ViewKeyHash> hiViews;  // FM4 Recomp (M9): of the scaled twins (HostImage::hiImage)
+    uint64_t hiAdoptedSince = 0, hiBindsSince = 0, hiOffsetBindsSince = 0, hiDroppedSince = 0, hiImages = 0;
     std::unordered_map<SamplerDescription, VkSampler, SamplerDescriptionHash> samplers;
     std::unordered_map<uint32_t, VkFormatFeatureFlags> formatFeatures;
     // FM4 Recomp: Xenia's null images (vulkan_texture_cache.cc:485-512): 1x1 R8G8B8A8, cleared to 0, per fetch dimension (1 2D,
@@ -306,6 +321,15 @@ bool FormatSupported(VkFormat format, bool linear, std::string& error)
     return true;
 }
 
+// FM4 Recomp (M9, FM4_INTERNAL_RES): whether an image of this description may get a scaled twin (EnsureHi): the display image is at
+// the internal resolution, one level, one layer, 2D, a raw 32 bpp colour format (resolve_resident.h ScaledTwinFormat). Such an image is
+// created as a blit source too; no other image is ever put in TRANSFER_SRC.
+void NameTwinFallback(const TextureDescription& d, const char* why);  // below
+bool TwinCapable(const TextureDescription& d)
+{
+    return runtime::video::scale::OutputScaled() && d.levelCount == 1 && d.layers == 1 && d.dimension != 2 && d.depth == 1 && ScaledTwinFormat(d.fetch.format);
+}
+
 HostImage* Image(const TextureEntry& e, std::string& error)
 {
     if (auto it = unit->images.find(e.key); it != unit->images.end())
@@ -329,6 +353,12 @@ HostImage* Image(const TextureEntry& e, std::string& error)
     info.samples = VK_SAMPLE_COUNT_1_BIT;
     info.tiling = VK_IMAGE_TILING_OPTIMAL;
     info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): an image a resolve may write verbatim (resolve_resident.h: single level, 2D, 32 bpp 6/7/50/54)
+    // is also the blit source that fills its scaled twin (AdoptResolve).
+    // FM4 Recomp (M9, live resolution, step 1): remembered per image (blitSource), because TwinCapable follows the current scale: an
+    // image created while the display image is 1280x720 must never become a blit source later. One scale a run: the two always agree.
+    if (TwinCapable(d))
+        info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT, h.blitSource = true;
     info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     // The device's limits for this format and type (a 3D BC or float image is a per-format property on Metal).
     VkImageFormatProperties limits{};
@@ -370,6 +400,11 @@ HostImage* Image(const TextureEntry& e, std::string& error)
     h.bytes = requirements.size;
     h.description = d;
     unit->imageBytes += h.bytes;
+    {
+        char label[112];
+        std::snprintf(label, sizeof label, "%ux%ux%u format %u at %08X, %u level(s), %u layer(s)", d.width, d.height, d.depth, d.fetch.format, d.base.physical, d.levelCount, d.layers);
+        h.ledger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::Texture, h.bytes, label);
+    }
     return &unit->images.emplace(e.key, h).first->second;
 }
 
@@ -509,6 +544,8 @@ bool Upload(const TextureBindContext& c, const uint32_t words[6], const TextureD
         DiagTextureUpload(d, c.ringMapped + offset, plan.stagingBytes);  // FM4_DIAG_TEXTURE_UPLOADS (diagnostic, diag_texture_uploads.h): nothing unless set
     }
     const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    if (image.hiValid)  // FM4 Recomp (M9): the image is reloaded from guest memory (1x bytes): its scaled twin no longer matches
+        image.hiValid = false, unit->hiDroppedSince++, NameTwinFallback(d, "reloaded from guest memory, its scaled twin dropped");
     Barrier(c.commands, image.image, d.levelCount, image.initialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, image.initialized ? shaders : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -549,6 +586,127 @@ VkImageView View(const TextureEntry& e, const HostImage& image, const uint32_t c
         return VK_NULL_HANDLE;
     unit->views.emplace(key, view);
     return view;
+}
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): the same view of the image's scaled twin (one level, 2D).
+VkImageView HiView(const TextureEntry& e, const HostImage& image, const uint32_t components[4], std::string& error)
+{
+    ViewKey key{e.key, {components[0], components[1], components[2], components[3]}};
+    if (auto it = unit->hiViews.find(key); it != unit->hiViews.end())
+        return it->second;
+    VkImageViewCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    info.image = image.hiImage;
+    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.format = VkFormat(e.description.host.vkFormat);
+    info.components = {VkComponentSwizzle(components[0]), VkComponentSwizzle(components[1]), VkComponentSwizzle(components[2]), VkComponentSwizzle(components[3])};
+    info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    if (Failed(vkCreateImageView(unit->dev.device, &info, nullptr, &view), "vkCreateImageView (scaled texture)", error))
+        return VK_NULL_HANDLE;
+    unit->hiViews.emplace(key, view);
+    return view;
+}
+
+// The scaled twin of `image` (created once; false, with the reason named once per run, when it cannot exist: a size with no whole
+// host size, a format the device cannot blit and filter, or the image budget).
+bool EnsureHi(HostImage& image, uint32_t halves)
+{
+    if (image.hiImage != VK_NULL_HANDLE)
+        return image.hiHalves == halves;
+    const TextureDescription& d = image.description;
+    const VkFormat format = VkFormat(d.host.vkFormat);
+    VkFormatProperties props{};
+    vkGetPhysicalDeviceFormatProperties(unit->dev.gpu, format, &props);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    VkImageCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = format;
+    info.extent = {runtime::video::scale::HostEdge(d.width, halves), runtime::video::scale::HostEdge(d.height, halves), 1};
+    info.mipLevels = info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageFormatProperties limits{};
+    const char* why = !TwinCapable(d) ? "not a single-level 2D texture of a raw 32 bpp colour format"
+                      : !runtime::video::scale::HostExact(d.width, halves) || !runtime::video::scale::HostExact(d.height, halves) ? "its size has no whole host size"
+                      : (props.optimalTilingFeatures & needed) != needed ? "its host format cannot be blitted and filtered"
+                      : vkGetPhysicalDeviceImageFormatProperties(unit->dev.gpu, format, info.imageType, info.tiling, info.usage, 0, &limits) != VK_SUCCESS ||
+                              info.extent.width > limits.maxExtent.width || info.extent.height > limits.maxExtent.height
+                          ? "the device has no image of that size"
+                          : nullptr;
+    VkImage twin = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkMemoryRequirements requirements{};
+    if (why == nullptr && vkCreateImage(unit->dev.device, &info, nullptr, &twin) != VK_SUCCESS)
+        why = "vkCreateImage failed";
+    if (why == nullptr)
+    {
+        vkGetImageMemoryRequirements(unit->dev.device, twin, &requirements);
+        VkMemoryAllocateInfo allocate{};
+        allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocate.allocationSize = requirements.size;
+        allocate.memoryTypeIndex = MemoryType(unit->dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (unit->imageBytes + requirements.size > kMaxTextureImageBytes)
+            why = "the texture image budget is full";
+        else if (vkAllocateMemory(unit->dev.device, &allocate, nullptr, &memory) != VK_SUCCESS || vkBindImageMemory(unit->dev.device, twin, memory, 0) != VK_SUCCESS)
+            why = "its memory could not be allocated";
+    }
+    if (why != nullptr)
+    {
+        vkDestroyImage(unit->dev.device, twin, nullptr);  // null-safe; never used by a command
+        vkFreeMemory(unit->dev.device, memory, nullptr);
+        static std::set<std::string> named;
+        if (named.insert(why).second)
+            std::fprintf(stderr, "[texture] internal resolution: no scaled twin for the %ux%u format %u texture at %08X: %s (first time for this reason)\n",
+                         d.width, d.height, d.fetch.format, d.base.physical, why);
+        return false;
+    }
+    image.hiImage = twin, image.hiMemory = memory, image.hiBytes = requirements.size, image.hiHalves = halves;
+    {
+        char label[112];
+        std::snprintf(label, sizeof label, "%ux%u twin of the %ux%u format %u texture at %08X", info.extent.width, info.extent.height, d.width, d.height, d.fetch.format, d.base.physical);
+        image.hiLedger = runtime::video::mem::Global().Add(runtime::video::mem::Kind::TextureTwin, image.hiBytes, label);
+    }
+    unit->imageBytes += image.hiBytes, unit->hiImages++;
+    static std::set<std::pair<uint32_t, uint32_t>> named;
+    if (named.insert({d.base.physical, d.width << 16 | d.height}).second)
+        std::fprintf(stderr, "[texture] internal resolution: scaled twin %ux%u for the %ux%u format %u texture at %08X\n", info.extent.width, info.extent.height,
+                     d.width, d.height, d.fetch.format, d.base.physical);
+    return true;
+}
+
+// The twin and its views go with the image (every submission that used them is confirmed complete: the callers' rule).
+void DestroyHi(const TextureKey& key, HostImage& image)
+{
+    for (auto it = unit->hiViews.begin(); it != unit->hiViews.end();)
+        if (it->first.key == key)
+        {
+            vkDestroyImageView(unit->dev.device, it->second, nullptr);
+            it = unit->hiViews.erase(it);
+        }
+        else
+            ++it;
+    if (image.hiImage == VK_NULL_HANDLE)
+        return;
+    vkDestroyImage(unit->dev.device, image.hiImage, nullptr);
+    vkFreeMemory(unit->dev.device, image.hiMemory, nullptr);
+    runtime::video::mem::Global().Release(image.hiLedger), image.hiLedger = 0;
+    unit->imageBytes -= image.hiBytes, unit->hiImages--;
+    image.hiImage = VK_NULL_HANDLE, image.hiMemory = VK_NULL_HANDLE, image.hiBytes = 0, image.hiInitialized = image.hiValid = false;
+}
+
+// FM4 Recomp (M9, FM4_INTERNAL_RES): why a texture that has a scaled twin is sampled or kept at 1x, once per texture and reason (the
+// swap line counts every occurrence): the evidence of which parts of the picture are not at the internal resolution.
+void NameTwinFallback(const TextureDescription& d, const char* why)
+{
+    static std::set<std::tuple<uint32_t, uint32_t, uint32_t, std::string>> named;
+    if (named.size() < 256 && named.insert({d.base.physical, d.width, d.height, why}).second)
+        std::fprintf(stderr, "[texture] internal resolution: the %ux%u format %u texture at %08X: %s (first time for this texture)\n", d.width, d.height,
+                     d.fetch.format, d.base.physical, why);
 }
 
 VkSampler Sampler(const SamplerDescription& s, std::string& error)
@@ -818,6 +976,17 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     view = View(*p.entry, *image, p.binding.components, error);
     if (view == VK_NULL_HANDLE)
         return false;
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): the scaled twin while it holds the same picture, unless the shader moves this slot's
+    // coordinates by texel offsets (they are divided by textureSize, which must be the guest's size: the 1x image, counted).
+    if (image->hiValid && t.fetchOffsets)
+        unit->hiOffsetBindsSince++, NameTwinFallback(d, "sampled at 1x by a fetch with texel offsets");
+    else if (image->hiValid)
+    {
+        view = HiView(*p.entry, *image, p.binding.components, error);
+        if (view == VK_NULL_HANDLE)
+            return false;
+        unit->hiBindsSince++;
+    }
     sampler = Sampler(s, error);
     return sampler != VK_NULL_HANDLE;
 }
@@ -922,7 +1091,7 @@ bool ResidentCover()
     return on;
 }
 
-uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words)
+uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words, VkImage hiWords)
 {
     if (!unit || r.extentLength == 0)
         return 0;
@@ -981,6 +1150,8 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
         {
             if (image.resident)
                 image.resident = false, unit->residentImages--, unit->residentDroppedSince++;
+            if (image.hiValid)  // FM4 Recomp (M9): the image will be reloaded from guest memory
+                image.hiValid = false, unit->hiDroppedSince++, NameTwinFallback(d, ("a resolve over it was not taken (" + why + "), its scaled twin dropped").c_str());
             continue;
         }
         // FM4 Recomp (M7, resident resolves): a rectangle wholly in the level's padding copies nothing (a zero extent is not a valid
@@ -999,6 +1170,46 @@ uint32_t AdoptResolve(VkCommandBuffer c, const ResidentResolve& r, VkImage words
             Barrier(c, image.image, d.levelCount, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
         }
+        // FM4 Recomp (M9, FM4_INTERNAL_RES): the resolve's words per host pixel into the image's scaled twin, at the scaled corner. The
+        // whole rectangle of level 0 of a single-level image only, with whole host edges; a twin that did not hold the image's picture
+        // is first filled from it (a LINEAR blit of the 1x image, which the copy above just completed), so texels no scaled resolve
+        // has written yet are the 1x picture enlarged, never undefined. Anything else leaves the twin out of use.
+        const bool hi = hiWords != VK_NULL_HANDLE && r.hiHalves > runtime::video::scale::kHalves1x && level == 0 && d.levelCount == 1 &&
+                        extent.width == r.width && extent.height == r.height && extent.width != 0 && extent.height != 0 &&
+                        runtime::video::scale::HostExact(x, r.hiHalves) && runtime::video::scale::HostExact(y, r.hiHalves) &&
+                        runtime::video::scale::HostExact(r.width, r.hiHalves) && runtime::video::scale::HostExact(r.height, r.hiHalves) &&
+                        TwinCapable(d) && image.blitSource && EnsureHi(image, r.hiHalves);  // blitSource: FM4 Recomp (M9, live resolution, step 1)
+        if (hi)
+        {
+            using runtime::video::scale::HostEdge;
+            const uint32_t h = r.hiHalves;
+            Barrier(c, image.hiImage, 1, image.hiInitialized ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, image.hiInitialized ? shaders : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT);
+            if (!image.hiValid)
+            {
+                Barrier(c, image.image, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shaders, 0,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkImageBlit blit{};
+                blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.srcOffsets[1] = {int32_t(d.width), int32_t(d.height), 1};
+                blit.dstOffsets[1] = {int32_t(HostEdge(d.width, h)), int32_t(HostEdge(d.height, h)), 1};
+                vkCmdBlitImage(c, image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.hiImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+                Barrier(c, image.image, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_ACCESS_TRANSFER_READ_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
+            }
+            VkImageCopy copy{};
+            copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.dstOffset = {int32_t(HostEdge(x, h)), int32_t(HostEdge(y, h)), 0};
+            copy.extent = {HostEdge(r.width, h), HostEdge(r.height, h), 1};
+            vkCmdCopyImage(c, hiWords, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.hiImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            Barrier(c, image.hiImage, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
+            image.hiInitialized = image.hiValid = true;
+            unit->hiAdoptedSince++;
+        }
+        else if (image.hiValid && extent.width != 0 && extent.height != 0)  // 1x words only: the twin no longer matches
+            image.hiValid = false, unit->hiDroppedSince++, NameTwinFallback(d, "a resolve wrote it with 1x words only, its scaled twin dropped");
         if (!image.resident)
             image.resident = true, unit->residentImages++;
         adopted++;
@@ -1134,6 +1345,14 @@ void ShutdownTextureUnit()
     activeWatch.store(nullptr, std::memory_order_release);
     for (auto& [key, view] : unit->views)
         vkDestroyImageView(unit->dev.device, view, nullptr);
+    for (auto& [key, view] : unit->hiViews)  // FM4 Recomp (M9): the scaled twins' views and images
+        vkDestroyImageView(unit->dev.device, view, nullptr);
+    unit->hiViews.clear();
+    for (auto& [key, image] : unit->images)
+    {
+        vkDestroyImage(unit->dev.device, image.hiImage, nullptr);  // null-safe
+        vkFreeMemory(unit->dev.device, image.hiMemory, nullptr);
+    }
     for (auto& [key, sampler] : unit->samplers)
         vkDestroySampler(unit->dev.device, sampler, nullptr);
     for (auto& [key, image] : unit->images)
@@ -1199,12 +1418,36 @@ void EvictIdleTextures()
             else
                 ++it;
         HostImage& image = unit->images.at(key);
+        DestroyHi(key, image);  // FM4 Recomp (M9): its scaled twin, if any
+        runtime::video::mem::Global().Release(image.ledger);
         vkDestroyImage(unit->dev.device, image.image, nullptr);
         vkFreeMemory(unit->dev.device, image.memory, nullptr);
         unit->imageBytes -= image.bytes;
         unit->images.erase(key);
         unit->evicted++, unit->evictedSince++;
     }
+}
+
+// FM4 Recomp (M9, live resolution, step 2): every scaled twin and its views destroyed, at a change of the internal scale (the
+// renderer's switch: every submission confirmed complete, no command buffer open, so nothing recorded or in flight samples one).
+// A twin is at one scale (EnsureHi refuses another) and Bind samples it while hiValid whatever the scale, so none may outlive the
+// scale it was made at. The 1x images are untouched: they hold guest memory's words and are sampled until the next resolve over
+// them gives scaled words again. The unit keeps no bound view between draws (Bind looks the view up at each bind; the prepare
+// memo holds entries and plans, never views), so nothing else needs forgetting.
+// Known limit: an image created while the display image was 1280x720 has no TRANSFER_SRC usage (HostImage::blitSource false) and
+// never gets a twin, so after a start at 720p a resolved texture stays 1x until it is evicted and made again.
+size_t DestroyTextureTwins()
+{
+    if (!unit)
+        return 0;
+    size_t destroyed = 0;
+    for (auto& [key, image] : unit->images)
+        if (image.hiImage != VK_NULL_HANDLE)
+            DestroyHi(key, image), destroyed++;
+    for (auto& [key, view] : unit->hiViews)  // none is left unless a view outlived its image (never expected)
+        vkDestroyImageView(unit->dev.device, view, nullptr);
+    unit->hiViews.clear();
+    return destroyed;
 }
 
 std::string TextureUnitSummary()
@@ -1232,6 +1475,14 @@ std::string TextureUnitSummary()
         summary += text;
     }
     unit->fillsSince = unit->fillBytesSince = unit->fillNsSince = unit->gpuLoadsSince = unit->gpuLoadBytesSince = unit->gpuFallbacksSince = 0;
+    if (runtime::video::scale::OutputScaled())  // FM4 Recomp (M9): the scaled twins of the swap
+    {
+        std::snprintf(text, sizeof text, "; scaled twins: %llu image(s), %llu write(s), %llu bind(s), %llu bind(s) of the 1x image for texel offsets, %llu dropped",
+                      (unsigned long long)unit->hiImages, (unsigned long long)unit->hiAdoptedSince, (unsigned long long)unit->hiBindsSince,
+                      (unsigned long long)unit->hiOffsetBindsSince, (unsigned long long)unit->hiDroppedSince);
+        summary += text;
+        unit->hiAdoptedSince = unit->hiBindsSince = unit->hiOffsetBindsSince = unit->hiDroppedSince = 0;
+    }
     if (ResolveResident())  // FM4 Recomp: the resident resolves of the swap (resolve_resident.h)
     {
         std::snprintf(text, sizeof text, "; resident: %llu image write(s), %llu bind(s), %llu dropped", (unsigned long long)unit->adoptedSince,

@@ -7,6 +7,32 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Rendering resolutions: 720p, Full HD, QHD and 4K, with the game's own anti-aliasing kept. Full HD
+  is the default.
+- Extra edge smoothing (Off, Soft, Standard, Strong) on top of the game's anti-aliasing. Standard
+  is the default.
+- A GRAPHICS menu in the game, in the Pause menu and on the Pre-Race screen, for the resolution,
+  edge smoothing and HDR. A choice changes at once, the resolution included. The same settings
+  are in the Settings panel (Command-comma in the game's menus), where a choice applies when
+  the panel closes.
+- HDR output (Off or Auto; Off is the default). Auto shows brighter highlights on a display that
+  supports HDR and the standard picture on any other; the menu says which is active and why.
+- Controller rumble: the game's vibration reaches a gamepad that has motors.
+
+### Changed
+
+- Faster races: about 40 frames per second while driving at Full HD and about 31 at QHD, measured
+  on an Apple M5 Mac in automated runs without a window.
+
+### Fixed
+
+- The sun's glare no longer covers the road when the sun is hidden behind a building, a hill or
+  the car: the flare now follows how much of the sun is visible.
+- A Mac volume that is really full no longer stops the game during a save: the game gets "disk
+  full" and shows its own message.
+
 ## [0.1.0] - 2026-11-18
 
 The first public beta. The full notes are on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0). The SHA-256 of

@@ -44,8 +44,12 @@ struct HostTargets
 {
     VkImageView color = VK_NULL_HANDLE, depth = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED, depthFormat = VK_FORMAT_UNDEFINED;
-    uint32_t width = 0, height = 0, samples = 1;
-    std::vector<PendingClear> clears;  // to record first in the draw's pass (the unit has forgotten them)
+    uint32_t width = 0, height = 0, samples = 1;  // the host images' size
+    // FM4 Recomp (M9, memory): the host height of the keys' full extent (the viewport's: FoldViewport maps to guestHeight rows); the
+    // images hold the rows in use only (`height`, the framebuffer's), so a draw's scissor and render area stay inside `height`.
+    uint32_t viewHeight = 0, viewRows = 0;  // viewRows: the guest rows viewHeight stands for (FoldViewport's height)
+    uint32_t guestWidth = 0, guestHeight = 0, halves = 2;  // FM4 Recomp (M9, FM4_INTERNAL_RES): the keys' guest size and the internal scale in halves (render_scale.h)
+    std::vector<PendingClear> clears;  // to record first in the draw's pass (the unit has forgotten them); host rectangles
 };
 
 // FM4 Recomp (M7 GPU cost, FM4_CLEAR_DRAWS): a clear-class draw (draw_record.h FindClearDraw) handed to acquireTargets instead of being
@@ -113,6 +117,15 @@ inline void OutsideRenderPass(VkCommandBuffer c)
         endOpenRenderPass(c);
 }
 
+// FM4 Recomp (M9, live resolution, step 2): what EdramHooks::rescale did (the switch's log line).
+struct RescaleCounts
+{
+    uint32_t targets = 0, shadows = 0;  // host targets and 1x resolve shadows destroyed
+    uint32_t outgrown = 0;              // images targets had outgrown, destroyed with them
+    uint32_t carriedClears = 0;         // pending clears kept aside for their key's next target
+    uint32_t residentImages = 0;        // scaled resident images of other scales destroyed
+};
+
 struct EdramHooks
 {
     // Before a Draw / DepthOnly draw is recorded: the host targets of `target` for the attachments the
@@ -154,6 +167,28 @@ struct EdramHooks
     void (*handOff)(uint64_t serial);
     bool (*writeBackHandedOff)(uint64_t serial, std::string& error);
     void (*forget)(uint64_t upToSerial);
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): with lastResolve's `out.hiHalves` set, the unit's image holding the same resolve converted per
+    // host pixel (R32_UINT, TRANSFER_SRC_OPTIMAL, the scaled rectangle at (0, 0)), valid until the next resolve; null otherwise.
+    VkImage (*lastResolveHi)();
+    // FM4 Recomp (M9, memory; FM4_EDRAM_RELEASE_REPLACED): destroys the images a host target outgrew (edram_vk.cpp NeedRows), calling
+    // `forgetView` for each one's attachment view first. Only when every submission is confirmed complete (no command recorded or in
+    // flight may still use them): the renderer calls it where it evicts idle textures. Returns how many were destroyed.
+    size_t (*releaseReplaced)(void (*forgetView)(VkImageView));
+    // FM4 Recomp (M9, live resolution, step 2; renderer.cpp SwitchResolution): the unit's side of a change of the internal scale.
+    // `prepareScale` (fallible, destroys nothing): whether every existing key has a whole host size within the device's limits at
+    // `halves`, then that scale's transfer modules and scaled resident image, made now if they are not there. False with `error`
+    // refuses the switch and leaves the unit as it was.
+    bool (*prepareScale)(uint32_t halves, std::string& error);
+    // Whether the unit holds nothing of an earlier submission (no read-back resolve pending or handed off): `rescale` may run.
+    bool (*rescaleReady)();
+    // Only when every submission is confirmed complete and `rescaleReady`: every host target and 1x shadow is destroyed
+    // (`forgetView` first, as releaseReplaced), with the images targets had outgrown; the ownership map returns to its start state;
+    // each key's pending clears are kept aside and put back when the key's target is made again at the new scale. Cannot fail.
+    // `toHalves`: the new scale (the scaled resident images of other scales are destroyed). The renderer sets the scale after it.
+    void (*rescale)(uint32_t toHalves, void (*forgetView)(VkImageView), RescaleCounts& counts);
+    // The pending clears `rescale` kept aside that no target took back (the renderer calls it at the swap after the switch, so a
+    // clear never lands frames late). Returns how many were dropped.
+    size_t (*dropCarriedClears)();
 };
 
 class UploadRing;  // pipeline_key.h
@@ -190,7 +225,9 @@ struct TextureHooks
     // FM4 Recomp (FM4_RESOLVE_RESIDENT, resolve_resident.h): after every recorded resolve. Copies the resolve's converted words
     // (`words`, EdramHooks::lastResolve) into each host image that takes them verbatim and is otherwise in step with guest
     // memory; every other image over the resolve's range stops being resident. Returns the images written.
-    uint32_t (*adoptResolve)(VkCommandBuffer commands, const ResidentResolve& resolve, VkImage words);
+    uint32_t (*adoptResolve)(VkCommandBuffer commands, const ResidentResolve& resolve, VkImage words, VkImage hiWords);
+    // FM4 Recomp (M9, FM4_INTERNAL_RES): `hiWords` (EdramHooks::lastResolveHi, or null) also goes into the image's scaled twin, which
+    // draws then sample instead (texture_vk.cpp HostImage::hiImage).
 };
 
 }  // namespace runtime::video

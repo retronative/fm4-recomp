@@ -22,6 +22,13 @@ int fd = -1;
 SDL_Joystick* joystick = nullptr;
 std::string pending;
 
+// What the pad receives (as ReCarbon's virtual pad, runtime/hid/input.cpp): one line per SDL_RumbleGamepad call that reaches it.
+bool SDLCALL Rumble(void*, Uint16 low, Uint16 high)
+{
+    std::fprintf(stderr, "[test pad] rumble low %u, high %u\n", unsigned(low), unsigned(high));
+    return true;
+}
+
 int ButtonOf(const std::string& name)
 {
     static const struct { const char* name; SDL_GamepadButton button; } kButtons[] = {
@@ -54,6 +61,7 @@ void Start()
     desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
     desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
     desc.name = "FM4 Recomp test pad";
+    desc.Rumble = Rumble;
     const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
     joystick = id != 0 ? SDL_OpenJoystick(id) : nullptr;
     std::fprintf(stderr, "[test pad] virtual gamepad %s (pipe %s)\n", joystick != nullptr ? "attached" : SDL_GetError(), path);

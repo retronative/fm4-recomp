@@ -147,11 +147,16 @@ uint32_t OpenDiscFile(uint8_t* base, const DiscEntry& entry, bool synchronous); 
 // Writable roots only: an empty file (refusing an existing name or a symlink) or a directory; truncation of a file.
 bool CreateHostEntry(const std::string& host, bool directory);
 bool TruncateHostFile(const std::string& host);
-// Writes `size` bytes at `offset` into a writable entry's host file (a failed host write stops (9)); returns `size`.
-uint32_t WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* buffer, uint32_t size);
+// FM4 Recomp: whether a host errno says the volume has no room (POSIX write(2), ftruncate(2), open(2), mkdir(2): ENOSPC "no
+// space left on device", EDQUOT "disc quota exceeded"). Such a failure is the guest's STATUS_DISK_FULL, not a stop. Pure.
+bool HostVolumeFull(int error);
+// Writes `size` bytes at `offset` into a writable entry's host file. True: all written. False: the host volume is full
+// (HostVolumeFull; the caller reports STATUS_DISK_FULL; bytes before the failure may have reached the file). Any other
+// host failure stops (9).
+bool WriteHostFile(const DiscEntry& entry, uint64_t offset, const uint8_t* buffer, uint32_t size);
 // Sets a writable host file's length (ftruncate: cut, or extended with zeros); stops (7) for a file outside a writable
-// root and (9) if the host refuses.
-void SetHostFileLength(const DiscEntry& entry, uint64_t length);
+// root. False: the host volume is full (as WriteHostFile; the length is unchanged). Any other host failure stops (9).
+bool SetHostFileLength(const DiscEntry& entry, uint64_t length);
 // Removes a writable root's host file (not a directory; a symlink or a host failure stops (9)).
 void RemoveHostFile(const DiscEntry& entry);  // FM4 Recomp: an empty saved-content directory too (one still holding files is left)
 // Whether a writable root is mounted on this host directory (an open content item).

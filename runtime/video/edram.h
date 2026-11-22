@@ -319,6 +319,18 @@ public:
     uint32_t ClearValueTiles() const;  // tiles recorded as constants
     static constexpr uint32_t kMaxClearRuns = 32;
 
+    // FM4 Recomp (M9, live resolution, step 2): back to the state of a new map (no owner, no shadow, no recorded constant, no
+    // remembered claim), for the moment every host image is destroyed and made again zeroed (edram_vk.cpp Rescale): what the map
+    // said the images held is gone with them. The skip-unwritten setting and its running tallies are kept (the swap line subtracts
+    // the tallies of the swap before: renderer.cpp).
+    void Reset()
+    {
+        const bool skip = skipUnwritten;
+        const SkipStats tallies = skipped_;
+        *this = Ownership();
+        skipUnwritten = skip, skipped_ = tallies;
+    }
+
 private:
     struct ClearRun
     {

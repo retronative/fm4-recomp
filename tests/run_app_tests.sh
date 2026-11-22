@@ -3,7 +3,8 @@
 # Copyright (C) 2026 FM4 Recomp contributors
 #
 # FM4 Recomp.app's pure logic, headless: the keyboard bindings' key table, file, parse rules, conflicts and save
-# (tests/app/test_keybindings.swift over app/setup/KeyBindings.swift), and what opening the app does: setup, repair, blocked or play
+# (tests/app/test_keybindings.swift over app/setup/KeyBindings.swift), the graphics settings' file
+# (tests/app/test_graphics_settings.swift over app/setup/GraphicsSettings.swift), and what opening the app does: setup, repair, blocked or play
 # (tests/app/test_launch_decision.swift over app/setup/Core.swift, KeyBindings.swift and LaunchDecision.swift). No window, no SwiftUI; the compiler
 # flags are scripts/release/make_app.sh's. A passing run removes its work directory.
 #
@@ -17,7 +18,10 @@ perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target a
   "$ROOT/app/setup/KeyBindings.swift" "$ROOT/tests/app/test_keybindings.swift" -o "$OUT/test_keybindings"
 perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-name LaunchDecisionTest \
   "$ROOT/app/setup/Core.swift" "$ROOT/app/setup/KeyBindings.swift" "$ROOT/app/setup/LaunchDecision.swift" "$ROOT/tests/app/test_launch_decision.swift" -o "$OUT/test_launch_decision"
+perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-name GraphicsSettingsTest \
+  "$ROOT/app/setup/GraphicsSettings.swift" "$ROOT/tests/app/test_graphics_settings.swift" -o "$OUT/test_graphics_settings"
 status=0
+perl -e 'alarm 60; exec @ARGV' "$OUT/test_graphics_settings" || status=$?
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_keybindings" || status=$?
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_launch_decision" || status=$?
 if [ "$status" = 0 ] && [ -z "${KEEP_WORK:-}" ]; then rm -r "$OUT"; fi

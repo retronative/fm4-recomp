@@ -15,6 +15,7 @@
 #include "stfs.h"
 #include "graphics.h"
 #include "input_script.h"  // FM4 Recomp (M7 stability harness): the input script's @title anchor
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -307,6 +308,12 @@ GUEST_IMPORT(XamContentGetDeviceData, "REFERENCE_DERIVED: Xenia xam_content_devi
     if (deviceId != runtime::kContentDeviceId)
         return (void)(ctx.r3.u64 = 0x48F);
     const uint64_t total = runtime::kContentCapacity, free = runtime::ContentFreeBytes();
+    // FM4 Recomp: logged when the answer changes, so a log shows what free space the game was told before a save.
+    static std::atomic<uint64_t> lastFree{~uint64_t(0)};
+    if (lastFree.exchange(free) != free)
+        std::fprintf(stderr, "[content] XamContentGetDeviceData(%u): %llu byte(s) free of %llu (the Mac's volume has %llu available, %llu kept in reserve)\n",
+                     deviceId, (unsigned long long)free, (unsigned long long)total, (unsigned long long)runtime::HostAvailableBytes(),
+                     (unsigned long long)runtime::kHostReserve);
     std::memset(base + data, 0, 0x50);
     runtime::Store32(base, data, runtime::kContentDeviceId);
     runtime::Store32(base, data + 4, runtime::kContentDeviceType);
