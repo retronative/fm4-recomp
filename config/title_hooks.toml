@@ -91,7 +91,7 @@ string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c
 string_copy = 0x82971220
 string_copy_bytes = 96
 string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
-# The GRAPHICS row (owner request 2026-11-20: the graphics settings in the Pause menu, like the keys): row id 10, after KEYBOARD
+# The GRAPHICS row (the graphics settings in the Pause menu, like the keys): row id 10, after KEYBOARD
 # CONTROLS and before Quit Race, whenever the player's data folder is known (the settings file can be written; no live keyboard
 # needed). The scene's list has 11 slots: the game's nine rows at most, and these two.
 [[hook.more]]
@@ -361,7 +361,7 @@ string_new_sha256 = "ec35b979155a5eb4fb69c1282f1c89a98450abbff7698628d774aa7a33c
 string_copy = 0x82971220
 string_copy_bytes = 96
 string_copy_sha256 = "b50902824eb7cbef57901ed25b6e25877839cf4c504879415057afb2b6b4bd81"
-# The GRAPHICS row here too (owner request 2026-11-21: wherever KEYBOARD CONTROLS is): row id 11, after KEYBOARD CONTROLS and before
+# The GRAPHICS row here too (wherever KEYBOARD CONTROLS is): row id 11, after KEYBOARD CONTROLS and before
 # Audio; the listener sends every id above 9 to its tail (above). The list has 11 slots and the game adds at most 10 rows of its own:
 # whether a twelfth row is reachable (the list is an ANIMATED_SCROLLING_LIST) is UNRESOLVED until seen with every row present.
 [[hook.more]]

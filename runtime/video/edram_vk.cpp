@@ -1546,7 +1546,7 @@ bool View(VkImage image, VkFormat format, VkImageAspectFlags aspects, VkImageVie
 // key itself; a resolve's 1x shadow of a scaled key under ShadowKey).
 // FM4 Recomp (M9, memory): whether every host target holds its key's full extent (the former sizing) or only the rows in use.
 // FM4_EDRAM_FULL_TARGETS=1: the full extent; =0: the rows in use. Unset: the full extent at 1x (the default path stays as it was
-// until the owner approves the change there) and the rows in use above 1x (FM4_INTERNAL_RES, where the full extent costs gigabytes).
+// until the change is validated there) and the rows in use above 1x (FM4_INTERNAL_RES, where the full extent costs gigabytes).
 // FM4 Recomp (M9, live resolution, step 1): the variable is read once and the line printed once, at the first call, as before; the
 // unset case follows the current scale at each call (it was the scale at the first call, kept for the run).
 bool FullTargets()

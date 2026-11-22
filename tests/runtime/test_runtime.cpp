@@ -3279,7 +3279,7 @@ int main(int, char** argv)
                                        hostText() == std::string("hXY\0\0\0", 6);
                 Expect(allocated && ExitCodeOf([&] { (void)setAllocation(h, 2); }) == int(StopCode::Unimplemented),
                        "NtSetInformationFile(allocation): at or above the size success {0, 8}, file unchanged; below it stops (7)");
-                // FM4 Recomp (after the owner's report of 2026-11-20, a session with ~500 MB free on the Mac): a nearly full host volume,
+                // FM4 Recomp (after a session with about 500 MB free on the Mac): a nearly full host volume,
                 // simulated (FM4_TEST_HOST_AVAILABLE_BYTES, content.h; the drive is not filled). By hand (content.h ContentFree =
                 // min(20 GiB - stored, host available - 2 GiB reserve)): 524288000 available (500 MB, below the reserve) -> 0 free.
                 // Then, on the 6-byte file "hXY\0\0\0": XamContentGetDeviceData reports {total 0x5_0000_0000, free 0}; one byte

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 SpeedBreaker / ReCarbon contributors
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // Occlusion query reports (EVENT_WRITE_ZPD) counted on the GPU: the Vulkan-free bookkeeping (report kinds, the weight of a host

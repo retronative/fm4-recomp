@@ -460,7 +460,7 @@ class PlayDefaults(unittest.TestCase):
         s = self.settings({})
         self.assertEqual(s["FM4_TEXTURE_GPU_UNTILE"], "0")
         self.assertEqual((s["FM4_GUEST_MEMORY_GPU"], s["FM4_VERTEX_CACHE_MB"], s["FM4_SUBMIT_IF_IDLE"], s["FM4_ASYNC_RETIRE"]), ("1", "256", "8", "1"))
-        # The four speed settings of the internal resolutions are on by default (owner decision 2026-11-22); 0 turns one off.
+        # The four speed settings of the internal resolutions are on by default; 0 turns one off.
         self.assertEqual([s[k] for k in ("FM4_INTERNAL_SCALE_PITCH", "FM4_RESOLVE_FUSED", "FM4_PRESENT_LAZY", "FM4_EDRAM_RELEASE_REPLACED")], ["1"] * 4)
         self.assertEqual(self.settings({"FM4_RESOLVE_FUSED": "0", "FM4_SUBMIT_IF_IDLE": "32"})["FM4_RESOLVE_FUSED"], "0")  # CONTROL: the environment wins
         self.assertEqual(self.settings({"FM4_SUBMIT_IF_IDLE": "32"})["FM4_SUBMIT_IF_IDLE"], "32")
@@ -493,7 +493,7 @@ class PlayDefaults(unittest.TestCase):
 
     def test_rendering_resolution_from_graphics_conf(self):
         header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
-        self.assertEqual(self.resolution({}), ("fhd", ""))                                         # no file: the default (owner decision 2026-11-21)
+        self.assertEqual(self.resolution({}), ("fhd", ""))                                         # no file: the default
         self.assertEqual(self.resolution({}, header + "internal_resolution = 720p\n"), ("720p", ""))
         self.assertEqual(self.resolution({}, header + "internal_resolution = fhd\n"), ("fhd", ""))   # the app's file (GraphicsSettings.swift)
         self.assertEqual(self.resolution({}, header + "internal_resolution = qhd\n"), ("qhd", ""))
@@ -584,7 +584,7 @@ class PlayDefaults(unittest.TestCase):
     def test_extended_view_from_graphics_conf(self):
         header = "# FM4 Recomp graphics settings, written by FM4 Recomp's Graphics panel. Delete this file for the defaults.\n"
         on = {"FM4_EXTENDED_VIEW_OFFERED": "1"}
-        # Not offered (0.2.0): off and the hook disarmed whatever the file or the environment says.
+        # Not offered: off and the hook disarmed whatever the file or the environment says.
         self.assertEqual(self.extended({}), ("off 0", ""))
         self.assertEqual(self.extended({}, "extended_view = on\n"), ("off 0", ""))
         self.assertEqual(self.extended({"FM4_EXTENDED_VIEW": "on", "FM4_EXTENDED_VIEW_HOOK": "1"}, "extended_view = on\n"), ("off 0", ""))
@@ -611,7 +611,7 @@ class PlayDefaults(unittest.TestCase):
         return done.stdout.strip()
 
     def test_occlusion_queries_default(self):
-        self.assertEqual(self.occlusion({}), "1")                                # on by default (owner decision 2026-11-23)
+        self.assertEqual(self.occlusion({}), "1")                                # on by default
         self.assertEqual(self.occlusion({"FM4_OCCLUSION_QUERIES": "0"}), "0")    # the environment turns it off
 
     def audio(self, env):

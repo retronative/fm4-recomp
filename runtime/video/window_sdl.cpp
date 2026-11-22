@@ -326,7 +326,8 @@ void RunWindowLoop()
                     runtime::view::Global().SetPreference(saved.extended != 0);  // Extended View: from the next frame
                 const HdrOutput now = HdrOutputNow();
                 runtime::settings::PublishHdrStatus({true, now.active, now.reason});
-                std::fprintf(stderr, "[graphics] Settings closed: EXTENDED VIEW %s, HDR %s; %s\n", saved.extended != 0 ? "ON" : "OFF", saved.hdr != 0 ? "AUTO" : "OFF",
+                std::fprintf(stderr, "[graphics] Settings closed: %sHDR %s; %s\n",
+                             !runtime::settings::ExtendedOffered() ? "" : saved.extended != 0 ? "EXTENDED VIEW ON, " : "EXTENDED VIEW OFF, ", saved.hdr != 0 ? "AUTO" : "OFF",
                              runtime::settings::HdrStatusLine(runtime::settings::GetHdrStatus()).c_str());
             }
         }

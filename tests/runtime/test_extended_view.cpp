@@ -26,7 +26,7 @@ int main()
     Expect(Near(FactorForWindow(3440, 1440), 1.34375f) && Near(FactorForWindow(2560, 1080), 1.3333333f) && Near(FactorForWindow(5120, 1440), 2.0f) &&
                FactorForWindow(7680, 1440) == 2.0f && Near(FactorForWindow(1400, 720), 1.09375f),
            "factor, wider: 3440x1440 is 1.34375, 2560x1080 1.33333, 5120x1440 2; wider than 32:9 stays 2; 1400x720 is 1.09375");
-    // Narrower than 16:9: 16:10 is (16/10) / (16/9) = 0.9; the owner's 2940x1846 display 1.592633 / 1.777778 = 0.895856; 3:2 is 0.84375; 4:3 is 0.75, and
+    // Narrower than 16:9: 16:10 is (16/10) / (16/9) = 0.9; a 2940x1846 display 1.592633 / 1.777778 = 0.895856; 3:2 is 0.84375; 4:3 is 0.75, and
     // nothing goes below it (5:4, a portrait window).
     Expect(Near(FactorForWindow(1920, 1200), 0.9f) && Near(FactorForWindow(2940, 1846), 0.895856f, 1e-5f) && Near(FactorForWindow(2160, 1440), 0.84375f) &&
                Near(FactorForWindow(1024, 768), 0.75f) && FactorForWindow(1280, 1024) == 0.75f && FactorForWindow(720, 1280) == 0.75f,

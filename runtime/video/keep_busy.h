@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// FM4 Recomp (M9 experiment, opt-in FM4_GPU_KEEP_BUSY=1, off by default; owner request 2026-11-21): keeps the GPU lightly busy between
+// FM4 Recomp (M9 experiment, opt-in FM4_GPU_KEEP_BUSY=1, off by default): keeps the GPU lightly busy between
 // the game's frames, to see whether Apple's GPU governor then raises the clock (OBSERVED with powermetrics: the GPU stays at 338-636 of
 // 1578 MHz while the game drops frames, never saturated; research/m9/perf/RESULTS.md) and whether the game's frames get shorter.
 //

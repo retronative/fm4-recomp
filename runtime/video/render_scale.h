@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 SpeedBreaker / ReCarbon contributors
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // FM4 Recomp (M9, opt-in FM4_INTERNAL_RES): internal rendering at 1.5 (FHD, 1920x1080), 2 (QHD, 2560x1440) or 3 (4K, 3840x2160) times

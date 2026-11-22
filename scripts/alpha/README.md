@@ -3,7 +3,7 @@
 # FM4 Recomp: macOS beta
 
 A static recompilation of *Forza Motorsport 4* (Xbox 360, USA Disc 1) to native Apple-silicon macOS. This beta plays the game
-in a window with sound, a gamepad or the keyboard. It is an early, unoptimised build: expect a low frame rate and the known
+in a window with sound, a gamepad (with rumble) or the keyboard. It is a beta: expect a frame rate below 60 in races and the known
 issues below.
 
 **You must supply your own game.** No game data is included: no disc files, artwork, audio, tracks or cars. The program does contain
@@ -131,6 +131,8 @@ renderer's CPU time.
 
 ## Fixed in this build
 
+- **The sun's glare no longer covers the road** when the sun is hidden behind a building, a hill or the car: the flare now follows
+  how much of the sun is visible.
 - **Missing road near the car after a race start** (seen in about half of the Bernese Alps Quick Race starts): the game's track
   loader could run ahead of the main thread's release of the previous scene and silently drop models and textures. The loader
   now waits for those releases. Verified in automated runs; please report it if you still see it.

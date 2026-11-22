@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 SpeedBreaker / ReCarbon contributors
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // FM4 Recomp (M9, opt-in FM4_POST_AA=on; the app's Graphics panel, "Extra edge smoothing"): a post-process anti-aliasing pass over the

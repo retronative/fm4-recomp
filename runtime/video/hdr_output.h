@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 SpeedBreaker / ReCarbon contributors
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // FM4 Recomp (M9, opt-in FM4_HDR=1, off by default): HDR output on a display with extended dynamic range (macOS EDR). The game's
@@ -110,7 +111,7 @@ inline float LocalScale(float peak, float neighbourhoodV8, float budget)
 }
 
 // The HUD under HDR (there is no mask of the HUD in the finished picture, so its white would be expanded to the peak like any
-// highlight; OBSERVED by the owner, 2026-11-22: "HUD color too white"). The renderer knows which draws are the HUD
+// highlight; OBSERVED in play: the HUD far too white). The renderer knows which draws are the HUD
 // (kernel/extended_view.h IsOverlayDraw) and scales their colour by this gain: the encoded value whose linear light L satisfies
 // L + (peak - 1) L^8 = 1, so a white HUD pixel is exactly standard white after Expand. 1 at a peak of 1.
 inline float HudGain(float peak)

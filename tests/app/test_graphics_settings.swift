@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// FM4 Recomp.app's graphics settings (app/setup/GraphicsSettings.swift), headless: the three resolutions and their spellings
-// (runtime/video/render_scale.h ParseInternalRes accepts each: 720p, fhd, qhd), Full HD with Standard smoothing as the defaults, the file, the parse rules,
+// FM4 Recomp.app's graphics settings (app/setup/GraphicsSettings.swift), headless: the four resolutions and their spellings
+// (runtime/video/render_scale.h ParseInternalRes accepts each: 720p, fhd, qhd, 4k), Full HD with Standard smoothing as the defaults, the file, the parse rules,
 // the atomic save and the load across "launches" (a fresh load of the saved file). Expected values by hand. "CONTROL" marks a
 // negative control.
 //

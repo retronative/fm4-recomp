@@ -458,9 +458,10 @@ void KeyboardHudBind(PPCContext& ctx, uint8_t* base, PPCFunc* original)
         });
         PublishHdr();  // what is active now, for the HDR row's description
         BuildGraphicsRows(ctx, base, self);
-        std::fprintf(stderr, "[graphics] GRAPHICS shown: %s, %s, HDR %s, EXTENDED VIEW %s (%s); %s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
+        std::fprintf(stderr, "[graphics] GRAPHICS shown: %s, %s, HDR %s%s%s (%s); %s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
                      settings::Menu::ValueLabel(1, graphics->Value(1)), settings::Menu::ValueLabel(2, graphics->Value(2)),
-                     settings::Menu::ValueLabel(3, graphics->Value(3)), settings::GraphicsPath().c_str(),
+                     settings::ExtendedOffered() ? ", EXTENDED VIEW " : "", settings::ExtendedOffered() ? settings::Menu::ValueLabel(3, graphics->Value(3)) : "",
+                     settings::GraphicsPath().c_str(),
                      settings::HdrStatusLine(settings::GetHdrStatus()).c_str());
         return;
     }
@@ -535,9 +536,9 @@ void KeyboardHudInput(PPCContext& ctx, uint8_t* base, PPCFunc* original)
         // Y do nothing (the HUD screen's save and reset are not this submenu's).
         if (code == kInputB)
         {
-            std::fprintf(stderr, "[graphics] GRAPHICS closed: %s, %s, HDR %s, EXTENDED VIEW %s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
+            std::fprintf(stderr, "[graphics] GRAPHICS closed: %s, %s, HDR %s%s%s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
                          settings::Menu::ValueLabel(1, graphics->Value(1)), settings::Menu::ValueLabel(2, graphics->Value(2)),
-                         settings::Menu::ValueLabel(3, graphics->Value(3)));
+                         settings::ExtendedOffered() ? ", EXTENDED VIEW " : "", settings::ExtendedOffered() ? settings::Menu::ValueLabel(3, graphics->Value(3)) : "");
             screen = 0, shown = Submenu::None;
             graphics.reset();
             PPC_STORE_U8(self + kHudChanged, 0);

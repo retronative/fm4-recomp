@@ -167,7 +167,7 @@ struct SmoothingRow: View {
           HStack(spacing: 8) {
             Text("Extra edge smoothing").font(.system(size: 14, weight: .semibold))
             Text(on ? "On" : "Off").font(.system(size: 12)).foregroundStyle(Theme.secondary)
-            if !on { Text("Default").font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Theme.secondary) }
+            if on && model.graphics.strength == GraphicsSettings.defaults.strength { Text("Default").font(.system(size: 10.5, weight: .semibold)).foregroundStyle(Theme.secondary) }
           }
           Text("Smooths the jagged edges left after the game's own anti-aliasing (thin lines, railings). Fine detail and small text get slightly softer.")
             .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)

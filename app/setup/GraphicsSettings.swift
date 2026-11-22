@@ -7,8 +7,9 @@
 // its strength, `on` being Standard: the post-process pass of runtime/video/post_aa.h). A setting the file does not name is its default.
 // play.sh reads the file at the game's start and exports
 // FM4_INTERNAL_RES (runtime/video/render_scale.h owns the spellings) and FM4_POST_AA; no file is Full HD with Standard smoothing, the
-// defaults (owner decision 2026-11-21). The app writes it, and so does the game's own GRAPHICS submenu (the Pause menu; runtime/kernel/graphics_menu.h, the same
-// text byte for byte). A choice applies the next time the game starts (the renderer reads both once).
+// defaults. The app writes it, and so does the game's own GRAPHICS submenu (the Pause menu; runtime/kernel/graphics_menu.h, the same
+// text byte for byte). The running game takes a choice at once from its own menu, or when the Settings panel closes; play.sh reads the
+// file at every start.
 // `hdr = auto | off` (HDR output, runtime/video/hdr_output.h; off by default): play.sh exports it as FM4_HDR. Auto uses HDR when the
 // display and the system can show it and standard range (SDR) otherwise; it is the player's preference, not what is active (the
 // running game writes that to hdr_status, HdrStatus below). Off is not written (a file that does not name it is off), so a file
@@ -40,7 +41,7 @@ enum InternalResolution: String, CaseIterable, Equatable {
   }
   var detail: String {
     switch self {
-    case .hd: return "The game's original resolution. Fastest, and the least memory."
+    case .hd: return "The game's original resolution. The least graphics memory."
     case .fhd: return "Sharper picture. Needs more graphics time and memory."
     case .qhd: return "Much sharper picture. Needs about twice the graphics time of 720p."
     case .uhd: return "Sharpest picture, for a 4K display. Very heavy: expect a low frame rate."

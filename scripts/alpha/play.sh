@@ -82,7 +82,7 @@ export FM4_DEFER_FENCES=1 FM4_GPU_TIMESTAMPS=1 FM4_RING_MB=256 FM4_WRITE_WATCH=1
 # FM4_LOAD_WAITS_RELEASES: a track-heap allocation that fails while releases are queued waits for them (the near road missing
 # after some race starts; runtime/game/release_wait.cpp).
 # Stack v2: shared guest memory read by the
-# GPU, GPU present, the vertex cache, submit-when-idle at 8 draws (owner decision 2026-11-22; 32 before: fewer long frames at QHD,
+# GPU, GPU present, the vertex cache, submit-when-idle at 8 draws (32 before: fewer long frames at QHD,
 # research/m9/perf/RESULTS.md), bulk register runs, async retire. GPU texture untile
 # (FM4_TEXTURE_GPU_UNTILE) is off: with it, Free Play -> Quick Race (Bernese Alps) drew the road and grass untextured.
 # Each is a default: a value already in the environment wins (0 turns a setting off), so a defect can be bisected setting by setting.
@@ -90,13 +90,13 @@ export FM4_VARIANT_MEMO="${FM4_VARIANT_MEMO:-1}" FM4_GPU_PRESENT="${FM4_GPU_PRES
   FM4_GUARD_HOT="${FM4_GUARD_HOT:-1}" FM4_GUEST_MEMORY_GPU="${FM4_GUEST_MEMORY_GPU:-1}" FM4_RESOLVE_RESIDENT_COVER="${FM4_RESOLVE_RESIDENT_COVER:-1}" \
   FM4_TEXTURE_GPU_UNTILE="${FM4_TEXTURE_GPU_UNTILE:-0}" FM4_VERTEX_CACHE_MB="${FM4_VERTEX_CACHE_MB:-256}" FM4_SUBMIT_IF_IDLE="${FM4_SUBMIT_IF_IDLE:-8}" \
   FM4_BULK_REGISTERS="${FM4_BULK_REGISTERS:-1}" FM4_ASYNC_RETIRE="${FM4_ASYNC_RETIRE:-1}"
-# The four speed settings of the internal resolutions (owner decision 2026-11-22; validated at 720p, Full HD, QHD and 4K, the held
+# The four speed settings of the internal resolutions (validated at 720p, Full HD, QHD and 4K, the held
 # main menu byte-identical with and without them): the scaled pitch and the fused resolves act only above 720p. 0 turns one off.
 export FM4_INTERNAL_SCALE_PITCH="${FM4_INTERNAL_SCALE_PITCH:-1}" FM4_RESOLVE_FUSED="${FM4_RESOLVE_FUSED:-1}" FM4_PRESENT_LAZY="${FM4_PRESENT_LAZY:-1}" \
   FM4_EDRAM_RELEASE_REPLACED="${FM4_EDRAM_RELEASE_REPLACED:-1}"
 if [ "$FM4_VERTEX_CACHE_MB" = 0 ]; then unset FM4_VERTEX_CACHE_MB; fi  # 0: no vertex cache (the game refuses a size outside 64-1024)
 # Rendering resolution (the Settings panel, Command-comma in the game's menus (--controls-panel below), writes $FM4_RECOMP_HOME/graphics.conf: internal_resolution =
-# 720p | fhd | qhd | 4k): 720p is the game's own 1280x720; fhd renders and shows 1920x1080 and is the default (owner decision 2026-11-21), qhd 2560x1440, 4k
+# 720p | fhd | qhd | 4k): 720p is the game's own 1280x720; fhd renders and shows 1920x1080 and is the default, qhd 2560x1440, 4k
 # 3840x2160. A value already
 # in the environment wins. No file is fhd; so is a file with any other value (the game would refuse to start on one), named here.
 RES=fhd
@@ -112,8 +112,8 @@ elif [ -f "$ROOT/graphics.conf" ]; then
 fi
 export FM4_INTERNAL_RES="$RES"
 # Extra edge smoothing (the same panel and file: anti_aliasing = off | soft | on | strong, on being the Standard strength;
-# runtime/video/post_aa.h, a post-process pass after the game's own anti-aliasing): on (Standard) unless the file says otherwise (owner
-# decision 2026-11-21). A value already in the environment wins; any other value in the file is on, named here (the game would refuse to start on one).
+# runtime/video/post_aa.h, a post-process pass after the game's own anti-aliasing): on (Standard) unless the file says otherwise.
+# A value already in the environment wins; any other value in the file is on, named here (the game would refuse to start on one).
 AA=on
 if [ -n "${FM4_POST_AA:-}" ]; then
   AA="$FM4_POST_AA"
@@ -142,15 +142,11 @@ elif [ -f "$ROOT/graphics.conf" ]; then
   esac
 fi
 export FM4_HDR="$HDR"
-# The sun's flare follows the sun's visibility (real occlusion queries, runtime/video/zpd_report.h): on (owner decision 2026-11-23;
-# validated at 720p, Full HD, QHD and 4K with no measurable cost, research/m9/glare/RESULTS.md). 0: the fixed count as before.
+# The sun's flare follows the sun's visibility (real occlusion queries, runtime/video/zpd_report.h): on (validated at 720p, Full HD, QHD and 4K with no measurable cost, research/m9/glare/RESULTS.md). 0: the fixed count as before.
 export FM4_OCCLUSION_QUERIES="${FM4_OCCLUSION_QUERIES:-1}"
-# Extended View (the same panel and file: extended_view = on | off; runtime/kernel/extended_view.h): races fill a window of another
-# shape than 16:9 (wider up to 32:9, taller down to 4:3), off unless the file says on. A value already in the environment wins; any other value in the file is off,
-# named here. Its title hook (the main view's aspect ratio, config/title_hooks.toml) is armed so the GRAPHICS menu and the
-# Settings panel can switch it while the game runs; with the setting off the hook changes nothing. 0 disarms it.
-# Not offered in this release (owner decision 2026-11-23: Extended View is for 0.2.1): without FM4_EXTENDED_VIEW_OFFERED=1 the
-# GRAPHICS menu and the Settings panel have no Extended View row, the file's line is not read and the hook is not armed.
+# A view setting that is not offered in this release (runtime/kernel/extended_view.h): off, its file line not read and its title
+# hooks not armed unless FM4_EXTENDED_VIEW_OFFERED=1 (then: extended_view = on | off in the file, a value already in the
+# environment wins, any other value in the file is off and named here).
 export FM4_EXTENDED_VIEW_OFFERED="${FM4_EXTENDED_VIEW_OFFERED:-0}"
 EXTENDED=off
 if [ "$FM4_EXTENDED_VIEW_OFFERED" != 1 ]; then
@@ -167,7 +163,8 @@ elif [ -f "$ROOT/graphics.conf" ]; then
 fi
 export FM4_EXTENDED_VIEW="$EXTENDED"
 if [ "$FM4_EXTENDED_VIEW_OFFERED" = 1 ]; then export FM4_EXTENDED_VIEW_HOOK="${FM4_EXTENDED_VIEW_HOOK:-1}"; else export FM4_EXTENDED_VIEW_HOOK=0; fi
-# The game's own GRAPHICS menu applies edge smoothing at once (runtime/video/renderer.cpp PostAaUnit); 0 turns that off.
+# The game's own GRAPHICS menu and the Settings panel apply the resolution, edge smoothing and HDR while the game runs
+# (runtime/video/renderer.cpp); 0 turns that off (a choice then applies at the next start).
 export FM4_GRAPHICS_LIVE="${FM4_GRAPHICS_LIVE:-1}"
 # Persistent shader and pipeline caches (FM4_SHADER_CACHE: compiled SPIR-V and the Vulkan pipeline cache, ~35 MB after a race) in the
 # data directory, so a shader's first-use compile stall happens once, not every session. FM4_SHADER_CACHE=0 turns them off; another

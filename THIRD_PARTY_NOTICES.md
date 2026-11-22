@@ -29,7 +29,7 @@ its header, with the source file and FM4 Recomp's changes.
 | Project | Copyright | Licence | Where |
 |---|---|---|---|
 | Earlier FM4 runtime code | Copyright (C) 2026 ForzaRecomp contributors | GPL-3.0-or-later | `bin/fm4recomp`: much of `runtime/kernel/`, `runtime/gpu/`, `runtime/shader/` and the runtime's entry files; `recomp/indirect.h`; `bin/fm4_validation_control` |
-| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h`, `post_aa.h`, `zpd_report.h`, `hdr_output.h` and `runtime/kernel/input_live.h`, `rumble.h`, `extended_view.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
+| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h`, `render_scale.h`, `post_aa.h`, `zpd_report.h`, `hdr_output.h` and `runtime/kernel/input_live.h`, `rumble.h`, `extended_view.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
 | **reFrozen** | Copyright (C) 2026 reFrozen contributors | GPL-3.0-or-later | The release scripts `scripts/release/make_app.sh` and `make_dmg.py` (not in the app) |
 
 ## Programs shipped beside FM4 Recomp
@@ -67,7 +67,7 @@ This product includes software developed by in &lt;in@fishtank.com&gt;.
 
 ## Source code
 
-FM4 Recomp 0.1.0 is built from the tag `v0.1.0` of <https://github.com/retronative/fm4-recomp>. That tree holds the
+FM4 Recomp 0.2.0 is built from the tag `v0.2.0` of <https://github.com/retronative/fm4-recomp>. That tree holds the
 complete source of FM4 Recomp and its build and release scripts: FM4 Recomp's own source for a release is the repository at
 that release's tag. `scripts/setup_tools.sh` there names the exact source of XenonRecomp (`ddd128bcca99`, with our patches in
 `patches/xenonrecomp/`), and `scripts/release/build_runtime_deps.sh` the sources of the libraries in `lib/`.
@@ -84,9 +84,9 @@ LGPL-2.1. They are not compiled into FM4 Recomp's programs: they are three separ
 decoder) load by name (`@rpath/<file>`) when they start.
 
 **Source offer.** With every binary release, FM4 Recomp publishes the complete source of these parts, at the versions in that
-release, on the same GitHub Release page as the binary, for as long as the binary is offered there: for 0.1.0,
-`FM4-Recomp-0.1.0-third-party-source.tar.xz`, with its SHA-256 in
-`FM4-Recomp-0.1.0-third-party-source.tar.xz.sha256`. It holds FFmpeg 7.1.1
+release, on the same GitHub Release page as the binary, for as long as the binary is offered there: for 0.2.0,
+`FM4-Recomp-0.2.0-third-party-source.tar.xz`, with its SHA-256 in
+`FM4-Recomp-0.2.0-third-party-source.tar.xz.sha256`. It holds FFmpeg 7.1.1
 (`https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz`, SHA-256 in `scripts/setup_tools.sh`), the patch and
 the repository's `scripts/build_ffmpeg_xma.sh` with the options listed in `third-party/ffmpeg/build-info.txt`;
 libmspack at XenonRecomp's pinned revision `305907723a4e7ab2018e58040059ffb5e77db837`; the source of the other libraries that

@@ -308,7 +308,7 @@ final class SetupModel: ObservableObject {
 
   // MARK: Settings -> Graphics
 
-  // Saved at once; the game reads it when it next starts (play.sh).
+  // Saved at once; the running game takes it when the Settings panel closes, and play.sh reads the file at every start.
   func choose(_ resolution: InternalResolution) {
     var new = graphics
     new.resolution = resolution

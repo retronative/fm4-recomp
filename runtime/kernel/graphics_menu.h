@@ -24,7 +24,7 @@ constexpr size_t kResolutionCount = 4, kSmoothingCount = 4, kHdrCount = 2, kExte
 extern const Option kResolutions[kResolutionCount];  // 720p, fhd (the default), qhd, 4k
 extern const Option kSmoothings[kSmoothingCount];    // off, soft, on (Standard, the default), strong
 extern const Option kHdrs[kHdrCount];                // off (the default), auto (HDR output where it can be shown, runtime/video/hdr_output.h)
-constexpr size_t kDefaultResolution = 1, kDefaultSmoothing = 2;  // Full HD with Standard smoothing (owner decision 2026-11-21)
+constexpr size_t kDefaultResolution = 1, kDefaultSmoothing = 2;  // Full HD with Standard smoothing
 constexpr size_t kDefaultHdr = 0;
 extern const Option kExtendeds[kExtendedCount];      // off (the default), on (Extended View, runtime/kernel/extended_view.h)
 constexpr size_t kDefaultExtended = 0;
@@ -79,7 +79,7 @@ class Menu
 {
 public:
     static constexpr size_t kResolutionRow = 0, kSmoothingRow = 1, kHdrRow = 2, kExtendedRow = 3, kRows = 4;
-    // The rows shown: EXTENDED VIEW only when it is offered (ExtendedOffered; not in 0.2.0, owner decision 2026-11-23). A file's
+    // The rows shown: EXTENDED VIEW only when it is offered (ExtendedOffered; not in this release). A file's
     // extended_view line is kept either way.
     static size_t Rows();
     // `path`: the file read now and written by every change. `applyLive` (optional): asked after a saved change whether the running

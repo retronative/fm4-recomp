@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// FM4 Recomp (M9 diagnostic, opt-in, off by default; the sun glare investigation, owner report 2026-11-22): what an occlusion
+// FM4 Recomp (M9 diagnostic, opt-in, off by default; the sun glare investigation): what an occlusion
 // query's end reports. EVENT_WRITE_ZPD answers Xenia's fixed 1000 passed samples (command_processor.cpp); this probe replaces that
 // number inside one run to see whether a picture element (the sun's flare) follows it. A probe only, never a setting.
 // FM4_DIAG_ZPD_SAMPLES=<n>[,<n>...] (each 0..1000000): the reported counts, one after another in windows of FM4_DIAG_ZPD_WINDOW

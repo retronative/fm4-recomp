@@ -123,7 +123,7 @@ public:
     float Factor() const { return latched_.load(std::memory_order_relaxed); }
 
     // The game's hook widened a main view at `vblank` (the 60 Hz count): frames without one for half a second (movies, loading,
-    // menus without a 3D scene) are 16:9, as the other FM4 port does (hl360-forza4 doc/wide-screens.md at d6597d7; the idea only).
+    // menus without a 3D scene) are 16:9, as another FM4 port does (the idea only).
     void NoteWidened(uint64_t vblank) { widenedAt_.store(vblank, std::memory_order_relaxed); }
     bool Widening(uint64_t vblank) const
     {
