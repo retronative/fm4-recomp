@@ -39,13 +39,18 @@ std::atomic<bool> pausePressed{false};  // Command-comma in a race (the event lo
 
 // FM4 Recomp (kernel/rumble.h; ReCarbon's SDL approach): the game's motor speeds to the gamepad. Main thread only.
 runtime::input::RumblePlanner rumble;
-bool rumbleCapable = false;  // the open gamepad says it can rumble and has not refused
+// What the pad says about itself when it connects is only logged: OBSERVED (a play session, an 8BitDo Ultimate 2): the pad
+// reconnected mid-session and then reported no rumble, and nothing was sent to it for the rest of the session. So the game's
+// request is always tried (as ReCarbon does: a pad without motors takes it and ignores it); a refusal is tried again later.
+uint64_t rumbleRetryAtMs = 0;  // after a refused command: no further command before this time (SDL_GetTicks)
+uint64_t rumbleRefusals = 0;
+constexpr uint64_t kRumbleRetryMs = 2000;
 uint64_t rumbleSends = 0;
 
 // The motors off now (the pad is about to be closed, or the process to end). A pad that is gone ignores it.
 void StopRumble()
 {
-    if (gamepad != nullptr && rumbleCapable && rumble.Running())
+    if (gamepad != nullptr && rumble.Running())
         SDL_RumbleGamepad(gamepad, 0, 0, 0);
     rumble.Refused();  // nothing running from here
 }
@@ -55,13 +60,16 @@ void UpdateRumble()
     // Not while the window is in the background or the game waits behind the Settings panel: the motors stop, and the game's
     // request is sent again when the game is back in front.
     const bool active = (SDL_GetWindowFlags(sdlWindow) & SDL_WINDOW_INPUT_FOCUS) != 0 && !runtime::controls::InputBlocked();
-    const runtime::input::RumbleCommand c = rumble.Step(runtime::input::GameRumble(), gamepad != nullptr && rumbleCapable, active, SDL_GetTicks());
+    const uint64_t now = SDL_GetTicks();
+    const runtime::input::RumbleCommand c = rumble.Step(runtime::input::GameRumble(), gamepad != nullptr && now >= rumbleRetryAtMs, active, now);
     if (!c.send)
         return;
     if (!SDL_RumbleGamepad(gamepad, c.low, c.high, c.durationMs))
     {
-        std::fprintf(stderr, "[input] rumble: the gamepad refused it (%s): no rumble on this controller\n", SDL_GetError());
-        rumbleCapable = false, rumble.Refused();
+        if (rumbleRefusals++ < 5)
+            std::fprintf(stderr, "[input] rumble: the gamepad refused low %u, high %u (%s); trying again in %llu s%s\n", unsigned(c.low), unsigned(c.high), SDL_GetError(),
+                         (unsigned long long)(kRumbleRetryMs / 1000), rumbleRefusals == 5 ? " (no further lines)" : "");
+        rumbleRetryAtMs = now + kRumbleRetryMs, rumble.Refused();
     }
     else if (rumbleSends++ < 8)
         std::fprintf(stderr, "[input] rumble: low %u, high %u to the gamepad%s\n", unsigned(c.low), unsigned(c.high), rumbleSends == 8 ? " (no further lines)" : "");
@@ -78,8 +86,9 @@ void PollLiveInput()
             if (count > 0 && (gamepad = SDL_OpenGamepad(ids[0])) != nullptr)
             {
                 // What it can do (as ReCarbon's hid/input.cpp): a pad without motors is never sent a rumble.
-                rumbleCapable = SDL_GetBooleanProperty(SDL_GetGamepadProperties(gamepad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
-                std::fprintf(stderr, "[input] gamepad connected: %s (rumble %s)\n", SDL_GetGamepadName(gamepad), rumbleCapable ? "yes" : "no: not supported by this controller");
+                const bool says = SDL_GetBooleanProperty(SDL_GetGamepadProperties(gamepad), SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+                rumbleRetryAtMs = 0, rumbleSends = 0;  // a new pad: tried at once, its first commands logged again
+                std::fprintf(stderr, "[input] gamepad connected: %s (it reports rumble: %s; the game's rumble is sent either way)\n", SDL_GetGamepadName(gamepad), says ? "yes" : "no");
             }
             SDL_free(ids);
         }
@@ -88,7 +97,7 @@ void PollLiveInput()
     if (gamepad != nullptr && !SDL_GamepadConnected(gamepad))
     {
         StopRumble();  // best effort; the planner starts the next pad still
-        SDL_CloseGamepad(gamepad), gamepad = nullptr, rumbleCapable = false;
+        SDL_CloseGamepad(gamepad), gamepad = nullptr;
         std::fprintf(stderr, "[input] gamepad disconnected\n");
     }
     if (gamepad != nullptr)

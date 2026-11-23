@@ -5,8 +5,8 @@
 // ReCarbon's (runtime/hid/input.cpp at 66401ea, GPL-3.0-or-later: XamInputSetState stores the two motor speeds, the main loop sends
 // them with SDL_RumbleGamepad, Suspend sends 0 and Resume sends the last request again), re-written as a pure planner so it is
 // tested without SDL. Our changes: the planner; a short hold (1 s, sent again every 0.5 s while the motors run) instead of 5 s
-// sent once, so a process that ends or hangs without a last word leaves the motors on for at most a second; a pad that cannot
-// rumble, or refuses, is left alone.
+// sent once, so a process that ends or hangs without a last word leaves the motors on for at most a second; a pad that
+// refuses a command is tried again after a pause (what a pad reports about its motors is not trusted: it can be wrong after a reconnect).
 // The game's own vibration setting is respected by forwarding only what the game asks for (HYPOTHESIS, not yet observed: with it
 // off the game asks for nothing).
 // X_INPUT_VIBRATION (Xenia hid/input.h:74-78 at 67f16c4): left motor speed u16, right motor speed u16, big-endian in the guest. The
