@@ -20,8 +20,8 @@ Motorsport 4* (USA); setup reads a disc image you made from it.
 
 ## Is there a release?
 
-Yes. **FM4 Recomp 0.1.0**, the first public beta, was published on 18 November 2026. See
-[Getting started](getting-started.md) to install it, and the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.1.0) for its notes.
+Yes. **FM4 Recomp 0.2.0**, the second public beta, was published on 23 November 2026. See
+[Getting started](getting-started.md) to install it, and the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.2.0) for its notes.
 The current state is on the [Status and releases](status.md) page.
 
 ## Which version of the game do I need?
@@ -32,8 +32,9 @@ build of the game. See [Compatibility](compatibility.md).
 
 ## How well does it run?
 
-It is an early, unoptimised beta: about 20 frames per second in the menus and about 29 in a
-race, measured on an Apple M5 Mac at the game's 1280x720 resolution. Performance work continues.
+It is still a beta. FM4 Recomp 0.2.0 runs races at about 40 frames per second while driving at
+Full HD and about 31 at QHD, measured on an Apple M5 Mac in automated runs without a window; 4K
+is very heavy. The frame rate stays below 60 in races. Performance work continues.
 
 ## Does it run on Intel Macs?
 

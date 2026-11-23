@@ -7,6 +7,12 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-23
+
+The second public beta. The full notes are on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.2.0). The SHA-256 of
+`FM4-Recomp-0.2.0.dmg` is `c05a16c64f81ec43de5202a07495a62101ca4a26557c4307366c407537180731`, and of
+`FM4-Recomp-0.2.0-third-party-source.tar.xz` is `2213ede8f5036837139ceb6458e9c99fd3dc81761acb8820e0b19e8bdd2e26dc`.
+
 ### Added
 
 - Rendering resolutions: 720p, Full HD, QHD and 4K, with the game's own anti-aliasing kept. Full HD
