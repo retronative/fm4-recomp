@@ -619,6 +619,45 @@ void TestExpand64()
     Expect(m.Prepare(asFloat, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: k_16_16_16_16 (26) still refused");
 }
 
+// FM4 Recomp: k_5_6_5 (4), the owner's play session of 2026-11-23 (a menu): fetch 810000FE 0EA00044 0007E07F 06281414 003DADC3
+// 0E9FEA18. Hand decode (xenos.h:1206-1307): 0EA00044: format 4, endian (0x44 >> 6) & 3 = 1 (8in16), base 0EA00000; 0007E07F:
+// width 0x7F + 1 = 128, height ((0x7E07F >> 13) & 0x1FFF) + 1 = 0x3F + 1 = 64. Host (xenia-canary 1c84dcac kBestHostFormats
+// k_5_6_5): R5G6B5_UNORM_PACK16, RGBB, red and blue exchanged at the load.
+const uint32_t k565Tex[6] = {0x810000FEu, 0x0EA00044u, 0x0007E07Fu, 0x06281414u, 0x003DADC3u, 0x0E9FEA18u};
+// A linear k_5_6_5 4x1, pitch 32 texels, endian 8in16, at 0x00100000.
+const uint32_t k565Small[6] = {2u | kClampEdgeXYZ | 1u << 22, 4u | 1u << 6 | kSmallBase, 3u, kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
+
+void Test565()
+{
+    TextureUnitModel m(TextureValidity::ReloadEveryBind);
+    // The constant asks for gamma (as DrawState decodes it from the same constant) and anisotropy.
+    const PreparedTexture p = m.Prepare(k565Tex, ShaderFetch{}, true, TextureDeviceFeatures{true, true, true, 16.0f});
+    Expect(p.entry != nullptr && p.error.empty() && p.entry->description.host.vkFormat == vk::kFormatR5G6B5UnormPack16 &&
+               p.entry->description.host.formatSwizzle == kSwizzleRGBB && p.entry->description.host.swapRedBlue565 &&
+               p.entry->description.width == 128 && p.entry->description.height == 64 && p.entry->description.base.physical == 0x0EA00000u,
+           "the owner's k_5_6_5 texture (4) 128x64 at 0EA00000 prepares as R5G6B5_UNORM_PACK16, RGBB, red and blue exchanged");
+    // By hand: guest red is bits 0-4, green 5-10, blue 11-15; R5G6B5_UNORM_PACK16 has red in bits 11-15 and blue in 0-4.
+    // Red 31 (001F) -> F800; green 63 (07E0) stays; blue 31 (F800) -> 001F; 1234 (r 0x14, g 0x11, b 0x02) -> A000 | 0220 | 0002 = A222.
+    Expect(SwapRedBlue565(0x001F) == 0xF800 && SwapRedBlue565(0x07E0) == 0x07E0 && SwapRedBlue565(0xF800) == 0x001F && SwapRedBlue565(0x1234) == 0xA222 &&
+               SwapRedBlue565(0xFFFF) == 0xFFFF && SwapRedBlue565(0) == 0,
+           "5:6:5 word: red 001F -> F800, green 07E0 kept, blue F800 -> 001F, 1234 -> A222; white and black unchanged");
+    // Staging: guest bytes big-endian per texel (8in16 swaps each halfword), then the exchange. Texels 001F, 07E0, F800, 1234 ->
+    // host little-endian words F800, 07E0, 001F, A222 = bytes 00 F8, E0 07, 1F 00, 22 A2.
+    const uint8_t guest[8] = {0x00, 0x1F, 0x07, 0xE0, 0xF8, 0x00, 0x12, 0x34};
+    const uint8_t want[8] = {0x00, 0xF8, 0xE0, 0x07, 0x1F, 0x00, 0x22, 0xA2};
+    FakeGuest g{kSmallBase, std::vector<uint8_t>(512, 0)};
+    std::memcpy(g.bytes.data(), guest, 8);
+    const PreparedTexture s = m.Prepare(k565Small, ShaderFetch{}, false, kFull);
+    std::vector<uint8_t> out(s.entry != nullptr ? s.plan.stagingBytes : 0, 0xEE);
+    std::string error;
+    const bool filled = s.entry != nullptr && s.plan.stagingBytes >= 8 && FillStaging(s.entry->description, s.plan, GuestOf, &g, out.data(), error);
+    Expect(filled && std::memcmp(out.data(), want, 8) == 0, "k_5_6_5 8in16 staging: each halfword swapped to host order, then red and blue exchanged");
+    uint32_t other[6];
+    std::memcpy(other, k565Small, sizeof other);
+    other[1] = 3u | 1u << 6 | kSmallBase;  // k_1_5_5_5: no host format
+    Expect(m.Prepare(other, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: k_1_5_5_5 (3) still refused");
+}
+
 // FM4 Recomp (M7, FM4_TEXTURE_PREPARE_ONCE): the property it relies on: a fetch's anisotropy reaches only the sampler (texture_info.cpp
 // :391), so Prepare with 7 (the constant's) and with an instruction's own value gives the same entry key, staging bytes and levels;
 // only sampler.maxAnisotropy-related fields may differ. Checked on the observed constants of this file.
@@ -1478,6 +1517,7 @@ int main()
     TestResidentResolve();
     TestResidentCover();  // FM4 Recomp (M7, resident resolves)
     TestExpand64();  // FM4 Recomp (alpha)
+    Test565();  // FM4 Recomp (k_5_6_5)
     TestPrepareAnisotropy();  // FM4 Recomp (M7, FM4_TEXTURE_PREPARE_ONCE)
     TestProtectingWatch();
     TestGuestWriteLogSerials();

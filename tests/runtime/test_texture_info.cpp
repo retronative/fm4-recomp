@@ -160,8 +160,12 @@ void TestFormatsAndDescriptions()
            "host format: k_16_16_16_16_EXPAND -> R16G16B16A16_SFLOAT (97), RGBA, float, 8-byte blocks (:243-247)");
     Expect(!HostFormatFor(27, h) && !HostFormatFor(28, h), "CONTROL: k_16_EXPAND (27) and k_16_16_EXPAND (28) are not mapped (not observed)");
     Expect(!HostFormatFor(26, h) && !HostFormatFor(33, h), "CONTROL: k_16_16_16_16 (26) and k_32_32_FLOAT (33) still have no host mapping");
-    Expect(!HostFormatFor(4, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
-           "CONTROL: 5_6_5 and 2_10_10_10 have no host mapping yet");
+    Expect(!HostFormatFor(3, h) && !HostFormatFor(7, h) && h.vkFormat == vk::kFormatUndefined,
+           "CONTROL: 1_5_5_5 and 2_10_10_10 have no host mapping yet");
+    // FM4 Recomp: k_5_6_5 (4) -> R5G6B5_UNORM_PACK16 (4), RGBB, red and blue exchanged at the load, 16 bits a texel (xenia-canary 1c84dcac).
+    Expect(HostFormatFor(4, h) && h.vkFormat == 4 && h.formatSwizzle == kSwizzleRGBB && h.swapRedBlue565 && !h.blockCompressed && !h.depth20e4 &&
+               BytesPerBlock(GetFormatInfo(4)) == 2,
+           "host format: k_5_6_5 -> R5G6B5_UNORM_PACK16 (4), RGBB, red and blue exchanged, 2-byte blocks");
 
     // The Y plane: level 0 only, extent 1280 * 719 + 1280 = 921,600 (texture_util.cc:420-423: rows - 1
     // pitches plus the last row; the base's pitch is the fetch constant's, 1280, not re-aligned).
@@ -286,8 +290,7 @@ void TestRefusals()
         {"dimension 1D tiled", With(With(kYPlane, 5, 3u << 9, 0u), 0, 0, 1u << 31), {}, "1D texture that is tiled"},
         {"stacked", With(kYPlane, 1, 1u << 10, 1u << 10), {}, "stacked"},
         {"shader samples 3D", std::vector<uint32_t>(kYPlane, kYPlane + 6), ShaderFetch{3, 3, 3, 7, 2}, "dimension 2"},
-        {"format 5_6_5 (4)", With(kYPlane, 1, 0x3Fu, 4u), {}, "no host format"},
-        {"format 5_6_5 (4)", With(kYPlane, 1, 0x3Fu, 4u), {}, "no host format"},
+        {"format 1_5_5_5 (3)", With(kYPlane, 1, 0x3Fu, 3u), {}, "no host format"},
         {"integer number format", With(kYPlane, 3, 1u, 1u), {}, "integer"},
         {"base address 0", With(kYPlane, 1, 0xFFFFF000u, 0u), {}, "base address 0"},
         {"base past 512 MB", With(kYPlane, 1, 0xFFFFF000u, 0x20000000u), {}, "past the 512 MB"},
@@ -629,7 +632,7 @@ void TestCache()
     Expect(watch.Rearm(0x09000000u, 65536) && watch.GetStats().rearms == 15, "CONTROL: Rearm over unwatched pages protects nothing");
 
     // A refused fetch constant: no entry, the reason; a failing backend: Loaded false, the entry invalid.
-    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 4u).data());  // 5_6_5: no host format
+    TextureCache::Lookup bad = cache.Find(With(kYPlane, 1, 0x3Fu, 3u).data());  // 1_5_5_5: no host format
     Expect(!bad.entry && Has(bad.error, "no host format") && cache.GetStats().refused == 1 && cache.Size() == 2, "CONTROL: a refused fetch constant makes no entry and names its reason");
     fake.fail = true;
     TextureCache::Lookup v = cache.Find(kUPlane);

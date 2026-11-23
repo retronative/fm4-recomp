@@ -818,8 +818,10 @@ void TestTextured()
     Expect(!Decode(g, vs, ps).textureSlots[0].null, "CONTROL-PAIR: a type-2 constant is not null");
     g = Textured(), word(g, 1, 1) = 0x00000086;  // base 0
     CONTROL(Decode(g, vs, ps), "base address 0");
-    g = Textured(), word(g, 1, 1) = 0x1B600084;  // format 4 (5_6_5; FM4 Recomp: DXT2_3, 19, is modelled)
-    CONTROL(Decode(g, vs, ps), "texture format 4");
+    g = Textured(), word(g, 1, 1) = 0x1B600084;  // format 4 (k_5_6_5: FM4 Recomp, sampled in FM4's menus, now modelled)
+    Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "texture format 4 (k_5_6_5) is modelled");
+    g = Textured(), word(g, 1, 1) = 0x1B600083;  // format 3 (k_1_5_5_5): still not
+    CONTROL(Decode(g, vs, ps), "texture format 3");
     g = Textured(), word(g, 1, 1) = 0x1B60004A;  // format 10 (k_8_8, the k_8_8 resolve's destination), endian 1
     Expect(Decode(g, vs, ps).kind == DrawKind::Draw, "texture format 10 (k_8_8) is modelled");
     g = Textured(), word(g, 1, 5) = 0x400;  // dimension 2 (3D) while the shader fetches 2D

@@ -167,6 +167,14 @@ bool FillStaging(const TextureDescription& d, const LoadPlan& plan, GuestBytesFn
             error = "level " + std::to_string(i) + " at " + Hex(l.address) + ": the " + (d.fetch.tiled ? "untile" : "linear copy") + " refused it";
             return false;
         }
+        if (d.host.swapRedBlue565)  // texture_info.h HostFormat::swapRedBlue565
+            for (uint64_t at = 0; at + 2 <= plan.levelBytes[i]; at += 2)
+            {
+                uint16_t word;
+                std::memcpy(&word, level + at, 2);
+                word = SwapRedBlue565(word);
+                std::memcpy(level + at, &word, 2);
+            }
         if (d.host.depth20e4)  // texture_info.h HostFormat::depth20e4
             for (uint64_t at = 0; at + 4 <= plan.levelBytes[i]; at += 4)
             {

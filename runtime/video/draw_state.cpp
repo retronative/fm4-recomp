@@ -462,6 +462,7 @@ struct Decoder
         switch (f)  // FR render.cpp:586-636 (what FM4's first screens sample); X xenos.h:491-581 names
         {
         case 2: case 6: case 50:   // k_8, k_8_8_8_8, k_8_8_8_8_AS_16_16_16_16
+        case 4:                    // k_5_6_5 (FM4 Recomp: a 128x64 texture sampled in the menus)
         case 18: case 51:          // k_DXT1, k_DXT1_AS_16_16_16_16
         case 20: case 53:          // k_DXT4_5, k_DXT4_5_AS_16_16_16_16 (FM4 Recomp)
         case 19: case 52:          // k_DXT2_3, k_DXT2_3_AS_16_16_16_16 (FM4 Recomp)

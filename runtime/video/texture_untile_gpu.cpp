@@ -56,6 +56,8 @@ bool PlanGpuUntile(const TextureDescription& d, const LoadPlan& plan, uint32_t m
         return why = "a 3D or cube texture", false;
     if (d.host.depth20e4)
         return why = "a converted format (20e4 depth)", false;
+    if (d.host.swapRedBlue565)
+        return why = "a converted format (5:6:5, red and blue exchanged)", false;
     if (d.levels.empty() || plan.levelOffsets.size() != d.levels.size() || plan.levelBytes.size() != d.levels.size())
         return why = "the load plan does not match the levels", false;
     const uint32_t log2 = d.log2BytesPerBlock;

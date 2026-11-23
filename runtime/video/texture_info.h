@@ -43,7 +43,8 @@ namespace vk {
 constexpr uint32_t kFormatUndefined = 0, kFormatR8Unorm = 9, kFormatR8G8B8A8Unorm = 37, kFormatA2B10G10R10UnormPack32 = 64,
                    kFormatR32Sfloat = 100, kFormatBc1RgbaUnormBlock = 133, kFormatR16G16Unorm = 77, kFormatR16G16Snorm = 78,
                    kFormatR8G8Unorm = 16, kFormatR8G8Snorm = 17, kFormatR16G16B16A16Sfloat = 97,
-                   kFormatBc2UnormBlock = 135, kFormatBc3UnormBlock = 137, kFormatBc4UnormBlock = 139, kFormatBc5UnormBlock = 141;
+                   kFormatBc2UnormBlock = 135, kFormatBc3UnormBlock = 137, kFormatBc4UnormBlock = 139, kFormatBc5UnormBlock = 141,
+                   kFormatR5G6B5UnormPack16 = 4;
 constexpr uint32_t kFilterNearest = 0, kFilterLinear = 1;
 constexpr uint32_t kMipmapModeNearest = 0, kMipmapModeLinear = 1;
 constexpr uint32_t kAddressRepeat = 0, kAddressMirroredRepeat = 1, kAddressClampToEdge = 2, kAddressClampToBorder = 3;
@@ -174,6 +175,11 @@ struct HostFormat
     // vulkan_texture_cache.cc:220-225), the same bits viewed signed; 0: none (signed components then refused unless signIgnored).
     uint32_t vkFormatSigned = 0;
     bool signedView = false;  // this description uses vkFormatSigned (every component signed)
+    // FM4 Recomp: k_5_6_5: each 16-bit texel (host order, after the endian swap) has its 5-bit end fields exchanged, so the guest's
+    // red (bits 0-4) lands in R5G6B5_UNORM_PACK16's red (bits 11-15) and blue the other way, green (bits 5-10) staying (Xenia
+    // vulkan_texture_cache.cc kBestHostFormats k_5_6_5 at xenia-canary 1c84dcac: kLoadShaderIndexR5G6B5ToB5G6R5 ->
+    // VK_FORMAT_R5G6B5_UNORM_PACK16, "Red and blue swapped in the load shader for simplicity", swizzle RGBB).
+    bool swapRedBlue565 = false;
 };
 bool HostFormatFor(uint32_t format, HostFormat& out);
 // FM4 Recomp: a fetch sampling every component signed from a format with a signed host format (Xenia's signed_separate
@@ -187,6 +193,9 @@ inline bool SignedSeparate(const TextureFetch& f)
 constexpr uint32_t kSwizzleRRRR = 0;                                 // 0 | 0 << 3 | 0 << 6 | 0 << 9
 constexpr uint32_t kSwizzleRGBA = 0 | 1 << 3 | 2 << 6 | 3 << 9;     // 0x688
 constexpr uint32_t kSwizzleRGGG = 0 | 1 << 3 | 1 << 6 | 1 << 9;     // k_8_8, k_16_16 (Xenia XE_GPU_TEXTURE_SWIZZLE_RGGG)
+constexpr uint32_t kSwizzleRGBB = 0 | 1 << 3 | 2 << 6 | 2 << 9;     // k_5_6_5 (Xenia XE_GPU_TEXTURE_SWIZZLE_RGBB: the 4th component is blue)
+// The 16-bit word of a k_5_6_5 texel as R5G6B5_UNORM_PACK16 holds it (HostFormat::swapRedBlue565).
+constexpr uint16_t SwapRedBlue565(uint16_t w) { return uint16_t((w & 0x1Fu) << 11 | (w & 0x7E0u) | w >> 11); }
 constexpr uint32_t SwizzleComponent(uint32_t swizzle, uint32_t i) { return (swizzle >> (3 * i)) & 7; }
 
 // ---- One stored mip level (ForzaRecomp texture.h MipLevel) ---------------------------------------

@@ -143,6 +143,10 @@ bool HostFormatFor(uint32_t format, HostFormat& out)
     switch (format)
     {
     case 2: out = {vk::kFormatR8Unorm, kSwizzleRRRR, false}; return true;                     // k_8
+    case 4:  // k_5_6_5 (xenia-canary 1c84dcac kBestHostFormats): R5G6B5_UNORM_PACK16, red and blue exchanged at the load, RGBB
+        out = {vk::kFormatR5G6B5UnormPack16, kSwizzleRGBB, false};
+        out.swapRedBlue565 = true;
+        return true;
     case 6: case 50: out = {vk::kFormatR8G8B8A8Unorm, kSwizzleRGBA, false}; return true;      // k_8_8_8_8 (+ AS_16_16_16_16)
     case 18: case 51: out = {vk::kFormatBc1RgbaUnormBlock, kSwizzleRGBA, true}; return true;  // k_DXT1 (+ AS_16_16_16_16)
     case 54: out = {vk::kFormatA2B10G10R10UnormPack32, kSwizzleRGBA, false}; return true;    // k_2_10_10_10_AS_16_16_16_16

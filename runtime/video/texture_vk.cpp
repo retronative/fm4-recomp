@@ -43,7 +43,7 @@ static_assert(vk::kFormatUndefined == VK_FORMAT_UNDEFINED && vk::kFormatR8Unorm 
               vk::kFormatBc4UnormBlock == VK_FORMAT_BC4_UNORM_BLOCK && vk::kFormatBc5UnormBlock == VK_FORMAT_BC5_UNORM_BLOCK &&
               vk::kFormatR16G16Unorm == VK_FORMAT_R16G16_UNORM && vk::kFormatR16G16Snorm == VK_FORMAT_R16G16_SNORM &&
               vk::kFormatR8G8Unorm == VK_FORMAT_R8G8_UNORM && vk::kFormatR8G8Snorm == VK_FORMAT_R8G8_SNORM &&
-              vk::kFormatR16G16B16A16Sfloat == VK_FORMAT_R16G16B16A16_SFLOAT);
+              vk::kFormatR16G16B16A16Sfloat == VK_FORMAT_R16G16B16A16_SFLOAT && vk::kFormatR5G6B5UnormPack16 == VK_FORMAT_R5G6B5_UNORM_PACK16);
 static_assert(vk::kFilterNearest == VK_FILTER_NEAREST && vk::kFilterLinear == VK_FILTER_LINEAR &&
               vk::kMipmapModeNearest == VK_SAMPLER_MIPMAP_MODE_NEAREST && vk::kMipmapModeLinear == VK_SAMPLER_MIPMAP_MODE_LINEAR);
 static_assert(vk::kAddressRepeat == VK_SAMPLER_ADDRESS_MODE_REPEAT && vk::kAddressMirroredRepeat == VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT &&
