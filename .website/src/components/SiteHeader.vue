@@ -3,6 +3,7 @@
 import { ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import BrandMark from './BrandMark.vue'
+import GitHubStar from './GitHubStar.vue'
 
 const links = [
   { to: '/', label: 'Home' },
@@ -39,19 +40,24 @@ function isCurrent(to: string) {
         </ul>
       </nav>
 
-      <button
-        type="button"
-        class="md:hidden inline-flex items-center justify-center w-11 h-11 border border-seam bg-black/40 text-chalk"
-        :aria-expanded="open"
-        aria-controls="mobile-nav"
-        @click="open = !open"
-      >
-        <span class="sr-only">{{ open ? 'Close menu' : 'Open menu' }}</span>
-        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
-          <path v-if="!open" d="M2 5h16M2 10h16M2 15h16" />
-          <path v-else d="M4 4l12 12M16 4L4 16" />
-        </svg>
-      </button>
+      <!-- The star is hidden from md to lg, where the full navigation leaves no room for it. -->
+      <div class="flex items-center gap-2 md:hidden lg:flex">
+        <GitHubStar compact class="h-11" />
+
+        <button
+          type="button"
+          class="md:hidden inline-flex items-center justify-center w-11 h-11 border border-seam bg-black/40 text-chalk"
+          :aria-expanded="open"
+          aria-controls="mobile-nav"
+          @click="open = !open"
+        >
+          <span class="sr-only">{{ open ? 'Close menu' : 'Open menu' }}</span>
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+            <path v-if="!open" d="M2 5h16M2 10h16M2 15h16" />
+            <path v-else d="M4 4l12 12M16 4L4 16" />
+          </svg>
+        </button>
+      </div>
     </div>
 
     <nav v-show="open" id="mobile-nav" aria-label="Main (mobile)" class="md:hidden border-b border-seam bg-asphalt shadow-2xl">

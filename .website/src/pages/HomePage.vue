@@ -2,6 +2,7 @@
 <script setup lang="ts">
 import { RouterLink } from 'vue-router'
 import BrandMark from '../components/BrandMark.vue'
+import GitHubStar from '../components/GitHubStar.vue'
 import Prose from '../components/Prose.vue'
 import ReleaseCta from '../components/ReleaseCta.vue'
 import { areas, notes, readme, status } from '../docs'
@@ -36,6 +37,7 @@ const cards = [
           </p>
           <div class="mt-6 flex flex-wrap items-stretch gap-4">
             <ReleaseCta />
+            <GitHubStar />
             <RouterLink to="/getting-started/" class="btn">Getting started</RouterLink>
             <a :href="REPO_URL" class="btn">Source on GitHub</a>
           </div>
