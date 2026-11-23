@@ -619,11 +619,11 @@ void TestExpand64()
     Expect(m.Prepare(asFloat, ShaderFetch{}, false, kFull).entry == nullptr, "CONTROL: k_16_16_16_16 (26) still refused");
 }
 
-// FM4 Recomp: k_5_6_5 (4), the owner's play session of 2026-11-23 (a menu): fetch 810000FE 0EA00044 0007E07F 06281414 003DADC3
+// FM4 Recomp: k_5_6_5 (4), sampled in an FM4 menu: fetch 810000FE 0EA00044 0007E07F 06281414 003DADC3
 // 0E9FEA18. Hand decode (xenos.h:1206-1307): 0EA00044: format 4, endian (0x44 >> 6) & 3 = 1 (8in16), base 0EA00000; 0007E07F:
 // width 0x7F + 1 = 128, height ((0x7E07F >> 13) & 0x1FFF) + 1 = 0x3F + 1 = 64. Host (xenia-canary 1c84dcac kBestHostFormats
 // k_5_6_5): R5G6B5_UNORM_PACK16, RGBB, red and blue exchanged at the load.
-const uint32_t k565Tex[6] = {0x810000FEu, 0x0EA00044u, 0x0007E07Fu, 0x06281414u, 0x003DADC3u, 0x0E9FEA18u};
+const uint32_t k565Tex[6] = {1u << 31 | 0x010000FEu, 0x0EA00044u, 0x0007E07Fu, 0x06281414u, 0x003DADC3u, 0x0E9FEA18u};
 // A linear k_5_6_5 4x1, pitch 32 texels, endian 8in16, at 0x00100000.
 const uint32_t k565Small[6] = {2u | kClampEdgeXYZ | 1u << 22, 4u | 1u << 6 | kSmallBase, 3u, kSwizzleXYZW | kLinearMagMin | kMipBaseMap, 0, kDim2D};
 
@@ -635,7 +635,7 @@ void Test565()
     Expect(p.entry != nullptr && p.error.empty() && p.entry->description.host.vkFormat == vk::kFormatR5G6B5UnormPack16 &&
                p.entry->description.host.formatSwizzle == kSwizzleRGBB && p.entry->description.host.swapRedBlue565 &&
                p.entry->description.width == 128 && p.entry->description.height == 64 && p.entry->description.base.physical == 0x0EA00000u,
-           "the owner's k_5_6_5 texture (4) 128x64 at 0EA00000 prepares as R5G6B5_UNORM_PACK16, RGBB, red and blue exchanged");
+           "the menu's k_5_6_5 texture (4) 128x64 at 0EA00000 prepares as R5G6B5_UNORM_PACK16, RGBB, red and blue exchanged");
     // By hand: guest red is bits 0-4, green 5-10, blue 11-15; R5G6B5_UNORM_PACK16 has red in bits 11-15 and blue in 0-4.
     // Red 31 (001F) -> F800; green 63 (07E0) stays; blue 31 (F800) -> 001F; 1234 (r 0x14, g 0x11, b 0x02) -> A000 | 0220 | 0002 = A222.
     Expect(SwapRedBlue565(0x001F) == 0xF800 && SwapRedBlue565(0x07E0) == 0x07E0 && SwapRedBlue565(0xF800) == 0x001F && SwapRedBlue565(0x1234) == 0xA222 &&
