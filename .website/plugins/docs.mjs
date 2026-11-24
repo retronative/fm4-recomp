@@ -1,8 +1,7 @@
 // Adapted from reFrozen .website (GPL-3.0-or-later); FM4 Recomp changes: reads FM4's public
 // Markdown (docs/*.md with optional front matter, the allowlisted reference/<area>/*.md notes,
 // reference/README.md, THIRD_PARTY_NOTICES.md and selected README.md sections); docs/status.md's
-// front matter gives the release headline and, once a release is published, the release page the
-// download button links (never a file); no milestone or list parsing; relative links resolved
+// front matter gives the release headline and, once a release is published, the matching Mac download; no milestone or list parsing; relative links resolved
 // against each file's repository path (fail-closed); GitHub alert blockquotes rendered as
 // callouts; typographer off; the build fails on private-looking content.
 //
@@ -33,12 +32,18 @@ export function parseFrontmatter(source) {
   return { data, body: source.slice(match[0].length) }
 }
 
-// The download button links only to the page of a published GitHub release of this repository
-// (the site links no file). docs/status.md sets it with `release_url` and `release_version`
-// (both or neither); without them the button shows "Coming soon". scripts/check-dist.mjs checks
-// the built page too.
+// Only the published tag of this repository may supply release assets.
+
 export const RELEASE_VERSION = /^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
 export const releasePageUrl = (repoUrl, version) => `${repoUrl}/releases/tag/${version}`
+
+/** Exact GitHub asset names for the published release. */
+export function releaseAssets(repoUrl, version) {
+  const stem = `${repoUrl}/releases/download/${version}/FM4-Recomp-${version.slice(1)}`
+  const dmg = `${stem}.dmg`
+  const source = `${stem}-source.tar.xz`
+  return [dmg, dmg + '.sha256', source, source + '.sha256']
+}
 
 /** docs/status.md's front matter: the single source of the release headline and link. */
 export function parseStatus(source, repoUrl) {
@@ -51,7 +56,8 @@ export function parseStatus(source, repoUrl) {
   if (releaseUrl && releaseUrl !== releasePageUrl(repoUrl, releaseVersion)) {
     throw new Error(`docs/status.md: release_url must be ${releasePageUrl(repoUrl, releaseVersion)} (got ${releaseUrl})`)
   }
-  return { releaseHeadline: data.release_headline, releasePlanned: data.release_planned, releaseUrl, releaseVersion }
+  const releaseDownloadUrl = releaseVersion ? releaseAssets(repoUrl, releaseVersion)[0] : null
+  return { releaseHeadline: data.release_headline, releasePlanned: data.release_planned, releaseUrl, releaseVersion, releaseDownloadUrl }
 }
 
 function createRenderer(base, repoUrl, repoRoot) {

@@ -28,6 +28,7 @@ declare module 'virtual:docs' {
     releasePlanned: string
     /** The published release's page on GitHub; null until a release is published. */
     releaseUrl: string | null
+    releaseDownloadUrl: string | null
     releaseVersion: string | null
   }
   export interface Note extends Doc {

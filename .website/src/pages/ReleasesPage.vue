@@ -17,7 +17,7 @@ const doc = requirePage(props.docRoute)
       <p class="eyebrow">Release</p>
       <h2 id="release-headline" class="section-title mt-2">{{ status.releaseHeadline }}</h2>
       <p class="mt-2 mb-0 text-muted">{{ status.releasePlanned }}</p>
-      <div class="mt-5"><ReleaseCta /></div>
+      <div class="mt-5 flex flex-wrap items-stretch gap-4"><ReleaseCta /></div>
     </section>
     <Prose class="mt-10" :html="doc.html" />
   </DocLayout>

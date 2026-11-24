@@ -22,7 +22,7 @@ export interface PageMeta {
 
 export const SITE = 'FM4 Recomp'
 export const SITE_DESCRIPTION =
-  'A static recompilation of Forza Motorsport 4 (Xbox 360, USA disc, title ID 4D530910) to native arm64 macOS, built on XenonRecomp. Unofficial fan project.'
+  'Play Forza Motorsport 4 on Apple silicon with the FM4 Static Recomp host and ShiftGlue runtime. This unofficial project requires your own supported Xbox 360 USA Disc 1.'
 
 const DocPage = () => import('./pages/DocPage.vue')
 

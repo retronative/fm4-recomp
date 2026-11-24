@@ -16,8 +16,7 @@ The original game is an Xbox 360 program: PowerPC machine code, written for the 
 operating system, its Xenos graphics chip and its audio hardware. A Mac with Apple silicon speaks
 a different machine language (arm64) and has none of those. FM4 Recomp bridges both gaps:
 
-1. **Translate the code once.** A recompiler (built on *XenonRecomp*, an MIT-licensed open-source
-   project) reads the game's PowerPC machine code and turns it into C++, which is then compiled
+1. **Translate the code once.** The recompiler reads the game's PowerPC machine code and turns it into C++, which is then compiled
    into ordinary native arm64 code.
 2. **Replace the platform.** A native runtime provides what the game calls into: the console's
    kernel and system functions, files, saves, input, sound (the game's XMA audio is decoded with
@@ -37,12 +36,9 @@ An **emulator** imitates a whole console while the game runs, for any game. FM4 
 translation work before you play, for this one game version, so what runs is plain arm64 code with
 a purpose-built runtime.
 
-## Fail closed, never guess
+## The Mac engine
 
-FM4 Recomp never pretends that something works. A system function it does not implement stops the
-game with a message naming the function, instead of reporting a made-up success. The recompiler
-fails rather than dropping code it cannot translate. That is why an unfinished part of the game
-ends with a named message and a log, not with wrong behaviour.
+Version 0.3.0 uses the FM4 Static Recomp host with the ShiftGlue SDK. Its graphics work goes through Vulkan and MoltenVK, and its bundled FFmpeg libraries decode the game’s audio. The source archive has the exact source revisions, changes and build instructions. The reference notes in this repository also document the earlier Mac renderer. See the [third-party notices](../THIRD_PARTY_NOTICES.md).
 
 ## Why only one version
 

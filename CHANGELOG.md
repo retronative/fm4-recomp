@@ -7,6 +7,16 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
+Public beta for Apple silicon, macOS 26 or later. [Mac download](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg) · [release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
+
+- Switched the Mac app to the FM4 Static Recomp host and ShiftGlue runtime, with bundled audio decoders.
+- Added Extended View, fullscreen and windowed play, automatic spatial FSR 1 upscaling and a graphics menu accessible from Pause or **⌘,**.
+- Choose 720p, Full HD, QHD or 4K. Full HD is the default. Resolution changes on **Save & Apply** with a loading indicator. HDR Auto uses an HDR-capable display.
+- Added controls for MSAA, scenery shadows, reflection updates, mirror, soft particles, crowds, motion blur, depth of field and car dirt. The D-pad navigates between settings tabs. Prompts follow the last input device.
+- Reduced the 4K graphics buffer reservation. The app reuses the performance playtest profile for existing settings and saves. Public 0.2.0 saves stay in their original profile.
+
 ## [0.2.0] - 2026-11-23
 
 The second public beta. The full notes are on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.2.0). The SHA-256 of

@@ -20,21 +20,23 @@ Motorsport 4* (USA); setup reads a disc image you made from it.
 
 ## Is there a release?
 
-Yes. **FM4 Recomp 0.2.0**, the second public beta, was published on 23 November 2026. See
-[Getting started](getting-started.md) to install it, and the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.2.0) for its notes.
-The current state is on the [Status and releases](status.md) page.
+Yes. [Download FM4 Recomp 0.3.0 for Apple silicon](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg). The public beta was released on 25 November 2026. Follow [Getting started](getting-started.md), or read the [release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
 
 ## Which version of the game do I need?
 
-The Xbox 360 USA version (title ID 4D530910). Disc 1 is required; Disc 2 is optional. Other
-regions and revisions are refused by setup, because static recompilation translates one exact
-build of the game. See [Compatibility](compatibility.md).
+The Xbox 360 USA Play Disc (Disc 1), title ID 4D530910. Setup verifies the disc image. Disc 1 is sufficient, and other regions and revisions are unsupported. See [Compatibility](compatibility.md).
 
 ## How well does it run?
 
-It is still a beta. FM4 Recomp 0.2.0 runs races at about 40 frames per second while driving at
-Full HD and about 31 at QHD, measured on an Apple M5 Mac in automated runs without a window; 4K
-is very heavy. The frame rate stays below 60 in races. Performance work continues.
+One QHD playtest on an Apple silicon Mac averaged about 58 rendered frames per second across 6,600 race frames outside the Graphics menu. Driving, loading and menus can perform differently. Use **F3** to show the FPS counter, or try Full HD when QHD or 4K misses your target on your Mac.
+
+## Where are the graphics settings?
+
+Open **Pause → GRAPHICS** in a race, or press **⌘,**. Use **Y / Save & Apply** to confirm. The [graphics guide](getting-started.md#graphics-settings) explains the thirteen controls, resolution switching and automatic FSR 1.
+
+## What happens to my old saves?
+
+0.3.0 uses the same settings and saves as the Mac performance playtest. Public 0.2.0 has a separate profile. Keep the original saves because migration between those engines has not been verified. See [Updating from a previous version](getting-started.md#updating-from-a-previous-version).
 
 ## Does it run on Intel Macs?
 
@@ -52,10 +54,7 @@ there.
 
 ## Why did the game stop with a message?
 
-FM4 Recomp stops with a named message when the game reaches something it does not implement yet,
-instead of guessing. The session's log names the missing piece. Please report that stop line and
-the text log, as described in [SUPPORT.md](../SUPPORT.md). Look through the log first, and do not
-attach captured frames of the game.
+Check the launcher message and the session log. If the launcher reports a GPU safeguard, read the `GPU_STOP` file in the [profile folder](getting-started.md#sessions-and-gpu-safeguards). Include the version, settings, steps and relevant lines in a [support report](../SUPPORT.md). Review the log for local paths and omit game files and captures.
 
 ## Is it legal?
 
@@ -68,6 +67,4 @@ terms and seek independent advice.
 
 ## Is it open source?
 
-Yes. FM4 Recomp is free software under the GNU General Public License, version 3 or later. The
-third-party code it uses is listed in the
-[third-party notices](../THIRD_PARTY_NOTICES.md).
+FM4 Recomp’s project code is GPL-3.0-or-later. The host, SDK, decoders and other third-party components carry their respective licences. The [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) contains the versioned source changes, decoder sources, licences and rebuild instructions. See [Third-party notices](../THIRD_PARTY_NOTICES.md).

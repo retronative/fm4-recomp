@@ -31,19 +31,9 @@ executable:
 
 ## What the macOS DMG contains
 
-The DMG is built from a tagged commit of this repository (`scripts/release/make_app.sh`,
-`scripts/release/make_dmg.py`) and published on the project's GitHub Releases page. It holds
-FM4 Recomp.app: the setup app, the `fm4recomp` runtime, open-source tools and libraries, and their
-licences (`licenses/THIRD_PARTY_NOTICES.md` in the app, which also says where the source is).
+The 0.3.0 DMG contains the macOS launcher and disc setup tools, the FM4 Static Recomp host and ShiftGlue runtime, Vulkan/Metal graphics libraries, replaceable audio and compression decoders and their licences. The engine program contains code translated by machine from the game executable. It requires the game data supplied from your own supported disc. The DMG includes no disc image, original executable, game artwork, tracks, movies or audio.
 
-No game files are included or distributed: it contains no game assets, disc images or original
-executables, and setup reads your own disc. The `fm4recomp` program is the native build of the
-recompiled game executable with FM4 Recomp's runtime; it does nothing without the game's data from
-your own, legally obtained disc.
-
-The source of a release is this repository at the release's tag. The source of its replaceable
-LGPL libraries (FFmpeg's XMA decoder and libmspack's LZX decoder) is published on the same release
-page as `FM4-Recomp-<version>-third-party-source.tar.xz` ([THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)).
+Use the matching [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) for the pinned host and SDK revisions, project changes, third-party sources and rebuild instructions. The translated sources must be generated from your own disc. The archive and DMG each have a SHA-256 file on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0). Detailed component terms and decoder replacement instructions accompany the app under `Contents/Resources/kit/licenses/`. See [Third-party notices](../THIRD_PARTY_NOTICES.md).
 
 ## Warranty
 

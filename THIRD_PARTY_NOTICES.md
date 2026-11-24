@@ -1,5 +1,18 @@
 # Third-party notices
 
+## FM4 Recomp 0.3.0 for macOS
+
+The 0.3.0 app ships a new engine alongside FM4 Recomp's macOS launcher, disc setup and validation tools. The actual app includes its version-specific notice in `Contents/Resources/kit/licenses/THIRD_PARTY_NOTICES.md` with the component licences and replacement instructions.
+
+- **Game host and SDK.** The host comes from [FM4 Static Recomp](https://github.com/i2kiselev/fm4-static-recomp), including its Pinyon Shift attribution. [ShiftGlue SDK](https://github.com/i2kiselev/shiftglue-sdk) includes work by Tom Clay, i2kiselev and Xenia contributors under BSD terms. The graphics engine includes adapted GPL-3.0-or-later anti-aliasing and HDR shader code from SpeedBreaker and ReCarbon.
+- **Audio and compression.** The engine loads the replaceable `libavcodec.58.dylib` and `libavutil.56.dylib` (FFmpeg contributors) and `libshiftglue_lzx.dylib` (libmspack, Stuart Caie and contributors). The disc setup helper uses a separate `libfm4_lzx.dylib`. LGPL terms and notices accompany the matching sources. The engine and setup LZX libraries are different builds.
+- **Graphics, input and tools.** The kit contains MoltenVK, Vulkan loaders and validation tools, SDL and other SDK dependencies, the AMD FidelityFX Vulkan library, the XenonRecomp-derived disc setup code and extract-xiso. The app's full notice identifies the shipped files, upstream revisions, authors and individual terms.
+- **Corresponding source.** Download the [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). Its README documents the pinned source and macOS changes, how to build compatible replacement libraries and how to sign the modified app. The [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0) contains the DMG and source checksums.
+
+## Earlier public releases (0.2.0 and 0.1.0)
+
+The following inventory and source filenames describe those versions and their original renderer.
+
 FM4 Recomp is licensed under GPL-3.0-or-later ([COPYING](COPYING), [NOTICE](NOTICE)). This file lists the third-party code
 that FM4 Recomp contains or ships, with its copyright holders, licence, the shipped file that contains it, and where its
 licence text is.

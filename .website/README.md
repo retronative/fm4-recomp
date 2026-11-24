@@ -71,7 +71,7 @@ The website never copies the repository's Markdown. `plugins/docs.mjs` reads it 
   front matter needs `release_headline` and `release_planned`; `release_version` (e.g.
   `v0.1.0`) and `release_url` are set together once that release is published, and
   `release_url` must be that tag's page on GitHub Releases. Until then the download button is a
-  disabled "Coming soon"; after, it links the release page (never a file). Milestone states are
+  disabled "Coming soon". Once published, the button links the matching Mac DMG. A separate link opens the tag page for notes and checksums. Milestone states are
   written only in `docs/status.md` (`check:status`).
 - `html: false` escapes any raw HTML in the Markdown and markdown-it's link validation rejects
   `javascript:`/`data:` URLs; that is the sanitisation.
@@ -120,8 +120,7 @@ npm run validate       # check:status, check:contrast, build, check:links, check
 - **check:dist**: only allowlisted file types (html, css, js, svg, woff2, txt, xml, json, ico,
   webmanifest, `CNAME`, `.nojekyll`; PNG only as the future icon and Open Graph files, ≤ 500 kB);
   no source maps; no file over 1 MB; no private-looking content (`scripts/private-content.mjs`);
-  no link to a `.dmg`; the download button on the home and releases pages agrees with
-  `docs/status.md` (a link to `release_url`, or disabled); no third-party runtime requests (external scripts, stylesheets, images,
+  release asset links are restricted to the tagged DMG, source archive and their checksums; the home and releases pages must have both the direct download and release notes links (or the disabled CTA before publication); no third-party runtime requests (external scripts, stylesheets, images,
   preconnects, CSS `@import`/`url()`, web-font services).
 - **check:contrast** computes WCAG contrast for each text colour on each surface it is used on and
   fails below AA (3:1 for the red focus ring and rules).
@@ -165,8 +164,7 @@ names, and `test:routing` then checks the image's declared size.
   project. The footer of every page carries `docs/LEGAL.md`'s first paragraph verbatim.
 - **Font**: Inter (SIL Open Font License 1.1), self-hosted as a latin variable-weight woff2 subset,
   with its licence text beside the file in `public/fonts/` (also published). `font-display: swap`.
-- **Download**: the site hosts no DMG and links no file; the download button goes to the GitHub
-  Release page only, and only once `docs/status.md` names a published release.
+- **Download**: GitHub Releases hosts the files. The button downloads the matching DMG and the adjacent link opens release notes and checksums when `docs/status.md` names a published release.
 
 ## Accessibility
 
