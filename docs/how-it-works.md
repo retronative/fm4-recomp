@@ -38,7 +38,7 @@ a purpose-built runtime.
 
 ## The Mac engine
 
-Version 0.3.0 uses the FM4 Static Recomp host with the ShiftGlue SDK. Its graphics work goes through Vulkan and MoltenVK, and its bundled FFmpeg libraries decode the game’s audio. The source archive has the exact source revisions, changes and build instructions. The reference notes in this repository also document the earlier Mac renderer. See the [third-party notices](../THIRD_PARTY_NOTICES.md).
+Versions 0.3.0 and 0.3.1 use the FM4 Static Recomp host with the ShiftGlue SDK. Its graphics work goes through Vulkan and MoltenVK, and its bundled FFmpeg libraries decode the game’s audio. The source archive has the exact source revisions, changes and build instructions. The reference notes in this repository also document the earlier Mac renderer. See the [third-party notices](../THIRD_PARTY_NOTICES.md).
 
 ## Why only one version
 

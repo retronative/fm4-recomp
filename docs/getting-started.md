@@ -1,12 +1,12 @@
 ---
 title: Getting started
-description: How to install FM4 Recomp 0.3.0 on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
+description: How to install FM4 Recomp 0.3.1 on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
 order: 1
 ---
 
 # Getting started
 
-**FM4 Recomp 0.3.0** is the public beta released on 25 November 2026. [Download the Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg) or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
+**FM4 Recomp 0.3.1** is the public beta released on 25 November 2026. [Download the Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
 
 ## What you will need
 
@@ -22,7 +22,7 @@ The app includes its runtime, graphics and audio libraries. Homebrew and Xcode a
 
 ## Install
 
-1. [Download FM4-Recomp-0.3.0.dmg](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg.sha256). In Terminal, open the folder containing both and run `shasum -a 256 -c FM4-Recomp-0.3.0.dmg.sha256`. A matching download reports `OK`.
+1. [Download FM4-Recomp-0.3.1.dmg](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg.sha256). In Terminal, open the folder containing both and run `shasum -a 256 -c FM4-Recomp-0.3.1.dmg.sha256`. A matching download reports `OK`.
 2. Open the DMG, drag **FM4 Recomp** into **Applications**, and open the app from there.
 3. The app is ad hoc signed and has not been notarised by Apple. If macOS blocks the first launch and you have verified the download, use **System Settings → Privacy & Security → Open Anyway** for FM4 Recomp.
 4. For a fresh installation, choose a storage location and select the supported USA Disc 1 image when the setup window asks. Allow about 9 GB for the extracted game data. Keep any external drive containing the data connected when playing.
@@ -30,13 +30,19 @@ The app includes its runtime, graphics and audio libraries. Homebrew and Xcode a
 
 ### Updating from a previous version
 
-Quit the old app before copying the new one into Applications. If you used the macOS performance playtest, 0.3.0 uses its existing profile, including its settings and saves. The default folder name still contains “Playtest”.
+Quit the earlier app, connect any external drive used for game data or saves, then replace the app in **Applications** and choose **Play**. Version 0.3.1 uses the production profile folder again. It keeps your recorded storage locations and can adopt the recorded Disc 1 setup from 0.3.0 when the production profile has no setup.
 
-If you are coming from the public 0.2.0 beta, your settings and saves stay in the old installation. This release uses a separate profile. Keep the old profile and any shared disc data. If setup asks for Disc 1 again, select your original supported disc image. Setup can verify existing extracted files when you select their original data location. Importing 0.2.0 or Xbox 360 saves into the new engine has not been verified.
+On first launch, the app checks for a career in this order.
+
+1. An existing native career in the configured production save folder takes priority.
+2. If that career is missing, the launcher imports compatible saved-game packages from the earlier public 0.2.0 layout.
+3. If a career is still missing, the launcher looks in the 0.3.0 or performance playtest profile. It also copies missing settings from that profile.
+
+If you played both versions, the careers stay separate. The launcher keeps the other career at its original location. If you see a different career than expected, quit before starting a new career and keep both profiles. The old 0.3.0 account is under `~/Library/Application Support/FM4 Recomp ShiftGlue Playtest/shiftglue/user/`. Your 0.2.0 saved-game packages remain under `content/1/00000001/` in the configured save folder. Back up the whole save tree, including its headers, before moving it. If the launcher reports an unavailable folder, reconnect the drive and try again.
 
 ## Disc 2
 
-Disc 1 is sufficient to play. Disc 2 installation on the 0.3.0 engine has not been verified. If you already installed optional content under 0.2.0, keep that installation.
+Disc 1 is sufficient to play. Disc 2 installation on the 0.3.1 engine has not been verified. If you already installed optional content under 0.2.0, keep that installation.
 
 ## Controls
 
@@ -88,12 +94,12 @@ A new profile uses Full HD, Standard edge smoothing and HDR Auto. HDR and Extend
 
 The launcher runs one session at a time and checks system diagnostics for a GPU hang or restart. If it creates `GPU_STOP` in the profile folder, read it before playing again. A session log can contain local paths. Review the text before sharing a bug report, and omit game files and captures.
 
-The default profile is `~/Library/Application Support/FM4 Recomp ShiftGlue Playtest/`. Use Finder’s **Go → Go to Folder** to open it.
+The default profile is `~/Library/Application Support/FM4 Recomp/`. Use Finder’s **Go → Go to Folder** to open it.
 
 | Inside the profile | Contents |
 |---|---|
-| `shiftglue/user/` | Game saves |
-| `shiftglue/config/graphics.toml` | Graphics settings |
+| `data/user-data/` | Default save folder. A custom or external save folder is recorded as `user_data_root` in `locations.conf`. |
+| `config/graphics.toml` | Graphics settings |
 | `logs/` | Session logs |
 
 ## Known issues
@@ -102,10 +108,10 @@ Frame rate and memory depend on resolution, track and Mac. Choosing 4K can subst
 
 ## Uninstall
 
-Quit the app and move it from Applications to the Bin. Keep the profile and disc data if you intend to reinstall. Back up your saves before removing a profile or an external data folder. The 0.2.0 and 0.3.0 profiles are separate.
+Quit the app and move it from Applications to the Bin. Keep the profile and disc data if you intend to reinstall. Back up your saves before removing a profile or an external data folder. The production and old playtest folders can contain different careers.
 
 ## Building from source
 
-[Browse the 0.3.0 source on GitHub](https://github.com/retronative/fm4-recomp/tree/main/ports/v0.3.0) for the game host, renderer and Mac launcher.
+Browse the [0.3.1 launcher and save migration on GitHub](https://github.com/retronative/fm4-recomp/tree/v0.3.1/scripts/alpha) or the [game host and renderer used by this release](https://github.com/retronative/fm4-recomp/tree/v0.3.1/ports/v0.3.0).
 
-Download the [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). Its README identifies the upstream host and SDK revisions, the local changes and the steps to regenerate the game code from your own supported disc. See also [Third-party notices](../THIRD_PARTY_NOTICES.md).
+Download the [0.3.1 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256). Its README identifies the upstream host and SDK revisions, the local changes and the steps to regenerate the game code from your own supported disc. See also [Third-party notices](../THIRD_PARTY_NOTICES.md).

@@ -94,11 +94,12 @@ func prerequisites(_ paths: Paths) -> [Check] {
   #endif
   let v = ProcessInfo.processInfo.operatingSystemVersion
   list.append(Check(name: "macOS 26 or later", ok: v.majorVersion >= 26, detail: "macOS \(v.majorVersion).\(v.minorVersion)"))
+  let engine = "engines/shiftglue/"
   let kit: [(String, [String])] = [
-    ("Game and setup tools", ["bin/fm4recomp", "bin/extract-xiso", "bin/xexsurvey", "bin/gdfx", "setup.sh", "play.sh", "locations.sh"]),
+    ("Disc setup and launch", ["bin/extract-xiso", "bin/xexsurvey", "lib/libfm4_lzx.dylib", "bin/gdfx", "setup.sh", "play.sh", "locations.sh", "shiftglue-playtest.sh", "migrate-career.sh", "migrate-playtest-profile.sh", "bin/fm4_migrate_career"]),
+    ("Game engine", ["fm4_static_recomp", "librexruntime.dylib", "librexgpu-fh1.dylib", "libfm4_static_recomp_XMediaFacade_default.dylib",
+      "libfm4_static_recomp_SpeechFacade_default.dylib", "graphics-settings.json", "vulkan/lib/libvulkan.1.dylib"].map { engine + $0 }),
     ("Graphics (Vulkan on Metal: MoltenVK)", ["lib/libvulkan.1.dylib", "lib/libMoltenVK.dylib", "vulkan/icd.d/MoltenVK_icd.json"]),
-    ("Shader compiler (glslang, SPIRV-Tools)", ["lib/libglslang.16.dylib", "lib/libSPIRV-Tools.dylib", "lib/libSPIRV-Tools-opt.dylib"]),
-    ("Window, sound and input (SDL 3)", ["lib/libSDL3.0.dylib"]),
     ("GPU safeguard (Vulkan validation layer)", ["lib/libVkLayer_khronos_validation.dylib",
       "vulkan/explicit_layer.d/VkLayer_khronos_validation.json", "bin/fm4_validation_control"]),
   ]

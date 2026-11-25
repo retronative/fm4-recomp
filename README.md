@@ -1,7 +1,7 @@
 # FM4 Recomp
 
 A static recompilation of *Forza Motorsport 4* (Xbox 360, USA disc, title ID 4D530910) to native
-arm64 macOS. The 0.3.0 Mac app uses the FM4 Static Recomp host and the ShiftGlue SDK.
+arm64 macOS. The 0.3.1 Mac app uses the FM4 Static Recomp host and the ShiftGlue SDK.
 
 > [!IMPORTANT]
 > FM4 Recomp is an unofficial fan project, not affiliated with, endorsed by or sponsored by
@@ -12,9 +12,11 @@ arm64 macOS. The 0.3.0 Mac app uses the FM4 Static Recomp host and the ShiftGlue
 
 ## Status
 
-**FM4 Recomp 0.3.0** is available for Apple silicon Macs running macOS 26 or later. Download the [Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg), follow [Getting started](docs/getting-started.md), or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
+**FM4 Recomp 0.3.1** is available for Apple silicon Macs running macOS 26 or later. Download the [Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg), follow [Getting started](docs/getting-started.md), or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
 
-This public beta adds Extended View for wider and taller screens and an in-race Graphics menu with fullscreen and windowed modes, 720p through 4K rendering, MSAA, HDR and eight track and camera effects. New profiles start at Full HD. Spatial FSR 1 enlarges the image automatically when needed. Press **⌘,** to open settings and **Save & Apply** to confirm your choices.
+Version 0.3.1 restores the production profile and imports compatible 0.2.0 careers and missing 0.3.0 playtest settings. If you played both versions, see the [upgrade guide](docs/getting-started.md#updating-from-a-previous-version) for the save-selection order.
+
+The game supports Extended View for wider and taller screens and an in-race Graphics menu with fullscreen and windowed modes, 720p through 4K rendering, MSAA, HDR and eight track and camera effects. New profiles start at Full HD. Spatial FSR 1 enlarges the image automatically when needed. Press **⌘,** to open settings and **Save & Apply** to confirm your choices.
 
 Changes by release are in [CHANGELOG.md](CHANGELOG.md). The public status of each milestone, the
 beta's contents and its known issues are in [docs/status.md](docs/status.md). See also
@@ -33,9 +35,9 @@ own disc. Its program contains code translated by machine from the game's execut
 
 ## Building from source
 
-Browse the [0.3.0 source code](ports/v0.3.0/README.md), including the [Graphics menu](ports/v0.3.0/host/src/ui/graphics_page.cpp), [renderer](ports/v0.3.0/sdk/src/ui/vulkan/vulkan_presenter.cpp) and [Mac launcher](ports/v0.3.0/launcher/app/setup/Main.swift).
+Browse the [0.3.1 Mac launcher](app/setup/), [career migration](scripts/alpha/migrate-career.swift) and [playtest profile import](scripts/alpha/migrate-playtest-profile.sh). The [0.3.0 engine source](ports/v0.3.0/README.md) supplies the [Graphics menu](ports/v0.3.0/host/src/ui/graphics_page.cpp) and [renderer](ports/v0.3.0/sdk/src/ui/vulkan/vulkan_presenter.cpp) in this release.
 
-For a full rebuild, use the [versioned source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). The included README identifies the exact source revisions, launcher changes, decoder dependencies and commands. Regenerating the game's code requires the supported disc. The [contributor guide](CONTRIBUTING.md) describes the tooling in this repository.
+For a full rebuild, use the [versioned source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256). The included README identifies the exact source revisions, launcher changes, decoder dependencies and commands. Regenerating the game's code requires the supported disc. The [contributor guide](CONTRIBUTING.md) describes the tooling in this repository.
 
 ## Contributing and security
 

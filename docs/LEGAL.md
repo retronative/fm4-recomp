@@ -31,9 +31,9 @@ executable:
 
 ## What the macOS DMG contains
 
-The 0.3.0 DMG contains the macOS launcher and disc setup tools, the FM4 Static Recomp host and ShiftGlue runtime, Vulkan/Metal graphics libraries, replaceable audio and compression decoders and their licences. The engine program contains code translated by machine from the game executable. It requires the game data supplied from your own supported disc. The DMG includes no disc image, original executable, game artwork, tracks, movies or audio.
+The 0.3.1 DMG contains the macOS launcher and disc setup tools, the FM4 Static Recomp host and ShiftGlue runtime, Vulkan/Metal graphics libraries, replaceable audio and compression decoders and their licences. The engine program contains code translated by machine from the game executable. It requires the game data supplied from your own supported disc. The DMG includes no disc image, original executable, game artwork, tracks, movies or audio.
 
-Use the matching [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) for the pinned host and SDK revisions, project changes, third-party sources and rebuild instructions. The translated sources must be generated from your own disc. The archive and DMG each have a SHA-256 file on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0). Detailed component terms and decoder replacement instructions accompany the app under `Contents/Resources/kit/licenses/`. See [Third-party notices](../THIRD_PARTY_NOTICES.md).
+Use the matching [0.3.1 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) for the pinned host and SDK revisions, project changes, third-party sources and rebuild instructions. The translated sources must be generated from your own disc. The archive and DMG each have a SHA-256 file on the [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1). Detailed component terms and decoder replacement instructions accompany the app under `Contents/Resources/kit/licenses/`. See [Third-party notices](../THIRD_PARTY_NOTICES.md).
 
 ## Warranty
 

@@ -29,7 +29,23 @@ import SwiftUI
 enum Entry {
   static func main() {
     let args = Array(CommandLine.arguments.dropFirst())
-    if args.first == "--setup" { exit(SetupCLI.run(Array(args.dropFirst()), paths: Paths.standard())) }
+    let paths = Paths.standard()
+    if args.isEmpty || (args.first == "--setup" && ["launch-check", "play", "status"].contains(args.dropFirst().first ?? "")) {
+      do {
+        let userHome = URL(fileURLWithPath: ProcessInfo.processInfo.environment["HOME"] ?? NSHomeDirectory())
+        try adoptPreviousSetup(paths, userHome: userHome)
+      } catch {
+        let reason = "Could not import the previous installation. " + error.localizedDescription
+        if args.isEmpty {
+          let alert = NSAlert()
+          alert.messageText = "FM4 Recomp setup"
+          alert.informativeText = reason
+          alert.runModal()
+        } else { FileHandle.standardError.write(Data((reason + "\n").utf8)) }
+        exit(1)
+      }
+    }
+    if args.first == "--setup" { exit(SetupCLI.run(Array(args.dropFirst()), paths: paths)) }
     if args.first == "--disc-panel" { DiscPanel.run(Array(args.dropFirst())) }
     if args.first == "--controls-panel" { ControlsPanel.run(Array(args.dropFirst())) }
     // No window restoration: an app quit while its window was hidden for a session came back with no window, so nothing started
@@ -62,8 +78,9 @@ enum Entry {
   }
   // The game this app's kit runs (play.sh's grandchild, its own app process with the window).
   static func focusGame() {
-    let kit = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/kit/bin/fm4recomp").standardizedFileURL.path
-    NSWorkspace.shared.runningApplications.first { $0.executableURL?.standardizedFileURL.path == kit }?.activate()
+    let executable = "engines/shiftglue/fm4_static_recomp"
+    let gameURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/kit").appendingPathComponent(executable).standardizedFileURL
+    NSWorkspace.shared.runningApplications.first { $0.executableURL?.standardizedFileURL == gameURL }?.activate()
   }
 }
 

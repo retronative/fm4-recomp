@@ -1,4 +1,8 @@
-# Rebuilding FM4 Recomp 0.3.0 for macOS
+# Rebuilding FM4 Recomp 0.3.1 for macOS
+
+The [0.3.1 source companion](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256) accompany the [release](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1). The [0.3.1 packaging script](profile-update/make_app.sh) builds the launcher and adds the migration tools to the previous release's app. Use the [launcher](../../app/setup/) and [migration code](../alpha/) from the 0.3.1 tag. The [0.3.0 host and SDK](../../ports/v0.3.0/README.md) are the engine source for both versions.
+
+## Rebuilding the 0.3.0 base
 
 Version 0.3.0 packages the FM4 Static Recomp host and ShiftGlue SDK with the Mac launcher. The source companion supplies the exact upstream revisions, host and SDK changes, decoder sources, notices and packaging scripts. The original engine and its build scripts are retained in this repository for earlier releases.
 

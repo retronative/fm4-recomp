@@ -1,0 +1,27 @@
+{
+  "version": "0.3.1",
+  "bundle_build": "10",
+  "bundle_identifier": "org.retronative.fm4recomp",
+  "base_dmg": {
+    "version": "0.3.0",
+    "sha256": "dafb8a792c72a405f71c7c886bf1246db66f405062121585eb45c791942bc967"
+  },
+  "engine_and_decoder_source": {
+    "filename": "FM4-Recomp-0.3.0-source.tar.xz",
+    "sha256": "c89809d9f6baba809044c506548d42f35bd7b50283cf3193284c779b080064b8"
+  },
+  "changed_app_files_sha256": {
+    "Contents/Info.plist": "6a4639841af089c5aac178bd96b090f0c0d0dceb5c7c824d53159d05206e2a1d",
+    "Contents/MacOS/FM4Recomp": "b11cb0d658b4155554472f673dee53e16a043291511623863026b7e0380f0a13",
+    "Contents/Resources/kit/README.md": "b1edf9570ffc5c920d0f8b1d8efdb4f0fd1eae2c979a39a148037ec6aa0d00e2",
+    "Contents/Resources/kit/bin/fm4_migrate_career": "4457f2912dea1ed0e90d77861b838eeb5a309605da36ada522ef51a380108061",
+    "Contents/Resources/kit/migrate-career.sh": "a4c9ae2394a3fa8a7076e56a45867a05d8102c5f2ee7a61fa52cd993e92a2a10",
+    "Contents/Resources/kit/migrate-playtest-profile.sh": "3452408a79dd3fad2750ed34898ce40eb1d208fccaac5ea643a6fb159e248b81",
+    "Contents/Resources/kit/play.sh": "7ca85c4a27ae9b223b193dfdd29e3693d40f36a7080817dbfa818ef00e50717a",
+    "Contents/Resources/kit/setup.sh": "fbf21e0c2358fb37e9ea7c607da598ad552045e9e030abf5a29c0a51dc87b872",
+    "Contents/Resources/kit/shiftglue-playtest.sh": "71ad2edf432a6e95d88e2f1a9de6b6dc0718ab09a1f12e1a181a2c6e20214ec4",
+    "Contents/_CodeSignature/CodeResources": "d9d73420be55f9bf4f876c52a37eef026855f8ba2b821a124bb340f2088c65d9"
+  },
+  "unchanged_regular_files": 211,
+  "unchanged_engine_regular_files": 16
+}

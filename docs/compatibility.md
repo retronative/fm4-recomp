@@ -11,7 +11,7 @@ order: 4
 | Item | Status |
 |---|---|
 | *Forza Motorsport 4*, Xbox 360, **USA** disc (title ID 4D530910), Disc 1 (Play Disc) | Supported, the only target |
-| Disc 2 (Content Install Disc) of the same version | Optional content installation has not been verified on the 0.3.0 engine |
+| Disc 2 (Content Install Disc) of the same version | Optional content installation has not been verified on this engine |
 | Other regions and revisions | Not supported: setup refuses them |
 | Other *Forza* games | Not supported |
 
@@ -43,8 +43,8 @@ Choose fullscreen or windowed mode and render at 720p, Full HD (default), QHD or
 |---|---|
 | Title screen, menus, movies, sound | Works |
 | Quick Race | Single-player racing tested, including Bernese Alps |
-| Saves | Local to the 0.3.0 / performance playtest profile. Import from Xbox 360 or public 0.2.0 is unverified |
-| Disc 2 content install | Unverified on the 0.3.0 engine |
+| Saves | Production profile with support for compatible 0.2.0 and 0.3.0 local saves. Original Xbox 360 save import is unverified. See [Upgrading](getting-started.md#updating-from-a-previous-version) |
+| Disc 2 content install | Unverified on this engine |
 | Other modes and later menus | Coverage varies by mode and track |
 | Achievements | Not available |
 | Xbox Live and online features | Not available |

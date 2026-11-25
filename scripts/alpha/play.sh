@@ -11,6 +11,11 @@
 # in its own process group under a hard deadline; afterwards the system log and the crash reports are searched for a GPU hang or
 # restart, and on any evidence ./GPU_STOP is written: every later session refuses to start until you read it and delete it yourself.
 set -euo pipefail
+# Finder, the supplied .command and the headless CLI all launch the production profile unless a test explicitly supplies a separate home.
+export FM4_ENGINE=shiftglue FM4_POST_AA=on FM4_HDR=auto
+export FM4_SHIFTGLUE_OPTIMIZE="${FM4_SHIFTGLUE_OPTIMIZE:-1}" FM4_SHIFTGLUE_SCOPED_PAGES="${FM4_SHIFTGLUE_SCOPED_PAGES:-1}"
+export FM4_SHIFTGLUE_RESOLVE_MIB="${FM4_SHIFTGLUE_RESOLVE_MIB:-768}"
+export FM4_SHIFTGLUE_4K_RESOLVE_MIB="${FM4_SHIFTGLUE_4K_RESOLVE_MIB:-1728}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 MINUTES=120; DEBUG="${FM4_RECOMP_DEBUG:-0}"
 for arg in "$@"; do
@@ -20,7 +25,7 @@ for arg in "$@"; do
   esac
 done
 DEADLINE=$((MINUTES * 60))
-ROOT="${FM4_RECOMP_HOME:-$HERE}"  # locations.conf, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
+ROOT="${FM4_RECOMP_HOME:-$HOME/Library/Application Support/FM4 Recomp}"  # locations.conf, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
 STOP_FLAG="$ROOT/GPU_STOP"
 LOCK="$ROOT/.play.lock"
 LOGS="$ROOT/logs/$(date '+%Y-%m-%d_%H%M%S')"
@@ -36,7 +41,7 @@ if [ -e "$STOP_FLAG" ]; then
   cat "$STOP_FLAG" >&2; exit 3
 fi
 # One game on this Mac at a time, whatever data folder it uses (the lock below is per folder).
-if other="$(pgrep -x fm4recomp)"; then echo "play: refused: FM4 Recomp is already running (pid $(echo $other | tr '\n' ' '))" >&2; exit 3; fi
+if other="$(pgrep -x 'fm4recomp|fm4_static_recomp')"; then echo "play: refused: FM4 Recomp is already running (pid $(echo $other | tr '\n' ' '))" >&2; exit 3; fi
 if ! mkdir "$LOCK" 2>/dev/null; then
   holder="$(cat "$LOCK/pid" 2>/dev/null || true)"
   if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then echo "play: another session is running (pid $holder)" >&2; exit 3; fi
@@ -44,7 +49,8 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
-mkdir -p "$LOGS/captures" "$DATA/home"
+mkdir -p "$LOGS/captures"
+GAME_HOME="$DATA/home"
 
 # The kit's own Vulkan: its loader and the MoltenVK driver, by their manifests (scripts/release/bundle_kit.sh); nothing from Homebrew or
 # the developer tools. VK_IMPLICIT_LAYER_PATH: the kit's empty folder, so no implicit layer installed elsewhere loads into the game.
@@ -183,9 +189,12 @@ fi
 # FM4_RECOMP_AUDIO=mute: no audio device is opened (test sessions on a shared Mac); otherwise the default output device.
 AUDIO=audible
 [ "${FM4_RECOMP_AUDIO:-}" = mute ] && AUDIO=mute
+source "$HERE/shiftglue-playtest.sh"
+configure_shiftglue
 USER_HOME="$HOME"
-export HOME="$DATA/home"
-echo "play: starting (session limit $MINUTES min; rendering resolution $RES, edge smoothing $AA; logs in $LOGS)"
+mkdir -p "$GAME_HOME"
+export HOME="$GAME_HOME"
+echo "play: starting (session limit $MINUTES min; graphics profile $ROOT/config; logs in $LOGS)"
 since=$(date +%s); touch "$LOGS/start"
 THERMAL_PID=""
 if [ "$PLAYTEST" = 1 ]; then
@@ -200,11 +209,12 @@ perl -e '
   $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[play] session limit: stopped\n"; exit 124 };
   alarm $deadline + 30; waitpid $pid, 0; alarm 0;
   my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-  "$DEADLINE" "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio "$AUDIO" \
-  --renderer window --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop \
-  --disc-setup "$HERE/bin/fm4recomp-setup" --controls-panel "$HERE/bin/fm4recomp-setup" \
-  --stop-at-swap 100000000 --deadline "$DEADLINE" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
-echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
+  "$DEADLINE" "${GAME_CMD[@]}" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
+if [ "${FM4_ENGINE:-native}" = shiftglue ] && [ "$status" = 0 ]; then
+  echo "play: the game ended (exit 0): ShiftGlue closed normally"
+else
+  echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
+fi
 if [ -n "$THERMAL_PID" ]; then kill "$THERMAL_PID" 2>/dev/null || true; fi
 if [ "$PLAYTEST" = 1 ]; then
   /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" \
@@ -215,7 +225,7 @@ evidence=""
 while IFS= read -r -d '' file; do evidence+="gpuEvent report: $file"$'\n'; done < <(find "$USER_HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -maxdepth 1 -name 'gpuEvent-*.ips' \
   -newer "$LOGS/start" -print0 2>/dev/null)
 /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" \
-  --predicate '(process == "fm4recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal") AND process != "log"' \
+  --predicate '(process == "fm4recomp" OR process == "fm4_static_recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal") AND process != "log"' \
   > "$LOGS/syslog.txt" 2>/dev/null || true
 evidence+="$(grep -Ev '^[0-9: .-]+ +[A-Za-z]+ +log\[[0-9]+:' "$LOGS/syslog.txt" | grep -E 'GPU Hang|kIOGPUCommandBufferCallbackError|GPU Restart|gpu restart|IOGPUFamily.*(timeout|timed out|hang|lockup|panic)|GPU.*(hang|lockup) detected' | head -20 || true)"
 if [ -n "$evidence" ]; then

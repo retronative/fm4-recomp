@@ -20,7 +20,7 @@ Motorsport 4* (USA); setup reads a disc image you made from it.
 
 ## Is there a release?
 
-Yes. [Download FM4 Recomp 0.3.0 for Apple silicon](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg). The public beta was released on 25 November 2026. Follow [Getting started](getting-started.md), or read the [release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
+Yes. [Download FM4 Recomp 0.3.1 for Apple silicon](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg). The public beta was released on 25 November 2026. Follow [Getting started](getting-started.md), or read the [release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
 
 ## Which version of the game do I need?
 
@@ -36,7 +36,7 @@ Open **Pause → GRAPHICS** in a race, or press **⌘,**. Use **Y / Save & Apply
 
 ## What happens to my old saves?
 
-0.3.0 uses the same settings and saves as the Mac performance playtest. Public 0.2.0 has a separate profile. Keep the original saves because migration between those engines has not been verified. See [Updating from a previous version](getting-started.md#updating-from-a-previous-version).
+Version 0.3.1 uses the production profile. It keeps an existing native career, then checks for a compatible 0.2.0 career and finally the 0.3.0 playtest career. Missing playtest settings are copied. If you have two different careers, both originals remain available. See [Updating from a previous version](getting-started.md#updating-from-a-previous-version) for their locations.
 
 ## Does it run on Intel Macs?
 
@@ -67,4 +67,4 @@ terms and seek independent advice.
 
 ## Is it open source?
 
-FM4 Recomp’s project code is GPL-3.0-or-later. The host, SDK, decoders and other third-party components carry their respective licences. The [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) contains the versioned source changes, decoder sources, licences and rebuild instructions. See [Third-party notices](../THIRD_PARTY_NOTICES.md).
+FM4 Recomp’s project code is GPL-3.0-or-later. The host, SDK, decoders and other third-party components carry their respective licences. The [0.3.1 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) contains the versioned source changes, decoder sources, licences and rebuild instructions. See [Third-party notices](../THIRD_PARTY_NOTICES.md).

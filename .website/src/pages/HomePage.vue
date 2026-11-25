@@ -39,7 +39,7 @@ const cards = [
             <ReleaseCta />
             <GitHubStar />
             <RouterLink to="/getting-started/" class="btn">Getting started</RouterLink>
-            <a :href="`${REPO_URL}/tree/main/ports/v0.3.0`" class="btn">0.3.0 source on GitHub</a>
+            <a :href="status.releaseVersion ? `${REPO_URL}/tree/${status.releaseVersion}#building-from-source` : REPO_URL" class="btn">Browse source on GitHub</a>
           </div>
         </div>
         <div class="hidden md:block">

@@ -7,6 +7,14 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-25
+
+[Download the Apple silicon app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) · [Release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
+
+- Fixed an upgrade that could open a fresh career and return players to the welcome race. The launcher now uses the production profile and the configured save location, including external storage.
+- Import compatible public 0.2.0 saves on first launch, then recover a missing career or settings from 0.3.0. Existing production careers take priority and the original files stay available for recovery.
+- Reuse recorded game-data locations when upgrading from a 0.3.0-only installation. See the [upgrade guide](docs/getting-started.md#updating-from-a-previous-version).
+
 ## [0.3.0] - 2026-11-25
 
 Public beta for Apple silicon, macOS 26 or later. [Mac download](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0.dmg) · [release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.0).
