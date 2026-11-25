@@ -1,0 +1,168 @@
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -11,9 +11,13 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <bit>
++#include <cstdlib>
+ #include <cstddef>
+ #include <cstring>
+ #include <fstream>
++#include <mutex>
++#include <unordered_map>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -154,6 +158,94 @@
+ }  // namespace shaders
+ 
+ namespace {
++
++// Observe the validated binding extents. A requested byte may never be read
++// by a shader. Neither the page union nor the chunk union is resident memory.
++bool ResolveCoverageEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("FM4_SHIFTGLUE_RESOLVE_COVERAGE");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++struct ResolveCoverage {
++  std::array<uint64_t, SharedMemory::kBufferSize / 4096 / 64> guest_pages{};
++  std::vector<uint64_t> chunks_4m;
++  uint64_t scale_area = 0, backing_bytes = 0;
++  uint64_t first_byte = UINT64_MAX, end_byte = 0, largest_binding = 0;
++  uint64_t bindings = 0, last_report_bindings = 0;
++};
++
++std::mutex resolve_coverage_mutex;
++std::unordered_map<const VulkanTextureCache*, ResolveCoverage> resolve_coverage;
++
++template <typename Words>
++void MarkCoverageBits(Words& words, size_t first, size_t last) {
++  const size_t begin_word = first / 64, end_word = last / 64;
++  const uint64_t head = UINT64_MAX << (first % 64);
++  const uint64_t tail = UINT64_MAX >> (63 - last % 64);
++  if (begin_word == end_word) {
++    words[begin_word] |= head & tail;
++  } else {
++    words[begin_word] |= head;
++    std::fill(words.begin() + begin_word + 1, words.begin() + end_word, UINT64_MAX);
++    words[end_word] |= tail;
++  }
++}
++
++void RecordResolveCoverage(const VulkanTextureCache& cache, uint64_t start, uint64_t bytes) {
++  if (!bytes) return;
++  std::lock_guard lock(resolve_coverage_mutex);
++  auto it = resolve_coverage.find(&cache);
++  if (it == resolve_coverage.end()) return;
++  auto& c = it->second;
++  if (start >= c.backing_bytes || bytes > c.backing_bytes - start) return;
++  const uint64_t last = start + bytes - 1;
++  const uint64_t scaled_page = c.scale_area * 4096;
++  MarkCoverageBits(c.guest_pages, size_t(start / scaled_page), size_t(last / scaled_page));
++  MarkCoverageBits(c.chunks_4m, size_t(start >> 22), size_t(last >> 22));
++  c.first_byte = std::min(c.first_byte, start);
++  c.end_byte = std::max(c.end_byte, last + 1);
++  c.largest_binding = std::max(c.largest_binding, bytes);
++  ++c.bindings;
++}
++
++void ReportResolveCoverage(VulkanTextureCache& cache, uint64_t frame, bool final) {
++  // GetScaledResolvedPageRuns takes the guest memory lock. Read it before
++  // the diagnostic lock to keep the diagnostic out of guest lock ordering.
++  // Destruction may follow a failed initialization, before the page tables exist.
++  {
++    std::lock_guard lock(resolve_coverage_mutex);
++    if (!resolve_coverage.contains(&cache)) return;
++  }
++  uint64_t live_guest_bytes = 0;
++  for (const auto& run : cache.GetScaledResolvedPageRuns()) live_guest_bytes += run.second;
++  std::lock_guard lock(resolve_coverage_mutex);
++  auto it = resolve_coverage.find(&cache);
++  if (it == resolve_coverage.end()) return;
++  auto& c = it->second;
++  uint32_t guest_pages = 0, chunks4 = 0, chunks16 = 0, chunks64 = 0;
++  for (uint64_t mask : c.guest_pages) guest_pages += std::popcount(mask);
++  for (uint64_t mask : c.chunks_4m) {
++    chunks4 += std::popcount(mask);
++    for (uint32_t i = 0; i < 64; i += 4) chunks16 += ((mask >> i) & 15) != 0;
++    for (uint32_t i = 0; i < 64; i += 16) chunks64 += ((mask >> i) & 65535) != 0;
++  }
++  REXGPU_INFO("Resolve coverage (demand upper bound): frame={} final={} scale_area={} "
++              "backing_bytes={} bindings={} bindings_since_report={} guest_pages_4k={} "
++              "page_union_scaled_bytes={} scaled_min={} scaled_end_exclusive={} "
++              "max_binding_bytes={} chunks_4MiB={} chunks_16MiB={} chunks_64MiB={} "
++              "live_marked_guest_bytes={} live_marked_scaled_bytes={}",
++              frame, final, c.scale_area, c.backing_bytes, c.bindings,
++              c.bindings - c.last_report_bindings, guest_pages,
++              uint64_t(guest_pages) * 4096 * c.scale_area, c.bindings ? c.first_byte : 0,
++              c.end_byte, c.largest_binding, chunks4, chunks16, chunks64, live_guest_bytes,
++              live_guest_bytes * c.scale_area);
++  c.last_report_bindings = c.bindings;
++  if (final) resolve_coverage.erase(it);
++}
++
+ 
+ // Keep invalid fetch constant texture reads aligned with D3D12 null SRV
+ // descriptors, which force all sampled channels to 0.
+@@ -691,6 +783,15 @@
+   if (runs.empty() || previous.scaled_resolve_buffer_ == VK_NULL_HANDLE) {
+     return;
+   }
++  if (ResolveCoverageEnabled()) {
++    // The old backing is read directly during resampling after this transfer.
++    const uint64_t old_area =
++        uint64_t(previous.draw_resolution_scale_x()) * previous.draw_resolution_scale_y();
++    for (const ScaledResolveRun& run : runs) {
++      RecordResolveCoverage(previous, uint64_t(run.start) * old_area,
++                            uint64_t(run.length) * old_area);
++    }
++  }
+   ReleaseInheritedBuffer();
+   inherited_buffer_ = std::exchange(previous.scaled_resolve_buffer_, VK_NULL_HANDLE);
+   inherited_buffer_memory_ = std::move(previous.scaled_resolve_buffer_memory_);
+@@ -809,6 +910,10 @@
+ }
+ 
+ void VulkanTextureCache::EndFrame() {
++  if (ResolveCoverageEnabled() && IsDrawResolutionScaled() &&
++      command_processor_.GetCurrentFrame() % 600 == 0) {
++    ReportResolveCoverage(*this, command_processor_.GetCurrentFrame(), false);
++  }
+   bool unsupported_header_written = false;
+   for (uint32_t i = 0; i < 64; ++i) {
+     uint32_t unsupported_features = unsupported_format_features_used_[i];
+@@ -3555,10 +3660,21 @@
+ 
+   scaled_resolve_last_usage_write_ = false;
+   scaled_resolve_last_written_range_ = std::make_pair(uint64_t(0), uint64_t(0));
++  if (ResolveCoverageEnabled()) {
++    std::lock_guard lock(resolve_coverage_mutex);
++    auto& c = resolve_coverage[this];
++    c = {};
++    c.scale_area = scale_area;
++    c.backing_bytes = scaled_resolve_buffer_size_;
++    c.chunks_4m.resize(size_t((c.backing_bytes + (UINT64_C(1) << 28) - 1) >> 28));
++  }
+   return true;
+ }
+ 
+ void VulkanTextureCache::ShutdownScaledResolveBuffer() {
++  if (ResolveCoverageEnabled()) {
++    ReportResolveCoverage(*this, command_processor_.GetCurrentFrame(), true);
++  }
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -3612,6 +3728,7 @@
+     return false;
+   }
+ 
++  if (ResolveCoverageEnabled()) RecordResolveCoverage(*this, start_scaled, length_scaled);
+   start_scaled_out = start_scaled;
+   length_scaled_out = length_scaled;
+   return true;

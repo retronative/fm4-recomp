@@ -1,0 +1,83 @@
+--- a/app/setup/Core.swift
++++ b/app/setup/Core.swift
+@@ -17,7 +17,7 @@
+       ?? Bundle.main.resourceURL!.appendingPathComponent("kit")
+     let userHome = URL(fileURLWithPath: env["HOME"] ?? NSHomeDirectory())
+     let home = env["FM4_RECOMP_HOME"].map { URL(fileURLWithPath: $0) }
+-      ?? userHome.appendingPathComponent("Library/Application Support/FM4 Recomp")
++      ?? userHome.appendingPathComponent("Library/Application Support/FM4 Recomp ShiftGlue Playtest")
+     return Paths(kit: kit, home: home)
+   }
+ 
+@@ -94,11 +94,12 @@
+   #endif
+   let v = ProcessInfo.processInfo.operatingSystemVersion
+   list.append(Check(name: "macOS 26 or later", ok: v.majorVersion >= 26, detail: "macOS \(v.majorVersion).\(v.minorVersion)"))
++  let engine = "engines/shiftglue/"
+   let kit: [(String, [String])] = [
+-    ("Game and setup tools", ["bin/fm4recomp", "bin/extract-xiso", "bin/xexsurvey", "bin/gdfx", "setup.sh", "play.sh", "locations.sh"]),
++    ("Disc setup and launch", ["bin/extract-xiso", "bin/xexsurvey", "lib/libfm4_lzx.dylib", "bin/gdfx", "setup.sh", "play.sh", "locations.sh", "shiftglue-playtest.sh"]),
++    ("Game engine", ["fm4_static_recomp", "librexruntime.dylib", "librexgpu-fh1.dylib", "libfm4_static_recomp_XMediaFacade_default.dylib",
++      "libfm4_static_recomp_SpeechFacade_default.dylib", "graphics-settings.json", "vulkan/lib/libvulkan.1.dylib"].map { engine + $0 }),
+     ("Graphics (Vulkan on Metal: MoltenVK)", ["lib/libvulkan.1.dylib", "lib/libMoltenVK.dylib", "vulkan/icd.d/MoltenVK_icd.json"]),
+-    ("Shader compiler (glslang, SPIRV-Tools)", ["lib/libglslang.16.dylib", "lib/libSPIRV-Tools.dylib", "lib/libSPIRV-Tools-opt.dylib"]),
+-    ("Window, sound and input (SDL 3)", ["lib/libSDL3.0.dylib"]),
+     ("GPU safeguard (Vulkan validation layer)", ["lib/libVkLayer_khronos_validation.dylib",
+       "vulkan/explicit_layer.d/VkLayer_khronos_validation.json", "bin/fm4_validation_control"]),
+   ]
+--- a/app/setup/Main.swift
++++ b/app/setup/Main.swift
+@@ -62,8 +62,7 @@
+   }
+   // The game this app's kit runs (play.sh's grandchild, its own app process with the window).
+   static func focusGame() {
+-    let executable = ProcessInfo.processInfo.environment["FM4_ENGINE"] == "shiftglue"
+-      ? "engines/shiftglue/fm4_static_recomp" : "bin/fm4recomp"
++    let executable = "engines/shiftglue/fm4_static_recomp"
+     let gameURL = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/kit").appendingPathComponent(executable).standardizedFileURL
+     NSWorkspace.shared.runningApplications.first { $0.executableURL?.standardizedFileURL == gameURL }?.activate()
+   }
+--- a/scripts/alpha/play.sh
++++ b/scripts/alpha/play.sh
+@@ -11,6 +11,11 @@
+ # in its own process group under a hard deadline; afterwards the system log and the crash reports are searched for a GPU hang or
+ # restart, and on any evidence ./GPU_STOP is written: every later session refuses to start until you read it and delete it yourself.
+ set -euo pipefail
++# Finder, the supplied .command and the headless CLI all launch this same isolated playtest profile.
++export FM4_ENGINE=shiftglue FM4_POST_AA=on FM4_HDR=auto
++export FM4_SHIFTGLUE_OPTIMIZE="${FM4_SHIFTGLUE_OPTIMIZE:-1}" FM4_SHIFTGLUE_SCOPED_PAGES="${FM4_SHIFTGLUE_SCOPED_PAGES:-1}"
++export FM4_SHIFTGLUE_RESOLVE_MIB="${FM4_SHIFTGLUE_RESOLVE_MIB:-768}"
++export FM4_SHIFTGLUE_4K_RESOLVE_MIB="${FM4_SHIFTGLUE_4K_RESOLVE_MIB:-1728}"
+ HERE="$(cd "$(dirname "$0")" && pwd)"
+ MINUTES=120; DEBUG="${FM4_RECOMP_DEBUG:-0}"
+ for arg in "$@"; do
+@@ -184,26 +189,12 @@
+ # FM4_RECOMP_AUDIO=mute: no audio device is opened (test sessions on a shared Mac); otherwise the default output device.
+ AUDIO=audible
+ [ "${FM4_RECOMP_AUDIO:-}" = mute ] && AUDIO=mute
+-GAME_CMD=(
+-  "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio "$AUDIO"
+-  --renderer window --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop
+-  --disc-setup "$HERE/bin/fm4recomp-setup" --controls-panel "$HERE/bin/fm4recomp-setup"
+-  --stop-at-swap 100000000 --deadline "$DEADLINE"
+-)
+-case "${FM4_ENGINE:-native}" in
+-  native) ;;
+-  shiftglue)
+-    # The alternate engine ships only in a separate local playtest kit.
+-    [ -r "$HERE/shiftglue-playtest.sh" ] || { echo "play: this kit does not include the ShiftGlue playtest engine" >&2; exit 2; }
+-    source "$HERE/shiftglue-playtest.sh"
+-    configure_shiftglue
+-    ;;
+-  *) echo "play: unknown engine $FM4_ENGINE" >&2; exit 2 ;;
+-esac
++source "$HERE/shiftglue-playtest.sh"
++configure_shiftglue
+ USER_HOME="$HOME"
+ mkdir -p "$GAME_HOME"
+ export HOME="$GAME_HOME"
+-echo "play: starting (session limit $MINUTES min; rendering resolution $RES, edge smoothing $AA; logs in $LOGS)"
++echo "play: starting (session limit $MINUTES min; graphics profile $ROOT/shiftglue/config; logs in $LOGS)"
+ since=$(date +%s); touch "$LOGS/start"
+ THERMAL_PID=""
+ if [ "$PLAYTEST" = 1 ]; then

@@ -2,6 +2,8 @@
 
 Version 0.3.0 packages the FM4 Static Recomp host and ShiftGlue SDK with the Mac launcher. The source companion supplies the exact upstream revisions, host and SDK changes, decoder sources, notices and packaging scripts. The original engine and its build scripts are retained in this repository for earlier releases.
 
+Read the [0.3.0 host, SDK and launcher code](../../ports/v0.3.0/README.md) directly in this repository.
+
 Download the archive and its checksum into an empty directory.
 
 ```sh

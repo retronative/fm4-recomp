@@ -1,0 +1,361 @@
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -14,6 +14,8 @@
+ #include <rex/ui/window_sdl.h>
+ 
+ #include <algorithm>
++#include <atomic>
++#include <cstdio>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -107,9 +109,36 @@
+   return requested_height;
+ }
+ 
++// FM4 Recomp Extended View. A window event supplies the drawable shape. Only
++// frames for which the game has adjusted a main camera use that shape.
++std::atomic<bool> fm4_view_enabled{false};
++std::atomic<float> fm4_drawable_factor{1.0f};
++std::atomic<SDL_WindowID> fm4_view_window{0};
++std::atomic<float> fm4_configured_aspect{0};
++std::atomic<uint64_t> fm4_swap{1}, fm4_last_main{0};
++std::atomic<float> fm4_active_factor{1.0f};
++
++float ViewFactor(unsigned w, unsigned h) {
++  if (!w || !h) return 1.0f;
++  const float f = (float(w) / float(h)) / (16.0f / 9.0f);
++  return f >= 1.0f / 1.01f && f <= 1.01f ? 1.0f : std::clamp(f, .75f, 2.0f);
++}
++
++void ApplyWindowedAspect(SDL_Window* window) {
++  // SDL_SetWindowAspectRatio also restores the floating window's size. A
++  // borderless fullscreen Cocoa window must retain its display bounds.
++  if (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) return;
++  const float aspect = fm4_view_enabled.load() ? 0.0f : fm4_configured_aspect.load();
++  float minimum = 0.0f, maximum = 0.0f;
++  if (SDL_GetWindowAspectRatio(window, &minimum, &maximum) &&
++      minimum == aspect && maximum == aspect) return;
++  SDL_SetWindowAspectRatio(window, aspect, aspect);
++}
++
+ void ApplyConfiguredAspectRatio(SDL_Window* window) {
+-  const float aspect = ParseAspectRatio(REXCVAR_GET(window_aspect_ratio));
+-  SDL_SetWindowAspectRatio(window, aspect, aspect);
++  fm4_view_window.store(SDL_GetWindowID(window));
++  fm4_configured_aspect.store(ParseAspectRatio(REXCVAR_GET(window_aspect_ratio)));
++  ApplyWindowedAspect(window);
+ }
+ 
+ // SDL timer callback (runs on SDL's timer thread): defer the actual hide to
+@@ -147,6 +176,47 @@
+ 
+ }  // namespace
+ 
++extern "C" void fm4_view_set_enabled(bool enabled) {
++  if (fm4_view_enabled.exchange(enabled) == enabled || !fm4_view_window.load()) return;
++  // This may run under the cvar registry lock. The UI callback needs only
++  // atomics and SDL's live window ID, even if SDL executes it immediately.
++  SDL_RunOnMainThread([](void*) {
++    if (SDL_Window* w = SDL_GetWindowFromID(fm4_view_window.load())) {
++      ApplyWindowedAspect(w);
++    }
++  }, nullptr, false);
++}
++
++extern "C" void fm4_view_drawable(unsigned w, unsigned h) {
++  fm4_drawable_factor.store(ViewFactor(w, h), std::memory_order_relaxed);
++}
++extern "C" float fm4_view_projection_factor() {
++  if (!fm4_view_enabled.load(std::memory_order_relaxed)) return 1.0f;
++  static const float test = [] {
++    const char* headless = std::getenv("FM4_COMPARE_OFFSCREEN");
++    const char* size = std::getenv("FM4_VIEW_TEST_SIZE");
++    unsigned w = 0, h = 0;
++    char tail;
++    return headless && !std::strcmp(headless, "1") && size &&
++           std::sscanf(size, "%ux%u%c", &w, &h, &tail) == 2 ? ViewFactor(w, h) : 0.0f;
++  }();
++  return test > 0 ? test : fm4_drawable_factor.load(std::memory_order_relaxed);
++}
++extern "C" void fm4_view_note_main() {
++  fm4_last_main.store(fm4_swap.load(std::memory_order_relaxed), std::memory_order_relaxed);
++}
++extern "C" float fm4_view_next_frame() {
++  const uint64_t now = fm4_swap.fetch_add(1, std::memory_order_relaxed);
++  const uint64_t main = fm4_last_main.load(std::memory_order_relaxed);
++  const float f = main && main <= now && now - main < 15 ? fm4_view_projection_factor() : 1.0f;
++  if (fm4_active_factor.exchange(f) != f)
++    REXLOG_INFO("Extended View: frame {} display aspect factor {:.4f}", now, f);
++  return f;
++}
++extern "C" float fm4_view_frame_factor() {
++  return fm4_active_factor.load(std::memory_order_relaxed);
++}
++
+ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+                                        const std::string_view title, uint32_t desired_logical_width,
+                                        uint32_t desired_logical_height) {
+@@ -557,6 +627,9 @@
+ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+   WindowDestructionReceiver destruction_receiver(this);
+   switch (event.type) {
++    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
++      ApplyWindowedAspect(sdl_window_);
++      break;
+     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+       OnActualSizeUpdate(uint32_t(event.window.data1), uint32_t(event.window.data2),
+                          destruction_receiver);
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -13,6 +13,10 @@
+ #include <atomic>
+ #include <cctype>
+ #include <chrono>
++#include <cmath>
++
++extern "C" void fm4_view_drawable(unsigned, unsigned);
++extern "C" float fm4_view_frame_factor();
+ #include <thread>
+ #include <utility>
+ 
+@@ -95,6 +99,9 @@
+ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
+     .allowed({"bilinear"});
+ #endif
++
++REXCVAR_DEFINE_BOOL(fm4_auto_fsr, false, "UI/Presenter",
++                    "Use spatial FSR only when enlarging the final game image.");
+ 
+ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
+                     "Enable output dithering in the final present pass");
+@@ -527,6 +534,11 @@
+       guest_output_properties_[guest_output_mailbox_writable_];
+   writable_properties.frontbuffer_width = frontbuffer_width;
+   writable_properties.frontbuffer_height = frontbuffer_height;
++  const float view = fm4_view_frame_factor();
++  if (view != 1.0f && display_aspect_ratio_x && display_aspect_ratio_y) {
++    display_aspect_ratio_x = uint32_t(std::lround(16000.0f * view));
++    display_aspect_ratio_y = 9000;
++  }
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
+   writable_properties.is_8bpc = false;
+@@ -1046,9 +1058,19 @@
+   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
+ 
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+-  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
+-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
+-      GuestOutputPaintConfig::IsTemporalEffect(config.GetEffect())) {
++  auto effect = config.GetEffect();
++  if (effect == GuestOutputPaintConfig::Effect::kFsr && REXCVAR_GET(fm4_auto_fsr)) {
++    // Compare the game picture to its fitted destination, excluding the bars.
++    const auto width = properties.frontbuffer_width;
++    const auto height = properties.frontbuffer_height;
++    if (width > output_width_clamped || height > output_height_clamped ||
++        (width == output_width_clamped && height == output_height_clamped)) {
++      effect = GuestOutputPaintConfig::Effect::kBilinear;
++    }
++  }
++  if (effect == GuestOutputPaintConfig::Effect::kCas ||
++      effect == GuestOutputPaintConfig::Effect::kFsr ||
++      GuestOutputPaintConfig::IsTemporalEffect(effect)) {
+     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
+     // good for up to 2x2 upscaling due to the way they fetch texels.
+     // CAS is primarily a sharpening filter, not an upscaling one (its upscaling
+@@ -1401,6 +1423,7 @@
+       SurfacePaintConnectionState::kUnconnectedSurfaceReportedUnusable) {
+     uint32_t surface_width = 0, surface_height = 0;
+     bool surface_area_available = surface_->GetSize(surface_width, surface_height);
++    if (surface_area_available) fm4_view_drawable(surface_width, surface_height);
+     if (!surface_area_available) {
+       // The surface is currently zero-area (or has become zero-area), try again
+       // when it's resized.
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -72,6 +72,7 @@
+       uint32_t tessellation_mode : 2;
+       // Write frac(interpolator 0 z + 0.5) as one more output (gpu_wrap_seam_*).
+       uint32_t wrap_seam_u2 : 1;
++      uint32_t fm4_pin_overlay : 1;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -2844,6 +2844,27 @@
+     }
+   }
+ 
++  // FM4 Recomp: pin full-screen fades and panel edges while narrowing other
++  // HUD vertices in the guest camera's clip space, before tile/viewport remap.
++  if (shader_modification.vertex.fm4_pin_overlay) {
++    // This variant applies only to triangle HUD draws. The point-size vec2
++    // is available to it without changing the descriptor or constant ABI.
++    id_vector_temp_ = {builder_->makeIntConstant(kSystemConstantPointConstantDiameter)};
++    auto scales = builder_->createLoad(builder_->createAccessChain(
++        spv::StorageClassUniform, uniform_system_constants_, id_vector_temp_), spv::NoPrecision);
++    auto edge = builder_->createBinOp(spv::OpFMul, type_float_, position_w,
++                                      builder_->makeFloatConstant(0.998f));
++    for (unsigned axis = 0; axis < 2; ++axis) {
++      auto v = builder_->createCompositeExtract(position_xyz, type_float_, axis);
++      auto abs_v = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs, v);
++      auto pinned = builder_->createBinOp(spv::OpFOrdGreaterThanEqual, type_bool_, abs_v, edge);
++      auto shrunk = builder_->createBinOp(spv::OpFMul, type_float_, v,
++                                          builder_->createCompositeExtract(scales, type_float_, axis));
++      auto selected = builder_->createTriOp(spv::OpSelect, type_float_, pinned, v, shrunk);
++      position_xyz = builder_->createCompositeInsert(selected, position_xyz, type_float3_, axis);
++    }
++  }
++
+   // Apply the NDC scale and offset for guest to host viewport transformation.
+   id_vector_temp_.clear();
+   id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantNdcScale));
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -370,9 +370,31 @@
+ }
+ }  // namespace
+ 
++extern "C" float fm4_view_next_frame();
++extern "C" float fm4_view_frame_factor();
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
++thread_local float fm4_draw_view = 1.0f;
++
++bool Fm4HudDraw(const RegisterFile& regs, xenos::PrimitiveType primitive) {
++  if (fm4_draw_view == 1.0f || regs.Get<reg::RB_SURFACE_INFO>().surface_pitch != 1280) return false;
++  const auto format = regs.Get<reg::RB_COLOR_INFO>(XE_GPU_REG_RB_COLOR_INFO).color_format;
++  if (format != xenos::ColorRenderTargetFormat::k_2_10_10_10 &&
++      format != xenos::ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10) return false;
++  return primitive == xenos::PrimitiveType::kTriangleList ||
++         primitive == xenos::PrimitiveType::kTriangleStrip ||
++         primitive == xenos::PrimitiveType::kTriangleFan;
++}
++
++bool Fm4FullViewport(const RegisterFile& regs) {
++  return regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) == 640 &&
++         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) == -360 &&
++         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) == 640 &&
++         regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) == 360;
++}
++
+ 
+ bool ScopedDrawPagesEnabled() {
+   static const bool enabled = [] {
+@@ -4140,6 +4162,7 @@
+   DrawCostFrame();
+   DrawProgramFrame();
+   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
++  fm4_draw_view = fm4_view_next_frame();
+   // Settings that rebuild host objects apply between frames.
+   if (object_slot_wanted_width_ &&
+       (object_slot_wanted_width_ != object_slot_image_width_ ||
+@@ -6598,6 +6621,16 @@
+   // skipped later tiles, which never reach it). It is the recorded draw
+   // while its state hash, shaders, draw words and the settings the
+   // derivation reads are the recorded ones (and its index version holds).
++  fm4_draw_view = fm4_view_frame_factor();
++  const bool fm4_hud = Fm4HudDraw(regs, prim_type);
++  const bool pin_hud = fm4_hud && Fm4FullViewport(regs);
++  if (pin_hud) {
++    static thread_local bool reported = false;
++    if (!reported && std::getenv("FM4_VIEW_TEST_SIZE")) {
++      REXGPU_INFO("Extended View: full-viewport HUD uses edge pin, factor {:.4f}", fm4_draw_view);
++      reported = true;
++    }
++  }
+   ProgramDraw* program_draw = nullptr;
+   bool program_matched = false;  // the recorded draw (any mode)
+   bool program_hit = false;      // performance mode: drawn from the program
+@@ -6614,7 +6647,8 @@
+     uint32_t miss = kMissNew;
+     if (pd.valid) {
+       const bool indexed = index_buffer_info != nullptr;
+-      if (pd.memo_state != memo_state || pd.active_vertex_shader != active_vertex_shader() ||
++      if (bool(pd.vertex_modification.vertex.fm4_pin_overlay) != pin_hud ||
++          pd.memo_state != memo_state || pd.active_vertex_shader != active_vertex_shader() ||
+           pd.active_pixel_shader != active_pixel_shader()) {
+         miss = kMissState;
+       } else if (pd.prim_type != uint32_t(prim_type) || pd.index_count != index_count ||
+@@ -6942,7 +6976,8 @@
+       TranslationMemo& translation_memo = translation_memos_[StateMemoSlot(
+           memo_state, uint64_t(uintptr_t(vertex_shader)),
+           uint64_t(uintptr_t(pixel_shader)) ^ uint64_t(interpolator_mask) << 1)];
+-      if (translation_memo.state_epoch == memo_state &&
++      if (bool(translation_memo.vertex_modification.vertex.fm4_pin_overlay) == pin_hud &&
++          translation_memo.state_epoch == memo_state &&
+           translation_memo.guest_prim_type == guest_prim_type &&
+           translation_memo.vertex_shader == vertex_shader &&
+           translation_memo.pixel_shader == pixel_shader &&
+@@ -6966,6 +7001,7 @@
+                                *pixel_shader, interpolator_mask, ps_param_gen_pos,
+                                normalized_depth_control)
+                          : SpirvShaderTranslator::Modification(0);
++        vertex_shader_modification.vertex.fm4_pin_overlay = pin_hud;
+         if (object_slot) {
+           pixel_shader_modification.pixel.object_slot_output = 1;
+         }
+@@ -10527,11 +10563,43 @@
+     viewport.x -= float(pa_sc_window_offset.window_x_offset * int32_t(draw_resolution_scale_x));
+     viewport.y += float(untile_rows * int32_t(draw_resolution_scale_y));
+   }
++  // For clipped, small viewports (notably the track map), move the whole
++  // hardware viewport. Moving only its geometry moves vertices beyond the
++  // original clip volume and cuts off the outside half of the map.
++  const auto primitive = regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type;
++  const bool hud = Fm4HudDraw(regs, primitive);
++  if (hud && !Fm4FullViewport(regs)) {
++    const float sx = std::min(1.0f / fm4_draw_view, 1.0f);
++    const float sy = std::min(fm4_draw_view, 1.0f);
++    const auto offset = regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable;
++    const float cx = (640.0f + (offset && !untile_tiling_ ? pa_sc_window_offset.window_x_offset : 0)) *
++                     draw_resolution_scale_x;
++    const float cy = (360.0f + (offset && !untile_tiling_ ? pa_sc_window_offset.window_y_offset : 0)) *
++                     draw_resolution_scale_y;
++    viewport.x = cx + (viewport.x - cx) * sx;
++    viewport.y = cy + (viewport.y - cy) * sy;
++    viewport.width *= sx;
++    viewport.height *= sy;
++  }
+   SetViewport(viewport);
+ 
+   // Scissor.
+   draw_util::Scissor scissor;
+   draw_util::GetScissor(regs, scissor);
++  if (Fm4HudDraw(regs, regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type)) {
++    const int start[] = {pa_sc_window_offset.window_x_offset, pa_sc_window_offset.window_y_offset};
++    for (unsigned i = 0; i < 2; ++i) {
++      const float scale = i ? std::min(fm4_draw_view, 1.0f) : std::min(1.0f / fm4_draw_view, 1.0f);
++      if (scale == 1.0f) continue;
++      const int length = i ? 720 : 1280;
++      const float centre = start[i] + length * .5f;
++      const int lo = int(scissor.offset[i]), hi = lo + int(scissor.extent[i]);
++      const int a = lo <= start[i] ? lo : int(std::floor(centre + (lo - centre) * scale));
++      const int b = hi >= start[i] + length ? hi : int(std::ceil(centre + (hi - centre) * scale));
++      scissor.offset[i] = std::max(0, a);
++      scissor.extent[i] = std::max(0, b - int(scissor.offset[i]));
++    }
++  }
+   scissor.offset[0] *= draw_resolution_scale_x;
+   scissor.offset[1] *= draw_resolution_scale_y;
+   scissor.extent[0] *= draw_resolution_scale_x;
+@@ -10738,6 +10806,15 @@
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   bool dirty = false;
++  const auto& fm4_regs = *register_file_;
++  const auto fm4_primitive = fm4_regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type;
++  if (Fm4HudDraw(fm4_regs, fm4_primitive) && Fm4FullViewport(fm4_regs)) {
++    const float scale[] = {std::min(1.0f / fm4_draw_view, 1.0f), std::min(fm4_draw_view, 1.0f)};
++    for (unsigned i = 0; i < 2; ++i) {
++      dirty |= system_constants_.point_constant_diameter[i] != scale[i];
++      system_constants_.point_constant_diameter[i] = scale[i];
++    }
++  }
+   // Texture signedness / gamma.
+   uint32_t textures_resolution_scaled = 0;
+   {

@@ -106,4 +106,6 @@ Quit the app and move it from Applications to the Bin. Keep the profile and disc
 
 ## Building from source
 
+[Browse the 0.3.0 source on GitHub](https://github.com/retronative/fm4-recomp/tree/main/ports/v0.3.0) for the game host, renderer and Mac launcher.
+
 Download the [0.3.0 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). Its README identifies the upstream host and SDK revisions, the local changes and the steps to regenerate the game code from your own supported disc. See also [Third-party notices](../THIRD_PARTY_NOTICES.md).

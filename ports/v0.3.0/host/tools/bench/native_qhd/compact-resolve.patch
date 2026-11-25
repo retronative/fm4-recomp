@@ -1,0 +1,844 @@
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -394,8 +394,8 @@
+   // Creates the render target cache, the pipeline cache, the texture cache,
+   // the FH1 native executor and (at 1x) the frame dump at a draw resolution
+   // scale.
+-  bool CreateScaledComponents(uint32_t draw_resolution_scale_x,
+-                              uint32_t draw_resolution_scale_y);
++  bool CreateScaledComponents(uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
++                              std::unique_ptr<VulkanTextureCache> prepared_texture_cache = nullptr);
+   // Points the shared memory and EDRAM descriptor set at the shared memory and
+   // at the render target cache's EDRAM buffer.
+   void WriteSharedMemoryAndEdramDescriptorSet();
+diff --git a/include/rex/graphics/vulkan/scaled_resolve_banks.h b/include/rex/graphics/vulkan/scaled_resolve_banks.h
+new file mode 100644
+--- /dev/null
++++ b/include/rex/graphics/vulkan/scaled_resolve_banks.h
+@@ -0,0 +1,90 @@
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++
++namespace rex::graphics::vulkan {
++
++// Each bank covers 16 MiB of guest addresses at any scale. A reservation is contiguous
++// within a descriptor, and any assigned bank stays at its slot until promotion.
++class ScaledResolveBanks {
++ public:
++  static constexpr uint32_t kCount = 32;
++  static constexpr uint32_t kGuestSize = uint32_t{16} << 20;
++  static constexpr uint64_t BankSize(uint32_t scale) { return uint64_t(kGuestSize) * scale * scale; }
++  static constexpr uint64_t kSize = uint64_t(kGuestSize) * 4;  // QHD default
++  static constexpr uint64_t kAddressSize = kSize * kCount;
++
++  int slot(uint32_t bank) const { return int(slots_[bank]) - 1; }
++
++  bool Translate(uint64_t start, uint64_t length, uint64_t& local,
++                 uint64_t bank_size = kSize) const {
++    if (!ValidRange(start, length, bank_size)) return false;
++    const uint32_t first = uint32_t(start / bank_size);
++    const uint32_t last = uint32_t((start + length - 1) / bank_size);
++    const int base = slot(first);
++    if (base < 0) return false;
++    for (uint32_t bank = first + 1; bank <= last; ++bank) {
++      if (slot(bank) != base + int(bank - first)) return false;
++    }
++    local = uint64_t(base) * bank_size + start % bank_size;
++    return true;
++  }
++
++  bool Reserve(uint64_t start, uint64_t length, uint32_t capacity,
++               uint64_t bank_size = kSize) {
++    if (!length) return true;
++    if (!capacity || capacity > kCount || !ValidRange(start, length, bank_size)) return false;
++    const uint32_t first = uint32_t(start / bank_size);
++    const uint32_t last = uint32_t((start + length - 1) / bank_size);
++    const uint32_t count = last - first + 1;
++    if (count > capacity) return false;
++
++    int required = -1;
++    for (uint32_t bank = first; bank <= last; ++bank) {
++      if (slot(bank) < 0) continue;
++      const int base = slot(bank) - int(bank - first);
++      if (base < 0 || base + int(count) > int(capacity) ||
++          (required >= 0 && base != required)) return false;
++      required = base;
++    }
++    const auto install = [&](uint32_t base) {
++      if (base + count > capacity) return false;
++      for (uint32_t bank = first; bank <= last; ++bank) {
++        const uint32_t destination = base + (bank - first);
++        if ((used_ & (uint32_t{1} << destination)) &&
++            slot(bank) != int(destination)) return false;
++      }
++      for (uint32_t bank = first; bank <= last; ++bank) {
++        const uint32_t destination = base + (bank - first);
++        used_ |= uint32_t{1} << destination;
++        slots_[bank] = uint8_t(destination + 1);
++      }
++      return true;
++    };
++    if (required >= 0) return install(uint32_t(required));
++    // Keep neighboring logical banks together whenever they fit, then try their
++    // natural slots and finally any contiguous hole. Unrelated gaps cost nothing.
++    if (first && slot(first - 1) >= 0 && install(uint32_t(slot(first - 1) + 1))) return true;
++    if (last + 1 < kCount && slot(last + 1) >= int(count) &&
++        install(uint32_t(slot(last + 1)) - count)) return true;
++    const uint32_t preferred = std::min(first % capacity, capacity - count);
++    for (uint32_t i = 0; i < capacity; ++i) {
++      if (install((preferred + i) % capacity)) return true;
++    }
++    return false;
++  }
++
++ private:
++  static bool ValidRange(uint64_t start, uint64_t length, uint64_t bank_size) {
++    if (!bank_size || bank_size > UINT64_MAX / kCount) return false;
++    const uint64_t space = bank_size * kCount;
++    return length && start < space && length <= space - start;
++  }
++
++  uint32_t used_ = 0;
++  std::array<uint8_t, kCount> slots_ = {};
++};
++
++}  // namespace rex::graphics::vulkan
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include <rex/graphics/pipeline/texture/cache.h>
++#include <rex/graphics/vulkan/scaled_resolve_banks.h>
+ #include <rex/graphics/vulkan/shader.h>
+ #include <rex/graphics/vulkan/shared_memory.h>
+ #include <rex/hash.h>
+@@ -179,6 +180,8 @@
+                                  uint32_t* height_unscaled_out = nullptr,
+                                  bool* swap_source_needs_rb_swap_out = nullptr);
+ 
++  // Returns an offset in the current buffer. Commit every range needed by a
++  // command before mapping any of them, since a commit can replace the buffer.
+   bool GetScaledResolveRange(uint32_t start_unscaled, uint32_t length_unscaled,
+                              uint32_t length_scaled_alignment_log2, uint64_t& start_scaled_out,
+                              uint64_t& length_scaled_out) const;
+@@ -187,6 +190,10 @@
+     return EnsureScaledResolveMemoryCommitted(start_unscaled, length_unscaled,
+                                               length_scaled_alignment_log2);
+   }
++  bool CommitScaledResolveDestination(uint32_t base, uint32_t extent_start, uint32_t extent_length,
++                                      uint32_t alignment_log2);
++  bool NeedsCompactSwitchPreflight(uint32_t next_scale) const;
++  bool PrepareCompactSwitch(VulkanTextureCache& previous);
+   // Unbinds and frees the scaled resolve buffer's sparse allocations that no
+   // resolve or texture load has reached for a while and that hold no page still
+   // marked as resolved nor any live scaled texture. Called as a frame's last
+@@ -195,6 +202,9 @@
+   void ReleaseStaleScaledResolveMemory();
+   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
+   uint64_t scaled_resolve_committed_bytes() const {
++    if (compact_resolve_capacity_) {
++      return compact_resolve_size_ + retired_compact_size_;
++    }
+     if (!scaled_resolve_buffer_sparse_) return scaled_resolve_buffer_size_;
+     uint64_t allocations = 0;
+     for (uint64_t bits : scaled_resolve_sparse_allocated_) allocations += std::popcount(bits);
+@@ -468,6 +478,12 @@
+   bool Initialize();
+   bool InitializeScaledResolveBuffer();
+   void ShutdownScaledResolveBuffer();
++  bool GetScaledResolveLogicalRange(uint32_t start_unscaled, uint32_t length_unscaled,
++                                    uint32_t length_alignment_log2, uint64_t& start_out,
++                                    uint64_t& length_out) const;
++  bool EnsureCompactScaledResolveRange(uint64_t start, uint64_t length);
++  bool AllocateCompactResolveBacking(bool dense);
++  void ReleaseRetiredCompactBuffer();
+ 
+   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
+ 
+@@ -615,6 +631,14 @@
+ 
+   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
+   uint64_t scaled_resolve_buffer_size_ = 0;
++  // Off unless a non-sparse 2x or 3x cache was created with a compact budget.
++  uint64_t compact_resolve_capacity_ = 0;
++  ScaledResolveBanks compact_resolve_banks_;
++  uint64_t compact_resolve_size_ = 0;
++  VkBuffer retired_compact_buffer_ = VK_NULL_HANDLE;
++  VkDeviceMemory retired_compact_memory_ = VK_NULL_HANDLE;
++  uint64_t retired_compact_size_ = 0;
++  uint64_t retired_compact_submission_ = UINT64_MAX;
+   bool scaled_resolve_buffer_sparse_ = false;
+   uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;
+   // Sparse: one allocation per granule, indexed by granule, null where unbound.
+@@ -640,6 +664,8 @@
+   void ReleaseInheritedBuffer();
+   VkBuffer inherited_buffer_ = VK_NULL_HANDLE;
+   std::vector<VkDeviceMemory> inherited_buffer_memory_;
++  bool inherited_banked_ = false;
++  ScaledResolveBanks inherited_banks_;
+   uint32_t inherited_scale_ = 1;
+   std::vector<ScaledResolveRun> inherited_runs_;
+   uint64_t inherited_buffer_submission_ = UINT64_MAX;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2622,8 +2622,9 @@
+   return true;
+ }
+ 
+-bool VulkanCommandProcessor::CreateScaledComponents(uint32_t draw_resolution_scale_x,
+-                                                    uint32_t draw_resolution_scale_y) {
++bool VulkanCommandProcessor::CreateScaledComponents(
++    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
++    std::unique_ptr<VulkanTextureCache> prepared_texture_cache) {
+   const uint32_t shared_memory_binding_count =
+       UINT32_C(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
+           GetVulkanDevice()->properties().maxStorageBufferRange);
+@@ -2644,9 +2645,12 @@
+   }
+ 
+   // Requires the transient descriptor set layouts.
+-  texture_cache_ =
+-      VulkanTextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
+-                                 draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
++  texture_cache_ = std::move(prepared_texture_cache);
++  if (!texture_cache_) {
++    texture_cache_ =
++        VulkanTextureCache::Create(*register_file_, *shared_memory_, draw_resolution_scale_x,
++                                   draw_resolution_scale_y, *this, guest_shader_pipeline_stages_);
++  }
+   if (!texture_cache_) {
+     REXGPU_ERROR("Failed to initialize the texture cache");
+     return false;
+@@ -2820,6 +2824,19 @@
+   if (fh1_native_executor_) {
+     fh1_native_executor_->FlushResolveReadbacks();
+   }
++  std::unique_ptr<VulkanTextureCache> prepared_texture_cache;
++  if (texture_cache_->NeedsCompactSwitchPreflight(scale_x)) {
++    // Verify every inherited source range and reserve the destination backing
++    // before detaching any active renderer resources or shader bindings.
++    prepared_texture_cache = VulkanTextureCache::Create(
++        *register_file_, *shared_memory_, scale_x, scale_y, *this, guest_shader_pipeline_stages_);
++    if (!prepared_texture_cache || !prepared_texture_cache->PrepareCompactSwitch(*texture_cache_)) {
++      REXGPU_WARN("Could not prepare scaled resolve storage for {}x, keeping {}x",
++                  scale_x, previous_scale_x);
++      declined_draw_resolution_scale_ = scale_x;
++      return;
++    }
++  }
+   // The guest loads a shader once and draws with it until it loads another,
+   // so the active ones are reloaded into the new pipeline cache (as the
+   // big-endian microcode LoadShader takes).
+@@ -2850,7 +2867,8 @@
+     render_target_cache_.reset();
+   };
+   const auto create = [&](uint32_t x, uint32_t y) {
+-    return CreateScaledComponents(x, y) && render_target_cache_->GetPath() == path &&
++    return CreateScaledComponents(x, y, std::move(prepared_texture_cache)) &&
++           render_target_cache_->GetPath() == path &&
+            (fh1_native_executor_ != nullptr) == native_executor;
+   };
+   // The old texture cache outlives the switch long enough to hand its scaled
+@@ -2861,11 +2879,14 @@
+     texture_cache_->InheritScaledResolves(*previous_texture_cache);
+     previous_texture_cache.reset();
+   } else {
+-    previous_texture_cache.reset();
+     REXGPU_ERROR("Could not switch to draw resolution scale {}x; staying at {}x", scale_x,
+                  previous_scale_x);
+     declined_draw_resolution_scale_ = scale_x;
+     destroy();
++    // The old cache still owns the original resolve data. The queue is idle,
++    // and CreateScaledComponents rebuilds samplers for the current settings.
++    previous_texture_cache->ClearSamplers();
++    prepared_texture_cache = std::move(previous_texture_cache);
+     if (!create(previous_scale_x, previous_scale_y)) {
+       REXGPU_ERROR("Could not restore draw resolution scale {}x{}", previous_scale_x,
+                    previous_scale_y);
+@@ -8462,6 +8483,8 @@
+       return true;
+     }
+ 
++    // Resolve committed this extent. The shader reads from binding offset zero,
++    // so source_offset_bytes below must be local to the current backing buffer.
+     uint64_t scaled_start = 0, scaled_length = 0;
+     if (!texture_cache_->GetScaledResolveRange(written_address, written_length, 0, scaled_start,
+                                                scaled_length)) {
+--- a/src/graphics/vulkan/fh1_native_executor.cpp
++++ b/src/graphics/vulkan/fh1_native_executor.cpp
+@@ -3222,11 +3222,11 @@
+       const uint32_t base = resolve_info.copy_dest_base;
+       const uint32_t range_unscaled = extent_start - base + extent_length;
+       uint64_t scaled_base, scaled_length, use_start, use_length;
+-      if (!config_.textures->GetScaledResolveRange(base, range_unscaled, 2, scaled_base,
++      if (!config_.textures->CommitScaledResolveDestination(base, extent_start, extent_length, 2) ||
++          !config_.textures->GetScaledResolveRange(base, range_unscaled, 2, scaled_base,
+                                                    scaled_length) ||
+           !config_.textures->GetScaledResolveRange(extent_start, extent_length, 2, use_start,
+-                                                   use_length) ||
+-          !config_.textures->CommitScaledResolveRange(base, range_unscaled, 2)) {
++                                                   use_length)) {
+         Skip("resolve_scaled_memory");
+         return false;
+       }
+--- a/src/graphics/vulkan/fm4_native_executor.cpp
++++ b/src/graphics/vulkan/fm4_native_executor.cpp
+@@ -519,8 +519,8 @@
+                                                const std::string& name) {
+   uint64_t start, size;
+   // Committing first: a copy from unbound sparse memory is undefined.
+-  if (!config_.textures->GetScaledResolveRange(address, length, 0, start, size) ||
+-      !config_.textures->CommitScaledResolveRange(address, length)) {
++  if (!config_.textures->CommitScaledResolveRange(address, length) ||
++      !config_.textures->GetScaledResolveRange(address, length, 0, start, size)) {
+     return;
+   }
+   command_processor_.PushBufferMemoryBarrier(
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1145,26 +1145,12 @@
+       uint64_t copy_dest_range_length = copy_dest_range_unscaled;
+       uint64_t copy_dest_use_start = resolve_info.copy_dest_extent_start;
+       uint64_t copy_dest_use_length = resolve_info.copy_dest_extent_length;
+-      if (draw_resolution_scaled) {
+-        if (!texture_cache.GetScaledResolveRange(
+-                resolve_info.copy_dest_base, copy_dest_range_unscaled,
+-                copy_shader_info.dest_bpe_log2, copy_dest_base, copy_dest_range_length) ||
+-            !texture_cache.GetScaledResolveRange(
+-                resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+-                copy_shader_info.dest_bpe_log2, copy_dest_use_start, copy_dest_use_length)) {
+-          REXGPU_ERROR(
+-              "VulkanRenderTargetCache: Failed to map scaled resolve "
+-              "destination range (base={:08X}, length={:08X})",
+-              resolve_info.copy_dest_base, copy_dest_range_unscaled);
+-          return false;
+-        }
+-      }
+-
+       // Make sure there is memory to write to.
+       bool copy_dest_committed;
+       if (draw_resolution_scaled) {
+-        copy_dest_committed = texture_cache.CommitScaledResolveRange(
+-            resolve_info.copy_dest_base, copy_dest_range_unscaled, copy_shader_info.dest_bpe_log2);
++        copy_dest_committed = texture_cache.CommitScaledResolveDestination(
++            resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
++            resolve_info.copy_dest_extent_length, copy_shader_info.dest_bpe_log2);
+       } else {
+         copy_dest_committed = shared_memory.RequestRange(resolve_info.copy_dest_extent_start,
+                                                          resolve_info.copy_dest_extent_length);
+@@ -1174,6 +1160,16 @@
+             "VulkanRenderTargetCache: Failed to obtain the resolve destination "
+             "memory region");
+       } else {
++        if (draw_resolution_scaled &&
++            (!texture_cache.GetScaledResolveRange(
++                 resolve_info.copy_dest_base, copy_dest_range_unscaled,
++                 copy_shader_info.dest_bpe_log2, copy_dest_base, copy_dest_range_length) ||
++             !texture_cache.GetScaledResolveRange(
++                 resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
++                 copy_shader_info.dest_bpe_log2, copy_dest_use_start, copy_dest_use_length))) {
++          REXGPU_ERROR("VulkanRenderTargetCache: Failed to map the committed scaled resolve");
++          return false;
++        }
+         // TODO(Triang3l): Switching between descriptors if exceeding
+         // maxStorageBufferRange.
+         // TODO(Triang3l): Use a single 512 MB shared memory binding if
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -11,7 +11,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <charconv>
+ #include <cstddef>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <utility>
+@@ -596,6 +598,9 @@
+ void VulkanTextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+   TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+   DestroyRetiredReplacementResources(completed_submission_index);
++  if (retired_compact_buffer_ && completed_submission_index >= retired_compact_submission_) {
++    ReleaseRetiredCompactBuffer();
++  }
+ }
+ 
+ void VulkanTextureCache::DestroyRetiredReplacementResources(uint64_t completed_submission_index) {
+@@ -686,12 +691,77 @@
+   }
+ }
+ 
++namespace {
++uint64_t CompactResolveBudget(uint32_t scale) {
++  if (scale != 2 && scale != 3) return 0;
++  const char* begin = std::getenv(scale == 3 ? "FM4_SHIFTGLUE_4K_RESOLVE_MIB"
++                                            : "FM4_SHIFTGLUE_RESOLVE_MIB");
++  if (!begin || !*begin) return 0;
++  const char* end = begin + std::strlen(begin);
++  uint32_t mib;
++  const auto parsed = std::from_chars(begin, end, mib);
++  const uint64_t bank_mib = ScaledResolveBanks::BankSize(scale) >> 20;
++  if (parsed.ec != std::errc{} || parsed.ptr != end || !mib ||
++      mib >= ScaledResolveBanks::kCount * bank_mib || mib % bank_mib) {
++    return 0;
++  }
++  return uint64_t(mib) << 20;
++}
++}  // namespace
++
++bool VulkanTextureCache::NeedsCompactSwitchPreflight(uint32_t next_scale) const {
++  return compact_resolve_capacity_ || CompactResolveBudget(next_scale);
++}
++
++bool VulkanTextureCache::PrepareCompactSwitch(VulkanTextureCache& previous) {
++  // Called after queue idle with the old renderer still installed. A failure
++  // here may discard only this unused candidate cache, never valid guest data.
++  const auto runs = previous.GetScaledResolveRuns();
++  if (runs.empty()) return true;
++  if (!previous.scaled_resolve_buffer_) return false;
++  ScaledResolveBanks prepared;
++  bool dense = false;
++  const uint32_t dest_scale = draw_resolution_scale_x();
++  const uint64_t area = uint64_t(dest_scale) * dest_scale;
++  const uint64_t bank_size = ScaledResolveBanks::BankSize(dest_scale);
++  const uint32_t banks = uint32_t(compact_resolve_capacity_ / bank_size);
++  for (const auto& run : runs) {
++    for (uint32_t offset = 0; offset < run.length;) {
++      const uint32_t start = run.start + offset;
++      const uint32_t guest_bank_remaining =
++          ScaledResolveBanks::kGuestSize - start % ScaledResolveBanks::kGuestSize;
++      const uint32_t length = std::min(run.length - offset, guest_bank_remaining);
++      uint64_t source_start, source_length;
++      if (!previous.GetScaledResolveRange(start, length, 0, source_start, source_length)) {
++        return false;
++      }
++      if (banks && !dense &&
++          !prepared.Reserve(uint64_t(start) * area, uint64_t(length) * area, banks, bank_size)) {
++        dense = true;
++      }
++      offset += length;
++    }
++  }
++  if (banks) {
++    if (!AllocateCompactResolveBacking(dense)) return false;
++    compact_resolve_banks_ = prepared;
++  }
++  const auto* device = command_processor_.GetVulkanDevice();
++  rescale_pipeline_ = ui::vulkan::util::CreateComputePipeline(
++      device, load_pipeline_layout_, shaders::fh1_scaled_resolve_rescale_cs,
++      sizeof(shaders::fh1_scaled_resolve_rescale_cs));
++  return rescale_pipeline_ != VK_NULL_HANDLE;
++}
++
+ void VulkanTextureCache::InheritScaledResolves(VulkanTextureCache& previous) {
+   std::vector<ScaledResolveRun> runs = previous.GetScaledResolveRuns();
+   if (runs.empty() || previous.scaled_resolve_buffer_ == VK_NULL_HANDLE) {
+     return;
+   }
+   ReleaseInheritedBuffer();
++  inherited_banked_ = previous.compact_resolve_capacity_ &&
++                      previous.compact_resolve_size_ != previous.scaled_resolve_buffer_size_;
++  inherited_banks_ = previous.compact_resolve_banks_;
+   inherited_buffer_ = std::exchange(previous.scaled_resolve_buffer_, VK_NULL_HANDLE);
+   inherited_buffer_memory_ = std::move(previous.scaled_resolve_buffer_memory_);
+   previous.scaled_resolve_buffer_memory_.clear();
+@@ -709,11 +779,14 @@
+     dfn.vkFreeMemory(device, memory, nullptr);
+   }
+   inherited_buffer_memory_.clear();
++  inherited_banked_ = false;
++  inherited_banks_ = {};
+   inherited_runs_.clear();
+   inherited_buffer_submission_ = UINT64_MAX;
+ }
+ 
+ void VulkanTextureCache::ResampleInheritedResolves() {
++  const uint64_t source_area = uint64_t(inherited_scale_) * inherited_scale_;
+   const std::vector<ScaledResolveRun> runs = std::move(inherited_runs_);
+   inherited_runs_.clear();
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -731,7 +804,6 @@
+   }
+   VulkanSharedMemory& vulkan_shared_memory = static_cast<VulkanSharedMemory&>(shared_memory());
+   const uint32_t scale = draw_resolution_scale_x();
+-  const uint64_t source_area = uint64_t(inherited_scale_) * inherited_scale_;
+   const uint64_t dest_area = uint64_t(scale) * scale;
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   // Written by earlier submissions; the GPU was idle at the switch.
+@@ -744,14 +816,25 @@
+   constexpr uint32_t kChunk = UINT32_C(1) << 20;
+   uint64_t guest_bytes = 0;
+   for (const ScaledResolveRun& run : runs) {
+-    for (uint32_t offset = 0; offset < run.length; offset += kChunk) {
++    for (uint32_t offset = 0; offset < run.length;) {
+       const uint32_t start = run.start + offset;
+-      const uint32_t length = std::min(kChunk, run.length - offset);
++      uint32_t length = std::min(kChunk, run.length - offset);
++      if (inherited_banked_ || compact_resolve_capacity_) {
++        length = std::min(length, ScaledResolveBanks::kGuestSize - start % ScaledResolveBanks::kGuestSize);
++      }
++      offset += length;
++      uint64_t source_offset = uint64_t(start) * source_area;
++      if (inherited_banked_ &&
++          !inherited_banks_.Translate(source_offset, length * source_area, source_offset,
++                                      ScaledResolveBanks::BankSize(inherited_scale_))) {
++        REXGPU_ERROR("Missing preflighted source bank at {:08X}", start);
++        continue;
++      }
+       VkBuffer dest_buffer;
+       uint64_t dest_start, dest_length;
+       if (scale > 1) {
+-        if (!GetScaledResolveRange(start, length, 0, dest_start, dest_length) ||
+-            !CommitScaledResolveRange(start, length)) {
++        if (!CommitScaledResolveRange(start, length) ||
++            !GetScaledResolveRange(start, length, 0, dest_start, dest_length)) {
+           continue;
+         }
+         UseScaledResolveBufferForWrite(dest_start, dest_length);
+@@ -776,8 +859,8 @@
+       }
+       VkDescriptorBufferInfo buffer_infos[kLoadDescriptorSetCount];
+       buffer_infos[kLoadDescriptorSetIndexDestination] = {dest_buffer, dest_start, dest_length};
+-      buffer_infos[kLoadDescriptorSetIndexSource] = {inherited_buffer_, start * source_area,
+-                                                     length * source_area};
++      buffer_infos[kLoadDescriptorSetIndexSource] = {
++          inherited_buffer_, source_offset, length * source_area};
+       VkWriteDescriptorSet writes[kLoadDescriptorSetCount] = {};
+       for (uint32_t i = 0; i < kLoadDescriptorSetCount; ++i) {
+         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+@@ -800,8 +883,8 @@
+       command_buffer.CmdVkDispatch(uint32_t((dest_words + 255) / 256), 1, 1);
+       command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kCompute, UINT32_MAX, "resample inherited resolves end");
+       guest_bytes += length;
+-    }
+-    MarkRangeAsResolved(run.start, run.length, run.bpb_log2);
++      MarkRangeAsResolved(start, length, run.bpb_log2);
++    }
+   }
+   inherited_buffer_submission_ = command_processor_.GetCurrentSubmission();
+   REXGPU_INFO("Resampled {} KB of resolved data from {}x to {}x in {} runs", guest_bytes >> 10,
+@@ -2296,13 +2379,34 @@
+   return copy_view_2d_;
+ }
+ 
++bool VulkanTextureCache::CommitScaledResolveDestination(uint32_t base, uint32_t extent_start,
++                                                        uint32_t extent_length,
++                                                        uint32_t alignment_log2) {
++  const uint64_t end = uint64_t(extent_start) + extent_length;
++  if (extent_start < base || end > SharedMemory::kBufferSize) return false;
++  uint64_t logical_base, base_length, logical_use, use_length;
++  if (!GetScaledResolveLogicalRange(base, uint32_t(end - base), alignment_log2, logical_base,
++                                    base_length) ||
++      !GetScaledResolveLogicalRange(extent_start, extent_length, alignment_log2, logical_use,
++                                    use_length)) return false;
++  // Independent alignment of the written length may reach past the enclosing
++  // descriptor's rounded end. Reserve the union with a single bank assignment.
++  const uint64_t union_length =
++      std::max(logical_base + base_length, logical_use + use_length) - logical_base;
++  if (compact_resolve_capacity_) return EnsureCompactScaledResolveRange(logical_base, union_length);
++  return EnsureScaledResolveBufferAllocated(logical_base, union_length);
++}
++
+ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
+                                                             uint32_t length_unscaled,
+                                                             uint32_t length_scaled_alignment_log2) {
+   uint64_t start_scaled, length_scaled;
+-  if (!GetScaledResolveRange(start_unscaled, length_unscaled, length_scaled_alignment_log2,
+-                             start_scaled, length_scaled)) {
++  if (!GetScaledResolveLogicalRange(start_unscaled, length_unscaled, length_scaled_alignment_log2,
++                                    start_scaled, length_scaled)) {
+     return false;
++  }
++  if (compact_resolve_capacity_) {
++    return EnsureCompactScaledResolveRange(start_scaled, length_scaled);
+   }
+   return EnsureScaledResolveBufferAllocated(start_scaled, length_scaled);
+ }
+@@ -2625,6 +2729,20 @@
+   // Aligning because if the data for a vector in a storage buffer is provided
+   // partially, the value read may still be (0, 0, 0, 0), and small (especially
+   // linear) textures won't be loaded correctly.
++  // Base and mip descriptors for this dispatch must come from the same buffer.
++  // Commit both first, even when a partially skipped base level uses the mips.
++  if (compact_resolve_capacity_ && texture_key.scaled_resolve) {
++    if (level_first == 0 &&
++        !CommitScaledResolveRange(texture_key.base_page << 12, vulkan_texture.GetGuestBaseSize(),
++                                  load_shader_info.source_bpe_log2)) {
++      return false;
++    }
++    if (level_last != 0 &&
++        !CommitScaledResolveRange(texture_key.mip_page << 12, vulkan_texture.GetGuestMipsSize(),
++                                  load_shader_info.source_bpe_log2)) {
++      return false;
++    }
++  }
+   uint32_t source_length_alignment = UINT32_C(1) << load_shader_info.source_bpe_log2;
+   VkDescriptorSet descriptor_set_source_base = VK_NULL_HANDLE;
+   VkDescriptorSet descriptor_set_source_mips = VK_NULL_HANDLE;
+@@ -3537,6 +3655,16 @@
+   }
+ 
+   if (scaled_resolve_buffer_ == VK_NULL_HANDLE) {
++    const uint32_t scale = draw_resolution_scale_x();
++    if (scale == draw_resolution_scale_y()) {
++      const uint64_t budget = CompactResolveBudget(scale);
++      const auto alignment = std::max<VkDeviceSize>(
++          1, vulkan_device->properties().minStorageBufferOffsetAlignment);
++      if (budget && ScaledResolveBanks::BankSize(scale) % alignment == 0) {
++        compact_resolve_capacity_ = budget;
++        return true;
++      }
++    }
+     buffer_create_info.flags = 0;
+     if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+             vulkan_device, scaled_resolve_buffer_size_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+@@ -3558,7 +3686,23 @@
+   return true;
+ }
+ 
++void VulkanTextureCache::ReleaseRetiredCompactBuffer() {
++  if (!retired_compact_buffer_) return;
++  const auto* device = command_processor_.GetVulkanDevice();
++  const auto& dfn = device->functions();
++  dfn.vkDestroyBuffer(device->device(), retired_compact_buffer_, nullptr);
++  dfn.vkFreeMemory(device->device(), retired_compact_memory_, nullptr);
++  retired_compact_buffer_ = VK_NULL_HANDLE;
++  retired_compact_memory_ = VK_NULL_HANDLE;
++  retired_compact_size_ = 0;
++  retired_compact_submission_ = UINT64_MAX;
++}
++
+ void VulkanTextureCache::ShutdownScaledResolveBuffer() {
++  ReleaseRetiredCompactBuffer();
++  compact_resolve_capacity_ = 0;
++  compact_resolve_banks_ = {};
++  compact_resolve_size_ = 0;
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -3588,7 +3732,21 @@
+                                                uint32_t length_scaled_alignment_log2,
+                                                uint64_t& start_scaled_out,
+                                                uint64_t& length_scaled_out) const {
+-  if (!IsDrawResolutionScaled()) {
++  if (!GetScaledResolveLogicalRange(start_unscaled, length_unscaled, length_scaled_alignment_log2,
++                                    start_scaled_out, length_scaled_out)) {
++    return false;
++  }
++  if (!compact_resolve_capacity_ || !length_scaled_out ||
++      compact_resolve_size_ == scaled_resolve_buffer_size_) return true;
++  return scaled_resolve_buffer_ &&
++         compact_resolve_banks_.Translate(start_scaled_out, length_scaled_out, start_scaled_out,
++                                          ScaledResolveBanks::BankSize(draw_resolution_scale_x()));
++}
++
++bool VulkanTextureCache::GetScaledResolveLogicalRange(
++    uint32_t start_unscaled, uint32_t length_unscaled, uint32_t length_scaled_alignment_log2,
++    uint64_t& start_scaled_out, uint64_t& length_scaled_out) const {
++  if (!IsDrawResolutionScaled() || length_scaled_alignment_log2 >= 64) {
+     return false;
+   }
+   if (length_unscaled == 0) {
+@@ -3614,6 +3772,87 @@
+ 
+   start_scaled_out = start_scaled;
+   length_scaled_out = length_scaled;
++  return true;
++}
++
++bool VulkanTextureCache::EnsureCompactScaledResolveRange(uint64_t start, uint64_t length) {
++  if (!length || compact_resolve_size_ == scaled_resolve_buffer_size_) return true;
++  uint64_t local;
++  const uint64_t bank_size = ScaledResolveBanks::BankSize(draw_resolution_scale_x());
++  if (scaled_resolve_buffer_ && compact_resolve_banks_.Translate(start, length, local, bank_size)) {
++    return true;
++  }
++  const uint32_t capacity = uint32_t(compact_resolve_capacity_ / bank_size);
++  auto next = compact_resolve_banks_;
++  if (!next.Reserve(start, length, capacity, bank_size)) return AllocateCompactResolveBacking(true);
++  if (!scaled_resolve_buffer_ && !AllocateCompactResolveBacking(false)) return false;
++  compact_resolve_banks_ = next;
++  return true;
++}
++
++bool VulkanTextureCache::AllocateCompactResolveBacking(bool dense) {
++  assert_true(compact_resolve_capacity_ != 0);
++  const uint64_t size = dense ? scaled_resolve_buffer_size_ : compact_resolve_capacity_;
++  if (scaled_resolve_buffer_ && !command_processor_.submission_open()) {
++    REXGPU_ERROR("Cannot promote scaled resolve storage outside an open submission");
++    return false;
++  }
++  const auto* device = command_processor_.GetVulkanDevice();
++  constexpr VkBufferUsageFlags kUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
++                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
++  VkBuffer next_buffer = VK_NULL_HANDLE;
++  VkDeviceMemory next_memory = VK_NULL_HANDLE;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          device, size, kUsage, ui::vulkan::util::MemoryPurpose::kDeviceLocal, next_buffer,
++          next_memory)) {
++    REXGPU_ERROR("Could not allocate {} MiB of scaled resolve storage", size >> 20);
++    return false;
++  }
++
++  if (scaled_resolve_buffer_) {
++    assert_true(dense && !retired_compact_buffer_);
++    // Previously submitted descriptors retain the old handle until this copy
++    // completes. All commands are recorded on the same ordered graphics queue.
++    command_processor_.PushBufferMemoryBarrier(
++        scaled_resolve_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
++    command_processor_.SubmitBarriers(true);
++    const uint64_t bank_size = ScaledResolveBanks::BankSize(draw_resolution_scale_x());
++    std::array<VkBufferCopy, ScaledResolveBanks::kCount> copies;
++    uint32_t count = 0;
++    for (uint32_t bank = 0; bank < ScaledResolveBanks::kCount; ++bank) {
++      const int slot = compact_resolve_banks_.slot(bank);
++      if (slot >= 0) {
++        copies[count++] = {uint64_t(slot) * bank_size, uint64_t(bank) * bank_size, bank_size};
++      }
++    }
++    if (count) {
++      command_processor_.deferred_command_buffer().CmdVkCopyBuffer(scaled_resolve_buffer_,
++                                                                  next_buffer, count, copies.data());
++      command_processor_.PushBufferMemoryBarrier(
++          next_buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
++          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
++          VK_QUEUE_FAMILY_IGNORED, false);
++      command_processor_.SubmitBarriers(true);
++    }
++    retired_compact_buffer_ = scaled_resolve_buffer_;
++    retired_compact_memory_ = scaled_resolve_buffer_memory_.front();
++    retired_compact_size_ = compact_resolve_size_;
++    retired_compact_submission_ = command_processor_.GetCurrentSubmission();
++    scaled_resolve_last_usage_write_ = false;
++    scaled_resolve_last_written_range_ = {0, 0};
++    REXGPU_INFO("Promoted {}x resolve storage from {} to {} MiB, copied {} banks",
++                draw_resolution_scale_x(), compact_resolve_size_ >> 20, size >> 20, count);
++  } else {
++    REXGPU_INFO("Allocated {} MiB of {} {}x resolve storage", size >> 20,
++                dense ? "dense" : "banked", draw_resolution_scale_x());
++  }
++  scaled_resolve_buffer_memory_.assign(1, next_memory);
++  scaled_resolve_buffer_ = next_buffer;
++  compact_resolve_size_ = size;
+   return true;
+ }
+ 
+@@ -3805,11 +4044,10 @@
+   if (!scaled_resolve_buffer_) {
+     return;
+   }
+-  if (written_start_scaled > scaled_resolve_buffer_size_) {
+-    written_start_scaled = scaled_resolve_buffer_size_;
+-  }
+-  written_length_scaled =
+-      std::min(written_length_scaled, scaled_resolve_buffer_size_ - written_start_scaled);
++  const uint64_t backing_size =
++      compact_resolve_capacity_ ? compact_resolve_size_ : scaled_resolve_buffer_size_;
++  written_start_scaled = std::min(written_start_scaled, backing_size);
++  written_length_scaled = std::min(written_length_scaled, backing_size - written_start_scaled);
+ 
+   if (scaled_resolve_last_usage_write_ && scaled_resolve_last_written_range_.second) {
+     VkPipelineStageFlags stage_mask;
+--- a/tests/unit/graphics/fm4_scaled_resolve_test.cpp
++++ b/tests/unit/graphics/fm4_scaled_resolve_test.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/graphics/pipeline/texture/cache.h>
+ #include <rex/graphics/register_file.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/graphics/vulkan/scaled_resolve_banks.h>
+ 
+ #include "test_memory.h"
+ 
+@@ -164,3 +165,83 @@
+   REQUIRE(cache.bound());
+   CHECK(cache.bound()->key().scaled_resolve);
+ }
++
++TEST_CASE("compact resolve bank assignments and dense promotion offsets", "[graphics][scaled]") {
++  using rex::graphics::vulkan::ScaledResolveBanks;
++  constexpr uint64_t bank = ScaledResolveBanks::kSize;
++  {
++    ScaledResolveBanks map;
++    uint64_t address = 0;
++    REQUIRE(map.Reserve(9 * bank, 1, 4));
++    REQUIRE(map.Reserve(9 * bank - 256, bank + 512, 4));
++    REQUIRE(map.Translate(9 * bank - 256, bank + 512, address));
++    REQUIRE(address == bank - 256);
++    REQUIRE(map.slot(8) == 0);
++    REQUIRE(map.slot(9) == 1);
++    REQUIRE(map.slot(10) == 2);
++  }
++  {
++    ScaledResolveBanks map;
++    uint64_t local = 0;
++    REQUIRE(map.Reserve(0, 1, 3));
++    REQUIRE(map.Reserve(6 * bank, 1, 3));
++    REQUIRE(!map.Reserve(0, bank + 1, 3));
++    REQUIRE(!map.Translate(0, bank + 1, local));
++    REQUIRE(map.slot(1) == -1);
++    REQUIRE(map.Translate(6 * bank + 3, 4, local));
++    REQUIRE(local == bank + 3);
++    REQUIRE(map.Reserve(31 * bank, bank, 3));
++    REQUIRE(!map.Reserve(12 * bank, 1, 3));
++    REQUIRE(!map.Reserve(31 * bank, bank + 1, 32));
++    REQUIRE(!map.Reserve(0, 1, 33));
++  }
++  {
++    ScaledResolveBanks map;
++    uint64_t local;
++    REQUIRE(map.Reserve(4 * bank, 3 * bank, 12));
++    REQUIRE(map.Reserve(26 * bank, 3 * bank, 12));
++    REQUIRE(map.Translate(26 * bank, 3 * bank, local));
++    for (uint32_t logical = 0; logical < ScaledResolveBanks::kCount; ++logical) {
++      const int slot = map.slot(logical);
++      if (slot < 0) continue;
++      REQUIRE(map.Translate(logical * bank + 64, 4, local));
++      REQUIRE(local == uint64_t(slot) * bank + 64);
++      // Copying this physical bank to its canonical destination preserves the byte.
++      REQUIRE(local - uint64_t(slot) * bank + logical * bank == logical * bank + 64);
++    }
++  }
++}
++
++TEST_CASE("4K resolves retain 64-bit guest-to-physical offsets and promote all live banks",
++          "[graphics][scaled]") {
++  using rex::graphics::vulkan::ScaledResolveBanks;
++  constexpr uint64_t bank = ScaledResolveBanks::BankSize(3);
++  constexpr uint64_t space = bank * ScaledResolveBanks::kCount;
++  constexpr uint64_t four_gib = uint64_t{1} << 32;
++  STATIC_REQUIRE(bank == uint64_t{144} * 1024 * 1024);
++  STATIC_REQUIRE(space == uint64_t{4608} * 1024 * 1024);
++  STATIC_REQUIRE(ScaledResolveBanks::BankSize(2) == ScaledResolveBanks::kSize);
++  ScaledResolveBanks map;
++  uint64_t local = 0;
++  REQUIRE(map.Reserve(four_gib - 16, 64, 12, bank));
++  REQUIRE(map.Translate(four_gib + 8, 1, local, bank));
++  REQUIRE(local == uint64_t(map.slot(28)) * bank + (four_gib + 8) % bank);
++  REQUIRE(map.Reserve(space - bank, bank, 12, bank));
++  REQUIRE(map.Translate(space - 1, 1, local, bank));
++  REQUIRE(local == uint64_t(map.slot(31) + 1) * bank - 1);
++  REQUIRE_FALSE(map.Reserve(space - 1, 2, 12, bank));
++  REQUIRE_FALSE(map.Translate(space, 1, local, bank));
++  REQUIRE_FALSE(map.Translate(UINT64_MAX - 4, 16, local, bank));
++  // Occupy all twelve compact banks, then require the next range to use dense storage.
++  for (uint32_t i = 0; i < 10; ++i) REQUIRE(map.Reserve(i * bank, 4, 12, bank));
++  REQUIRE_FALSE(map.Reserve(uint64_t{14} * bank, 4, 12, bank));
++  // Verify the byte each whole-bank promotion copy places at its canonical address.
++  for (uint32_t i = 0; i < ScaledResolveBanks::kCount; ++i) {
++    const int slot = map.slot(i);
++    if (slot < 0) continue;
++    const uint64_t logical = uint64_t(i + 1) * bank - 1;
++    REQUIRE(map.Translate(logical, 1, local, bank));
++    REQUIRE(local == uint64_t(slot + 1) * bank - 1);
++    REQUIRE(uint64_t(i) * bank + (local - uint64_t(slot) * bank) == logical);
++  }
++}

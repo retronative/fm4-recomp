@@ -1,0 +1,663 @@
+// Portions copyright (c) 2026, Pinyon Shift contributors (BSD 3-Clause: see THIRD_PARTY_NOTICES.md).
+// Copyright (c) 2026, i2kiselev (BSD 3-Clause: see LICENSE in the repository root).
+#pragma once
+
+#include "custom_music.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <string>
+#include <vector>
+
+#include <rex/cvar.h>
+#include <rex/input/input_system.h>
+#include <rex/input/mnk/mnk_input_driver.h>
+#include <rex/kernel/xboxkrnl/io.h>
+#include <rex/logging.h>
+#include <rex/rex_app.h>
+#include <rex/system.h>
+#include <rex/system/gpu_plugin.h>
+#include <rex/system/xmemory.h>
+#include <rex/ui/flags.h>
+#include <rex/ui/keybinds.h>
+#include <rex/ui/overlay/achievement_notification.h>
+#include <rex/ui/overlay/debug_overlay.h>
+#include <rex/ui/vulkan/provider.h>
+#include <rex/ui/window.h>
+#include <rex/ui/window_listener.h>
+#include <rex/ui/windowed_app_context.h>
+
+#include "built_in_defaults.h"
+#include "code_image_check.h"
+#include "config/host_config.h"
+#include "disc2_install.h"
+#include "file_open_log.h"
+#include "game_hooks.h"
+#include "game_language.h"
+#include "guest_addresses.h"
+#include "input/controller_layout.h"
+#include "input/controls.h"
+#include "input/input_context.h"
+#include "input/keyboard_ramp.h"
+#include "input/prompt_strings.h"
+#include "input/prompt_swap.h"
+#include "mixer_options.h"
+#include "scripted_input.h"
+#include "shader_cache/cache_writer.h"
+#include "shader_cache/disc_shaders.h"
+#include "tool_mode.h"
+#include "ui/controls_page.h"
+#include "ui/gameplay_page.h"
+#include "ui/graphics_page.h"
+#include "ui/guest_frame_stats.h"
+#include "ui/hostui/host_ui.h"
+#include "ui/hostui/ui_fonts.h"
+
+REXCVAR_DECLARE(std::string, fm4_config_root);
+REXCVAR_DECLARE(std::string, fm4_write_graphics_schema);
+REXCVAR_DECLARE(std::string, fm4_dump_disc_shaders);
+REXCVAR_DECLARE(std::string, fm4_build_shader_cache);
+REXCVAR_DECLARE(std::string, fm4_shader_list_dir);
+REXCVAR_DECLARE(std::string, fm4_export_ui_fonts);
+REXCVAR_DECLARE(bool, fm4_show_fps);
+REXCVAR_DECLARE(bool, controller_vibration);
+
+// Window shortcuts run before the gamepad keyboard driver and the open GRAPHICS page.
+class WindowShortcuts final : public rex::ui::WindowInputListener {
+ public:
+  explicit WindowShortcuts(rex::ui::Window& window) : window_(window) {
+    window_.AddInputListener(this, fm4_static_recomp::hostui::HostUi::kZOrder + 1);
+  }
+  ~WindowShortcuts() override { window_.RemoveInputListener(this); }
+
+  void OnKeyDown(rex::ui::KeyEvent& e) override {
+#if REX_PLATFORM_MAC
+    if (e.is_super_pressed() && e.virtual_key() == rex::ui::VirtualKey::kOemComma) {
+      if (e.prev_state()) {
+        e.set_handled(true);
+      } else {
+        rex::ui::ProcessKeyEvent(e);
+      }
+      return;
+    }
+#endif
+    if (e.virtual_key() != rex::ui::VirtualKey::kReturn || !e.is_alt_pressed()) {
+      return;
+    }
+    e.set_handled(true);
+    if (!e.prev_state()) {
+      window_.SetFullscreen(!window_.IsFullscreen());
+    }
+  }
+
+ private:
+  rex::ui::Window& window_;
+};
+
+class Fm4App final : public rex::ReXApp {
+ public:
+  using rex::ReXApp::ReXApp;
+
+  static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& context) {
+#if defined(_WIN32)
+    // On laptops with an AMD integrated and an NVIDIA GPU, AMD's switchable graphics Vulkan
+    // layer (older drivers) hides both GPUs from the loader, and the game finds none (issue
+    // #28). Without it our device selection picks the discrete GPU; Godot does the same.
+    constexpr const char* kAmdLayerOff = "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1";
+    size_t set_length = 0;
+    if (getenv_s(&set_length, nullptr, 0, kAmdLayerOff) == 0 && !set_length) {
+      _putenv_s(kAmdLayerOff, "1");
+    }
+#endif
+    return std::unique_ptr<Fm4App>(new Fm4App(context, "fm4_static_recomp", PPCImageConfig));
+  }
+
+ protected:
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    const std::string configured = REXCVAR_GET(fm4_config_root);
+    const std::filesystem::path config_root =
+        configured.empty() ? paths.user_data_root.parent_path() / "config"
+                           : std::filesystem::path(configured);
+    graphics_config_ =
+        std::make_unique<fm4_static_recomp::config::HostConfig>(config_root / "graphics.toml");
+    controls_config_ =
+        std::make_unique<fm4_static_recomp::config::HostConfig>(config_root / "controls.toml");
+    gameplay_config_ =
+        std::make_unique<fm4_static_recomp::config::HostConfig>(config_root / "gameplay.toml");
+  }
+
+  void OnPreSetup(rex::RuntimeConfig& config) override {
+    const fm4_static_recomp::ToolMode mode = fm4_static_recomp::CurrentToolMode();
+    if (mode == fm4_static_recomp::ToolMode::kInstall ||
+        mode == fm4_static_recomp::ToolMode::kShaderCache ||
+        mode == fm4_static_recomp::ToolMode::kUiFonts) {
+      config.gpu_plugin.clear();
+      config.audio_factory = nullptr;
+      config.tool_mode = true;
+      return;
+    }
+    config.gpu_plugin = "fh1";
+    fm4_static_recomp::ConfigureScriptedInput(config);
+    fm4_static_recomp::ApplyBuiltInDefaults(fm4_static_recomp::DefaultStage::kBeforeGpuPlugin);
+    // The GPU settings are registered by the plugin, so it is loaded here
+    // rather than by the app, and the saved values reach them before the GPU
+    // is set up.
+    config.graphics =
+        rex::system::LoadGpuPlugin(config.gpu_plugin, rex::cvar::GetFlagByName("gpu_backend"));
+    if (mode == fm4_static_recomp::ToolMode::kSchema) {
+      return;
+    }
+    fm4_static_recomp::ApplyBuiltInDefaults(fm4_static_recomp::DefaultStage::kAfterGpuPlugin);
+    // Local comparison harness only: retain the GPU output mailbox without a
+    // surface, window, overlays or changes to guest rendering.
+    if (const char* value = std::getenv("FM4_COMPARE_OFFSCREEN");
+        value && std::string_view(value) == "1") {
+      if (XFAILED(config.graphics->SetupPresentation(nullptr))) {
+        REXLOG_ERROR("Comparison: offscreen presenter setup failed");
+        std::abort();
+      }
+      REXLOG_INFO("Comparison: offscreen Vulkan presenter, no window");
+    }
+    if (graphics_config_->Load()) {
+      fm4_static_recomp::ui::ApplySavedGraphicsSettings(*graphics_config_);
+    } else {
+      REXLOG_ERROR("Graphics settings: cannot read {}", graphics_config_->path().string());
+    }
+    // Count new guest images, independently of how often the host redraws its UI.
+    guest_frame_count_.store(0, std::memory_order_relaxed);
+#if defined(__APPLE__)
+    presented_guest_frame_.store({}, std::memory_order_relaxed);
+#endif
+    config.graphics->SetNativeGuestOutputRenderer(
+        [](const rex::system::NativeGuestOutputRenderContext& context) {
+          if (context.phase == rex::system::NativeGuestOutputPhase::kPresented) {
+            guest_frame_count_.fetch_add(1, std::memory_order_relaxed);
+#if defined(__APPLE__)
+            presented_guest_frame_.store({context.frame_sequence + 1, context.guest_output_width,
+                                          context.guest_output_height}, std::memory_order_relaxed);
+#endif
+          }
+          return false;
+        });
+    fm4_static_recomp::InstallPixelShaderSwitches();
+    fm4_static_recomp::InstallExtendedView();
+    fm4_static_recomp::InstallAudioPopFix();
+    fm4_static_recomp::InstallAudioCompatibility();
+    rex::kernel::xboxkrnl::SetGuestFileOpenObserver([](std::string_view guest_path) {
+      fm4_static_recomp::NoteGuestFileOpen(guest_path);
+      fm4_static_recomp::LogFileOpen(guest_path);
+    });
+    if (controls_config_->Load()) {
+      controls_ = fm4_static_recomp::input::LoadControls(*controls_config_);
+    } else {
+      REXLOG_ERROR("Controls: cannot read {}", controls_config_->path().string());
+    }
+    if (gameplay_config_->Load()) {
+      fm4_static_recomp::ui::ApplySavedGameplaySettings(*gameplay_config_);
+    } else {
+      REXLOG_ERROR("Gameplay settings: cannot read {}", gameplay_config_->path().string());
+    }
+  }
+
+  bool WantsPresentation() const override {
+    if (const char* value = std::getenv("FM4_COMPARE_OFFSCREEN");
+        value && std::string_view(value) == "1") {
+      return false;
+    }
+    return fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kNone;
+  }
+
+  bool ConstructRuntime(const rex::PathConfig& paths) override {
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kSchema) {
+      const std::filesystem::path path = std::string(REXCVAR_GET(fm4_write_graphics_schema));
+      if (fm4_static_recomp::ui::WriteGraphicsSchema(path)) {
+        REXLOG_INFO("Graphics schema written to {}", path.string());
+      } else {
+        REXLOG_ERROR("Graphics schema: cannot write {}", path.string());
+      }
+      return true;
+    }
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kUiFonts) {
+      const std::filesystem::path out_dir = std::string(REXCVAR_GET(fm4_export_ui_fonts));
+      std::string error;
+      if (fm4_static_recomp::hostui::ExportUiFonts(
+              paths.game_data_root / "Media" / "UI" / "Fonts.zip", out_dir, &error)) {
+        REXLOG_INFO("UI fonts: exported {} to {}",
+                    std::size(fm4_static_recomp::hostui::kUiFontMembers), out_dir.string());
+      } else {
+        REXLOG_ERROR("UI fonts: {}", error);
+      }
+      return true;
+    }
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kNone &&
+        !fm4_static_recomp::ApplyGameLanguage()) {
+      return false;
+    }
+    if (!rex::ReXApp::ConstructRuntime(paths)) {
+      return false;
+    }
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kNone &&
+        !GameFolderMatchesBuild(paths.game_data_root)) {
+      return false;
+    }
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kNone) {
+      fm4_static_recomp::InstallMixerOptions(paths.game_data_root);
+    }
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kShaderCache) {
+      return RunShaderCacheTool();
+    }
+    return true;
+  }
+
+  bool ShouldStartModuleThread() override {
+    // Frame replay owns captured guest memory; running the title concurrently
+    // can overwrite it while the GPU replays the recorded commands.
+    return rex::cvar::GetFlagByName("fh1_frame_replay").empty();
+  }
+
+  void LaunchModule() override {
+    if (fm4_static_recomp::CurrentToolMode() == fm4_static_recomp::ToolMode::kNone) {
+      rex::ReXApp::LaunchModule();
+      return;
+    }
+    app_context().RequestDeferredQuit();
+  }
+
+  void OnPostSetup() override {
+    fm4_static_recomp::InstallContentPackages(*runtime());
+    if (fm4_static_recomp::CurrentToolMode() != fm4_static_recomp::ToolMode::kNone) {
+      return;
+    }
+    if (rex::cvar::GetFlagByName("gpu_backend") == "vulkan" && runtime()->graphics_system()) {
+      const auto* const provider = static_cast<const rex::ui::vulkan::VulkanProvider*>(
+          runtime()->graphics_system()->provider());
+      fm4_static_recomp::ApplyGpuVendorDefaults(provider->vulkan_device()->properties().vendorID);
+    }
+    if (rex::ui::Window* const window = this->window()) {
+      window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
+      window_shortcuts_ = std::make_unique<WindowShortcuts>(*window);
+      fm4_static_recomp::ui::LimitFrameRateToDisplay(
+          fm4_static_recomp::ui::DisplayRefreshHz(window->GetNativeWindowHandle()));
+    }
+    fm4_static_recomp::StartCaptureWatcher([this]() -> rex::ui::Presenter* {
+      return runtime() && runtime()->graphics_system() ? runtime()->graphics_system()->presenter()
+                                                       : nullptr;
+    });
+    fm4_static_recomp::SetGraphicsPageOpener([this] {
+      if (rex::ui::Window* const window = this->window()) {
+        window->app_context().CallInUIThreadDeferred([this] { OpenGraphicsPage(); });
+      }
+    });
+    InstallKeyboard();
+    fm4_static_recomp::InitializeCustomMusic();
+    if (!REXCVAR_GET(controller_vibration)) {
+      rex::cvar::SetFlagByName("pad_rumble_strength", "0");
+    }
+    SetGuestFrameStats([sampler = fm4_static_recomp::ui::GuestFrameStats{}]() mutable {
+      const auto stats = sampler.Sample(guest_frame_count_.load(std::memory_order_relaxed),
+                                        std::chrono::steady_clock::now());
+      return rex::ui::FrameStats{
+          .frame_time_ms = stats.frame_time_ms,
+          .fps = stats.fps,
+          .frame_count = stats.frame_count,
+      };
+    });
+    if (REXCVAR_GET(fm4_show_fps)) {
+      rex::ui::SetBuildLabel(" ");
+      if (rex::ui::Window* const window = this->window()) {
+        window->app_context().CallInUIThreadDeferred([] {
+          rex::ui::TriggerBind("bind_debug_overlay");
+        });
+      }
+    }
+    rex::ui::RegisterBind("bind_toggle_fullscreen", "F11", "Toggle fullscreen", [this] {
+      if (rex::ui::Window* const window = this->window()) {
+        window->SetFullscreen(!window->IsFullscreen());
+      }
+    });
+    // The SDK's pad_chord_game_menu runs the bind of this name.
+#if REX_PLATFORM_MAC
+    constexpr const char* graphics_key = "Cmd+Comma";
+#else
+    constexpr const char* graphics_key = "F6";
+#endif
+    rex::ui::RegisterBind("bind_game_menu", graphics_key, "Toggle the GRAPHICS page", [this] {
+      // A START pressed before BACK has already closed the page by itself.
+      if (host_ui_ && host_ui_->is_closing()) {
+        return;
+      }
+      if (host_ui_ && host_ui_->is_open()) {
+        host_ui_->Leave();
+      } else {
+        OpenGraphicsPage();
+      }
+    });
+  }
+
+  void OnShutdown() override {
+    rex::ui::UnregisterBind("bind_toggle_fullscreen");
+    rex::ui::UnregisterBind("bind_game_menu");
+    fm4_static_recomp::ShutdownCustomMusic();
+    fm4_static_recomp::SetInputTick(nullptr);
+    fm4_static_recomp::SetPromptTextSource(nullptr);
+    fm4_static_recomp::SetGraphicsPageOpener(nullptr);
+    if (auto* const input_system =
+            runtime() ? static_cast<rex::input::InputSystem*>(runtime()->input_system()) : nullptr) {
+      input_system->SetKeyboardStateFilter(nullptr);
+    }
+    host_ui_.reset();
+#if defined(__APPLE__)
+    fm4_static_recomp::ui::SetMacResolutionLoading(false, {});
+#endif
+    window_shortcuts_.reset();
+  }
+
+  // A registered dialog, even one with nothing to draw, moves presentation to
+  // the UI thread, which repaints at the display rate on top of every guest
+  // frame: ~290 presents of 120 frames, and a present held back (an external
+  // frame limiter) no longer throttles the guest.
+  std::unique_ptr<rex::ui::AchievementNotificationDialog> CreateAchievementNotificationDialog()
+      override {
+    return nullptr;
+  }
+
+ private:
+  inline static std::atomic<uint64_t> guest_frame_count_{0};
+#if defined(__APPLE__)
+  inline static std::atomic<fm4_static_recomp::ui::PresentedGuestFrame> presented_guest_frame_{{}};
+#endif
+
+  // The game code is recompiled from one code image's default.xex; the other image's would
+  // run against it, so a game folder of another release is refused before the game starts.
+  static bool GameFolderMatchesBuild(const std::filesystem::path& game_root) {
+    const auto mismatch = fm4_static_recomp::CodeImageMismatch(
+        fm4_static_recomp::FileSha256(game_root / "default.xex"), fm4_guest::kCodeImage,
+        fm4_guest::kReleases);
+    if (!mismatch) {
+      return true;
+    }
+    REXLOG_ERROR("{}", *mismatch);
+    rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, *mismatch);
+    return false;
+  }
+
+  // The keyboard's bindings follow the input context each tick, and its
+  // steering, pedals and look are smoothed while driving.
+  void InstallKeyboard() {
+    namespace input = fm4_static_recomp::input;
+    auto* const input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system());
+    binding_switcher_ = std::make_unique<input::BindingSwitcher>(controls_);
+    // Before the main loop's first tick, so the driver never reads its own keybind_* defaults.
+    binding_switcher_->Update(input::InputContext::kMenu);
+    // The driver's own default allows mouse look, which would hide the cursor in the
+    // start menus until the first tick.
+    rex::input::mnk::SetMouseLookActive(false);
+    input::ApplyMouseLook(controls_.mouse_look);
+    prompt_swap_ = CreatePromptSwap(controls_);
+    // Never call the input system while holding controls_mutex_: it runs the keyboard filter
+    // under its own device lock.
+    fm4_static_recomp::SetInputTick([this, input_system] {
+      const input::InputContext context = input::CurrentInputContext();
+      rex::input::mnk::SetMouseLookActive(context == input::InputContext::kDriving);
+      // The keyboard is a synthetic device; a pad that has not moved never takes over.
+      const auto device = input_system ? input_system->ActiveDevice(0) : std::nullopt;
+      const bool keyboard = device && device->synthetic;
+      keyboard_prompts_.store(keyboard, std::memory_order_relaxed);
+      const std::lock_guard lock(controls_mutex_);
+      binding_switcher_->Update(context);
+      if (input_system && prompt_swap_) {
+        prompt_swap_->Update(keyboard, context);
+      }
+    });
+    fm4_static_recomp::SetPromptTextSource(
+        [this](uint16_t key, std::u16string_view text) -> std::optional<std::u16string> {
+          if (!keyboard_prompts_.load(std::memory_order_relaxed)) {
+            return std::nullopt;
+          }
+          const std::lock_guard lock(controls_mutex_);
+          return input::KeyboardText(key, text, controls_);
+        });
+    if (!input_system) {
+      return;
+    }
+    ramp_rates_ = controls_.ramp;
+    input_system->SetKeyboardStateFilter(
+        [this, ramp = input::KeyboardRamp(controls_.ramp),
+         last = std::chrono::steady_clock::now()](uint32_t user_index,
+                                                  rex::input::X_INPUT_GAMEPAD& pad) mutable {
+          if (user_index != 0) {
+            return;
+          }
+          const auto now = std::chrono::steady_clock::now();
+          const double elapsed = std::chrono::duration<double>(now - last).count();
+          last = now;
+          {
+            const std::lock_guard lock(ramp_mutex_);
+            ramp.SetRates(ramp_rates_);
+          }
+          ramp.Apply(pad, elapsed, input::CurrentInputContext() == input::InputContext::kDriving,
+                     rex::input::mnk::IsHoldLookEngaged());
+        });
+  }
+
+  // The keys the KEYBOARD tab saved, at once: the keyboard driver's binds
+  // at the next tick, the keycaps, the button texts, the ramp times and the menu's own keys.
+  bool ApplyControls() {
+    namespace input = fm4_static_recomp::input;
+    if (!controls_config_->Load()) {
+      REXLOG_ERROR("Controls: cannot read {}", controls_config_->path().string());
+      return false;
+    }
+    input::Controls controls = input::LoadControls(*controls_config_);
+    std::unique_ptr<input::PromptSwap> swap = CreatePromptSwap(controls);
+    {
+      const std::lock_guard lock(ramp_mutex_);
+      ramp_rates_ = controls.ramp;
+    }
+    input::ApplyMouseLook(controls.mouse_look);
+    {
+      const std::lock_guard lock(controls_mutex_);
+      // The old keycaps stay registered with the texture cache until taken back.
+      if (prompt_swap_) {
+        prompt_swap_->Update(false, input::CurrentInputContext());
+      }
+      controls_ = std::move(controls);
+      binding_switcher_ = std::make_unique<input::BindingSwitcher>(controls_);
+      prompt_swap_ = std::move(swap);
+    }
+    if (host_ui_) {
+      host_ui_->SetMenuKeys(CurrentMenuKeys());
+    }
+    REXLOG_INFO("Controls: applied {}", controls_config_->path().string());
+    return true;
+  }
+
+  fm4_static_recomp::hostui::MenuKeys CurrentMenuKeys() const {
+    using fm4_static_recomp::input::PadControl;
+    const auto& menu = controls_.menu.keys;
+    return {.up = menu[size_t(PadControl::kDpadUp)],
+            .down = menu[size_t(PadControl::kDpadDown)],
+            .left = menu[size_t(PadControl::kDpadLeft)],
+            .right = menu[size_t(PadControl::kDpadRight)],
+            .accept = menu[size_t(PadControl::kA)],
+            .back = menu[size_t(PadControl::kB)],
+            .apply = menu[size_t(PadControl::kY)],
+            .clear = menu[size_t(PadControl::kX)],
+            .previous_tab = menu[size_t(PadControl::kLeftShoulder)],
+            .next_tab = menu[size_t(PadControl::kRightShoulder)]};
+  }
+
+  // The keycaps for the game's button icons, from its own icons and font.
+  std::unique_ptr<fm4_static_recomp::input::PromptSwap> CreatePromptSwap(
+      const fm4_static_recomp::input::Controls& controls) {
+    namespace hostui = fm4_static_recomp::hostui;
+    const auto ui_root = game_data_root() / "Media" / "UI";
+    const auto textures = hostui::UiArchive::Open(ui_root / "Textures.zip");
+    const auto fonts = hostui::UiArchive::Open(ui_root / "Fonts.zip");
+    // The help bar's font (fontmap.xml: B_Swiss_721_Medium).
+    const auto font_data = fonts ? fonts->Read("b_vector_aa.dt") : std::nullopt;
+    const auto font = font_data ? hostui::VectorFont::Parse(*font_data) : std::nullopt;
+    if (!textures || !font) {
+      REXLOG_WARN("Prompt icons: cannot read Textures.zip or Fonts.zip; keeping the pad icons");
+      return nullptr;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    auto icons = fm4_static_recomp::input::LoadPromptTextures(*textures);
+    const size_t count = icons.size();
+    auto swap = std::make_unique<fm4_static_recomp::input::PromptSwap>(std::move(icons), *font,
+                                                                       controls);
+    REXLOG_INFO("Prompt icons: {} of {} icons, keycaps drawn in {} ms", count,
+                fm4_static_recomp::input::kPromptTextureNames.size(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count());
+    return swap;
+  }
+
+  // Returning false makes the process exit with a failure code.
+  bool RunShaderCacheTool() {
+    namespace shader_cache = fm4_static_recomp::shader_cache;
+    const std::span<const uint8_t> image(
+        runtime()->memory()->TranslateVirtual<const uint8_t*>(PPCImageConfig.image_base),
+        PPCImageConfig.image_size);
+    size_t files = 0;
+    std::string error;
+    const auto scanned = shader_cache::ScanDisc(game_data_root(), image, &error, &files);
+    if (!scanned) {
+      REXLOG_ERROR("Shader cache: {}", error);
+      return false;
+    }
+    const std::vector<shader_cache::DiscShader>& shaders = *scanned;
+    const size_t pixel = size_t(std::count_if(shaders.begin(), shaders.end(),
+                                              [](const auto& shader) { return shader.pixel; }));
+    REXLOG_INFO("Disc shaders: {} distinct ({} vertex, {} pixel) from {} files", shaders.size(),
+                shaders.size() - pixel, pixel, files);
+    const std::string dump = REXCVAR_GET(fm4_dump_disc_shaders);
+    if (!dump.empty() && !shader_cache::WriteDump(shaders, dump)) {
+      REXLOG_ERROR("Disc shaders: cannot write the dump to {}", dump);
+      return false;
+    }
+    const std::string shareable = REXCVAR_GET(fm4_build_shader_cache);
+    if (shareable.empty()) {
+      return true;
+    }
+    const auto result = shader_cache::WriteShaderCache(
+        shaders, std::string(REXCVAR_GET(fm4_shader_list_dir)), shareable, &error);
+    if (!result) {
+      REXLOG_ERROR("Shader cache: {}", error);
+      return false;
+    }
+    if (!result->shaders_written && !result->pipelines_added && !result->pipelines_skipped) {
+      REXLOG_INFO("Shader cache: already complete, nothing to add ({} of {} shaders, {} not on the "
+                  "disc; {} pipelines)",
+                  result->shaders_needed - result->shaders_missing, result->shaders_needed,
+                  result->shaders_missing, result->pipelines_listed);
+      return true;
+    }
+    const std::string pipelines =
+        result->cache_version
+            ? fmt::format("pipelines skipped: list version {:08X}, cache version {:08X}",
+                          result->list_version, result->cache_version)
+        : result->pipelines_skipped
+            ? fmt::format("pipelines skipped: list version {:08X}, tool {:08X}",
+                          result->list_version, shader_cache::kPipelineStorageVersion)
+            : fmt::format("{} of {} pipelines added", result->pipelines_added,
+                          result->pipelines_listed);
+    REXLOG_INFO("Shader cache: {} of {} shaders ({} not on the disc), {}", result->shaders_written,
+                result->shaders_needed, result->shaders_missing, pipelines);
+    return true;
+  }
+
+  void OpenGraphicsPage() {
+    if (host_ui_ && host_ui_->is_open()) {
+      return;
+    }
+    rex::ui::Presenter* const presenter =
+        runtime() && runtime()->graphics_system() ? runtime()->graphics_system()->presenter()
+                                                  : nullptr;
+    if (!presenter || !immediate_drawer() || !window() || !graphics_config_) {
+      REXLOG_WARN("Graphics page: presentation is not ready");
+      return;
+    }
+    if (!host_ui_) {
+      host_ui_ = std::make_unique<fm4_static_recomp::hostui::HostUi>(
+          *this, *presenter, *immediate_drawer(), *window(),
+          static_cast<rex::input::InputSystem*>(runtime()->input_system()), game_data_root(),
+          CurrentMenuKeys());
+    }
+    fm4_static_recomp::ui::GraphicsPageServices services;
+#if defined(__APPLE__)
+    services.presented_guest_frame = [] {
+      return presented_guest_frame_.load(std::memory_order_relaxed);
+    };
+    services.resolution_loading = fm4_static_recomp::ui::SetMacResolutionLoading;
+#endif
+    services.is_fullscreen = [this] {
+      return window() && window()->IsFullscreen();
+    };
+    services.set_fullscreen = [this](bool fs) {
+      if (auto* const window = this->window()) {
+        window->SetFullscreen(fs);
+      }
+    };
+    services.display_refresh_hz = [hz = fm4_static_recomp::ui::DisplayRefreshHz(
+                                       window()->GetNativeWindowHandle())] { return hz; };
+    services.draw_resolution_scale = [this]() -> uint32_t {
+      auto* graphics = runtime() ? runtime()->graphics_system() : nullptr;
+      return graphics ? graphics->draw_resolution_scale() : 0;
+    };
+    services.output_size = [this]() -> std::optional<std::pair<uint32_t, uint32_t>> {
+      const uint32_t width = window() ? window()->GetActualPhysicalWidth() : 0;
+      const uint32_t height = window() ? window()->GetActualPhysicalHeight() : 0;
+      if (!width || !height) {
+        return std::nullopt;
+      }
+      if (!REXCVAR_GET(present_letterbox)) {
+        return std::pair{width, height};
+      }
+      return uint64_t(width) * 9 > uint64_t(height) * 16 ? std::pair{height * 16 / 9, height}
+                                                         : std::pair{width, width * 9 / 16};
+    };
+    services.upscalers = [presenter] { return presenter->GetUpscalers(); };
+    namespace ui = fm4_static_recomp::ui;
+    std::vector<fm4_static_recomp::hostui::MenuTab> tabs = {
+        {"GRAPHICS",
+         [this, services] { return ui::CreateGraphicsPage(*graphics_config_, services); }},
+        {"KEYBOARD", [this] {
+           ui::ControlsPageServices keys;
+           keys.controller_layout = [] { return fm4_static_recomp::input::ControllerLayout(); };
+           keys.apply = [this] { return ApplyControls(); };
+           return ui::CreateControlsPage(*controls_config_, std::move(keys));
+         }},
+        {"MOUSE", [this] {
+           ui::ControlsPageServices mouse;
+           mouse.apply = [this] { return ApplyControls(); };
+           return ui::CreateMousePage(*controls_config_, std::move(mouse));
+         }},
+        {"GAMEPLAY", [this] { return ui::CreateGameplayPage(*gameplay_config_); }}};
+    host_ui_->Open(std::move(tabs), 0);
+  }
+
+  std::unique_ptr<fm4_static_recomp::config::HostConfig> graphics_config_;
+  std::unique_ptr<fm4_static_recomp::config::HostConfig> controls_config_;
+  std::unique_ptr<fm4_static_recomp::config::HostConfig> gameplay_config_;
+  // The keyboard filter's ramp times, apart from controls_mutex_: the filter runs under the
+  // input system's device lock.
+  std::mutex ramp_mutex_;
+  fm4_static_recomp::input::RampRates ramp_rates_{};
+  // Guards the three below: the input tick and the button texts read them on guest threads,
+  // the KEYBOARD tab replaces them on the UI thread.
+  mutable std::mutex controls_mutex_;
+  fm4_static_recomp::input::Controls controls_ = fm4_static_recomp::input::DefaultControls();
+  std::unique_ptr<fm4_static_recomp::input::BindingSwitcher> binding_switcher_;
+  std::unique_ptr<fm4_static_recomp::input::PromptSwap> prompt_swap_;
+  std::atomic<bool> keyboard_prompts_{false};
+  std::unique_ptr<fm4_static_recomp::hostui::HostUi> host_ui_;
+  std::unique_ptr<WindowShortcuts> window_shortcuts_;
+};

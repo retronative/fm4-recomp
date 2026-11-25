@@ -1,0 +1,581 @@
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 7c050e8..f3b67f6 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -114,6 +114,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       // (a car part's ground shadow, fm4_decal_motion.h). Last for the same
+       // reason.
+       uint32_t decal_slot_output : 1;
++      uint32_t native_fhd : 1;
+     } pixel;
+     uint64_t value = 0;
+ 
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index d00c00d..24af80d 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -395,7 +395,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // the FH1 native executor and (at 1x) the frame dump at a draw resolution
+   // scale.
+   bool CreateScaledComponents(uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+-                              std::unique_ptr<VulkanTextureCache> prepared_texture_cache = nullptr);
++                              bool native_fhd, std::unique_ptr<VulkanTextureCache> prepared_texture_cache = nullptr);
+   // Points the shared memory and EDRAM descriptor set at the shared memory and
+   // at the render target cache's EDRAM buffer.
+   void WriteSharedMemoryAndEdramDescriptorSet();
+diff --git a/include/rex/graphics/vulkan/fh1_native_executor.h b/include/rex/graphics/vulkan/fh1_native_executor.h
+index 9507101..0e08141 100644
+--- a/include/rex/graphics/vulkan/fh1_native_executor.h
++++ b/include/rex/graphics/vulkan/fh1_native_executor.h
+@@ -53,6 +53,7 @@ class VulkanTextureCache;
+ struct Fh1VulkanExecutorConfig {
+   // fh1_untile_predicated_tiling: the screen height in guest pixels, or 0.
+   uint32_t untile_height = 0;
++  bool native_fhd = false;
+   bool msaa_2x_supported = true;
+   bool gamma_as_unorm16 = false;
+   bool depth_float24_round = false;
+@@ -90,6 +91,16 @@ class Fh1NativeExecutor {
+   // tiles resolved are copied down to the EDRAM rows of their surfaces, where
+   // the last tile leaves them on the console.
+   void EndUntiledTiling();
++  bool NativeFhd() const { return config_.native_fhd; }
++  // Resolved guest memory keeps its integer address layout. Only physical
++  // attachments, viewports and scissors use these rounded raster boundaries.
++  uint32_t RasterEdge(uint32_t guest) const {
++    return NativeFhd() ? (guest * 3u + 1u) / 2u : guest * scale_;
++  }
++  int32_t RasterEdge(int32_t guest) const {
++    if (!NativeFhd()) return guest * int32_t(scale_);
++    return (3 * guest + (guest >= 0 ? 1 : 0)) / 2;
++  }
+   // The host sample count of surfaces the guest renders with this many
+   // samples (fh1_msaa_single_sample, fh1_msaa_2x).
+   xenos::MsaaSamples HostMsaaSamples(xenos::MsaaSamples guest) const {
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 17d8d6c..cc842f1 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -3459,6 +3459,14 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+             builder_->createBinOp(spv::OpIEqual, type_bool_, position_mod,
+                                   builder_->makeUintConstant(i ? (draw_resolution_scale_y_ >> 1)
+                                                                : (draw_resolution_scale_x_ >> 1)));
++        if (GetSpirvShaderModification().pixel.native_fhd) {
++          // One write per guest pixel: of every three physical samples, the
++          // first and last are the representatives for two guest pixels.
++          position_is_center = builder_->createBinOp(spv::OpINotEqual, type_bool_,
++              builder_->createBinOp(spv::OpUMod, type_uint_,
++                  builder_->createUnaryOp(spv::OpConvertFToU, type_uint_, position),
++                  builder_->makeUintConstant(3)), builder_->makeUintConstant(1));
++        }
+         memexport_allowed = memexport_allowed != spv::NoResult
+                                 ? builder_->createBinOp(spv::OpLogicalAnd, type_bool_,
+                                                         memexport_allowed, position_is_center)
+@@ -3552,7 +3560,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+     if (draw_resolution_scale_x_ > 1) {
+       param_gen_x = builder_->createNoContractionBinOp(
+           spv::OpFMul, type_float_, param_gen_x,
+-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
++          builder_->makeFloatConstant(modification.pixel.native_fhd ? (2.0f / 3.0f) : 1.0f / float(draw_resolution_scale_x_)));
+     }
+     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_x);
+@@ -3588,7 +3596,7 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+     if (draw_resolution_scale_y_ > 1) {
+       param_gen_y = builder_->createNoContractionBinOp(
+           spv::OpFMul, type_float_, param_gen_y,
+-          builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
++          builder_->makeFloatConstant(modification.pixel.native_fhd ? (2.0f / 3.0f) : 1.0f / float(draw_resolution_scale_y_)));
+     }
+     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_y);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 06efee1..a5f06a0 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -65,6 +65,15 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(fm4_native_fhd, false, "GPU/Vulkan", "Rasterize at native 1920x1080.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++namespace {
++std::atomic_bool fm4_native_fhd_applied{false};
++}
++extern "C" __attribute__((visibility("default"))) bool fm4_native_fhd_is_active() {
++  return fm4_native_fhd_applied.load(std::memory_order_acquire);
++}
++
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_INT32(vulkan_async_pipeline_wait_ms, REX_PLATFORM_ANDROID ? 0 : 250, "GPU/Vulkan",
+                      "With async_shader_compilation, how long a draw whose pipeline a worker is "
+@@ -1759,7 +1768,7 @@ bool VulkanCommandProcessor::SetupContext() {
+         "polygon modes will fall back to solid fill");
+   }
+ 
+-  if (!CreateScaledComponents(draw_resolution_scale_x, draw_resolution_scale_y)) {
++  if (!CreateScaledComponents(draw_resolution_scale_x, draw_resolution_scale_y, REXCVAR_GET(fm4_native_fhd))) {
+     return false;
+   }
+   draw_resolution_scale_.store(draw_resolution_scale_x, std::memory_order_relaxed);
+@@ -2712,7 +2721,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+ bool VulkanCommandProcessor::CreateScaledComponents(
+     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+-    std::unique_ptr<VulkanTextureCache> prepared_texture_cache) {
++    bool native_fhd, std::unique_ptr<VulkanTextureCache> prepared_texture_cache) {
+   const uint32_t shared_memory_binding_count =
+       UINT32_C(1) << SpirvShaderTranslator::GetSharedMemoryStorageBufferCountLog2(
+           GetVulkanDevice()->properties().maxStorageBufferRange);
+@@ -2758,6 +2767,7 @@ bool VulkanCommandProcessor::CreateScaledComponents(
+     native_config.gamma_as_unorm16 = render_target_cache_->gamma_render_target_as_unorm16();
+     native_config.depth_float24_round = render_target_cache_->depth_float24_round();
+     native_config.fixed16_truncated = render_target_cache_->IsFixedRG16TruncatedToMinus1To1();
++    native_config.native_fhd = native_fhd && draw_resolution_scale_x == 2 && draw_resolution_scale_y == 2;
+     native_config.memory = shared_memory_.get();
+     native_config.textures = texture_cache_.get();
+     native_config.render_targets = render_target_cache_.get();
+@@ -2874,9 +2884,11 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+   // fh1_untile_predicated_tiling sizes the FH1 executor's surfaces, so a
+   // change rebuilds the same components as a scale switch, at the same scale;
+   // so does the executor's MSAA setting.
++  const bool previous_fhd = fh1_native_executor_ && fh1_native_executor_->NativeFhd();
++  const bool requested_fhd = scale_x == 2 && scale_y == 2 && REXCVAR_GET(fm4_native_fhd);
+   const bool untile_changed =
+       fh1_native_executor_ && REXCVAR_GET(fh1_untile_predicated_tiling) != untile_tiling_;
+-  if (scale_x == previous_scale_x && scale_y == previous_scale_y && !untile_changed &&
++  if (scale_x == previous_scale_x && scale_y == previous_scale_y && previous_fhd == requested_fhd && !untile_changed &&
+       !(fh1_native_executor_ && fh1_native_executor_->IsSingleSampleMsaaOutdated())) {
+     declined_draw_resolution_scale_ = 0;
+     return;
+@@ -2954,8 +2966,8 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+     pipeline_cache_.reset();
+     render_target_cache_.reset();
+   };
+-  const auto create = [&](uint32_t x, uint32_t y) {
+-    return CreateScaledComponents(x, y, std::move(prepared_texture_cache)) &&
++  const auto create = [&](uint32_t x, uint32_t y, bool fhd) {
++    return CreateScaledComponents(x, y, fhd, std::move(prepared_texture_cache)) &&
+            render_target_cache_->GetPath() == path &&
+            (fh1_native_executor_ != nullptr) == native_executor;
+   };
+@@ -2963,7 +2975,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+   // resolve data to the new one.
+   std::unique_ptr<VulkanTextureCache> previous_texture_cache = std::move(texture_cache_);
+   destroy();
+-  if (create(scale_x, scale_y)) {
++  if (create(scale_x, scale_y, requested_fhd)) {
+     texture_cache_->InheritScaledResolves(*previous_texture_cache);
+     previous_texture_cache.reset();
+   } else {
+@@ -2975,7 +2987,7 @@ void VulkanCommandProcessor::SwitchDrawResolutionScaleIfRequested() {
+     // and CreateScaledComponents rebuilds samplers for the current settings.
+     previous_texture_cache->ClearSamplers();
+     prepared_texture_cache = std::move(previous_texture_cache);
+-    if (!create(previous_scale_x, previous_scale_y)) {
++    if (!create(previous_scale_x, previous_scale_y, previous_fhd)) {
+       REXGPU_ERROR("Could not restore draw resolution scale {}x{}", previous_scale_x,
+                    previous_scale_y);
+       device_lost_ = true;
+@@ -3096,6 +3108,7 @@ void VulkanCommandProcessor::ResetCachedDrawState() {
+ }
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
++  fm4_native_fhd_applied.store(false, std::memory_order_release);
+   AwaitAllQueueOperationsCompletion();
+   StopSubmissionWorker();
+ #if defined(REXGLUE_ENABLE_CS_PROBES)
+@@ -4350,6 +4363,14 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+             ? frontbuffer_height_scaled
+             : (frontbuffer_height ? frontbuffer_height : frontbuffer_height_unscaled);
+   }
++  const bool native_fhd = fh1_native_executor_ && fh1_native_executor_->NativeFhd();
++  const bool fhd_swap = native_fhd && frontbuffer_width_scaled > frontbuffer_width_unscaled &&
++                        frontbuffer_height_scaled > frontbuffer_height_unscaled;
++  if (fhd_swap) {
++    guest_output_width = (guest_output_width * 3u + 2u) / 4u;
++    guest_output_height = (guest_output_height * 3u + 2u) / 4u;
++  }
++  fm4_native_fhd_applied.store(native_fhd, std::memory_order_release);
+   bool swap_source_scaled = frontbuffer_width_unscaled && frontbuffer_height_unscaled &&
+                             (frontbuffer_width_scaled != frontbuffer_width_unscaled ||
+                              frontbuffer_height_scaled != frontbuffer_height_unscaled);
+@@ -4457,7 +4478,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, guest_output_width, guest_output_height, display_width, display_height,
+-       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap,
++       frontbuffer_format, swap_texture_view, swap_post_effect, swap_source_needs_rb_swap, fhd_swap,
+        hud_snapshot_view, hdr_active, scene_fxaa, scene_lut, hudless_wanted, camera_depth_view,
+        camera, plain_ground_motion](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         // In case the swap command is the only one in the frame.
+@@ -4733,7 +4754,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+               uint32_t(swap_apply_gamma_compute_descriptor_sets.size()),
+               swap_apply_gamma_compute_descriptor_sets.data(), 0, nullptr);
+           SwapApplyGammaConstants swap_apply_gamma_constants = {
+-              {guest_output_width, guest_output_height}};
++              {guest_output_width | (fhd_swap ? 0x80000000u : 0u), guest_output_height}};
+           deferred_command_buffer_.CmdVkPushConstants(
+               swap_apply_gamma_compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+               sizeof(swap_apply_gamma_constants), &swap_apply_gamma_constants);
+@@ -4800,6 +4821,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+                   float(REXCVAR_GET(scene_lut_strength)) / 100.0f,
+                   float(scene_lut_size_ - 1) / float(scene_lut_size_),
+                   0.5f / float(scene_lut_size_)};
++              if (fhd_swap) constants.flags |= 16u;
+               if (fxaa_requested) {
+                 constants.flags |= 1u;
+                 if (swap_post_effect == SwapPostEffect::kFxaaExtreme) constants.flags |= 2u;
+@@ -4903,7 +4925,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+             deferred_command_buffer_.CmdVkBindDescriptorSets(
+                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                 &hud_mask_set, 0, nullptr);
+-            const uint32_t hud_mask_size[2] = {guest_output_width, guest_output_height};
++            const uint32_t hud_mask_size[2] = {guest_output_width | (fhd_swap ? 0x80000000u : 0u), guest_output_height};
+             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                         sizeof(hud_mask_size), hud_mask_size);
+@@ -4995,7 +5017,7 @@ void VulkanCommandProcessor::IssueSwapImpl(uint32_t frontbuffer_ptr, uint32_t fr
+             deferred_command_buffer_.CmdVkBindDescriptorSets(
+                 VK_PIPELINE_BIND_POINT_COMPUTE, swap_hud_mask_pipeline_layout_, 0, 1,
+                 &hudless_mask_set, 0, nullptr);
+-            const uint32_t hudless_mask_size[2] = {guest_output_width, guest_output_height};
++            const uint32_t hudless_mask_size[2] = {guest_output_width | (fhd_swap ? 0x80000000u : 0u), guest_output_height};
+             deferred_command_buffer_.CmdVkPushConstants(swap_hud_mask_pipeline_layout_,
+                                                         VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                         sizeof(hudless_mask_size),
+@@ -7002,6 +7024,7 @@ bool VulkanCommandProcessor::IssueDrawImpl(xenos::PrimitiveType prim_type, uint3
+                                normalized_depth_control)
+                          : SpirvShaderTranslator::Modification(0);
+         vertex_shader_modification.vertex.fm4_pin_overlay = pin_hud;
++        pixel_shader_modification.pixel.native_fhd = pixel_shader && fh1_native_executor_ && fh1_native_executor_->NativeFhd();
+         if (object_slot) {
+           pixel_shader_modification.pixel.object_slot_output = 1;
+         }
+@@ -9181,6 +9204,11 @@ uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) con
+   if (samples == 0 || !texture_cache_) {
+     return samples;
+   }
++  if (fh1_native_executor_ && fh1_native_executor_->NativeFhd()) {
++    // The query counts physical samples. The 3:2 raster covers 9/4 of
++    // the guest pixels, regardless of the integer resolve storage layout.
++    return (samples / 9) * 4 + ((samples % 9) * 4 + 4) / 9;
++  }
+   uint64_t scale_x = texture_cache_->draw_resolution_scale_x();
+   uint64_t scale_y = texture_cache_->draw_resolution_scale_y();
+   uint64_t scale = scale_x * scale_y;
+@@ -10581,6 +10609,13 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+     viewport.width *= sx;
+     viewport.height *= sy;
+   }
++  const bool native_fhd = fh1_native_executor_ && fh1_native_executor_->NativeFhd();
++  if (native_fhd) {
++    viewport.x *= 0.75f;
++    viewport.y *= 0.75f;
++    viewport.width *= 0.75f;
++    viewport.height *= 0.75f;
++  }
+   SetViewport(viewport);
+ 
+   // Scissor.
+@@ -10622,6 +10657,26 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+   scissor_rect.offset.y = int32_t(scissor.offset[1]);
+   scissor_rect.extent.width = scissor.extent[0];
+   scissor_rect.extent.height = scissor.extent[1];
++  if (native_fhd) {
++    // Round endpoints together so adjacent tiles meet on the same pixel.
++    const auto physical = [](int64_t coordinate) {
++      return int32_t((coordinate * 3 + (coordinate >= 0 ? 2 : -1)) / 4);
++    };
++    const int32_t left = physical(scissor_rect.offset.x), top = physical(scissor_rect.offset.y);
++    const int32_t right = physical(int64_t(scissor_rect.offset.x) + scissor_rect.extent.width);
++    const int32_t bottom = physical(int64_t(scissor_rect.offset.y) + scissor_rect.extent.height);
++    scissor_rect.offset = {left, top};
++    scissor_rect.extent = {uint32_t(right - left), uint32_t(bottom - top)};
++    if (normalized_depth_control.z_enable && !hud && viewport.width == 1920.0f &&
++        std::abs(viewport.height) == 1080.0f) {
++      static bool logged = false;
++      if (!logged) {
++        REXGPU_INFO("FM4 FHD: depth-tested 3D viewport {}x{}, scissor {}x{}", viewport.width,
++                    viewport.height, scissor_rect.extent.width, scissor_rect.extent.height);
++        logged = true;
++      }
++    }
++  }
+   SetScissor(scissor_rect);
+ 
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+diff --git a/src/graphics/vulkan/fh1_camera.cpp b/src/graphics/vulkan/fh1_camera.cpp
+index be3773f..297f145 100644
+--- a/src/graphics/vulkan/fh1_camera.cpp
++++ b/src/graphics/vulkan/fh1_camera.cpp
+@@ -465,8 +465,7 @@ uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
+ 
+ int32_t Fh1NativeExecutor::ObjectRowOffset() const {
+   if (untile_height_) return 0;
+-  return std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)) *
+-         int32_t(scale_);
++  return RasterEdge(std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)));
+ }
+ 
+ uint64_t Fh1NativeExecutor::CurrentColorKey() const {
+@@ -740,9 +739,9 @@ void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
+   // A band holds the surface's rows. The copy is resized only before a
+   // frame's first band, to the bottom of the lowest band seen, so frames
+   // with a taller band than it has are dropped until the next.
+-  const uint32_t width = surface->width * scale_;
+-  const uint32_t height = std::min(surface->height, surface->image_height) * scale_;
+-  const uint32_t dest_row = band_row * scale_;
++  const uint32_t width = RasterEdge(surface->width);
++  const uint32_t height = RasterEdge(std::min(surface->height, surface->image_height));
++  const uint32_t dest_row = RasterEdge(band_row);
+   camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
+   if (camera_depth_rows_ &&
+       (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {
+diff --git a/src/graphics/vulkan/fh1_inspector.cpp b/src/graphics/vulkan/fh1_inspector.cpp
+index c236423..23377ab 100644
+--- a/src/graphics/vulkan/fh1_inspector.cpp
++++ b/src/graphics/vulkan/fh1_inspector.cpp
+@@ -124,8 +124,8 @@ void main() {
+       return image;
+     }
+   }
+-  const uint32_t width = uint32_t(rect.right - rect.left) * scale_;
+-  const uint32_t height = uint32_t(rect.bottom - rect.top) * scale_;
++  const uint32_t width = uint32_t(RasterEdge(rect.right) - RasterEdge(rect.left));
++  const uint32_t height = uint32_t(RasterEdge(rect.bottom) - RasterEdge(rect.top));
+   const uint32_t longest = std::max(width, height);
+   image.width = std::max(1u, width * std::min(longest, 256u) / longest);
+   image.height = std::max(1u, height * std::min(longest, 256u) / longest);
+@@ -164,8 +164,8 @@ void main() {
+   writes[1].pBufferInfo = &buffer;
+   fn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+   const uint32_t constants[] = {
+-      uint32_t(rect.left) * scale_,
+-      uint32_t(rect.top) * scale_,
++      uint32_t(RasterEdge(rect.left)),
++      uint32_t(RasterEdge(rect.top)),
+       width,
+       height,
+       image.width,
+@@ -228,8 +228,8 @@ void Fh1NativeExecutor::FinishInspection(uint64_t frame) {
+         item.depth
+             ? xenos::GetDepthRenderTargetFormatName(xenos::DepthRenderTargetFormat(item.format))
+             : xenos::GetColorRenderTargetFormatName(xenos::ColorRenderTargetFormat(item.format));
+-    item.width = surface.width * scale_;
+-    item.height = surface.image_height * scale_;
++    item.width = RasterEdge(surface.width);
++    item.height = RasterEdge(surface.image_height);
+     item.samples = surface.samples;
+     item.draws = inspection_draws_[key];
+     item.image = QueueInspectionImage(
+diff --git a/src/graphics/vulkan/fh1_native_executor.cpp b/src/graphics/vulkan/fh1_native_executor.cpp
+index feb3e50..2c5fca9 100644
+--- a/src/graphics/vulkan/fh1_native_executor.cpp
++++ b/src/graphics/vulkan/fh1_native_executor.cpp
+@@ -701,13 +701,12 @@ uint32_t Fh1NativeExecutor::SurfaceHeight(uint32_t pitch_tiles, uint32_t msaa) c
+ }
+ 
+ Fh1NativeExecutor::Rect Fh1NativeExecutor::HostRect(const Rect& rect) const {
+-  return {rect.left * int32_t(scale_), rect.top * int32_t(scale_), rect.right * int32_t(scale_),
+-          rect.bottom * int32_t(scale_)};
++  return {RasterEdge(rect.left), RasterEdge(rect.top), RasterEdge(rect.right), RasterEdge(rect.bottom)};
+ }
+ 
+ uint32_t Fh1NativeExecutor::TransferFlags() const {
+   return (config_.depth_float24_round ? 1u : 0u) | (config_.gamma_as_unorm16 ? 2u : 0u) |
+-         (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12);
++         (config_.fixed16_truncated ? 0u : 4u) | ((scale_ - 1) << 12) | (NativeFhd() ? 1u << 14 : 0u);
+ }
+ 
+ Fh1NativeExecutor::Surface* Fh1NativeExecutor::FindSurface(uint32_t packed_key) {
+@@ -790,7 +789,7 @@ void Fh1NativeExecutor::BeginSurfaceRendering(Surface& surface, bool uint_view)
+   attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+   VkRenderingInfo info = {};
+   info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+-  info.renderArea.extent = {surface.width * scale_, surface.image_height * scale_};
++  info.renderArea.extent = {RasterEdge(surface.width), RasterEdge(surface.image_height)};
+   info.layerCount = 1;
+   if (surface.key.is_depth) {
+     info.pDepthAttachment = &attachment;
+@@ -820,9 +819,9 @@ void Fh1NativeExecutor::EndUntiledTiling() {
+     VkImageCopy region = {};
+     region.srcSubresource = {AspectMask(*surface), 0, 0, 1};
+     region.dstSubresource = region.srcSubresource;
+-    region.srcOffset = {0, int32_t(band * scale_), 0};
++    region.srcOffset = {0, int32_t(RasterEdge(band)), 0};
+     // Rows past the band would overlap their own destination.
+-    region.extent = {surface->width * scale_, std::min(untile_height_ - band, band) * scale_, 1};
++    region.extent = {RasterEdge(surface->width), RasterEdge(std::min(untile_height_ - band, band)), 1};
+     command_processor_.deferred_command_buffer().CmdVkCopyImage(
+         surface->image, VK_IMAGE_LAYOUT_GENERAL, surface->image, VK_IMAGE_LAYOUT_GENERAL, region);
+     Count("untile_copy_down");
+@@ -875,7 +874,7 @@ Fh1NativeExecutor::Surface* Fh1NativeExecutor::GetOrCreateSurface(const SurfaceK
+   VkClearAttachment clear = {};
+   clear.aspectMask = AspectMask(stored);
+   VkClearRect clear_rect = {};
+-  clear_rect.rect.extent = {stored.width * scale_, stored.image_height * scale_};
++  clear_rect.rect.extent = {RasterEdge(stored.width), RasterEdge(stored.image_height)};
+   clear_rect.layerCount = 1;
+   command_processor_.deferred_command_buffer().CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+   Count("surface_created");
+@@ -894,7 +893,7 @@ bool Fh1NativeExecutor::CreateSurfaceImage(Surface& surface) {
+                          : 0;
+   image_info.imageType = VK_IMAGE_TYPE_2D;
+   image_info.format = surface.format;
+-  image_info.extent = {surface.width * scale_, surface.image_height * scale_, 1};
++  image_info.extent = {RasterEdge(surface.width), RasterEdge(surface.image_height), 1};
+   image_info.mipLevels = 1;
+   image_info.arrayLayers = 1;
+   image_info.samples = VkSampleCountFlagBits(surface.samples);
+@@ -1007,7 +1006,7 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
+   VkImageCopy region = {};
+   region.srcSubresource = {aspect, 0, 0, 1};
+   region.dstSubresource = region.srcSubresource;
+-  region.extent = {surface.width * scale_, old_rows * scale_, 1};
++  region.extent = {RasterEdge(surface.width), RasterEdge(old_rows), 1};
+   commands.CmdVkCopyImage(surface.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, grown.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
+   // The old image lives until the GPU has finished this submission.
+@@ -1041,8 +1040,8 @@ void Fh1NativeExecutor::EnsureSurfaceRows(Surface& surface, uint32_t rows) {
+   VkClearAttachment clear = {};
+   clear.aspectMask = aspect;
+   VkClearRect clear_rect = {};
+-  clear_rect.rect.offset = {0, int32_t(old_rows * scale_)};
+-  clear_rect.rect.extent = {surface.width * scale_, (new_rows - old_rows) * scale_};
++  clear_rect.rect.offset = {0, int32_t(RasterEdge(old_rows))};
++  clear_rect.rect.extent = {RasterEdge(surface.width), RasterEdge(new_rows) - RasterEdge(old_rows)};
+   clear_rect.layerCount = 1;
+   commands.CmdVkClearAttachments(1, &clear, 1, &clear_rect);
+   Count("surface_grown");
+@@ -1794,7 +1793,7 @@ void Fh1NativeExecutor::FlushDepthTransfersExported(Surface& dest, size_t first,
+ }
+ 
+ bool Fh1NativeExecutor::EnsureTransferWords(const Surface& dest) {
+-  const VkDeviceSize size = VkDeviceSize(dest.width) * dest.height * scale_ * scale_ *
++  const VkDeviceSize size = VkDeviceSize(RasterEdge(dest.width)) * RasterEdge(dest.height) *
+                             dest.samples * sizeof(uint32_t);
+   if (transfer_words_ && transfer_words_size_ >= size) return true;
+   if (transfer_words_) {
+@@ -1894,7 +1893,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t
+       const uint32_t constants[kComputeConstantCount] = {
+           uint32_t(rect.left) | (uint32_t(rect.top) << 16),
+           uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16),
+-          LayoutConstant(dest), LayoutConstant(*source), flags, dest.width * scale_,
++          LayoutConstant(dest), LayoutConstant(*source), flags, RasterEdge(dest.width),
+           dest.samples, 0};
+       command_buffer.CmdVkPushConstants(compute_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                         sizeof(constants), constants);
+@@ -1953,7 +1952,7 @@ void Fh1NativeExecutor::FlushDepthTransfers(Surface& dest, size_t first, size_t
+       set_bound = true;
+     }
+     const uint32_t constants[kTransferConstantCount] = {
+-        LayoutConstant(dest), (dest.width * scale_) | (dest.samples << 16),
++        LayoutConstant(dest), (RasterEdge(dest.width)) | (dest.samples << 16),
+         flags | (pass ? (pass - 1) << 8 : 0)};
+     command_buffer.CmdVkPushConstants(words_pipeline_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                       sizeof(constants), constants);
+@@ -2476,7 +2475,7 @@ void Fh1NativeExecutor::DiscoverShaderDraw(const VulkanShader::VulkanTranslation
+         "{}{{\"slot\":{},\"key\":\"{:08X}\",\"depth\":{},\"base_tiles\":{},"
+         "\"pitch_tiles\":{},\"format\":{},\"width\":{},\"height\":{},\"samples\":{}}}",
+         first ? "" : ",", i, key.Pack(), key.is_depth, key.base_tiles, key.pitch_tiles,
+-        key.format, surface->width * scale_, surface->image_height * scale_, surface->samples);
++        key.format, RasterEdge(surface->width), RasterEdge(surface->image_height), surface->samples);
+     first = false;
+   }
+   shader_discovery_draws_ << "]}\n";
+@@ -2493,8 +2492,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
+       bound[i] = FindSurface(pending_keys_[i].Pack());
+       if (!bound[i]) continue;
+       clears |= !bound[i]->pending_clears.empty();
+-      clear_width = std::min(clear_width, bound[i]->width * scale_);
+-      clear_height = std::min(clear_height, bound[i]->image_height * scale_);
++      clear_width = std::min(clear_width, RasterEdge(bound[i]->width));
++      clear_height = std::min(clear_height, RasterEdge(bound[i]->image_height));
+     }
+     if (clears) {
+       FoldPendingClears(bound, clear_width, clear_height, nullptr, nullptr, true);
+@@ -2536,8 +2535,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
+     attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+     attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+     if (i) color_count = i;
+-    width = std::min(width, surface->width * scale_);
+-    height = std::min(height, surface->image_height * scale_);
++    width = std::min(width, RasterEdge(surface->width));
++    height = std::min(height, RasterEdge(surface->image_height));
+   }
+   if (width == UINT32_MAX) {
+     // No attachments: the surface pitch bounds the draw.
+@@ -2545,8 +2544,8 @@ void Fh1NativeExecutor::BeginDrawRendering() {
+     const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+     const uint32_t pitch_tiles = std::max(Fh1PitchTiles(surface_info.surface_pitch, msaa), 1u);
+     const uint32_t msaa_x_log2 = uint32_t(msaa >= uint32_t(xenos::MsaaSamples::k4X));
+-    width = pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2) * scale_;
+-    height = SurfaceHeight(pitch_tiles, msaa) * scale_;
++    width = RasterEdge(pitch_tiles * (xenos::kEdramTileWidthSamples >> msaa_x_log2));
++    height = RasterEdge(SurfaceHeight(pitch_tiles, msaa));
+   }
+   const uint64_t id = bound_id;
+   if (attachment_barriers_skipped_) {
+@@ -2575,6 +2574,13 @@ void Fh1NativeExecutor::BeginDrawRendering() {
+     info.pStencilAttachment = &depth;
+   }
+   if (clears) FoldPendingClears(bound, clear_width, clear_height, colors, &depth, true);
++  if (NativeFhd() && info.pDepthAttachment && color_count && width == 1920 && height >= 1080) {
++    static bool logged = false;
++    if (!logged) {
++      REXGPU_INFO("FM4 FHD: Vulkan depth/color render area {}x{}, {} color attachments", width, height, color_count);
++      logged = true;
++    }
++  }
+   rendering_id_ = id;
+   if (gpu_query_pool_ != VK_NULL_HANDLE) {
+     std::string label;
+@@ -2829,7 +2835,11 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
+       vulkan_device->device(), image_view != VK_NULL_HANDLE ? 5 : 3, writes, 0, nullptr);
+   const SurfaceKey& owner = surface.key;
+   const uint32_t host_sample_mode = HostSampleMode(surface);
+-  const Rect rect = unscaled_dest ? source.rect : HostRect(source.rect);
++  // Dispatch covers the integer-addressed resolved texture, independently
++  // of the physical raster. The shader maps source reads to the native grid.
++  const Rect rect = unscaled_dest ? source.rect :
++      Rect{source.rect.left * int32_t(scale_), source.rect.top * int32_t(scale_),
++           source.rect.right * int32_t(scale_), source.rect.bottom * int32_t(scale_)};
+   uint32_t constants[kComputeConstantCount + 3];
+   constants[0] = uint32_t(rect.left) | (uint32_t(rect.top) << 16);
+   constants[1] = uint32_t(rect.right - rect.left) | (uint32_t(rect.bottom - rect.top) << 16);
+@@ -2878,7 +2888,8 @@ bool Fh1NativeExecutor::ResolveToMemory(const SourceRect& source, const SurfaceK
+     }
+   }
+   constants[4] = sample_select;
+-  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u);
++  constants[5] = dest_info | ((scale_ - 1) << 20) | (unscaled_dest ? 1u << 22 : 0u) |
++                 (NativeFhd() ? 1u << 29 : 0u);
+   constants[6] = dest_base;
+   constants[7] = dest_pitch;
+   constants[8] = image_row * scale_;
+@@ -3580,9 +3591,9 @@ void Fh1NativeExecutor::MaybeSnapshotBeforeHud(const Fh1DrawInfo& draw) {
+     hud_snapshot_taken_ = false;
+     return;
+   }
+-  const uint32_t width = surface->width * scale_;
++  const uint32_t width = RasterEdge(surface->width);
+   // The rows the image holds: on demand they may stop short of the period.
+-  const uint32_t height = surface->image_height * scale_;
++  const uint32_t height = RasterEdge(surface->image_height);
+   const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+   const auto& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+diff --git a/src/graphics/vulkan/scene_post.cpp b/src/graphics/vulkan/scene_post.cpp
+index 8c2d2b8..4d145d1 100644
+--- a/src/graphics/vulkan/scene_post.cpp
++++ b/src/graphics/vulkan/scene_post.cpp
+@@ -54,7 +54,7 @@ vec3 Sorted(vec3 v) {
+ 
+ bool Changed(ivec2 pixel) {
+   pixel = clamp(pixel, ivec2(0), ivec2(c.size) - 1);
+-  vec3 difference = abs(Sorted(texelFetch(frame, pixel, 0).rgb) -
++  vec3 difference = abs(Sorted(texelFetch(frame, (c.flags & 16u) != 0u ? (4 * pixel + 2) / 3 : pixel, 0).rgb) -
+                         Sorted(texelFetch(scene, pixel, 0).rgb));
+   return max(difference.x, max(difference.y, difference.z)) > 0.006;
+ }

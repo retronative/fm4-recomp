@@ -1,0 +1,196 @@
+--- a/src/graphics/shaders/fh1_native_edram.hlsli
++++ b/src/graphics/shaders/fh1_native_edram.hlsli
+@@ -85,6 +85,8 @@
+ // inside the guest pixel for the source lookup (the same subpixel of the
+ // source's guest pixel, as both surfaces are at the same scale).
+ #define FH1_FLAG_SCALE_SHIFT 12u  // transfer flags: resolution scale - 1, 12:13
++// FHD uses a 3:2 physical raster and a virtual 2x grid for EDRAM address and texture storage.
++#define FH1_FLAG_NATIVE_FHD (1u << 14u)
+ static uint fh1_scale = 1u;
+ // Untiled predicated tiling: a later tile's band is this many guest rows below
+ // the EDRAM rows of the source surface.
+@@ -94,6 +96,13 @@
+   fh1_scale = scale;
+   fh1_subpixel = pixel % scale;
+   pixel /= scale;
++}
++
++void SetTransferPixel(inout uint2 pixel, uint flags) {
++  if ((flags & FH1_FLAG_NATIVE_FHD) != 0u) {
++    pixel = (pixel * 4u + 2u) / 3u;
++  }
++  SetScaledPixel(pixel, ((flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
+ }
+ 
+ // Layouts: base_tiles 0:10, pitch_tiles (32bpp) 11:18, msaa 19:20,
+@@ -378,6 +387,10 @@
+   host_sample = HostSample(guest_sample, source_msaa, LayoutHostSampleMode(source_layout));
+   }
+ 
++  if ((flags & FH1_FLAG_NATIVE_FHD) != 0u) {
++    source_pixel = (source_pixel * 3 + 1) / 4;
++  }
++
+ #ifdef FH1_SOURCE_DEPTH
+ #ifdef FH1_SOURCE_MSAA
+   float depth = fh1_source_depth.Load(source_pixel, host_sample);
+--- a/src/graphics/shaders/fh1_native_transfer.ps.hlsl
++++ b/src/graphics/shaders/fh1_native_transfer.ps.hlsl
+@@ -55,7 +55,7 @@
+   uint guest_sample = GuestSample(host_sample, LayoutMsaa(FH1_DEST_LAYOUT),
+                                   LayoutHostSampleMode(FH1_DEST_LAYOUT));
+   uint2 pixel = uint2(position.xy);
+-  SetScaledPixel(pixel, ((FH1_FLAGS >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
++  SetTransferPixel(pixel, FH1_FLAGS);
+   return LoadSourceWord(FH1_DEST_LAYOUT, pixel, guest_sample, half, FH1_SOURCE_LAYOUT,
+                         FH1_FLAGS);
+ }
+--- a/src/graphics/shaders/fh1_native_transfer_words.cs.hlsl
++++ b/src/graphics/shaders/fh1_native_transfer_words.cs.hlsl
+@@ -36,7 +36,7 @@
+     uint guest_sample = GuestSample(host_sample, LayoutMsaa(fh1_dest_layout),
+                                     LayoutHostSampleMode(fh1_dest_layout));
+     uint2 guest_pixel = pixel;
+-    SetScaledPixel(guest_pixel, ((fh1_flags >> FH1_FLAG_SCALE_SHIFT) & 3u) + 1u);
++    SetTransferPixel(guest_pixel, fh1_flags);
+     fh1_words.Store((base + host_sample) * 4u,
+                     LoadSourceWord(fh1_dest_layout, guest_pixel, guest_sample, 0u,
+                                    fh1_source_layout, fh1_flags));
+--- a/src/graphics/shaders/fh1_native_resolve_memory.cs.hlsl
++++ b/src/graphics/shaders/fh1_native_resolve_memory.cs.hlsl
+@@ -183,7 +183,8 @@
+ 
+ uint LoadOwnerWord(uint2 pixel, uint sample, uint half) {
+   uint flags = (((FH1_DEST_INFO >> 7u) & 1u) ? FH1_FLAG_FLOAT24_ROUND : 0u) |
+-               (((FH1_DEST_INFO >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u);
++               (((FH1_DEST_INFO >> 18u) & 1u) ? FH1_FLAG_GAMMA_UNORM16 : 0u) |
++               (((FH1_DEST_INFO >> 29u) & 1u) ? FH1_FLAG_NATIVE_FHD : 0u);
+   return LoadSourceWord(FH1_RESOLVE_LAYOUT, pixel, sample, half, FH1_OWNER_LAYOUT, flags);
+ }
+ 
+--- a/src/graphics/shaders/hdr_hud_mask.cs.glsl
++++ b/src/graphics/shaders/hdr_hud_mask.cs.glsl
+@@ -29,9 +29,14 @@
+   return vec3(low, v.r + v.g + v.b - low - high, high);
+ }
+ 
++uvec2 OutputSize() {
++  return uvec2(constants.size.x & 0x7fffffffu, constants.size.y);
++}
++
+ bool Changed(ivec2 pixel) {
+-  pixel = clamp(pixel, ivec2(0), ivec2(constants.size) - 1);
+-  vec3 difference = abs(Sorted(texelFetch(frame, pixel, 0).rgb) -
++  pixel = clamp(pixel, ivec2(0), ivec2(OutputSize()) - 1);
++  ivec2 frame_pixel = (constants.size.x >> 31u) != 0u ? (pixel * 4 + 2) / 3 : pixel;
++  vec3 difference = abs(Sorted(texelFetch(frame, frame_pixel, 0).rgb) -
+                         Sorted(texelFetch(scene, pixel, 0).rgb));
+   // Half an 8-bit step is 0.002.
+   return max(difference.x, max(difference.y, difference.z)) > 0.006;
+@@ -39,7 +44,7 @@
+ 
+ void main() {
+   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+-  if (any(greaterThanEqual(uvec2(pixel), constants.size))) {
++  if (any(greaterThanEqual(uvec2(pixel), OutputSize()))) {
+     return;
+   }
+   bool hud = false;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -672,6 +672,7 @@
+ 
+ const char* GetSwapApplyGammaTableComputeRbSwapSource() {
+   return R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
+ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform XeApplyGammaRampConstants {
+@@ -684,11 +685,13 @@
+ 
+ void main() {
+   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+-  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) {
++  uvec2 size = uvec2(xe_apply_gamma_size.x & 0x7fffffffu, xe_apply_gamma_size.y);
++  if (any(greaterThanEqual(uvec2(pixel), size))) {
+     return;
+   }
+ 
+-  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 255.0 + vec3(0.5)).bgr;
++  ivec2 source_pixel = (xe_apply_gamma_size.x >> 31u) != 0u ? (pixel * 4 + 2) / 3 : pixel;
++  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, source_pixel, 0).rgb * 255.0 + vec3(0.5)).bgr;
+   imageStore(
+       xe_apply_gamma_dest, pixel,
+       vec4(texelFetch(xe_apply_gamma_ramp, int(source.r)).b,
+@@ -700,6 +703,7 @@
+ 
+ const char* GetSwapApplyGammaPwlComputeRbSwapSource() {
+   return R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
+ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform XeApplyGammaRampConstants {
+@@ -719,11 +723,13 @@
+ 
+ void main() {
+   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+-  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) {
++  uvec2 size = uvec2(xe_apply_gamma_size.x & 0x7fffffffu, xe_apply_gamma_size.y);
++  if (any(greaterThanEqual(uvec2(pixel), size))) {
+     return;
+   }
+ 
+-  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 1023.0 + vec3(0.5)).bgr;
++  ivec2 source_pixel = (xe_apply_gamma_size.x >> 31u) != 0u ? (pixel * 4 + 2) / 3 : pixel;
++  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, source_pixel, 0).rgb * 1023.0 + vec3(0.5)).bgr;
+   imageStore(xe_apply_gamma_dest, pixel,
+              vec4(ApplyPwl(source.r, 0u), ApplyPwl(source.g, 1u),
+                   ApplyPwl(source.b, 2u), 1.0));
+@@ -733,6 +739,7 @@
+ 
+ const char* GetSwapApplyGammaTableFxaaLumaComputeRbSwapSource() {
+   return R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
+ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform XeApplyGammaRampConstants {
+@@ -747,11 +754,13 @@
+ 
+ void main() {
+   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+-  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) {
++  uvec2 size = uvec2(xe_apply_gamma_size.x & 0x7fffffffu, xe_apply_gamma_size.y);
++  if (any(greaterThanEqual(uvec2(pixel), size))) {
+     return;
+   }
+ 
+-  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 255.0 + vec3(0.5)).bgr;
++  ivec2 source_pixel = (xe_apply_gamma_size.x >> 31u) != 0u ? (pixel * 4 + 2) / 3 : pixel;
++  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, source_pixel, 0).rgb * 255.0 + vec3(0.5)).bgr;
+   vec3 rgb = vec3(texelFetch(xe_apply_gamma_ramp, int(source.r)).b,
+                   texelFetch(xe_apply_gamma_ramp, int(source.g)).g,
+                   texelFetch(xe_apply_gamma_ramp, int(source.b)).r);
+@@ -762,6 +771,7 @@
+ 
+ const char* GetSwapApplyGammaPwlFxaaLumaComputeRbSwapSource() {
+   return R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
+ layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+ 
+ layout(push_constant) uniform XeApplyGammaRampConstants {
+@@ -783,11 +793,13 @@
+ 
+ void main() {
+   ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+-  if (any(greaterThanEqual(uvec2(pixel), xe_apply_gamma_size))) {
++  uvec2 size = uvec2(xe_apply_gamma_size.x & 0x7fffffffu, xe_apply_gamma_size.y);
++  if (any(greaterThanEqual(uvec2(pixel), size))) {
+     return;
+   }
+ 
+-  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, pixel, 0).rgb * 1023.0 + vec3(0.5)).bgr;
++  ivec2 source_pixel = (xe_apply_gamma_size.x >> 31u) != 0u ? (pixel * 4 + 2) / 3 : pixel;
++  uvec3 source = uvec3(texelFetch(xe_apply_gamma_source, source_pixel, 0).rgb * 1023.0 + vec3(0.5)).bgr;
+   vec3 rgb = vec3(ApplyPwl(source.r, 0u), ApplyPwl(source.g, 1u),
+                   ApplyPwl(source.b, 2u));
+   imageStore(xe_apply_gamma_dest, pixel, vec4(rgb, dot(rgb, kLumaWeights)));

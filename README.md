@@ -33,7 +33,9 @@ own disc. Its program contains code translated by machine from the game's execut
 
 ## Building from source
 
-For the 0.3.0 engine and macOS app, use the [versioned source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). The included README identifies the exact source revisions, launcher changes, decoder dependencies and commands. Regenerating the game's code requires the supported disc. The [contributor guide](CONTRIBUTING.md) describes the tooling in this repository.
+Browse the [0.3.0 source code](ports/v0.3.0/README.md), including the [Graphics menu](ports/v0.3.0/host/src/ui/graphics_page.cpp), [renderer](ports/v0.3.0/sdk/src/ui/vulkan/vulkan_presenter.cpp) and [Mac launcher](ports/v0.3.0/launcher/app/setup/Main.swift).
+
+For a full rebuild, use the [versioned source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.0/FM4-Recomp-0.3.0-source.tar.xz.sha256). The included README identifies the exact source revisions, launcher changes, decoder dependencies and commands. Regenerating the game's code requires the supported disc. The [contributor guide](CONTRIBUTING.md) describes the tooling in this repository.
 
 ## Contributing and security
 

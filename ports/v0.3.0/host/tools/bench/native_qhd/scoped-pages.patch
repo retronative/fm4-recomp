@@ -1,0 +1,431 @@
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -24,6 +24,8 @@
+ 
+ namespace rex::graphics {
+ 
++class DrawPageRanges;
++
+ // Manages memory for unconverted textures, resolve targets, vertex and index
+ // buffers that can be accessed from shaders with Xenon physical addresses, with
+ // system page size granularity.
+@@ -42,6 +44,11 @@
+   // Returns whether cached bindings may need to request their memory again.
+   // If consume is true, resets the latched change flag (e.g. for IssueDraw).
+   bool CheckUnprotectedGpuPages(bool consume = true);
++  bool CheckUnprotectedGpuPagesForRanges(const DrawPageRanges& ranges, bool consume = true);
++  bool HasUnprotectedGpuPagesToCheck() const {
++    return unprotected_gpu_pages_pending_.load(std::memory_order_acquire) ||
++           unprotected_gpu_pages_changed_.load(std::memory_order_acquire);
++  }
+ 
+   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
+                                       void* context, uint32_t address_first, uint32_t address_last,
+@@ -201,6 +208,7 @@
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
+ 
+  private:
++  bool CheckUnprotectedGpuPagesImpl(const DrawPageRanges* ranges, bool consume);
+   memory::Memory& memory_;
+ 
+   // Log2 of invalidation granularity (the system page size, but the dependency
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -17,6 +18,7 @@
+ #include <rex/bit.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/graphics/draw_page_ranges.h>
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+@@ -124,17 +126,50 @@
+ }
+ 
+ bool SharedMemory::CheckUnprotectedGpuPages(bool consume) {
+-  if (!unprotected_gpu_pages_pending_.load(std::memory_order_acquire) &&
+-      !unprotected_gpu_pages_changed_.load(std::memory_order_acquire)) {
++  return CheckUnprotectedGpuPagesImpl(nullptr, consume);
++}
++
++bool SharedMemory::CheckUnprotectedGpuPagesForRanges(const DrawPageRanges& ranges, bool consume) {
++  return CheckUnprotectedGpuPagesImpl(&ranges, consume);
++}
++
++bool SharedMemory::CheckUnprotectedGpuPagesImpl(const DrawPageRanges* ranges, bool consume) {
++  if (!HasUnprotectedGpuPagesToCheck()) {
+     return false;
+   }
+   auto global_lock = global_critical_region_.Acquire(kSharedMemoryLockSource);
++  // Optional validation evidence. Sampling is disabled during timing runs.
++  static const bool audit = [] {
++    const char* value = std::getenv("FM4_SHIFTGLUE_PAGE_AUDIT");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  if (audit) {
++    struct Counts { uint64_t calls = 0, samples = 0, scoped = 0, possible = 0, selected = 0; };
++    thread_local Counts totals;
++    if (!(totals.calls++ % 251)) {
++      ++totals.samples;
++      totals.scoped += ranges != nullptr;
++      for (const auto& item : unprotected_gpu_pages_) {
++        ++totals.possible;
++        totals.selected += !ranges || ranges->ContainsPage(item.first);
++      }
++      if (totals.samples == 1 || !(totals.samples % 512)) {
++        REXGPU_INFO("Draw page audit: samples={} scoped={} candidate_pages={} selected_pages={}",
++                    totals.samples, totals.scoped, totals.possible, totals.selected);
++      }
++    }
++  }
+   bool changed = false;
+   if (unprotected_gpu_pages_pending_.load(std::memory_order_relaxed)) {
+     for (auto it = unprotected_gpu_pages_.begin(); it != unprotected_gpu_pages_.end();) {
+       const uint32_t page = it->first;
+       const uint64_t bit = uint64_t(1) << (page & 63);
+       const bool gpu_valid = (system_page_flags_valid_and_gpu_written_[page >> 6] & bit) != 0;
++      // Keep other valid snapshots for the draw that actually depends on them.
++      if (gpu_valid && ranges && !ranges->ContainsPage(page)) {
++        ++it;
++        continue;
++      }
+       if (gpu_valid && std::memcmp(it->second.data(),
+                                   memory().TranslatePhysical(page << page_size_log2_),
+                                   it->second.size()) == 0) {
+--- /dev/null
++++ b/include/rex/graphics/draw_page_ranges.h
+@@ -0,0 +1,52 @@
++#pragma once
++
++#include <cstdint>
++
++namespace rex::graphics {
++
++// Guest physical byte ranges read by one draw. An unrepresentable range
++// makes the caller fall back to the exhaustive snapshot check for that draw.
++class DrawPageRanges {
++ public:
++  bool Add(uint32_t address, uint32_t length) {
++    if (!length) return true;
++    constexpr uint32_t kGuestBytes = 1u << 29;
++    if (address >= kGuestBytes || length > kGuestBytes - address) return false;
++    uint32_t first = address >> 12;
++    uint32_t last = (address + length - 1) >> 12;
++    for (uint32_t i = 0; i < count_; ++i) {
++      auto& range = ranges_[i];
++      if (first > range.last + 1 || last + 1 < range.first) continue;
++      if (first < range.first) range.first = first;
++      if (last > range.last) range.last = last;
++      MarkBuckets(first, last);
++      return true;
++    }
++    if (count_ == kCapacity) return false;
++    ranges_[count_++] = {first, last};
++    MarkBuckets(first, last);
++    return true;
++  }
++
++  bool ContainsPage(uint32_t page) const {
++    if (page >= (1u << 17) || !(buckets_ & (uint64_t(1) << (page >> 11)))) return false;
++    for (uint32_t i = 0; i < count_; ++i) {
++      if (page >= ranges_[i].first && page <= ranges_[i].last) return true;
++    }
++    return false;
++  }
++
++ private:
++  void MarkBuckets(uint32_t first, uint32_t last) {
++    // Reject pages outside the draw's 8 MiB regions with a single bit test.
++    buckets_ |= (~uint64_t(0) << (first >> 11)) & (~uint64_t(0) >> (63 - (last >> 11)));
++  }
++
++  struct PageInterval { uint32_t first, last; };
++  static constexpr uint32_t kCapacity = 96;
++  PageInterval ranges_[kCapacity];
++  uint64_t buckets_ = 0;
++  uint32_t count_ = 0;
++};
++
++}  // namespace rex::graphics
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -29,6 +29,8 @@
+ #include <rex/thread/mutex.h>
+ 
+ namespace rex::graphics {
++
++class DrawPageRanges;
+ 
+ // Manages host copies of guest textures, performing untiling, format and endian
+ // conversion of textures stored in the shared memory, and also handling
+@@ -144,6 +146,8 @@
+     return texture_became_outdated_.load(std::memory_order_relaxed);
+   }
+ 
++  // Returns false if the draw requires a full preserved-page scan.
++  bool AddDrawTexturePageRanges(uint32_t used_texture_mask, DrawPageRanges& ranges) const;
+   virtual void RequestTextures(uint32_t used_texture_mask);
+   void InspectActiveTextures(uint32_t mask, std::map<uint64_t, Fh1InspectionTexture>& out) const;
+ 
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/graphics/draw_page_ranges.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/texture/cache.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+@@ -790,6 +791,91 @@
+   return true;
+ }
+ 
++bool TextureCache::AddDrawTexturePageRanges(uint32_t used_texture_mask,
++                                            DrawPageRanges& ranges) const {
++  const auto& regs = register_file();
++  uint32_t slot;
++  while (rex::bit_scan_forward(used_texture_mask, &slot)) {
++    const uint32_t bit = UINT32_C(1) << slot;
++    used_texture_mask &= ~bit;
++    const auto& binding = texture_bindings_[slot];
++    const uint32_t* words = &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
++
++    const TextureKey* logical_key = nullptr;
++    const Texture* texture = nullptr;
++    const Texture* signed_texture = nullptr;
++    if (binding.fetch_words_valid &&
++        ((texture_bindings_in_sync_ & bit) ||
++         !std::memcmp(binding.fetch_words, words, sizeof(binding.fetch_words)))) {
++      logical_key = &binding.key;
++      texture = binding.texture;
++      signed_texture = binding.texture_signed;
++    } else {
++      const BindingMemo& memo = binding_memos_[BindingMemoSlot(words)];
++      if (memo.epoch == binding_memo_epoch_ &&
++          !std::memcmp(memo.fetch_words, words, sizeof(memo.fetch_words))) {
++        logical_key = &memo.key;
++        texture = memo.texture;
++        signed_texture = memo.texture_signed;
++      }
++    }
++
++    auto add_footprint = [&](const TextureKey& key, uint32_t base_bytes, uint32_t mip_bytes) {
++      return (base_bytes || mip_bytes) &&
++             (!base_bytes || (key.base_page && ranges.Add(key.base_page << 12, base_bytes))) &&
++             (!mip_bytes || (key.mip_page && ranges.Add(key.mip_page << 12, mip_bytes)));
++    };
++    if (logical_key) {
++      if (!logical_key->is_valid || (!texture && !signed_texture) ||
++          logical_key->dimension == xenos::DataDimension::k3D) {
++        return false;
++      }
++      for (const Texture* backing : {texture, signed_texture}) {
++        if (!backing) continue;
++        const TextureKey& key = backing->key();
++        // A mip rebased to satisfy a device limit has a different footprint.
++        if (key.base_page != logical_key->base_page || key.mip_page != logical_key->mip_page ||
++            !add_footprint(key, backing->GetGuestBaseSize(), backing->GetGuestMipsSize())) {
++          return false;
++        }
++      }
++      continue;
++    }
++
++    // A previously unseen fetch has no host object yet. Only derive the
++    // canonical guest layout for ordinary 2D/cube inputs. This bound keeps
++    // the layout's 32-bit extent arithmetic safe even for 16-byte texels.
++    const auto fetch = regs.GetTextureFetch(slot);
++    if (fetch.type != xenos::FetchConstantType::kTexture ||
++        (fetch.dimension != xenos::DataDimension::k2DOrStacked &&
++         fetch.dimension != xenos::DataDimension::kCube)) {
++      return false;
++    }
++    TextureKey key;
++    BindingInfoFromFetchConstant(fetch, key, nullptr);
++    if (!key.is_valid || !key.pitch || key.GetWidth() > 2048 || key.GetHeight() > 2048 ||
++        (key.pitch << 5) > 2048 || key.GetDepthOrArraySize() > 6) {
++      return false;
++    }
++    const uint32_t block_bytes = FormatInfo::Get(key.format)->bytes_per_block();
++    if (!block_bytes || block_bytes > 16 || (block_bytes & (block_bytes - 1))) {
++      return false;
++    }
++    // FindOrCreateTexture drops scaling before rebasing. If the unscaled
++    // extent fits, both possible owners and signs use this same guest layout.
++    const uint32_t max_size = GetMaxHostTextureWidthHeight(key.dimension);
++    if (key.GetWidth() > max_size || key.GetHeight() > max_size ||
++        key.GetDepthOrArraySize() > GetMaxHostTextureDepthOrArraySize(key.dimension)) {
++      return false;
++    }
++    const auto layout = key.GetGuestLayout();
++    if (!add_footprint(key, layout.base.level_data_extent_bytes, layout.mips_total_extent_bytes)) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+   const auto& regs = register_file();
+ 
+--- a/include/rex/graphics/pipeline/shader/spirv.h
++++ b/include/rex/graphics/pipeline/shader/spirv.h
+@@ -47,6 +47,12 @@
+     return texture_bindings_;
+   }
+   const uint32_t GetUsedTextureMaskAfterTranslation() const { return used_texture_mask_; }
++  // Translation may still be publishing the mask on another thread.
++  bool TryGetUsedTextureMask(uint32_t& mask) const {
++    if (!bindings_setup_complete_.load(std::memory_order_acquire)) return false;
++    mask = used_texture_mask_;
++    return true;
++  }
+ 
+   struct SamplerBinding {
+     uint32_t fetch_constant : 5;
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -42,6 +42,7 @@
+ #include <rex/graphics/d3d12/fh1_frame_census.h>
+ #endif
+ #include <rex/math.h>
++#include <rex/graphics/draw_page_ranges.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/fm4_reactive_mask.h>
+ #include <rex/graphics/fm4_scene_jitter.h>
+@@ -372,6 +373,62 @@
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
++
++bool ScopedDrawPagesEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("FM4_SHIFTGLUE_SCOPED_PAGES");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++bool CollectDrawPageRanges(const RegisterFile& regs, const VulkanShader* vertex_shader,
++                           const VulkanShader* pixel_shader, const VulkanTextureCache& textures,
++                           DrawPageRanges& ranges) {
++  const auto edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
++  if (!vertex_shader ||
++      (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly)) {
++    return false;
++  }
++  if (edram_mode == xenos::EdramMode::kDepthOnly) pixel_shader = nullptr;
++
++  uint32_t texture_mask = 0;
++  for (const VulkanShader* shader : {vertex_shader, pixel_shader}) {
++    if (!shader) continue;
++    uint32_t stage_mask;
++    if (!shader->TryGetUsedTextureMask(stage_mask) || !shader->is_ucode_analyzed() ||
++        shader->memexport_eM_written()) {
++      return false;
++    }
++    texture_mask |= stage_mask;
++    const auto& fetch_bits = shader->constant_register_map().vertex_fetch_bitmap;
++    for (uint32_t word = 0; word < rex::countof(fetch_bits); ++word) {
++      uint32_t bits = fetch_bits[word];
++      uint32_t bit;
++      while (rex::bit_scan_forward(bits, &bit)) {
++        bits &= bits - 1;
++        const auto fetch = regs.GetVertexFetch(word * 32 + bit);
++        if (fetch.type != xenos::FetchConstantType::kVertex ||
++            !ranges.Add(uint32_t(fetch.address) << 2, uint32_t(fetch.size) << 2)) {
++          return false;
++        }
++      }
++    }
++  }
++
++  // Match PrimitiveProcessor::Process before it consults converted indices.
++  const auto draw = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  if (draw.source_select == xenos::SourceSelect::kDMA) {
++    const uint32_t stride = draw.index_size == xenos::IndexFormat::kInt16 ? 2 : 4;
++    const uint32_t count =
++        std::min<uint32_t>(draw.num_indices, regs.Get<reg::VGT_DMA_SIZE>().num_words);
++    const uint32_t base = regs[XE_GPU_REG_VGT_DMA_BASE] & ~(stride - 1);
++    if (!ranges.Add(base, count * stride)) return false;
++  } else if (draw.source_select != xenos::SourceSelect::kAutoIndex) {
++    return false;
++  }
++  return textures.AddDrawTexturePageRanges(texture_mask, ranges);
++}
+ 
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+@@ -4044,6 +4101,11 @@
+ 
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
++  // A previously unbound texture may become the presentation source. Leave
++  // the changed flag for the next draw to invalidate its residency caches.
++  if (ScopedDrawPagesEnabled() && REXCVAR_GET(unprotected_page_check_interval) == 1) {
++    shared_memory_->CheckUnprotectedGpuPages(false);
++  }
+   DrawCostFrame();
+   DrawProgramFrame();
+   IssueSwapImpl(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+@@ -5761,6 +5823,9 @@
+       *this, *register_file_, *memory_, *shared_memory_,
+       [this](uint32_t address, uint32_t length, std::vector<uint8_t>& out) {
+         // The swap closed the frame's submission; the readback needs its own.
++        if (ScopedDrawPagesEnabled() && REXCVAR_GET(unprotected_page_check_interval) == 1) {
++          shared_memory_->CheckUnprotectedGpuPages(false);
++        }
+         if ((!submission_open_ && !BeginSubmission(false)) ||
+             !shared_memory_->RequestRange(address, length)) {
+           return false;
+@@ -6216,6 +6281,9 @@
+   }();
+   if (std::get<0>(dump_range) != UINT32_MAX && fh1_native_executor_ &&
+       debug_frame_draw_index_ == std::get<0>(dump_range) + 1) {
++    if (ScopedDrawPagesEnabled() && REXCVAR_GET(unprotected_page_check_interval) == 1) {
++      shared_memory_->CheckUnprotectedGpuPages(false);
++    }
+     fh1_native_executor_->DumpResolveOutput(std::get<1>(dump_range), std::get<2>(dump_range));
+     texture_cache_->DebugDumpTextures(
+         std::get<1>(dump_range),
+@@ -6229,10 +6297,28 @@
+       program_timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+   // Texture request memos and vertex residency bits must observe CPU writes
+   // hidden by a larger host page before deciding that a binding is unchanged.
+-  if (++unprotected_page_check_counter_ >=
+-      uint32_t(REXCVAR_GET(unprotected_page_check_interval))) {
++  const uint32_t check_interval = uint32_t(REXCVAR_GET(unprotected_page_check_interval));
++  if (++unprotected_page_check_counter_ >= check_interval) {
+     unprotected_page_check_counter_ = 0;
+-    if (shared_memory_->CheckUnprotectedGpuPages()) {
++    if (check_interval == 1 && ScopedDrawPagesEnabled()) {
++      if (shared_memory_->HasUnprotectedGpuPagesToCheck()) {
++        DrawPageRanges ranges;
++        const bool scoped =
++            !draw_program_ && !frame_dump_ &&
++            !(fh1_native_executor_ && fh1_native_executor_->inspection_active()) &&
++            CollectDrawPageRanges(*register_file_, static_cast<VulkanShader*>(active_vertex_shader()),
++                                  static_cast<VulkanShader*>(active_pixel_shader()), *texture_cache_,
++                                  ranges);
++        const bool changed = scoped ? shared_memory_->CheckUnprotectedGpuPagesForRanges(ranges)
++                                    : shared_memory_->CheckUnprotectedGpuPages();
++        if (changed) {
++          InvalidateAllVertexBufferResidency();
++          // Converted index buffers have their own CPU-write watch. A write
++          // detected by comparing an unprotected page bypassed that watch.
++          primitive_processor_->MemoryInvalidationCallback(0, SharedMemory::kBufferSize, true);
++        }
++      }
++    } else if (shared_memory_->CheckUnprotectedGpuPages()) {
+       InvalidateAllVertexBufferResidency();
+     }
+   }

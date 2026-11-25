@@ -1,0 +1,890 @@
+// UP-1.3: the camera and depth a temporal upscaler needs, taken from the
+// title's own draws. FH1's scene vertex shaders read one world-view-projection
+// matrix per object from float constants c128-c131 (a row each: clip x, y, z
+// and w). The static world shares one matrix across hundreds of draws, so the
+// largest group of draws with equal matrices is the world, and matching its
+// objects with the previous frame's gives the camera's motion: for geometry
+// that did not move, WVP_prev * WVP_cur^-1 = VP_prev * VP_cur^-1. The same
+// matrix gives the lens: the y row's length is 1 / tan(fov_y / 2), and the z
+// and w rows give the near and far planes.
+
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <rex/graphics/fm4_camera_cut.h>
+#include <rex/graphics/fm4_decal_motion.h>
+#include <rex/graphics/fm4_reactive_mask.h>
+#include <rex/graphics/fm4_scene_jitter.h>
+#include <rex/graphics/fm4_shadow_motion.h>
+#include <rex/graphics/fm4_wheel_motion.h>
+#include <rex/graphics/vulkan/command_processor.h>
+#include <rex/graphics/vulkan/fh1_native_executor.h>
+#include <rex/logging.h>
+#include <rex/ui/vulkan/util.h>
+
+namespace rex::graphics::vulkan {
+
+namespace {
+
+// The registers of the world-view-projection rows.
+constexpr uint32_t kCameraFirstRegister = 128;
+// UP-1.7: the first register of a car's own world-view-projection.
+constexpr uint32_t kObjectFirstRegister = 0;
+// Fewer draws in the largest group: no recognisable world (menus, loads).
+constexpr size_t kCameraMinWorldDraws = 16;
+
+const char* const kCameraDepthSource = R"(#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(push_constant) uniform CameraDepthConstants {
+  uvec2 size;
+  // Host depth to guest z: float24 depth is kept halved.
+  float scale;
+  // The band's first row in the destination.
+  uint dest_row;
+} c;
+#if MULTISAMPLED
+layout(set = 0, binding = 0) uniform texture2DMS depth;
+#else
+layout(set = 0, binding = 0) uniform texture2D depth;
+#endif
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D dest;
+void main() {
+  uvec2 pixel = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(pixel, c.size))) {
+    return;
+  }
+#if MULTISAMPLED
+  // The samples' mean: the standard sample locations centre on the pixel, so over one
+  // surface it is the depth at the pixel's centre, which the colour resolve and the object
+  // slots (gl_FragCoord.z) hold. Sample 0 lies off the centre, and on a sloped surface it
+  // never matched a slot's depth: with the game's MSAA most pixels lost their object's motion.
+  float z = 0.0;
+  int samples = textureSamples(depth);
+  for (int i = 0; i < samples; ++i) {
+    z += texelFetch(depth, ivec2(pixel), i).r;
+  }
+  z *= c.scale / float(samples);
+#else
+  float z = texelFetch(depth, ivec2(pixel), 0).r * c.scale;
+#endif
+  imageStore(dest, ivec2(pixel.x, pixel.y + c.dest_row), vec4(z, 0.0, 0.0, 0.0));
+}
+)";
+
+using Matrix = std::array<double, 16>;
+
+Matrix ToMatrix(const std::array<float, 16>& m) {
+  Matrix out;
+  for (size_t i = 0; i < 16; ++i) out[i] = m[i];
+  return out;
+}
+
+Matrix Multiply(const Matrix& a, const Matrix& b) {
+  Matrix out = {};
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      double sum = 0.0;
+      for (int k = 0; k < 4; ++k) sum += a[r * 4 + k] * b[k * 4 + c];
+      out[r * 4 + c] = sum;
+    }
+  }
+  return out;
+}
+
+// Gauss-Jordan with partial pivoting; false when singular.
+bool Invert(const Matrix& m, Matrix& out) {
+  double a[4][8];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      a[r][c] = m[r * 4 + c];
+      a[r][c + 4] = r == c ? 1.0 : 0.0;
+    }
+  }
+  for (int col = 0; col < 4; ++col) {
+    int pivot = col;
+    for (int r = col + 1; r < 4; ++r) {
+      if (std::abs(a[r][col]) > std::abs(a[pivot][col])) pivot = r;
+    }
+    if (std::abs(a[pivot][col]) < 1e-12) return false;
+    if (pivot != col) {
+      for (int c = 0; c < 8; ++c) std::swap(a[pivot][c], a[col][c]);
+    }
+    const double inv = 1.0 / a[col][col];
+    for (int c = 0; c < 8; ++c) a[col][c] *= inv;
+    for (int r = 0; r < 4; ++r) {
+      if (r == col) continue;
+      const double f = a[r][col];
+      if (f == 0.0) continue;
+      for (int c = 0; c < 8; ++c) a[r][c] -= f * a[col][c];
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) out[r * 4 + c] = a[r][c + 4];
+  }
+  return true;
+}
+
+// The radical inverse of index in base, in [0, 1).
+float Halton(uint32_t index, uint32_t base) {
+  float result = 0.0f;
+  float fraction = 1.0f;
+  while (index) {
+    fraction /= float(base);
+    result += fraction * float(index % base);
+    index /= base;
+  }
+  return result;
+}
+
+double RowLength(const std::array<float, 16>& m, int row) {
+  return std::sqrt(double(m[row * 4]) * m[row * 4] + double(m[row * 4 + 1]) * m[row * 4 + 1] +
+                   double(m[row * 4 + 2]) * m[row * 4 + 2]);
+}
+
+struct MatrixHash {
+  size_t operator()(const std::array<float, 16>& m) const {
+    uint64_t h = 1469598103934665603ull;
+    for (float f : m) {
+      // -0 equals 0.
+      const uint32_t bits = f == 0.0f ? 0u : std::bit_cast<uint32_t>(f);
+      h ^= bits;
+      h *= 1099511628211ull;
+    }
+    return size_t(h);
+  }
+};
+
+}  // namespace
+
+void Fh1NativeExecutor::NoteCameraDraw(const Fh1DrawInfo& draw) {
+  draw_jittered_ = false;
+  current_object_slot_ = 0;
+  current_decal_ = false;
+  if (!camera_tracking_enabled_ || !initialized_ || !draw.vertex_shader || !draw.rasterization_done ||
+      draw.memexport) {
+    return;
+  }
+  if (IsSceneEdramTexture()) return;
+  const Shader::ConstantRegisterMap& map = draw.vertex_shader->constant_register_map();
+  draw_jittered_ =
+      camera_scene_depth_valid_ &&
+      Fm4JitterSceneDraw(Fm4JitterPlacement(map.float_bitmap),
+                         draw.normalized_depth_control.z_enable &&
+                             CurrentDepthKey() == camera_scene_depth_,
+                         (draw.normalized_color_mask & 0xF) &&
+                             Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
+  const bool mirror = mirror_composite_enabled_ && draw.pixel_shader &&
+                      SamplesMirror(*draw.pixel_shader);
+  if (DrawObjectMatrixRegister(*draw.vertex_shader) != kCameraFirstRegister) {
+    // UP-1.7: a car, with its own matrix in c0-c3.
+    if (!object_motion_enabled_ ||
+        DrawObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
+      return;
+    }
+    std::array<float, 16> registers;
+    std::memcpy(registers.data(),
+                &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                       kObjectFirstRegister * 4],
+                sizeof(registers));
+    const std::array<float, 16> wvp = Fm4ObjectMatrix(registers);
+    const bool reads_world = Fm4ReadsWorldMatrix(std::to_array(map.float_bitmap));
+    if (SceneObjectMatrixRegister(*draw.vertex_shader) != kObjectFirstRegister) {
+      if (shadow_motion_enabled_ &&
+          Fm4CarShadowMapDraw(wvp, register_file_.Get<reg::RB_COLOR_INFO>().color_format)) {
+        shadow_map_meshes_.insert(DrawVertexBuffer(draw));
+      }
+      if (decal_motion_enabled_ && reads_world && camera_scene_depth_valid_ &&
+          Fm4ShadowDecalDraw(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL],
+                             register_file_.values[XE_GPU_REG_RB_BLENDCONTROL0],
+                             draw.normalized_color_mask,
+                             Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_))) {
+        const auto part = object_slot_by_world_.find(WorldMatrixKey());
+        if (part != object_slot_by_world_.end() && part->second) {
+          // Without the depth test the host keeps float24 depth unhalved (draw_util).
+          const bool full_float24 =
+              !draw.normalized_depth_control.z_enable &&
+              register_file_.Get<reg::RB_DEPTH_INFO>().depth_format ==
+                  xenos::DepthRenderTargetFormat::kD24FS8;
+          current_object_slot_ = part->second | (full_float24 ? kObjectSlotHalveDepth : 0);
+          current_decal_ = true;
+        }
+      }
+      return;
+    }
+    std::optional<std::array<float, 16>> world;
+    if (reads_world) {
+      std::array<float, 16> world_registers;
+      std::memcpy(world_registers.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 8 * 4],
+                  sizeof(world_registers));
+      world = Fm4ObjectMatrix(world_registers);
+    }
+    current_object_slot_ = AssignObjectSlot(DrawObjectKey(draw), wvp, world);
+    if (decal_motion_enabled_ && reads_world && current_object_slot_) {
+      object_slot_by_world_.emplace(WorldMatrixKey(), current_object_slot_);
+    }
+    if (shadow_motion_enabled_) {
+      shadow_scene_slots_[DrawVertexBuffer(draw)].push_back(current_object_slot_);
+    }
+    if (mirror) current_object_slot_ = MirrorSlot(current_object_slot_);
+    return;
+  }
+  if (!draw.normalized_depth_control.z_enable) return;
+  CameraDraw& noted = camera_draws_.emplace_back();
+  std::memcpy(noted.wvp.data(),
+              &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + kCameraFirstRegister * 4],
+              sizeof(noted.wvp));
+  noted.object = DrawObjectKey(draw);
+  noted.depth_key = CurrentDepthKey();
+  noted.color_key = CurrentColorKey();
+  if (noted.depth_key == camera_scene_depth_) camera_depth_dirty_ = true;
+  if (object_motion_enabled_ && IsSceneObjectDraw(*draw.vertex_shader)) {
+    // Still a camera draw for the scene's depth and colour: the showroom's camera draws hold
+    // no matrix in c128-c131 either.
+    if (Fm4PlacedByObjectMatrix(std::to_array(map.float_bitmap), noted.wvp)) {
+      std::array<float, 16> registers;
+      std::memcpy(registers.data(),
+                  &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X +
+                                         kObjectFirstRegister * 4],
+                  sizeof(registers));
+      current_object_slot_ =
+          AssignObjectSlot(noted.object, Fm4ObjectMatrix(registers), std::nullopt);
+    } else {
+      current_object_slot_ = AssignObjectSlot(noted.object, noted.wvp, std::nullopt);
+    }
+    if (mirror) current_object_slot_ = MirrorSlot(current_object_slot_);
+  }
+}
+
+bool Fh1NativeExecutor::SamplesMirror(const Shader& pixel_shader) const {
+  if (!mirror_texture_base_) return false;
+  const std::vector<Shader::TextureBinding>& bindings = pixel_shader.texture_bindings();
+  return std::any_of(bindings.begin(), bindings.end(),
+                     [this](const Shader::TextureBinding& binding) {
+                       return register_file_.GetTextureFetch(binding.fetch_constant).base_address
+                                  << 12 ==
+                              mirror_texture_base_;
+                     });
+}
+
+uint32_t Fh1NativeExecutor::MirrorSlot(uint32_t slot) {
+  // One a frame, not shared with the objects that move as the glass does. Without a previous
+  // match the glass stays still: the swap pass puts the frame back over it anyway.
+  if (!mirror_slot_) {
+    if (object_reprojections_.size() >= kMaxObjectSlots) {
+      Count("object_slots_full");
+      return slot;
+    }
+    if (object_reprojections_.empty()) object_reprojections_.emplace_back();
+    const std::array<float, 16> reprojection =
+        slot ? object_reprojections_[slot]
+             : std::array<float, 16>{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    object_reprojections_.push_back(reprojection);
+    mirror_slot_ = uint32_t(object_reprojections_.size() - 1);
+  }
+  // The frame put back must not shake by the jitter.
+  draw_jittered_ = false;
+  Count("mirror_draw");
+  return mirror_slot_;
+}
+
+uint64_t Fh1NativeExecutor::WorldMatrixKey() const {
+  std::array<float, 16> world;
+  std::memcpy(world.data(), &register_file_.values[XE_GPU_REG_SHADER_CONSTANT_000_X + 8 * 4],
+              sizeof(world));
+  return MatrixHash()(world);
+}
+
+uint64_t Fh1NativeExecutor::DrawObjectKey(const Fh1DrawInfo& draw) const {
+  // The object: the shader and its first vertex buffer.
+  uint64_t object = draw.vertex_shader->ucode_data_hash();
+  const auto& bindings = draw.vertex_shader->vertex_bindings();
+  if (!bindings.empty()) {
+    const xenos::xe_gpu_vertex_fetch_t fetch =
+        register_file_.GetVertexFetch(bindings.front().fetch_constant);
+    object ^= (uint64_t(fetch.address) << 2) * 0x9E3779B97F4A7C15ull;
+  }
+  return object;
+}
+
+uint32_t Fh1NativeExecutor::DrawVertexBuffer(const Fh1DrawInfo& draw) const {
+  // The car's shadow map pass draws its meshes with shaders of its own, from the same vertex
+  // buffers.
+  const auto& bindings = draw.vertex_shader->vertex_bindings();
+  return bindings.empty()
+             ? 0
+             : register_file_.GetVertexFetch(bindings.front().fetch_constant).address;
+}
+
+uint32_t Fh1NativeExecutor::TakeShadowSlot() {
+  const uint32_t slot = Fm4ShadowSlot(shadow_map_meshes_, shadow_scene_slots_);
+  if ((frame_ % 600) == 0 && shadow_motion_enabled_) {
+    REXGPU_INFO("FH1 camera: ground shadow in slot {} of {} shadow map meshes", slot,
+                shadow_map_meshes_.size());
+  }
+  shadow_map_meshes_.clear();
+  shadow_scene_slots_.clear();
+  return slot;
+}
+
+uint32_t Fh1NativeExecutor::AssignObjectSlot(uint64_t object, const std::array<float, 16>& wvp,
+                                             const std::optional<std::array<float, 16>>& world) {
+  // One mesh drawn several times a frame (a car's four wheels, or each
+  // predicated tile's band) is told apart by its order among the draws of
+  // that mesh, which a frame repeats.
+  const uint64_t key = object ^ (uint64_t(object_occurrences_[object]++) + 1) *
+                                    0xC2B2AE3D27D4EB4Full;
+  object_current_wvp_.emplace(key, wvp);
+  if (world) object_current_world_.emplace(key, *world);
+  uint32_t slot = 0;
+  // Objects new this frame keep the camera's motion (slot 0).
+  auto previous = object_previous_wvp_.find(key);
+  Matrix current_inverse;
+  if (previous != object_previous_wvp_.end() && Invert(ToMatrix(wvp), current_inverse)) {
+    Matrix previous_wvp = ToMatrix(previous->second);
+    const auto previous_world = object_previous_world_.find(key);
+    if (spin_free_wheels_ && world && previous_world != object_previous_world_.end()) {
+      if (const std::optional<Matrix> spin_free =
+              Fm4SpinFreePreviousWvp(previous->second, previous_world->second, *world)) {
+        previous_wvp = *spin_free;
+      }
+    }
+    const Matrix reprojection = Multiply(previous_wvp, current_inverse);
+    std::array<float, 16> matrix;
+    for (size_t i = 0; i < 16; ++i) matrix[i] = float(reprojection[i]);
+    // Objects that move with the world (most props and the world's own
+    // pieces) reproject as the camera does up to rounding: one slot for all,
+    // at 1/4096 of clip space (under 0.1 pixel at 1280x720).
+    uint64_t hash = 1469598103934665603ull;
+    for (double element : reprojection) {
+      hash ^= uint64_t(std::llround(element * 4096.0));
+      hash *= 1099511628211ull;
+    }
+    auto same = object_slot_by_matrix_.find(hash);
+    if (same != object_slot_by_matrix_.end()) {
+      slot = same->second;
+    } else {
+      if (object_reprojections_.empty()) object_reprojections_.emplace_back();
+      if (object_reprojections_.size() < kMaxObjectSlots) {
+        slot = uint32_t(object_reprojections_.size());
+        object_reprojections_.push_back(matrix);
+        object_slot_by_matrix_.emplace(hash, slot);
+      } else {
+        Count("object_slots_full");
+      }
+    }
+  }
+  if (object_slot_draws_.size() <= slot) {
+    object_slot_draws_.resize(slot + 1);
+    object_slot_turned_votes_.resize(slot + 1);
+  }
+  ++object_slot_draws_[slot];
+  if (const std::optional<bool> turned = Fm4SceneTurned(wvp)) {
+    ++object_slot_turned_votes_[slot][*turned ? 0 : 1];
+  }
+  return slot;
+}
+
+bool Fh1NativeExecutor::IsSceneObjectDraw(const Shader& vertex_shader) const {
+  return object_motion_enabled_ && SceneObjectMatrixRegister(vertex_shader) != UINT32_MAX;
+}
+
+bool Fh1NativeExecutor::IsSceneReactiveDraw() const {
+  if (!reactive_mask_enabled_ || !object_motion_enabled_ || !camera_tracking_enabled_ ||
+      !camera_scene_depth_valid_) {
+    return false;
+  }
+  return Fm4ReactiveSceneDraw(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL],
+                              register_file_.values[XE_GPU_REG_RB_BLENDCONTROL0],
+                              register_file_.values[XE_GPU_REG_RB_COLOR_MASK],
+                              CurrentDepthKey() == camera_scene_depth_,
+                              Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_));
+}
+
+bool Fh1NativeExecutor::IsSceneShadowedDraw(const Shader& pixel_shader) const {
+  constexpr uint32_t kZEnable = 1u << 1;
+  if ((!reactive_shadows_enabled_ && !shadow_motion_enabled_) || !object_motion_enabled_ ||
+      !camera_tracking_enabled_ || !camera_scene_depth_valid_ ||
+      !(register_file_.values[XE_GPU_REG_RB_DEPTHCONTROL] & kZEnable) ||
+      CurrentDepthKey() != camera_scene_depth_ ||
+      !Fm4SameColorSurface(CurrentColorKey(), camera_scene_color_)) {
+    return false;
+  }
+  const std::vector<Shader::TextureBinding>& bindings = pixel_shader.texture_bindings();
+  return std::any_of(bindings.begin(), bindings.end(),
+                     [](const Shader::TextureBinding& binding) {
+                       return binding.fetch_constant == kFm4GroundShadowFetchConstant;
+                     }) &&
+         Fm4GroundShadowMap(register_file_.GetTextureFetch(kFm4GroundShadowFetchConstant));
+}
+
+uint32_t Fh1NativeExecutor::SceneObjectMatrixRegister(const Shader& vertex_shader) const {
+  if (!camera_tracking_enabled_ || !camera_scene_depth_valid_) return UINT32_MAX;
+  const uint32_t matrix_register = DrawObjectMatrixRegister(vertex_shader);
+  if (matrix_register == UINT32_MAX) return UINT32_MAX;
+  // Only draws that write the scene's depth: what the swap pass compares the
+  // slot's depth with. Transparency without depth writes keeps what is
+  // behind it.
+  const auto depth_control = register_file_.Get<reg::RB_DEPTHCONTROL>();
+  if (!depth_control.z_enable || !depth_control.z_write_enable ||
+      CurrentDepthKey() != camera_scene_depth_ || IsSceneEdramTexture()) {
+    return UINT32_MAX;
+  }
+  return matrix_register;
+}
+
+bool Fh1NativeExecutor::IsSceneEdramTexture() const {
+  return camera_scene_depth_valid_ &&
+         Fm4SceneEdramTexture(CurrentColorKey(), register_file_.values[XE_GPU_REG_RB_COLOR_MASK],
+                              camera_scene_color_);
+}
+
+uint32_t Fh1NativeExecutor::DrawObjectMatrixRegister(const Shader& vertex_shader) const {
+  // The world's draws read the camera's world-view-projection at c128-c131;
+  // cars (body, wheels, interior: 60-odd vertex shaders a frame on the
+  // Fujimi drive) read their own at c0-c3 instead.
+  const Shader::ConstantRegisterMap& map = vertex_shader.constant_register_map();
+  return Fm4MatrixRegister(std::to_array(map.float_bitmap), map.float_dynamic_addressing);
+}
+
+uint32_t Fh1NativeExecutor::CurrentDepthKey() const {
+  const auto depth_info = register_file_.Get<reg::RB_DEPTH_INFO>();
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  const uint32_t msaa = uint32_t(surface_info.msaa_samples);
+  return MakeDepthKey(depth_info.depth_base, Fh1PitchTiles(surface_info.surface_pitch, msaa), msaa,
+                      depth_info.depth_format)
+      .Pack();
+}
+
+int32_t Fh1NativeExecutor::ObjectRowOffset() const {
+  if (untile_height_) return 0;
+  return RasterEdge(std::max(0, -int32_t(register_file_.Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset)));
+}
+
+uint64_t Fh1NativeExecutor::CurrentColorKey() const {
+  const auto color_info = register_file_.Get<reg::RB_COLOR_INFO>();
+  const auto surface_info = register_file_.Get<reg::RB_SURFACE_INFO>();
+  return uint64_t(color_info.color_base) | uint64_t(surface_info.surface_pitch) << 16 |
+         uint64_t(surface_info.msaa_samples) << 32 | uint64_t(color_info.color_format) << 40;
+}
+
+void Fh1NativeExecutor::AdvanceJitter() {
+  // A scene drawn turned 180 degrees is turned back by the post pass, so a
+  // surface offset moves the picture the other way on the screen. In the
+  // upscalers' convention the frame's jitter is then (-x, -y): of the four
+  // signs it is the one that came closest to a native 3x render of a still
+  // scene (PSNR, FSR 3.1.4 at 3x). FM4's showroom draws it upright, where
+  // (-x, -y) made DLSS shake a still frame by 2.4 levels of luma a frame and
+  // (x, y) by 0.5.
+  const float sign = scene_turned_ ? -1.0f : 1.0f;
+  camera_ready_.jitter_x = sign * jitter_x_;
+  camera_ready_.jitter_y = sign * jitter_y_;
+  if (jitter_phases_) {
+    jitter_index_ = (jitter_index_ + 1) % jitter_phases_;
+    jitter_x_ = Halton(jitter_index_ + 1, 2) - 0.5f;
+    jitter_y_ = Halton(jitter_index_ + 1, 3) - 0.5f;
+  } else {
+    jitter_x_ = 0.0f;
+    jitter_y_ = 0.0f;
+  }
+}
+
+bool Fh1NativeExecutor::GetSceneJitter(float& x, float& y) const {
+  // Only draws placed by a matrix (Fm4JitterSceneDraw): a screen-space pass
+  // in the scene (a quad ending at the screen edge) would leave a strip of
+  // the edge unwritten when moved, which showed as flickering stale colours.
+  if (!jitter_phases_ || !draw_jittered_) return false;
+  x = jitter_x_;
+  y = jitter_y_;
+  return true;
+}
+
+void Fh1NativeExecutor::FinishCameraFrame() {
+  camera_ready_valid_ = false;
+  camera_depth_dirty_ = false;
+  std::vector<std::array<float, 16>> object_reprojections = std::move(object_reprojections_);
+  object_reprojections_.clear();
+  std::vector<uint32_t> object_slot_draws = std::move(object_slot_draws_);
+  object_slot_draws_.clear();
+  std::vector<std::array<uint32_t, 2>> object_slot_turned_votes =
+      std::move(object_slot_turned_votes_);
+  object_slot_turned_votes_.clear();
+  object_slot_by_matrix_.clear();
+  object_slot_by_world_.clear();
+  object_occurrences_.clear();
+  object_previous_wvp_ = std::move(object_current_wvp_);
+  object_current_wvp_.clear();
+  object_previous_world_ = std::move(object_current_world_);
+  object_current_world_.clear();
+  object_reprojections_ready_.clear();
+  object_shadow_slot_ready_ = 0;
+  object_mirror_slot_ready_ = 0;
+  const uint32_t mirror_slot = mirror_slot_;
+  mirror_slot_ = 0;
+  const uint32_t shadow_slot = TakeShadowSlot();
+  if (!camera_tracking_enabled_ || camera_draws_.empty()) {
+    camera_scene_depth_valid_ = false;
+    camera_draws_.clear();
+    camera_previous_objects_.clear();
+    return;
+  }
+  std::unordered_map<uint32_t, size_t> depth_counts;
+  for (const CameraDraw& noted : camera_draws_) ++depth_counts[noted.depth_key];
+  std::vector<Fm4DepthCandidate> depth_candidates;
+  for (const auto& [key, count] : depth_counts) {
+    const Surface* surface = FindSurface(key);
+    depth_candidates.push_back({key, surface ? surface->width : 0u, count});
+  }
+  const uint32_t scene_depth = Fm4SceneDepth(depth_candidates);
+  // The next frame's bands copy it (shadow and reflection depths come
+  // first in a frame, so a running count would pick them).
+  camera_scene_depth_ = scene_depth;
+  camera_scene_depth_valid_ = true;
+  std::unordered_map<uint64_t, size_t> color_counts;
+  for (const CameraDraw& noted : camera_draws_) {
+    if (noted.depth_key == scene_depth) ++color_counts[noted.color_key];
+  }
+  camera_scene_color_ =
+      std::max_element(color_counts.begin(), color_counts.end(),
+                       [](const auto& a, const auto& b) { return a.second < b.second; })
+          ->first;
+  // The world: the largest group of scene draws sharing one matrix.
+  std::unordered_map<std::array<float, 16>, size_t, MatrixHash> groups;
+  std::unordered_map<uint64_t, std::array<float, 16>> objects;
+  std::unordered_map<uint64_t, bool> ambiguous;
+  for (const CameraDraw& noted : camera_draws_) {
+    if (noted.depth_key != scene_depth) continue;
+    ++groups[noted.wvp];
+    auto [it, inserted] = objects.emplace(noted.object, noted.wvp);
+    // An object drawn with two matrices (instances) cannot be matched.
+    if (!inserted && it->second != noted.wvp) ambiguous[noted.object] = true;
+  }
+  camera_draws_.clear();
+  for (const auto& [object, unused] : ambiguous) objects.erase(object);
+  const auto world =
+      std::max_element(groups.begin(), groups.end(),
+                       [](const auto& a, const auto& b) { return a.second < b.second; });
+  const bool world_found = world != groups.end() && world->second >= kCameraMinWorldDraws;
+  // Without a world group the camera can still be the objects' (the showroom
+  // without MSAA draws its 12 c128 draws, no projection, once instead of once
+  // per tile).
+  const uint32_t object_slot =
+      Fm4CameraObjectSlot(object_slot_draws, uint32_t(kCameraMinWorldDraws));
+  if (!world_found && !object_slot) {
+    camera_previous_objects_.clear();
+    return;
+  }
+  static const std::array<float, 16> kNoWorld = {};
+  const std::array<float, 16>& current = world_found ? world->first : kNoWorld;
+
+  // The lens, from the world's matrix (its world transform has unit scale).
+  Camera camera = {};
+  const double y_scale = RowLength(current, 1);
+  const double z_length = RowLength(current, 2);
+  const double w_length = RowLength(current, 3);
+  const double k = w_length > 0.0 ? z_length / w_length : 0.0;
+  const double near_plane =
+      k > 0.0 ? (k * current[15] / w_length - current[11] / w_length) / k : 0.0;
+  Matrix current_inverse;
+  const bool projection = world_found && y_scale > 0.0 && near_plane > 0.0 &&
+                          Invert(ToMatrix(current), current_inverse);
+  if (projection) {
+    lens_fov_y_ = float(2.0 * std::atan(1.0 / y_scale));
+    lens_near_ = float(near_plane);
+    lens_far_ = k > 1.0 ? float(k * near_plane / (k - 1.0)) : 0.0f;
+  }
+  camera.fov_y = lens_fov_y_;
+  camera.near_plane = lens_near_;
+  camera.far_plane = lens_far_;
+
+  // The previous frame's matrix for the same objects.
+  std::unordered_map<std::array<float, 16>, size_t, MatrixHash> previous_matches;
+  size_t matched = 0;
+  for (const auto& [object, wvp] : objects) {
+    if (!world_found || wvp != current) continue;
+    auto previous = camera_previous_objects_.find(object);
+    if (previous == camera_previous_objects_.end()) continue;
+    ++previous_matches[previous->second];
+    ++matched;
+  }
+  camera.cut = true;
+  Matrix reprojection = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  std::optional<Matrix> candidate;
+  if (projection) {
+    if (!previous_matches.empty()) {
+      const auto previous =
+          std::max_element(previous_matches.begin(), previous_matches.end(),
+                           [](const auto& a, const auto& b) { return a.second < b.second; });
+      if (previous->second >= kCameraMinWorldDraws / 2 && previous->second * 2 >= matched) {
+        candidate = Multiply(ToMatrix(previous->first), current_inverse);
+      }
+    }
+  } else if (object_slot) {
+    candidate = ToMatrix(object_reprojections[object_slot]);
+  }
+  // Which way up the scene is drawn: the world's matrix, or most of the
+  // camera slot's draws (a wheel turned on its axle says otherwise).
+  std::optional<bool> turned;
+  if (projection) {
+    turned = Fm4SceneTurned(current);
+  } else if (object_slot && object_slot < object_slot_turned_votes.size()) {
+    const auto [turned_votes, upright_votes] = object_slot_turned_votes[object_slot];
+    if (turned_votes > 2 * upright_votes) turned = true;
+    if (upright_votes > 2 * turned_votes) turned = false;
+  }
+  if (turned) scene_turned_ = *turned;
+  camera.turned = scene_turned_;
+  // A jump of the view between frames is a cut even when the world carries
+  // over.
+  if (candidate && Fm4ReprojectedScreenShift(*candidate, camera.near_plane, camera.far_plane) <
+                       kFm4CameraCutScreenShift) {
+    reprojection = *candidate;
+    camera.cut = false;
+  }
+  for (size_t i = 0; i < 16; ++i) camera.reprojection[i] = float(reprojection[i]);
+  if (camera.cut) Count("camera_cut");
+  Count("camera_frame");
+  if ((frame_ % 600) == 0) {
+    REXGPU_INFO(
+        "FH1 camera: world group {} draws, {} matched, cut {}, fov_y {:.2f} deg, near {:.3f}, "
+        "far {:.0f}, turned {}",
+        world_found ? world->second : 0, matched, camera.cut, camera.fov_y * 57.29578f,
+        camera.near_plane, camera.far_plane, camera.turned);
+  }
+  camera_ready_ = camera;
+  camera_ready_valid_ = true;
+  camera_previous_objects_ = std::move(objects);
+  if (!camera.cut) {
+    if (shadow_slot < object_reprojections.size()) object_shadow_slot_ready_ = shadow_slot;
+    if (mirror_slot < object_reprojections.size()) object_mirror_slot_ready_ = mirror_slot;
+    if (object_reprojections.size() > 1) Count("camera_object_frame");
+    if ((frame_ % 600) == 0) {
+      REXGPU_INFO("FH1 camera: {} object reprojections",
+                  object_reprojections.empty() ? 0 : object_reprojections.size() - 1);
+    }
+    object_reprojections_ready_ = std::move(object_reprojections);
+  }
+}
+
+bool Fh1NativeExecutor::EnsureCameraDepthPipelines() {
+  if (camera_depth_pipelines_[0] != VK_NULL_HANDLE) return true;
+  if (camera_depth_failed_) return false;
+  camera_depth_failed_ = true;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  VkDescriptorSetLayoutBinding bindings[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    bindings[i].binding = i;
+    bindings[i].descriptorType =
+        i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[i].descriptorCount = 1;
+    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  }
+  VkDescriptorSetLayoutCreateInfo set_layout_info = {};
+  set_layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  set_layout_info.bindingCount = 2;
+  set_layout_info.pBindings = bindings;
+  if (dfn.vkCreateDescriptorSetLayout(device, &set_layout_info, nullptr,
+                                      &camera_depth_set_layout_) != VK_SUCCESS) {
+    return false;
+  }
+  VkPushConstantRange push_constant_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(uint32_t) * 4};
+  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
+  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  pipeline_layout_info.setLayoutCount = 1;
+  pipeline_layout_info.pSetLayouts = &camera_depth_set_layout_;
+  pipeline_layout_info.pushConstantRangeCount = 1;
+  pipeline_layout_info.pPushConstantRanges = &push_constant_range;
+  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
+                                 &camera_depth_pipeline_layout_) != VK_SUCCESS) {
+    return false;
+  }
+  for (uint32_t multisampled = 0; multisampled < 2; ++multisampled) {
+    std::string source = kCameraDepthSource;
+    source.insert(source.find('\n') + 1,
+                  std::string("#define MULTISAMPLED ") + (multisampled ? "1\n" : "0\n"));
+    std::vector<uint32_t> spirv;
+    std::string error;
+    if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, source, spirv,
+                                               error)) {
+      REXGPU_WARN("Failed to compile the camera depth shader: {}", error);
+      return false;
+    }
+    camera_depth_pipelines_[multisampled] = ui::vulkan::util::CreateComputePipeline(
+        vulkan_device, camera_depth_pipeline_layout_, spirv.data(),
+        spirv.size() * sizeof(uint32_t));
+    if (camera_depth_pipelines_[multisampled] == VK_NULL_HANDLE) return false;
+  }
+  camera_depth_failed_ = false;
+  return true;
+}
+
+void Fh1NativeExecutor::SnapshotCameraDepth(uint32_t band_row) {
+  if (!camera_tracking_enabled_ || !camera_depth_dirty_ || !camera_scene_depth_valid_) return;
+  Surface* surface = FindSurface(camera_scene_depth_);
+  if (!surface || !surface->key.is_depth || surface->sampled_view == VK_NULL_HANDLE ||
+      !EnsureCameraDepthPipelines()) {
+    return;
+  }
+  camera_depth_dirty_ = false;
+  // A band holds the surface's rows. The copy is resized only before a
+  // frame's first band, to the bottom of the lowest band seen, so frames
+  // with a taller band than it has are dropped until the next.
+  const uint32_t width = RasterEdge(surface->width);
+  const uint32_t height = RasterEdge(std::min(surface->height, surface->image_height));
+  const uint32_t dest_row = RasterEdge(band_row);
+  camera_depth_wanted_height_ = std::max(camera_depth_wanted_height_, dest_row + height);
+  if (camera_depth_rows_ &&
+      (camera_depth_.width != width || camera_depth_.height < dest_row + height)) {
+    Count("camera_depth_band_unfit");
+    return;
+  }
+  const uint32_t full_height = camera_depth_wanted_height_;
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  command_processor_.EndRenderPass();
+  if (camera_depth_.image != VK_NULL_HANDLE &&
+      (camera_depth_.width != width || camera_depth_.height != full_height)) {
+    camera_depth_rows_ = 0;
+    command_processor_.Fh1AwaitAllQueueOperations();
+    if (camera_depth_.view) dfn.vkDestroyImageView(device, camera_depth_.view, nullptr);
+    if (camera_depth_.image) dfn.vkDestroyImage(device, camera_depth_.image, nullptr);
+    if (camera_depth_.memory) dfn.vkFreeMemory(device, camera_depth_.memory, nullptr);
+    camera_depth_ = Surface();
+  }
+  if (camera_depth_.image == VK_NULL_HANDLE) {
+    VkImageCreateInfo image_info = {};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.format = VK_FORMAT_R32_SFLOAT;
+    image_info.extent = {width, full_height, 1};
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+            camera_depth_.image, camera_depth_.memory)) {
+      Skip("camera_depth_create");
+      camera_depth_ = Surface();
+      return;
+    }
+    VkImageViewCreateInfo view_info = {};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = camera_depth_.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R32_SFLOAT;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (dfn.vkCreateImageView(device, &view_info, nullptr, &camera_depth_.view) != VK_SUCCESS) {
+      dfn.vkDestroyImage(device, camera_depth_.image, nullptr);
+      dfn.vkFreeMemory(device, camera_depth_.memory, nullptr);
+      camera_depth_ = Surface();
+      Skip("camera_depth_create");
+      return;
+    }
+    camera_depth_.format = VK_FORMAT_R32_SFLOAT;
+    camera_depth_.width = width;
+    camera_depth_.height = full_height;
+  }
+  TransitionForSampling(*surface, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  Transition(camera_depth_, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+             VK_ACCESS_SHADER_WRITE_BIT);
+  command_processor_.SubmitBarriers(true);
+  // A set per snapshot, not per frame: a frame has one per tile, and the submission worker may
+  // already be binding the previous tile's when this one is written.
+  const VkDescriptorSet set = AllocateDescriptorSet(camera_depth_set_layout_);
+  if (set == VK_NULL_HANDLE) {
+    Skip("camera_depth_descriptor");
+    return;
+  }
+  VkDescriptorImageInfo images[2] = {
+      {VK_NULL_HANDLE, surface->sampled_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+      {VK_NULL_HANDLE, camera_depth_.view, VK_IMAGE_LAYOUT_GENERAL},
+  };
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType =
+        i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    writes[i].pImageInfo = &images[i];
+  }
+  dfn.vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+  command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         camera_depth_pipeline_layout_, 0, 1, &set, 0, nullptr);
+  struct {
+    uint32_t size[2];
+    float scale;
+    uint32_t dest_row;
+  } constants = {{width, height},
+                 xenos::DepthRenderTargetFormat(surface->key.format) ==
+                         xenos::DepthRenderTargetFormat::kD24FS8
+                     ? 2.0f
+                     : 1.0f,
+                 dest_row};
+  camera_depth_scale_ = constants.scale;
+  command_buffer.CmdVkPushConstants(camera_depth_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                    sizeof(constants), &constants);
+  command_processor_.BindExternalComputePipeline(camera_depth_pipelines_[surface->samples > 1]);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kCompute, UINT32_MAX, "camera depth");
+  command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+  command_processor_.Checkpoint(VulkanCommandProcessor::CheckpointKind::kCompute, UINT32_MAX, "camera depth end");
+  camera_depth_rows_ = std::max(camera_depth_rows_, dest_row + height);
+  Count("camera_depth_snapshot");
+}
+
+VkImageView Fh1NativeExecutor::TakeCameraFrame(uint32_t width, uint32_t height,
+                                               Camera& camera_out) {
+  const bool depth_ready = camera_depth_rows_ready_ >= height;
+  const bool ready = depth_ready && camera_ready_valid_;
+  camera_depth_rows_ready_ = 0;
+  if (!ready || camera_depth_.view == VK_NULL_HANDLE || camera_depth_.width < width ||
+      camera_depth_.height < height) {
+    Count(!depth_ready && !camera_ready_valid_ ? "camera_take_none"
+          : !camera_ready_valid_                       ? "camera_take_no_matrix"
+          : !ready                                     ? "camera_take_no_depth"
+                                                       : "camera_take_small");
+    return VK_NULL_HANDLE;
+  }
+  Count("camera_take");
+  camera_out = camera_ready_;
+  TransitionForSampling(camera_depth_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  return camera_depth_.view;
+}
+
+void Fh1NativeExecutor::DestroyCamera() {
+  const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (camera_depth_.view) dfn.vkDestroyImageView(device, camera_depth_.view, nullptr);
+  if (camera_depth_.image) dfn.vkDestroyImage(device, camera_depth_.image, nullptr);
+  if (camera_depth_.memory) dfn.vkFreeMemory(device, camera_depth_.memory, nullptr);
+  camera_depth_ = Surface();
+  camera_depth_rows_ = 0;
+  camera_depth_rows_ready_ = 0;
+  for (VkPipeline& pipeline : camera_depth_pipelines_) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
+  }
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         camera_depth_pipeline_layout_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
+                                         camera_depth_set_layout_);
+}
+
+}  // namespace rex::graphics::vulkan

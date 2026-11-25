@@ -1,0 +1,112 @@
+# Graphics settings
+
+[← Back to the README](../README.md)
+
+In the 1.0 playtest, select **Pause → GRAPHICS** during a race.
+Press **⌘,** on Mac, **F6** on other platforms, or hold **BACK + START** on a controller.
+You can also choose **Play Career → My Profile → Options → PC OPTIONS**. All open the
+**GRAPHICS** tab, which this guide describes. Each row explains itself; a changed row is marked red until **SAVE &
+APPLY** (**Y** on a controller, the menu's Y key on the keyboard, **Y** by default) saves the
+changes to `config\graphics.toml` in the state folder and applies them one after another. The
+page then says the settings are applied; a row's change takes effect at once or from the next
+race or screen, as the row says. Leaving with unapplied changes asks once more; leaving again
+discards them. A
+[launch option](launch-options.md) for one of these settings sets its starting value for that
+session only.
+
+## Mac graphics menu
+
+Open **Pause → GRAPHICS** during a single-player race, or press **Command-comma (⌘,)**. On a controller, press **Up** from the first setting to reach the tabs. **Left** and **Right** switch tabs there. Press **Down** or **A** to enter the selected tab. In the settings list, **Up** and **Down** select a row and **Left** and **Right** change its value.
+
+Press **Y (Save & Apply)** to use your choices. Browsing resolutions keeps the current picture on screen. The **Changing resolution…** indicator waits for a new frame at the requested size. The Graphics page stays open so you can choose when to resume.
+
+| Setting | What it changes |
+| --- | --- |
+| Display Mode | Switch between fullscreen and a window. |
+| Resolution | Choose the game's render size. The choices are 720p, 1080p (Full HD), 1440p (QHD) and 4K (2160p). A new profile starts at Full HD. You can choose 4K even on a smaller screen. |
+| MSAA | Smooths the edges of 3D objects. Game uses 2× in races and 4× in the showroom. Off, 2× and 4× set both. Takes effect in the next scene. |
+| HDR | Auto uses HDR on a compatible display. Off uses standard brightness. |
+| Extended View | Matches the camera to the window shape. A wider window shows more at the sides and a taller window shows more above and below. |
+| Scenery Shadows | Adds shadows for trackside cones and barriers during races. These can flicker near the edge of the screen. |
+| Reflection Updates | Controls how often reflections on cars refresh. Console follows the original game. Every Race also updates them in 16-car and split-screen races. Double updates twice as many reflection faces per frame. |
+| Mirror | Full refreshes the rear-view mirror every frame and can show up to 16 cars. Console shows up to six at half rate in 12- and 16-car races. |
+| Soft Particles | Softens the edge of smoke and dust where they touch cars or the road. |
+| Crowds | Every Race adds spectators to solo and 16-car races and uses more memory. Console follows the original game's race settings. |
+| Motion Blur | Blurs the road surface as the car gains speed. |
+| Depth of Field | Blurs areas outside the camera's focus in the showroom, pre-race sequences, replays and Photo Mode. Takes effect from the next screen. |
+| Car Dirt | Shows dirt accumulating on the car during a race. |
+
+**Automatic upscaling.** When the rendered picture is smaller than the area it fills in the game window, spatial FSR 1 enlarges it. At matching sizes the picture passes through at its rendered size. A larger rendered picture is scaled down. The comparison uses the visible game area in display pixels and excludes black bars. MSAA remains available at every resolution.
+
+The sections below describe the detailed graphics menu on other platforms.
+
+## Presets
+
+GRAPHICS PRESET sets every row below it; changing one of them makes the preset CUSTOM.
+FRAME RATE, FULLSCREEN, RESOLUTION, UPSCALER and SHARPNESS are not part of a preset.
+
+| Setting | Console | High | Ultra | Experimental |
+|---|:---:|:---:|:---:|:---:|
+| Showroom MSAA | 4x | 2x | 2x | 4x |
+| Race MSAA | 2x | 2x | 2x | 4x |
+| Anisotropic filtering | Game | 16x | 16x | 16x |
+| Level of detail | Console | High | Ultra | Ultra |
+| Scenery shadows | Off | Off | Off | On |
+| Reflection updates | Console | Console | Every race | Double |
+| Mirror | Console | Console | Full | Full |
+| Soft particles | Off | Off | On | On |
+| Crowds | Console | Console | Console | Every race |
+| Post AA | Off | FXAA | FXAA Extreme | FXAA Extreme |
+| Bloom | Console | Full rate | Full rate | Full rate |
+| Motion blur | On | On | On | On |
+| Depth of field | On | On | On | On |
+| Car dirt | On | On | On | On |
+
+## What each setting does
+
+### Display
+
+| Setting | Effect |
+|---|---|
+| FRAME RATE | Frame rate of races, menus and the showroom, 60 fps up to your display's refresh rate (at most 240). Pick a rate your PC holds (see [Benchmarks](performance.md#benchmarks)). Without G-Sync or FreeSync, pick the refresh rate or a whole fraction of it. How it works: [High frame rates](high-frame-rate.md). |
+| FULLSCREEN | In the game only: switches between fullscreen and a window at once; **F11** and **Alt+Enter** do the same while you play. Not saved: the next start follows the launcher's WINDOWED. |
+| VSYNC | Off by default, which suits G-Sync and FreeSync displays. Turn it on if you see tearing. |
+| RESOLUTION | On Mac, choose **720p** (1280×720), **1080p (Full HD)** (1920×1080), **1440p (QHD)** (2560×1440) or **4K (2160p)** (3840×2160). The note below the row also gives the output size. |
+| WINDOWED, WINDOW SIZE | In the launcher only, at the top of its GRAPHICS: the game starts in a window of this size, and **Alt+Enter** switches between window and fullscreen while you play. RESOLUTION and UPSCALER then go by the window instead of your screen: with an upscaler chosen, turning WINDOWED on or picking a smaller size lowers a scale it cannot run at, shown as a change before SAVE. From the next start. More in [Playing in a window](windowed.md). |
+
+### Anti-aliasing and textures
+
+| Setting | Effect |
+|---|---|
+| UPSCALER | Off stretches the picture to your display. DLSS (NVIDIA RTX GPUs), FSR 4 (AMD Radeon RX 6000 or later, recent Ryzen APUs; Windows), FSR 2 or FSR 3 (any GPU) upscale it from the chosen render resolution with the game's depth and motion and smooth edges themselves, so MSAA and post AA are off while one runs. With the output at the render size they work as anti-aliasing alone (DLAA). FSR 1 (any GPU, light on the GPU) upscales and sharpens the finished picture, after MSAA and post AA, which stay on: for example, rendering at 720p on a 1080p handheld. They all only upscale: while one is chosen, RESOLUTION lists the sizes that fit the screen (720p and 1440p on a QHD display). Choosing an upscaler while rendering at a larger size also lowers the resolution, shown as a change before SAVE & APPLY. The launcher's GRAPHICS follow the same rule for the display the launcher is on, or for WINDOW SIZE with WINDOWED on. A larger scale saved before, or a game window or screen smaller than that display, is downscaled without the upscaler: the row then reads e.g. `DLSS (OFF)` and MSAA and post AA apply again. Applies at once; the MSAA change from the next screen. How they work and which to pick: [Upscalers](upscalers.md). |
+| SHARPNESS | Sharpening after the upscaler: Off, or 10 % to 100 %; 30 % by default. FSR 1 always sharpens a little, even at Off; strong sharpening makes fences and fine nets (e.g. the 599 GTO's grille) shimmer, so keep it moderate. Applies at once. |
+| DLSS PRESET | In the launcher only, while UPSCALER is DLSS: the DLSS model. Auto takes M where DLSS upscales by more than 1.8x on an RTX 40 or later GPU, else K; K, M, J and L pick one; Default leaves the choice to the DLSS runtime and the NVIDIA app's override. From the next start. |
+| SHOWROOM MSAA | The game's own multisampling in the showroom, menus, pre-race, replays and photo mode: 4x as on the console, 2x or off. Fewer samples are faster and leave edge smoothing to the resolution scale. From the next screen. |
+| RACE MSAA | The same in races, the countdown and the results: 2x as on the console (4x in races alone on track), 4x (heavy on the GPU) or off. From the next race. |
+| POST AA | FXAA or FXAA Extreme over the finished picture; Extreme smooths and softens more. Off while DLSS, FSR 2, FSR 3 or FSR 4 runs; under FSR 1 it applies before the upscale, and its softening is upscaled too. |
+| ANISOTROPIC FILTERING | Keeps textures sharp at grazing angles. Game keeps what the game asks for; 2x to 16x force it. |
+
+### Scene detail
+
+| Setting | Effect |
+|---|---|
+| LEVEL OF DETAIL | How far away, and for how many cars, detailed models stay in use. High moves the switch distances out about 1.4 times, Ultra about twice and keeps your own car on its best model. From the next race load. |
+| REFLECTION UPDATES | How often car paint, glass and chrome reflections are redrawn. The console freezes them in 16-car races and split screen; Every race redraws them there too; Double redraws twice as much each frame. |
+| MIRROR | Full draws the rear-view mirror every frame with up to 16 cars, where the console halves its rate and shows 6 cars in large races. |
+| SCENERY SHADOWS | Experimental, only in the Experimental preset. Shadows of cones, barriers and other scenery in races, otherwise only in replays and photo mode. |
+| CROWDS | Every race adds the crowds the console leaves out of 1- and 16-car races. |
+| CAR DIRT | The dirt cars gather in a race. Off leaves cars clean. |
+
+> [!WARNING]
+> SCENERY SHADOWS has a known bug: a shadow vanishes or flickers as its object nears the edge
+> of the screen, most visibly on large objects
+> ([#3](https://github.com/i2kiselev/fm4-static-recomp/issues/3)).
+
+### Effects
+
+| Setting | Effect |
+|---|---|
+| SOFT PARTICLES | Smoke and dust fade into the ground and cars instead of cutting into them. |
+| BLOOM | Full rate updates the glow every frame, where the console skips every second one in 16-car races. |
+| MOTION BLUR | The speed blur on the road surface. |
+| DEPTH OF FIELD | The focus blur of the showroom, pre-race and replay cameras and photo mode. |
