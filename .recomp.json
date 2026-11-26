@@ -1,0 +1,16 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Forza Motorsport 4",
+  "system": "Xbox 360",
+  "type": "recomp",
+  "original": { "region": "USA" },
+  "project": "FM4 Recomp",
+  "status": "released",
+  "targets": ["macOS"],
+  "toolchain": "Xenonrecomp",
+  "approach": "Static recompilation of default.xex to native arm64, own Xbox 360 kernel and Xenos-to-Vulkan (MoltenVK) renderer",
+  "maintainers": [{ "name": "retronative", "link": "https://github.com/retronative" }],
+  "links": [{ "label": "Releases", "url": "https://github.com/retronative/fm4-recomp/releases" }],
+  "help": ["Race frame rate (60 fps)", "Testing on more Macs"],
+  "notes": "Public betas for Apple silicon Macs (macOS 26+): title screen, menus and races with sound, gamepad or keyboard, 720p to 4K, HDR. Bring your own USA disc; no game files included."
+}
