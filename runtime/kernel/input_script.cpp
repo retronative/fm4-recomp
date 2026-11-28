@@ -63,7 +63,7 @@ bool Fail(std::string& error, unsigned line, const char* what, std::string_view 
 
 bool ParseScript(std::string_view text, Script& out, std::string& error)
 {
-    out.events.clear(), out.race.clear(), out.hasRace = false, out.anchorTitle = false;
+    out.events.clear(), out.race.clear(), out.hasRace = false, out.anchorTitle = false, out.chain.clear();
     error.clear();
     unsigned number = 0;
     while (!text.empty())
@@ -78,14 +78,25 @@ bool ParseScript(std::string_view text, Script& out, std::string& error)
         const std::string_view first = Token(line, at);
         if (first.empty())
             continue;
+        if (first == "@scene")  // FM4 Recomp (shader warm-up): `@scene race|menu N`
+        {
+            const std::string_view kind = Token(line, at), count = Token(line, at);
+            uint64_t swaps = 0;
+            if ((kind != "race" && kind != "menu") || !ParseVblank(count, swaps) || swaps == 0 || swaps > 100000 || !Token(line, at).empty())
+                return Fail(error, number, "@scene needs race or menu and a swap count from 1 to 100000, not", line);
+            out.chain.push_back(Section{kind == "race" ? Scene::Race : Scene::Menu, uint32_t(swaps), {}});
+            continue;
+        }
         if (first == "@race" || first == "@title")
         {
+            if (!out.chain.empty())
+                return Fail(error, number, "@race or @title after a @scene list", first);
             if (out.hasRace || !Token(line, at).empty())
                 return Fail(error, number, "a second @race or @title anchor, or words after it", first);
             out.hasRace = true, out.anchorTitle = first == "@title";
             continue;
         }
-        std::vector<Event>& list = out.hasRace ? out.race : out.events;
+        std::vector<Event>& list = !out.chain.empty() ? out.chain.back().events : out.hasRace ? out.race : out.events;
         Event event;
         if (!ParseVblank(first, event.vblank))
             return Fail(error, number, "the vblank must be a decimal number, not", first);
@@ -143,9 +154,67 @@ bool Poller::TitleAccepted(uint64_t vblank)
     return true;
 }
 
+long Poller::ChainFirstIndex(size_t k) const
+{
+    // Each @scene list takes its events' indices and one more for "started, nothing held yet", after the first two lists' (the
+    // @race list's "nothing yet" is events + race).
+    long index = long(script_.events.size() + script_.race.size()) + 1;
+    for (size_t j = 0; j < k && j < script_.chain.size(); j++)
+        index += long(script_.chain[j].events.size()) + 1;
+    return index;
+}
+
+bool Poller::Armed(uint64_t vblank) const
+{
+    if (stage_ >= script_.chain.size())
+        return false;
+    // The list before the next @scene list: started, and past its last event.
+    const std::vector<Event>* before = &script_.events;
+    uint64_t start = 0;
+    if (stage_ > 0)
+        before = &script_.chain[stage_ - 1].events, start = stageStart_;
+    else if (script_.hasRace)
+    {
+        if (!raced_)
+            return false;
+        before = &script_.race, start = raceStart_;
+    }
+    return before->empty() || vblank >= start + before->back().vblank;
+}
+
+bool Poller::Swap(uint64_t vblank, bool race)
+{
+    if (!Armed(vblank))
+        return false;
+    const Section& next = script_.chain[stage_];
+    inRow_ = race == (next.scene == Scene::Race) ? inRow_ + 1 : 0;
+    if (inRow_ < next.swaps)
+        return false;
+    stage_++, stageStart_ = vblank, inRow_ = 0;
+    return true;
+}
+
 Report Poller::Poll(uint64_t vblank)
 {
     Report report;
+    if (stage_ > 0)  // FM4 Recomp (shader warm-up): a @scene list runs
+    {
+        const Section& section = script_.chain[stage_ - 1];
+        long at = -1;
+        for (size_t i = 0; i < section.events.size() && section.events[i].vblank <= vblank - std::min(vblank, stageStart_); i++)
+            at = long(i);
+        report.event = ChainFirstIndex(stage_ - 1) + (at >= 0 ? at : long(section.events.size()));
+        if (packet_ == 0 || report.event != event_)
+            packet_++, event_ = report.event;
+        report.packet = packet_;
+        if (at >= 0)
+        {
+            const Event& e = section.events[size_t(at)];
+            report.buttons = e.buttons, report.leftTrigger = e.leftTrigger, report.rightTrigger = e.rightTrigger;
+            std::copy(std::begin(e.thumbs), std::end(e.thumbs), report.thumbs);
+        }
+        return report;
+    }
     // FM4 Recomp: after the race start, the race list's events follow the first list's in numbering (events.size() + i); before
     // its first event, events.size() + race.size() (nothing held), a state of its own.
     long race = -1;

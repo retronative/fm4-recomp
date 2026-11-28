@@ -87,6 +87,33 @@ enum GraphicsSettingsTest {
     expect(error("extended_view = yes\n") == "line 1: unknown extended_view 'yes' (off or on)" && error("extended_view = ON\n") == "line 1: unknown extended_view 'ON' (off or on)" &&
              error("extended_view = on\nextended_view = off\n") == "line 2: extended_view is set twice",
            "CONTROL: another value, another case, and extended_view named twice are refused")
+    // FM4 Recomp (render scenario settings): the game's own values by default and not written; the others after extended_view, in the
+    // order of runtime/kernel/graphics_menu.cpp's rows (tests/runtime/test_runtime.cpp holds the same texts).
+    var effects = GraphicsSettings()
+    effects.sceneryShadows = true
+    effects.reflections = .double
+    effects.detail = .ultra
+    effects.depthOfField = false
+    expect(d.serialized() == header + "internal_resolution = fhd\nanti_aliasing = on\n" &&
+             effects.serialized() == header + "internal_resolution = fhd\nanti_aliasing = on\nscenery_shadows = on\nreflection_updates = double\nlevel_of_detail = ultra\ndepth_of_field = off\n" &&
+             GraphicsSettings.parse(effects.serialized()) == .success(effects) &&
+             GraphicsSettings.parse("mirror = full\nsoft_particles = on\ncrowds = every_race\nbloom = full_rate\n")
+               == .success(GraphicsSettings(fullMirror: true, softParticles: true, crowdsEveryRace: true, fullRateBloom: true)) &&
+             GraphicsSettings.parse("depth_of_field = on\nmirror = console\n") == .success(d),
+           "render scenario settings: written only when not the game's own, in row order; parsed back")
+    var still = GraphicsSettings()
+    still.motionBlur = false
+    still.carDirt = false
+    expect(still.serialized() == header + "internal_resolution = fhd\nanti_aliasing = on\nmotion_blur = off\ncar_dirt = off\n" &&
+             GraphicsSettings.parse(still.serialized()) == .success(still) &&
+             GraphicsSettings.parse("motion_blur = on\ncar_dirt = on\n") == .success(d) &&
+             error("car_dirt = none\n") == "line 1: unknown car_dirt 'none' (on or off)" &&
+             error("motion_blur = off\nmotion_blur = off\n") == "line 2: motion_blur is set twice",
+           "motion blur and car dirt: written only when off, after depth_of_field; parsed back; refused spellings")
+    expect(error("mirror = on\n") == "line 1: unknown mirror 'on' (console or full)" &&
+             error("reflection_updates = twice\n") == "line 1: unknown reflection_updates 'twice' (console, every_race or double)" &&
+             error("crowds = every_race\ncrowds = console\n") == "line 2: crowds is set twice",
+           "CONTROL: a wrong spelling and a repeat are refused with graphics_menu.cpp's messages")
     // The game's last word (hdr_status) and the line under the choice: the preference is separate from what is active.
     expect(HdrStatus.parse("active = hdr\n") == HdrStatus(active: true, reason: "") &&
              HdrStatus.parse("# c\nactive = sdr\nreason = this display does not support HDR\n") == HdrStatus(active: false, reason: "this display does not support HDR") &&

@@ -11,7 +11,7 @@ order: 4
 | Item | Status |
 |---|---|
 | *Forza Motorsport 4*, Xbox 360, **USA** disc (title ID 4D530910), Disc 1 (Play Disc) | Supported, the only target |
-| Disc 2 (Content Install Disc) of the same version | Optional content installation has not been verified on this engine |
+| Disc 2 (Content Install Disc) of the same version | Optional; installed through the game's own content install |
 | Other regions and revisions | Not supported: setup refuses them |
 | Other *Forza* games | Not supported |
 
@@ -25,16 +25,19 @@ any game data.
 |---|---|
 | Apple silicon (M-series) | Target platform |
 | Intel Macs | Not supported |
-| Minimum macOS version | macOS 26 or later |
+| Minimum macOS version | macOS 26 (tested on macOS 27.0.1) |
 
-Choose fullscreen or windowed mode and render at 720p, Full HD (default), QHD or 4K. Extended View adjusts the camera to the window shape. HDR Auto uses the display’s HDR capability. Spatial FSR 1 enlarges the rendered picture when the visible game area is larger. One QHD playtest on an Apple silicon Mac averaged about 58 rendered frames per second across 6,600 race frames outside the Graphics menu. Results depend on your hardware and race. See [Graphics settings](getting-started.md#graphics-settings).
+The game runs in a window. It renders at 720p, Full HD (the default), QHD or 4K, chosen in the
+game's GRAPHICS menu or the Settings panel, with optional HDR output on a display that supports
+it and ten graphics effects. The frame rate is below 60 frames per second in races: with the usual
+60 Hz pacing, races run at up to 30 frames per second; 4K is very heavy.
 
 ## Controllers
 
 | Input | Status |
 |---|---|
-| Gamepads that SDL recognises on macOS (Xbox layout) | Xbox-layout controls, with on-screen prompts for the last active input device |
-| Keyboard | Driving and menu controls. Open the Keyboard tab to view or change bindings. |
+| Gamepads that SDL recognises on macOS (Xbox layout) | Supported; the layout is fixed. The game's vibration reaches a gamepad that has motors |
+| Keyboard | Supported; the key of every action can be changed in the game. After a key press the game's prompts name your keys and show keycaps |
 | Kinect | Not supported |
 
 ## The game
@@ -42,10 +45,10 @@ Choose fullscreen or windowed mode and render at 720p, Full HD (default), QHD or
 | Part | Status |
 |---|---|
 | Title screen, menus, movies, sound | Works |
-| Quick Race | Single-player racing tested, including Bernese Alps |
-| Saves | Production profile with support for compatible 0.2.0 and 0.3.0 local saves. Original Xbox 360 save import is unverified. See [Upgrading](getting-started.md#updating-from-a-previous-version) |
-| Disc 2 content install | Unverified on this engine |
-| Other modes and later menus | Coverage varies by mode and track |
+| Quick Race | Works: ten Quick Races on different tracks started, left through the Pause menu's QUIT RACE and back to the menus in one automated session (the shader warm-up's route). What follows a finished race has only passed automated tests (see the known issues) |
+| Saves | Stored on your Mac. Careers from FM4 Recomp 0.2.0 and 0.3.1 carry over. Compatibility with saves from a real Xbox 360 is unverified: saves made here are expected to load only here |
+| Disc 2 content install | Works |
+| Other modes and later menus | Not all reached in testing. An unsupported feature stops the game with a named message |
 | Achievements | Not available |
 | Xbox Live and online features | Not available |
 

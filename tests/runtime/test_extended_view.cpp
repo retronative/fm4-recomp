@@ -6,6 +6,7 @@
 // (3440/1440) / (16/9) = 1.34375; 2560x1080 is 1.33333; 32:9 5120x1440 is 2; the HUD rule is FM4's observed frame structure
 // (research/m9/ultrawide/RESULTS.md), written out here as cases.
 #include "extended_view.h"
+#include "menu_preview.h"
 #include <cstdio>
 
 using namespace runtime::view;
@@ -120,6 +121,47 @@ int main()
         Expect(off && pending && latched && idle && widening && resized && offAgain && forced && clamped && tallForced && tallClamped,
                "state: off is 1; on follows the window; a change waits for the latch; the effective factor needs a main view widened in the last half second; "
                "a resize to 16:9 goes back to 1; a forced factor (diagnostic) wins and is clamped to 0.75..2");
+    }
+    {
+        // menu_preview.h (the GRAPHICS submenu's Y: Preview). The help bar's corner is x 1000..1280, y 632..720 of the 1280x720 frame.
+        namespace p = runtime::preview;
+        const uint64_t blurH = 0x362b1c7e698a2e23ull, blurV = 0xf9daba5e30b16f65ull, toneCopy = 0xe9cd98c0331323d0ull, menu = 0x5aec3362fe526813ull;
+        const bool off = p::Classify(false, blurH, false, 0, 0, 1280, 720) == p::Action::Draw && p::Classify(false, menu, true, 0, 0, 1280, 720) == p::Action::Draw;
+        const bool blur = p::Classify(true, blurH, false, 0, 0, 1280, 720) == p::Action::Flatten && p::Classify(true, blurV, false, 0, 0, 1280, 720) == p::Action::Flatten &&
+                          p::Classify(true, toneCopy, false, 0, 0, 1280, 720) == p::Action::Draw && p::Classify(true, menu, false, 0, 0, 1280, 720) == p::Action::Draw;
+        uint32_t x = 0, y = 0, w = 1280, h = 720;
+        const bool whole = p::Classify(true, menu, true, x, y, w, h) == p::Action::Clip;
+        p::ClipToHint(x, y, w, h);
+        const bool wholeClipped = whole && x == 1000 && y == 632 && w == 280 && h == 88;
+        const bool missed = p::Classify(true, menu, true, 0, 0, 640, 360) == p::Action::Skip && p::Classify(true, menu, true, 999, 0, 1, 720) == p::Action::Skip &&
+                            p::Classify(true, menu, true, 0, 0, 1280, 632) == p::Action::Skip && p::Classify(true, menu, true, 900, 650, 0, 10) == p::Action::Skip;
+        uint32_t ex = 999, ey = 0, ew = 2, eh = 720;
+        const bool edge = p::Classify(true, menu, true, ex, ey, ew, eh) == p::Action::Clip;
+        p::ClipToHint(ex, ey, ew, eh);
+        uint32_t cx = 1000, cy = 700, cw = 500, ch = 100;
+        const bool corner = p::Classify(true, menu, true, cx, cy, cw, ch) == p::Action::Clip;
+        p::ClipToHint(cx, cy, cw, ch);
+        Expect(off && blur && wholeClipped && missed && edge && ex == 1000 && ew == 1 && ey == 632 && eh == 88 && corner && cx == 1000 && cy == 700 && cw == 280 && ch == 20,
+               "menu preview: off changes nothing (CONTROL); on, both pause blur passes are flattened and the scene's copy stays; a menu draw over the whole "
+               "frame is clipped to the help bar's corner (1000,632 280x88), one that misses it (or touches only its edge, or is empty) is left out, one "
+               "overlapping it keeps the overlap");
+    }
+    {
+        // FlattenBlur: words 4..31 (c1.x .. c7.w) become 0; c0 (the weights, words 0-3) and c8 on (word 32) stay.
+        uint32_t words[40];
+        for (uint32_t w = 0; w < 40; w++)
+            words[w] = 0x3F800000u + w;  // 1.0f and its neighbours: none zero
+        runtime::preview::FlattenBlur(words);
+        bool zeroed = true, kept = true;
+        for (uint32_t w = 0; w < 40; w++)
+        {
+            if (w >= 4 && w < 32)
+                zeroed = zeroed && words[w] == 0;
+            else
+                kept = kept && words[w] == 0x3F800000u + w;
+        }
+        Expect(zeroed && kept && words[3] == 0x3F800003u && words[32] == 0x3F800020u,
+               "menu preview: flattening the blur zeroes c1-c7 (its tap offsets) and keeps c0 (its weights) and c8 on");
     }
     std::printf("extended view tests: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

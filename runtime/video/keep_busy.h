@@ -7,7 +7,8 @@
 //
 // What it does: a second VkDevice on the same GPU (its own queue, command buffer, fence, pipeline and 1 MB buffer; nothing shared
 // with the renderer's device, slots, guard or submission gate) and a thread that submits one fixed compute dispatch after another,
-// waiting for each. The work is bounded: FM4_GPU_KEEP_BUSY_GROUPS (1..256, default 64) squared workgroups of 8x8 invocations, each a
+// waiting for each; FM4_GPU_KEEP_BUSY_DEPTH=<1..4> keeps that many queued (a backlog: each command buffer, fence and buffer region its
+// own, resubmitted only after its own fence signalled). The work is bounded: FM4_GPU_KEEP_BUSY_GROUPS (1..256, default 64) squared workgroups of 8x8 invocations, each a
 // 32-step loop and one store.
 // GPU safety: valid work only; the command buffer is recorded once and submitted again only after its previous submission
 // completed; each fence wait is bounded (the renderer guard's bound) and a miss writes GPU_STOP, stops submitting and leaves every object alone

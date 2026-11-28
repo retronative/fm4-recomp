@@ -4,6 +4,11 @@
 #
 # FM4 Recomp alpha: plays the game in a window, with sound, a gamepad or the keyboard. Run ./setup.sh first (same FM4_RECOMP_HOME).
 #   ./play.sh [minutes] [--debug]   (the session ends after this many minutes, default 120; closing the window ends it too)
+#   ./play.sh --warm-up [minutes]    (default 90) the shader warm-up: the game, hidden and muted, plays the kit's scripted route (title,
+#   Free Play, ten Quick Races; warmup/route.txt) on a throwaway copy of the kit's prepared profile (warmup/profile: past the welcome
+#   race), with the player's graphics settings, into the player's shader cache, so those shaders are compiled before the player meets
+#   them. The player's saves are never opened. It prints "progress <percent> <stage>" lines; it ends at the route's end (exit 0), or
+#   when stopped (TERM: the shaders compiled so far are kept).
 # Normal play: no Vulkan validation layer and no Metal API validation, which cost
 # about two thirds of the renderer's CPU time. --debug (or FM4_RECOMP_DEBUG=1) restores full validation: the pinned layer, proven
 # live first by a deliberate, query-only misuse it must report, Metal API validation, and a stop at the first validation message.
@@ -11,24 +16,21 @@
 # in its own process group under a hard deadline; afterwards the system log and the crash reports are searched for a GPU hang or
 # restart, and on any evidence ./GPU_STOP is written: every later session refuses to start until you read it and delete it yourself.
 set -euo pipefail
-# Finder, the supplied .command and the headless CLI all launch the production profile unless a test explicitly supplies a separate home.
-export FM4_ENGINE=shiftglue FM4_POST_AA=on FM4_HDR=auto
-export FM4_SHIFTGLUE_OPTIMIZE="${FM4_SHIFTGLUE_OPTIMIZE:-1}" FM4_SHIFTGLUE_SCOPED_PAGES="${FM4_SHIFTGLUE_SCOPED_PAGES:-1}"
-export FM4_SHIFTGLUE_RESOLVE_MIB="${FM4_SHIFTGLUE_RESOLVE_MIB:-768}"
-export FM4_SHIFTGLUE_4K_RESOLVE_MIB="${FM4_SHIFTGLUE_4K_RESOLVE_MIB:-1728}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-MINUTES=120; DEBUG="${FM4_RECOMP_DEBUG:-0}"
+MINUTES=""; DEBUG="${FM4_RECOMP_DEBUG:-0}"; WARMUP=0
 for arg in "$@"; do
   case "$arg" in
     --debug) DEBUG=1 ;;
-    *) [[ "$arg" =~ ^[1-9][0-9]*$ ]] || { echo "usage: ./play.sh [minutes] [--debug]" >&2; exit 2; }; MINUTES="$arg" ;;
+    --warm-up) WARMUP=1 ;;
+    *) [[ "$arg" =~ ^[1-9][0-9]*$ ]] || { echo "usage: ./play.sh [minutes] [--debug] | ./play.sh --warm-up [minutes]" >&2; exit 2; }; MINUTES="$arg" ;;
   esac
 done
+if [ "$WARMUP" = 1 ]; then MINUTES="${MINUTES:-90}"; DEBUG=0; else MINUTES="${MINUTES:-120}"; fi
 DEADLINE=$((MINUTES * 60))
-ROOT="${FM4_RECOMP_HOME:-$HOME/Library/Application Support/FM4 Recomp}"  # locations.conf, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
+ROOT="${FM4_RECOMP_HOME:-$HERE}"  # locations.conf, logs and GPU_STOP (FM4 Recomp.app: ~/Library/Application Support/FM4 Recomp)
 STOP_FLAG="$ROOT/GPU_STOP"
 LOCK="$ROOT/.play.lock"
-LOGS="$ROOT/logs/$(date '+%Y-%m-%d_%H%M%S')"
+LOGS="$ROOT/logs/$(date '+%Y-%m-%d_%H%M%S')$([ "$WARMUP" = 1 ] && echo _warm-up || true)"
 # The game data, user data and (once set up) Disc 2 where setup.sh recorded them (locations.conf; an external drive must be connected).
 source "$HERE/locations.sh"
 loc_game_args "$ROOT" || { echo "play: not starting" >&2; exit 1; }
@@ -49,8 +51,38 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
-mkdir -p "$LOGS/captures"
-GAME_HOME="$DATA/home"
+mkdir -p "$LOGS/captures" "$DATA/home"
+if [ "$WARMUP" = 1 ]; then
+  # The warm-up's own user data: a fresh copy of the prepared profile each time, removed afterwards; its keyboard bindings and Disc 2
+  # setup are not the game's concern here (the route uses the scripted pad, and no Disc 2 car).
+  ROUTE="$HERE/warmup/route.txt"
+  for f in "$ROUTE" "$HERE/warmup/profile/content"; do
+    [ -e "$f" ] || { echo "play: $f is missing: this copy of FM4 Recomp is incomplete; download it again" >&2; exit 1; }
+  done
+  WARM_USER="$DATA/warm-up/user-data"
+  rm -rf "$DATA/warm-up"
+  mkdir -p "$DATA/warm-up"
+  cp -R "$HERE/warmup/profile" "$WARM_USER"
+  trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; rm -rf "$DATA/warm-up"' EXIT
+  args=()
+  for ((i = 0; i < ${#LOC_GAME_ARGS[@]}; i++)); do
+    case "${LOC_GAME_ARGS[$i]}" in
+      --user-data) args+=(--user-data "$WARM_USER"); i=$((i + 1)) ;;
+      --keybindings) i=$((i + 1)) ;;
+      *) args+=("${LOC_GAME_ARGS[$i]}") ;;
+    esac
+  done
+  LOC_GAME_ARGS=("${args[@]}")
+else
+# Saved games kept by FM4 Recomp 0.3.x (its own layout in the same user-data folder) replace this layout's older copies, once
+# (migrate-from-0.3.swift). On any surprise nothing changes and the game does not start: the stale copy is never played.
+if ! saves="$(/bin/bash "$HERE/migrate-from-0.3.sh" "$LOC_USER_DATA_ROOT" 2>&1)"; then
+  printf '%s\n' "$saves" >&2
+  echo "play: not starting: your 0.3 saved games could not be brought over: $(printf '%s\n' "$saves" | tail -1 | sed 's/^saves: //')" >&2
+  exit 1
+fi
+[ -z "$saves" ] || printf '%s\n' "$saves"
+fi
 
 # The kit's own Vulkan: its loader and the MoltenVK driver, by their manifests (scripts/release/bundle_kit.sh); nothing from Homebrew or
 # the developer tools. VK_IMPLICIT_LAYER_PATH: the kit's empty folder, so no implicit layer installed elsewhere loads into the game.
@@ -96,6 +128,16 @@ export FM4_VARIANT_MEMO="${FM4_VARIANT_MEMO:-1}" FM4_GPU_PRESENT="${FM4_GPU_PRES
   FM4_GUARD_HOT="${FM4_GUARD_HOT:-1}" FM4_GUEST_MEMORY_GPU="${FM4_GUEST_MEMORY_GPU:-1}" FM4_RESOLVE_RESIDENT_COVER="${FM4_RESOLVE_RESIDENT_COVER:-1}" \
   FM4_TEXTURE_GPU_UNTILE="${FM4_TEXTURE_GPU_UNTILE:-0}" FM4_VERTEX_CACHE_MB="${FM4_VERTEX_CACHE_MB:-256}" FM4_SUBMIT_IF_IDLE="${FM4_SUBMIT_IF_IDLE:-8}" \
   FM4_BULK_REGISTERS="${FM4_BULK_REGISTERS:-1}" FM4_ASYNC_RETIRE="${FM4_ASYNC_RETIRE:-1}"
+# FM4_NO_DRAIN (2026-11-25, ShiftGlue's command-processor model): fences and interrupts reach the game when
+# the command processor reaches them, not after the GPU drains; only a resolve that is not a steady capture is waited for. +14 % (occlusion
+# off) to +24 % (on) on the parked QHD yardstick; menus, race load, driving and photo mode rendered the same. FM4_NO_DRAIN=0 restores the drain.
+export FM4_NO_DRAIN="${FM4_NO_DRAIN:-1}"
+# Keyboard prompts (runtime/game/prompt_text.cpp): after a key press the game's button prompts name the bound keys ("Press SPACE to
+# start"), after a pad input the pad's buttons again. FM4_KEYBOARD_PROMPTS=0 keeps the game's own words.
+export FM4_KEYBOARD_PROMPTS="${FM4_KEYBOARD_PROMPTS:-1}"
+# Keycap icons (runtime/video/keycap.h): with the keyboard prompts, the pad's button icons become keycaps of the bound keys.
+# FM4_KEYCAP_ICONS=0 keeps the pad's icons.
+export FM4_KEYCAP_ICONS="${FM4_KEYCAP_ICONS:-1}"
 # The four speed settings of the internal resolutions (validated at 720p, Full HD, QHD and 4K, the held
 # main menu byte-identical with and without them): the scaled pitch and the fused resolves act only above 720p. 0 turns one off.
 export FM4_INTERNAL_SCALE_PITCH="${FM4_INTERNAL_SCALE_PITCH:-1}" FM4_RESOLVE_FUSED="${FM4_RESOLVE_FUSED:-1}" FM4_PRESENT_LAZY="${FM4_PRESENT_LAZY:-1}" \
@@ -172,6 +214,14 @@ if [ "$FM4_EXTENDED_VIEW_OFFERED" = 1 ]; then export FM4_EXTENDED_VIEW_HOOK="${F
 # The game's own GRAPHICS menu and the Settings panel apply the resolution, edge smoothing and HDR while the game runs
 # (runtime/video/renderer.cpp); 0 turns that off (a choice then applies at the next start).
 export FM4_GRAPHICS_LIVE="${FM4_GRAPHICS_LIVE:-1}"
+# FM4 Recomp (render scenario settings): the GRAPHICS menu's SCENERY SHADOWS ... LEVEL OF DETAIL and DEPTH OF FIELD rows and their title
+# hooks (config/title_hooks.toml; runtime/game/render_scenario.cpp). The game reads their values from graphics.conf itself (each line
+# only when not the game's own), so nothing is exported for them here. On since a bounded run with every one at its maximum (drive
+# route, 2026-11-26: applied, no stop, no failed allocation); 0 hides the rows and leaves the game's values.
+export FM4_RENDER_SCENARIO="${FM4_RENDER_SCENARIO:-1}" FM4_DEPTH_OF_FIELD_HOOK="${FM4_DEPTH_OF_FIELD_HOOK:-1}"
+# MOTION BLUR and CAR DIRT (runtime/video/shader_overrides.h): pixel-shader constants of FM4's road detail and car shaders, set by the
+# renderer when a row is OFF (graphics.conf motion_blur / car_dirt). 0 hides the rows.
+export FM4_SHADER_OVERRIDES="${FM4_SHADER_OVERRIDES:-1}"
 # Persistent shader and pipeline caches (FM4_SHADER_CACHE: compiled SPIR-V and the Vulkan pipeline cache, ~35 MB after a race) in the
 # data directory, so a shader's first-use compile stall happens once, not every session. FM4_SHADER_CACHE=0 turns them off; another
 # path moves them.
@@ -189,12 +239,17 @@ fi
 # FM4_RECOMP_AUDIO=mute: no audio device is opened (test sessions on a shared Mac); otherwise the default output device.
 AUDIO=audible
 [ "${FM4_RECOMP_AUDIO:-}" = mute ] && AUDIO=mute
-source "$HERE/shiftglue-playtest.sh"
-configure_shiftglue
+# The game's window, its Disc 2 panel and Settings panel, and the live pad; the warm-up: offscreen, muted, the route's scripted pad.
+GAME_MODE=(--renderer window --disc-setup "$HERE/bin/fm4recomp-setup" --controls-panel "$HERE/bin/fm4recomp-setup")
+if [ "$WARMUP" = 1 ]; then
+  AUDIO=mute
+  unset FM4_INPUT_LIVE
+  export FM4_INPUT_SCRIPT="$ROUTE"
+  GAME_MODE=(--renderer present)
+fi
 USER_HOME="$HOME"
-mkdir -p "$GAME_HOME"
-export HOME="$GAME_HOME"
-echo "play: starting (session limit $MINUTES min; graphics profile $ROOT/config; logs in $LOGS)"
+export HOME="$DATA/home"
+echo "play: starting (session limit $MINUTES min; rendering resolution $RES, edge smoothing $AA; logs in $LOGS)"
 since=$(date +%s); touch "$LOGS/start"
 THERMAL_PID=""
 if [ "$PLAYTEST" = 1 ]; then
@@ -202,6 +257,29 @@ if [ "$PLAYTEST" = 1 ]; then
   THERMAL_PID=$!
 fi
 status=0
+WATCH_PID=""
+if [ "$WARMUP" = 1 ]; then
+  # Progress from the route's sections as the game logs them; at the route's last event (its last @scene list's last line, a release
+  # some 20 s of menu after the last race, past a pipeline-cache save) the game is stopped and the warm-up is complete.
+  races="$(grep -c '^@scene' "$ROUTE")"
+  last="$(grep -Ev '^[[:space:]]*(#|$)' "$ROUTE" | tail -1 | awk '{print $1}')"
+  echo "progress 0 Starting the game"
+  # No sleep while it runs: muted, nothing else holds the Mac awake (a played game's audio does), and an idle sleep mid-route stopped
+  # a test warm-up with an in-process GPU_STOP (a fence wait expired across the sleep, 2026-11-27).
+  /usr/bin/caffeinate -i -w $$ &
+  ( seen=0
+    while sleep 2; do
+      n="$(grep -c '^\[input\] @scene' "$LOGS/game.log" 2>/dev/null || true)"
+      if [ "${n:-0}" -gt "$seen" ]; then
+        seen=$n; echo "progress $((100 * (n - 1) / races + 2)) Warming up shaders: race $n of $races"
+      fi
+      if [ "$seen" = "$races" ] && grep -q "at scene vblank $last: released" "$LOGS/game.log"; then
+        touch "$LOGS/warm-up-complete"; pkill -TERM -x fm4recomp || true; break
+      fi
+    done ) &
+  WATCH_PID=$!
+fi
+run_game() {
 perl -e '
   my ($deadline, @cmd) = @ARGV;
   my $pid = fork; die "fork: $!" unless defined $pid;
@@ -209,12 +287,26 @@ perl -e '
   $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; waitpid $pid, 0; print STDERR "[play] session limit: stopped\n"; exit 124 };
   alarm $deadline + 30; waitpid $pid, 0; alarm 0;
   my $s = $?; exit($s & 127 ? 128 + ($s & 127) : $s >> 8);' \
-  "$DEADLINE" "${GAME_CMD[@]}" > "$LOGS/game.out" 2> "$LOGS/game.log" || status=$?
-if [ "${FM4_ENGINE:-native}" = shiftglue ] && [ "$status" = 0 ]; then
-  echo "play: the game ended (exit 0): ShiftGlue closed normally"
+  "$DEADLINE" "$HERE/bin/fm4recomp" "${LOC_GAME_ARGS[@]}" --gpu-stop "$STOP_FLAG" --audio "$AUDIO" \
+  "${GAME_MODE[@]}" --gpu-capture "$LOGS/captures" --vk-validation "$VALIDATION" --shader-classes branch,predicate,loop,dynloop \
+  --stop-at-swap 100000000 --deadline "$DEADLINE" > "$LOGS/game.out" 2> "$LOGS/game.log"
+}
+if [ "$WARMUP" = 1 ]; then
+  # A stop of the warm-up (the setup app's Skip: TERM to this script) reaches the game; bash runs the trap during wait, not while a
+  # foreground command runs. The shaders compiled so far stay in the cache.
+  run_game &
+  LAUNCH=$!
+  trap 'pkill -TERM -x fm4recomp 2>/dev/null || true' TERM INT
+  while :; do
+    wait "$LAUNCH" && { status=0; break; } || status=$?
+    kill -0 "$LAUNCH" 2>/dev/null || break
+  done
+  trap - TERM INT
 else
-  echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
+  run_game || status=$?
 fi
+echo "play: the game ended (exit $status): $(grep -m1 '^\[stop ' "$LOGS/game.log" || echo 'no stop line')"
+if [ -n "$WATCH_PID" ]; then kill "$WATCH_PID" 2>/dev/null || true; wait "$WATCH_PID" 2>/dev/null || true; fi
 if [ -n "$THERMAL_PID" ]; then kill "$THERMAL_PID" 2>/dev/null || true; fi
 if [ "$PLAYTEST" = 1 ]; then
   /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" \
@@ -225,7 +317,7 @@ evidence=""
 while IFS= read -r -d '' file; do evidence+="gpuEvent report: $file"$'\n'; done < <(find "$USER_HOME/Library/Logs/DiagnosticReports" /Library/Logs/DiagnosticReports -maxdepth 1 -name 'gpuEvent-*.ips' \
   -newer "$LOGS/start" -print0 2>/dev/null)
 /usr/bin/log show --style compact --start "$(date -r "$since" '+%Y-%m-%d %H:%M:%S')" \
-  --predicate '(process == "fm4recomp" OR process == "fm4_static_recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal") AND process != "log"' \
+  --predicate '(process == "fm4recomp" OR eventMessage CONTAINS "GPU Hang" OR eventMessage CONTAINS "IOGPU" OR eventMessage CONTAINS "GPU Restart" OR subsystem CONTAINS "Metal") AND process != "log"' \
   > "$LOGS/syslog.txt" 2>/dev/null || true
 evidence+="$(grep -Ev '^[0-9: .-]+ +[A-Za-z]+ +log\[[0-9]+:' "$LOGS/syslog.txt" | grep -E 'GPU Hang|kIOGPUCommandBufferCallbackError|GPU Restart|gpu restart|IOGPUFamily.*(timeout|timed out|hang|lockup|panic)|GPU.*(hang|lockup) detected' | head -20 || true)"
 if [ -n "$evidence" ]; then
@@ -240,5 +332,13 @@ elif grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' "$LOGS/game.l
 fi
 if grep -E 'Validation (Error|Warning)|\[vulkan validation\]' "$LOGS/game.log" | head -5; then
   echo "play: the validation layer reported problems (above); please send $LOGS/game.log to the developers" >&2
+fi
+if [ "$WARMUP" = 1 ]; then
+  if [ -e "$LOGS/warm-up-complete" ]; then
+    echo "progress 100 Shaders warmed up"
+    echo "play: warm-up complete, no GPU hang evidence. Log: $LOGS/game.log"; exit 0
+  fi
+  echo "play: the warm-up stopped before the route's end (exit $status); the shaders compiled so far are kept. Log: $LOGS/game.log" >&2
+  exit 1
 fi
 echo "play: session over, no GPU hang evidence. Log: $LOGS/game.log"

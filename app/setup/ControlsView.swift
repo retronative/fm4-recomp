@@ -102,7 +102,7 @@ struct StatusBar: View {
         Spacer()
         SecondaryButton(title: "Cancel") { model.endCapture(); model.controlsNotice = "" }
       } else if model.confirmingReset {
-        Text("Reset every key to the defaults (W throttle, S brake, A/D steer, Space = A, Delete = B, arrows = D-pad)?")
+        Text("Reset every key to the defaults (W throttle, S brake, A/D steer, Space = A, Backspace = B, arrows = D-pad)?")
           .font(.system(size: 12.5)).fixedSize(horizontal: false, vertical: true)
         Spacer()
         SecondaryButton(title: "Cancel") { model.confirmingReset = false }

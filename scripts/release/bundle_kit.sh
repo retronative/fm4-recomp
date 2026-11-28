@@ -6,7 +6,9 @@
 # copies; no Homebrew, Xcode or developer tools on the player's Mac): bin/ (fm4recomp, the validation layer's negative control,
 # extract-xiso, xexsurvey, gdfx, fm4recomp-setup: the launcher's setup app, the in-game Disc setup panel), lib/ (SDL3, the Vulkan loader, MoltenVK, the Vulkan validation layer, glslang, SPIRV-Tools),
 # vulkan/ (the MoltenVK driver and the validation layer manifests, by relative path), setup.sh, play.sh, locations.sh (their
-# shared storage-location helpers), README.md, licenses/.
+# shared storage-location helpers), README.md, licenses/, warmup/ (play.sh --warm-up: route.txt from scripts/alpha/warmup, and the
+# prepared profile from FM4_WARMUP_PROFILE=<dir>: a profile past the welcome race, kept out of git as game-made data; only its save
+# files are accepted).
 # The LGPL parts are libraries of their own in lib/, as in ReCarbon (never inside a program, so a user can replace them:
 # THIRD_PARTY_NOTICES.md): FFmpeg's libavcodec and libavutil, from the prefix the build linked (FM4_FFMPEG_XMA), and
 # libmspack's LZX decoder, libfm4_lzx.dylib, from the build. The build must be the release build
@@ -55,6 +57,9 @@ cp "$ROOT/build/native/runtime/fm4recomp" "$ROOT/build/native/tests/fm4_validati
 # same sources as FM4 Recomp.app (scripts/release/make_app.sh), so the kit's panel is the launcher's own UI.
 /usr/bin/xcrun swiftc -O -swift-version 5 -target "arm64-apple-macos$TARGET" -parse-as-library -module-name FM4RecompSetup \
   -file-prefix-map "$ROOT=fm4-recomp" "$ROOT"/app/setup/*.swift -o "$KIT/bin/fm4recomp-setup"
+# The import of saved games kept by FM4 Recomp 0.3.x (play.sh runs migrate-from-0.3.sh, which runs this).
+/usr/bin/xcrun swiftc -O -swift-version 5 -target "arm64-apple-macos$TARGET" -module-name FM4MigrateFrom03 \
+  -file-prefix-map "$ROOT=fm4-recomp" "$ROOT/scripts/alpha/migrate-from-0.3.swift" -o "$KIT/bin/fm4_migrate_from_03"
 chmod u+w "$KIT"/bin/*
 
 is_bundled() { local n; for n in "${NAMES[@]}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
@@ -93,8 +98,21 @@ sed 's|"library_path": "[^"]*"|"library_path": "../../lib/libVkLayer_khronos_val
 grep -q '"api_version": "1.4.363"' "$KIT/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" ||
   { echo "bundle_kit: the validation layer is not the pinned 1.4.363" >&2; exit 1; }
 
-cp "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/README.md" "$KIT/"
-chmod +x "$KIT/setup.sh" "$KIT/play.sh"
+cp "$ROOT/scripts/alpha/setup.sh" "$ROOT/scripts/alpha/play.sh" "$ROOT/scripts/alpha/locations.sh" "$ROOT/scripts/alpha/migrate-from-0.3.sh" \
+   "$ROOT/scripts/alpha/README.md" "$KIT/"
+chmod +x "$KIT/setup.sh" "$KIT/play.sh" "$KIT/migrate-from-0.3.sh"
+# The shader warm-up (play.sh --warm-up): the route, and the prepared profile, refused unless it holds exactly the save files.
+WARM="${FM4_WARMUP_PROFILE:-}"
+[ -n "$WARM" ] && [ -d "$WARM" ] || { echo "bundle_kit: FM4_WARMUP_PROFILE=<prepared profile dir> is required (play.sh --warm-up)" >&2; exit 1; }
+want="content/1/00000001/ForzaProfile.xcontent content/1/00000001/ForzaProfile/ForzaProfile content/1/00000001/ForzaProfile/GameplayLog \
+content/1/00000001/ForzaProfile/PlayerDatabase content/1/00000001/ForzaProfile/VersionFlags content/1/00000001/marketplace.xcontent"
+have="$(cd "$WARM" && find . -type f | sed 's|^\./||' | sort | tr '\n' ' ')"
+[ "$have" = "$(echo $want | tr ' ' '\n' | sort | tr '\n' ' ')" ] ||
+  { echo "bundle_kit: $WARM must hold exactly the profile's save files ($want); it has: $have" >&2; exit 1; }
+mkdir -p "$KIT/warmup"
+/opt/homebrew/bin/python3 -I "$ROOT/scripts/alpha/warmup/make_route.py" "$ROOT/scripts/alpha/warmup/races.tsv" > "$KIT/warmup/route.txt"
+cp -R "$WARM" "$KIT/warmup/profile"
+mkdir -p "$KIT/warmup/profile/content/1/00000001/marketplace"
 cp "$ROOT/COPYING" "$ROOT/NOTICE" "$ROOT/THIRD_PARTY_NOTICES.md" "$KIT/licenses/"
 cp -R "$ROOT/LICENSES" "$KIT/licenses/LICENSES"
 # The bundled libraries' own licence files, from the same place as the libraries: the pinned sources' copies in the deps

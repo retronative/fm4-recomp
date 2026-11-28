@@ -19,6 +19,13 @@ extern const uint32_t kStringAssign;    // (&field, &string): a reference stored
 extern const uint32_t kUserString;      // (&out, UTF-16BE text, -1): a CUserString
 extern const uint32_t kStringCopy;      // (&copy, &string): a reference copied (AddRef)
 extern const uint32_t kSetText;         // (text element, &string)
+extern const uint32_t kTextAssign;              // (&wide string, UTF-16BE text, length): a text element's string assigned (keyboard prompts)
+extern const uint32_t kTextSetup;               // a scene text element's setup (its element in r31; MakeLocString, GetText, kTextAssign)
+extern const uint32_t kTextSetupGetTextReturn;  // kTextSetup + this: the return address of its GetText call (the string lookup's lr)
+extern const uint32_t kTextElementString;       // text element + this: its std::wstring (inline 16 bytes while capacity < 8, else a pointer)
+extern const uint32_t kTextElementLength;       // ... the string's length (characters)
+extern const uint32_t kTextElementCapacity;     // ... the string's capacity
+extern const uint32_t kTextElementLayout;       // ... byte: lay the text out again at the next update
 extern const uint32_t kFireSceneEvent;  // (screen, event id)
 extern const uint32_t kHudTeardown;     // the option screen's vtable slot 4: frees the rows at kHudCollection
 extern const uint32_t kNameHash;        // (name) -> the id of a scene component name
@@ -51,6 +58,9 @@ extern const uint32_t kScreenMatchInput;       // screen vtable: (screen, input,
 extern const uint32_t kInputA, kInputB, kInputX, kInputY;  // input codes
 extern const uint32_t kPauseInfoHidden;        // Pause menu + this: "screen info hidden" (byte; set once)
 extern const uint32_t kHideScreenInfoEvent;    // the data address of the HIDE_SCREEN_INFO event id (the Pause menu's)
+extern const uint32_t kManagerClose;           // screen manager vtable: close (manager, owner), as the base screen's Back
+extern const uint32_t kScreenEvent;            // screen vtable: fire a scene event (screen, event id)
+extern const uint32_t kBackEvent;              // the data address of the event id the base screen's Back fires after closing
 extern const uint32_t kPreRaceInfoHidden;      // Pre-Race screen + this: the same byte (set every time)
 extern const uint32_t kPreRaceHideScreenInfoEvent;  // its HIDE_SCREEN_INFO event id's data address
 extern const uint32_t kHelpBarName;            // the data address of "COMPONENT_HELP_BUTTON_BAR"
@@ -68,4 +78,19 @@ extern const uint32_t kRequestQueueFirst;      // the queue of thread entry i is
 extern const uint32_t kRequestQueueStride;     // (begin and end pointers in its first two words)
 extern const uint32_t kCurrentThread;          // r13 + this: the current thread's block
 extern const uint32_t kThreadId;               // thread block + this: the thread id the game's "current thread id" function returns
+// FM4 Recomp: the render scenario settings (render_scenario.cpp; config/title_hooks.toml has the evidence).
+extern const uint32_t kMainLoop;               // the main loop
+extern const uint32_t kMainLoopTick;           // kMainLoop + this: the return address of its once-a-tick call (the tick hook)
+extern const uint32_t kScenarioManagerPointer; // the data address of the render scenario manager pointer
+extern const uint32_t kScenarioControlOffsets; // the data address of the control offset table (one word per control id)
+extern const uint32_t kScenarioOverrideValues; // manager + this + offset[id]: the override value of control id
+extern const uint32_t kScenarioOverrideMask;   // manager + this: the override mask, bit id (ids 32..63 in the next word)
+// The control ids the settings write.
+extern const uint32_t kScenarioCarLodThresholds, kScenarioCarFocusLodMinMax, kScenarioCarLodTransDist, kScenarioCarKeepLod0, kScenarioCarForceNoLod0,
+    kScenarioCarMinWheelLod, kScenarioCollidablesInMirror, kScenarioCollidableShadows, kScenarioCrowdLoad, kScenarioEnvMapFrequencyScale,
+    kScenarioMaxCarsInMirror, kScenarioHalfRateMirror, kScenarioHalfRateBloom, kScenarioSoftParticles;
+// Evidence anchors (never called): functions whose bytes pin the numbers above (the build refuses an image where they differ).
+extern const uint32_t kScenarioPush, kGetCarLodThresholds, kGetCarFocusLodMinMax, kGetCarLodTransDist, kGetCarKeepLod0, kGetCarForceNoLod0,
+    kGetCarMinWheelLod, kGetCollidablesInMirror, kGetCollidableShadows, kGetCrowdLoad, kGetEnvMapFrequencyScale, kGetMaxCarsInMirror,
+    kGetHalfRateMirror, kGetHalfRateBloom, kGetSoftParticles;
 }  // namespace fm4::sym

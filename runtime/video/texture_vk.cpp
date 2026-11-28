@@ -24,6 +24,13 @@
 #include "shader_cache.h"
 #include "kernel/virtual_memory.h"
 #include "guest_memory.h"
+#include "keycap.h"                // FM4 Recomp (FM4_KEYCAP_ICONS)
+#include "kernel/controls_menu.h"
+#include "kernel/input_live.h"
+#include "kernel/key_bindings.h"
+#include <map>
+#include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -94,7 +101,24 @@ struct HostImage
     uint64_t ledger = 0, hiLedger = 0;  // FM4 Recomp (M9, FM4_DIAG_MEMORY): mem_ledger.h ids
     bool hiInitialized = false, hiValid = false;
     bool blitSource = false;  // FM4 Recomp (M9, live resolution, step 1): created with TRANSFER_SRC (TwinCapable at its creation; Image)
+    // FM4 Recomp (FM4_KEYCAP_ICONS, keycap.h): the prompt icon its last upload held (kIcons index, -1 none), and whether this draw's
+    // StagingBytes reserved ring bytes for its keycap's first upload.
+    int icon = -1;
+    bool keycapReserved = false;
 };
+
+// FM4 Recomp (FM4_KEYCAP_ICONS): a keycap image (RGBA8, keycap::kIcons' icon at kKeycapScale, every level), made at its first
+// keyboard bind, uploaded through that draw's ring, then kept for the run (a key rebinding makes another; each ~22 KB).
+struct KeycapImage
+{
+    std::vector<runtime::video::keycap::Rgba> levels;
+    VkImage image = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    uint64_t stagingBytes = 0;
+    bool uploaded = false, failed = false;
+};
+constexpr uint32_t kKeycapScale = 2;
 
 // FM4 Recomp (opt-in FM4_WRITE_WATCH=1; ReCarbon
 // write_watch.cpp's design, adapted): an image whose guest pages were protected (read-only) before the hash that
@@ -240,6 +264,8 @@ struct Unit
     // 2 3D, 3 cube with six layers), created at the first null binding.
     HostImage nullImages[4];
     VkImageView nullViews[4] = {};
+    std::map<std::string, KeycapImage> keycaps;  // FM4 Recomp (FM4_KEYCAP_ICONS): by icon and labels (KeycapName)
+    uint64_t keycapBindsSince = 0;
     uint64_t imageBytes = 0, uploads = 0, uploadedBytes = 0, uploadsSince = 0, uploadedBytesSince = 0;
     uint64_t reusedSince = 0, reusedBytesSince = 0;  // FM4 Recomp: binds that skipped an unchanged reload (FM4_TEXTURE_REUSE)
     uint64_t swap = 0, evicted = 0, evictedSince = 0;  // FM4 Recomp: EvictIdleTextures
@@ -837,6 +863,170 @@ bool WatchClean(const HostImage& image)
     return clean;
 }
 
+// FM4 Recomp (FM4_KEYCAP_ICONS=1, keycap.h): the game's prompt icons drawn as keycaps of the bound keys while the keyboard was
+// the last device used (input_live.h KeyboardLastUsed). Read once.
+bool KeycapIconsOn()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_KEYCAP_ICONS");
+        const bool set = v != nullptr && std::strcmp(v, "1") == 0;
+        if (set)
+            std::fprintf(stderr, "[texture] keycap icons on (FM4_KEYCAP_ICONS=1): the pad's prompt icons show the bound keys while the keyboard was used last\n");
+        return set;
+    }();
+    return on;
+}
+
+// The prompt icon a just-uploaded texture holds (keycap::kIcons index), or -1: only a 32x32, single-level, format-50 2D texture is
+// hashed (its 4096-byte base level, ContentHash seed 0, as the table's hashes of the .xds data).
+int IconOf(const TextureDescription& d, const uint8_t* base)
+{
+    namespace kc = runtime::video::keycap;
+    if (!KeycapIconsOn() || d.fetch.format != kc::kIconFormat || d.width != kc::kIconWidth || d.height != kc::kIconHeight || d.levelCount != 1 ||
+        d.dimension != 1 || d.layers != 1 || d.levels.empty() || d.levels[0].extentBytes != kc::kIconBytes)
+        return -1;
+    std::string ignored;
+    const uint8_t* bytes = GuestBytes(const_cast<uint8_t*>(base), d.levels[0].address, kc::kIconBytes, ignored);
+    const int icon = bytes == nullptr ? -1 : kc::FindIcon(ContentHash(bytes, kc::kIconBytes, 0));
+    static std::set<int> named;
+    if (icon >= 0 && named.insert(icon).second)
+        std::fprintf(stderr, "[texture] keycap icons: %s at %08X (host format %u)\n", kc::kIcons[size_t(icon)].name, d.base.physical, unsigned(d.host.vkFormat));
+    return icon;
+}
+
+// The cap's labels for an icon with the active bindings (empty: an action has no key, the pad icon stays).
+std::vector<std::string> KeycapLabels(int icon)
+{
+    namespace kc = runtime::video::keycap;
+    const auto bindings = runtime::input::ActiveKeyBindings();
+    std::vector<std::string> keys;
+    for (const char* id : kc::kIcons[size_t(icon)].actions)
+    {
+        if (id == nullptr)
+            break;
+        std::string label;
+        for (size_t i = 0; i < runtime::input::kActionCount; i++)
+            if (std::strcmp(runtime::input::kActions[i].id, id) == 0 && !bindings->keys[i].empty())
+                label = runtime::controls::KeyLabel(bindings->keys[i][0]);
+        keys.push_back(label);
+    }
+    return kc::CapLabels(keys);
+}
+
+// The keycap for a texture's icon while the keyboard was used last (created on first need, not yet uploaded), or null.
+KeycapImage* KeycapFor(const HostImage& image)
+{
+    namespace kc = runtime::video::keycap;
+    if (image.icon < 0 || !KeycapIconsOn() || !runtime::input::KeyboardLastUsed())
+        return nullptr;
+    const std::vector<std::string> labels = KeycapLabels(image.icon);
+    std::string name = std::to_string(image.icon);
+    for (const std::string& l : labels)
+        name += "\n" + l;
+    auto [it, fresh] = unit->keycaps.try_emplace(name);
+    KeycapImage& k = it->second;
+    if (fresh)
+    {
+        k.failed = labels.empty();
+        if (!k.failed)
+        {
+            k.levels = kc::IconLevels(size_t(image.icon), labels, kKeycapScale, kc::CoreTextInk);
+            for (const kc::Rgba& l : k.levels)
+                k.stagingBytes += (uint64_t(l.width) * l.height * 4 + 15) & ~uint64_t(15);
+            VkImageCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = VK_FORMAT_R8G8B8A8_UNORM;
+            info.extent = {k.levels[0].width, k.levels[0].height, 1};
+            info.mipLevels = uint32_t(k.levels.size());
+            info.arrayLayers = 1;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            k.failed = vkCreateImage(unit->dev.device, &info, nullptr, &k.image) != VK_SUCCESS;
+            if (!k.failed)
+            {
+                VkMemoryRequirements requirements{};
+                vkGetImageMemoryRequirements(unit->dev.device, k.image, &requirements);
+                VkMemoryAllocateInfo allocate{};
+                allocate.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                allocate.allocationSize = requirements.size;
+                allocate.memoryTypeIndex = MemoryType(unit->dev, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                k.failed = vkAllocateMemory(unit->dev.device, &allocate, nullptr, &k.memory) != VK_SUCCESS ||
+                           vkBindImageMemory(unit->dev.device, k.image, k.memory, 0) != VK_SUCCESS;
+            }
+            if (!k.failed)
+            {
+                VkImageViewCreateInfo v{};
+                v.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                v.image = k.image;
+                v.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                v.format = info.format;
+                v.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+                v.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, info.mipLevels, 0, 1};
+                k.failed = vkCreateImageView(unit->dev.device, &v, nullptr, &k.view) != VK_SUCCESS;
+            }
+        }
+        std::string shown;
+        for (const std::string& l : labels)
+            shown += (shown.empty() ? "" : " ") + l;
+        std::fprintf(stderr, "[texture] keycap icons: %s %s\n", kc::kIcons[size_t(image.icon)].name,
+                     labels.empty() ? "keeps the pad icon (an action has no key)" : k.failed ? "keeps the pad icon (its image could not be made)" : ("shows " + shown).c_str());
+    }
+    return k.failed ? nullptr : &k;
+}
+
+// The ring bytes this draw must reserve for a keycap's first upload (StagingBytes), marking the image so Bind uploads it.
+uint64_t KeycapReserve(HostImage& image)
+{
+    image.keycapReserved = false;
+    KeycapImage* k = KeycapFor(image);
+    if (k == nullptr || k->uploaded)
+        return 0;
+    image.keycapReserved = true;
+    return k->stagingBytes + StagingAlignment(4, unit->copyAlignment);
+}
+
+// Bind's substitution: the keycap's view (uploading it first when this draw reserved its bytes), or null for the pad icon.
+VkImageView KeycapView(const TextureBindContext& c, HostImage& image)
+{
+    const bool reserved = image.keycapReserved;
+    image.keycapReserved = false;
+    KeycapImage* k = KeycapFor(image);
+    if (k == nullptr || (!k->uploaded && !reserved))
+        return VK_NULL_HANDLE;
+    if (!k->uploaded)
+    {
+        uint64_t offset = 0;
+        if (!PlaceInRing(*c.allocator, k->stagingBytes, StagingAlignment(4, unit->copyAlignment), offset))
+            return VK_NULL_HANDLE;
+        std::vector<VkBufferImageCopy> copies;
+        uint64_t at = offset;
+        for (uint32_t i = 0; i < k->levels.size(); i++)
+        {
+            const auto& l = k->levels[i];
+            std::memcpy(c.ringMapped + at, l.pixels.data(), l.pixels.size());
+            VkBufferImageCopy copy{};
+            copy.bufferOffset = at;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, i, 0, 1};
+            copy.imageExtent = {l.width, l.height, 1};
+            copies.push_back(copy);
+            at += (l.pixels.size() + 15) & ~size_t(15);
+        }
+        const VkPipelineStageFlags shaders = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        Barrier(c.commands, k->image, uint32_t(k->levels.size()), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdCopyBufferToImage(c.commands, c.ring, k->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copies.size()), copies.data());
+        Barrier(c.commands, k->image, uint32_t(k->levels.size()), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, shaders, VK_ACCESS_SHADER_READ_BIT);
+        k->uploaded = true;
+        k->levels.clear(), k->levels.shrink_to_fit();
+    }
+    unit->keycapBindsSince++;
+    return k->view;
+}
+
 bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, VkSampler& sampler, std::string& error)
 {
     if (!unit || c.allocator == nullptr || c.ringMapped == nullptr || c.base == nullptr)
@@ -959,6 +1149,7 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
     {
         if (!Upload(c, t.words, d, p.binding, p.plan, *image, error))
             return false;
+        image->icon = IconOf(d, c.base);  // FM4 Recomp (FM4_KEYCAP_ICONS)
         image->sourceHash = sourceHash, image->hashed = reuse;
         if (reuse)
             CommitWatch(*image);
@@ -987,6 +1178,9 @@ bool Bind(const TextureBindContext& c, const TextureSlot& t, VkImageView& view, 
             return false;
         unit->hiBindsSince++;
     }
+    if (image->icon >= 0 || image->keycapReserved)  // FM4 Recomp (FM4_KEYCAP_ICONS): the keycap in place of the pad's icon
+        if (const VkImageView keycap = KeycapView(c, *image); keycap != VK_NULL_HANDLE)
+            view = keycap;
     sampler = Sampler(s, error);
     return sampler != VK_NULL_HANDLE;
 }
@@ -1007,7 +1201,16 @@ uint32_t PrepareAniso(const TextureSlot& t)
     return once ? t.anisoFilter : 7u;
 }
 
+uint64_t GuestStagingBytes(const TextureSlot& t, const uint8_t* base, HostImage*& found);
 uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
+{
+    HostImage* image = nullptr;
+    const uint64_t bytes = GuestStagingBytes(t, base, image);
+    // FM4 Recomp (FM4_KEYCAP_ICONS): a keycap's first upload goes through this draw's ring too.
+    return image != nullptr && image->icon >= 0 ? bytes + KeycapReserve(*image) : bytes;
+}
+
+uint64_t GuestStagingBytes(const TextureSlot& t, const uint8_t* base, HostImage*& found)
 {
     if (!unit || t.null)
         return 0;
@@ -1016,6 +1219,7 @@ uint64_t StagingBytes(const TextureSlot& t, const uint8_t* base)
     if (p.entry == nullptr)
         return 0;
     const auto it = unit->images.find(p.entry->key);  // FM4 Recomp (M7 CPU cost): one lookup (it was two of the same key per texture per draw)
+    found = it == unit->images.end() ? nullptr : &it->second;
     if (it != unit->images.end() && it->second.resident)
         return 0;  // FM4 Recomp (FM4_RESOLVE_RESIDENT): bound without an upload
     const uint64_t alignment = StagingAlignment(1u << p.entry->description.log2BytesPerBlock, unit->copyAlignment);
@@ -1355,6 +1559,12 @@ void ShutdownTextureUnit()
     }
     for (auto& [key, sampler] : unit->samplers)
         vkDestroySampler(unit->dev.device, sampler, nullptr);
+    for (auto& [key, k] : unit->keycaps)  // FM4 Recomp (FM4_KEYCAP_ICONS): null-safe
+    {
+        vkDestroyImageView(unit->dev.device, k.view, nullptr);
+        vkDestroyImage(unit->dev.device, k.image, nullptr);
+        vkFreeMemory(unit->dev.device, k.memory, nullptr);
+    }
     for (auto& [key, image] : unit->images)
     {
         vkDestroyImage(unit->dev.device, image.image, nullptr);

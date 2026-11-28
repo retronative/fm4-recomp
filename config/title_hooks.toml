@@ -331,6 +331,20 @@ value = 380
 [[value]]
 name = "kHideScreenInfoEvent"
 value = 0x82DDE980
+# Closing the option screen as its Back does (GRAPHICS: A saves, then returns to the menu that opened it). The base screen's Back
+# sub_82529F30 (this, input), for the Back input (sub_822D0F48(input, 8, 69, 1) true, 8252A014): the screen manager (sub_822B99B8)
+# vtable +56 (manager, this+276 the owner), then the screen's vtable +124 (this, *(0x82E023A8)): `lis r11,-32032; lwz r4,9128(r11)`
+# at 8252A048 (the same event the HUD screen's own B path fires after its question, 825387F8..82538808). Static reading of the
+# translation (2026-11-23).
+[[value]]
+name = "kManagerClose"
+value = 56
+[[value]]
+name = "kScreenEvent"
+value = 124
+[[value]]
+name = "kBackEvent"
+value = 0x82E023A8
 
 # The Pre-Race screen's KEYBOARD CONTROLS row (the pre-race screen where players adjust Audio and HUD).
 # ForzaUI::CPreRace (RTTI .?AVCPreRace@ForzaUI@@ 0x82D6D36C, vtable 0x820438FC, constructor sub_825BF750, scene 4_C_INI_PRERACE: MENU,
@@ -530,3 +544,278 @@ value = 112
 [[value]]
 name = "kFovForRecord"
 value = 756
+
+# Keyboard prompts (runtime/game/prompt_text.cpp, kernel/keyboard_prompts.h; FM4 Recomp 0.3.1's "prompts follow the input device",
+# fm4-engine 0.3.2 host/, BSD-3): while the keyboard was the device used last (input_live.h LastDevice), FM4's English strings that
+# name pad buttons in prose name the bound keys instead ("Press A to start the game." -> "Press SPACE to start").
+# sub_823A4780 (r3 = string table, r4 = 16-bit key) -> r3 = the UTF-16BE text: `mr r31,r3; mr r3,r4; cmplwi r31,0; beq; lwz r11,12(r31);
+# ...; bl 0x823a4800 (the key's entry); lwz r10,2(r3); lwz r11,8(r31); rlwinm r10,r10,1,0,30; add r3,r10,r11` (pool + 2 x offset), or
+# the fallback text at 0x82D970E4 (`lis r11,-32039; lwz r3,28900(r11)`). Every localized string's GetText reaches it: the vtable of the string-id object MakeLocString makes,
+# 0x8200254C (stored by its constructor sub_822A0E00 at 0x822A0E10..28, called from MakeLocString sub_822B1AE8) has slot +20 =
+# sub_82380978 (the only data word 0x82380978 in the image), which loads the table (*(*(0x82DC36D4) + (byte +4 + 24) * 4)) and the key
+# (+8) and ends with `b 0x823a4780`: a tail call, translated as a plain call that leaves ctx.lr as its caller set it, so the lookup
+# sees its GetText caller's return address. The reference hooks the same entry (midasm 0x823A4780, return_on_true; host/config/rexglue/
+# analysis/main-xex.toml:229-236, guest-addresses.toml:13-14 kStringLookup). Here a delegate: the handler runs the original, then
+# replaces r3 for the 24 prompt keys. Static reading (2026-11-25); behaviour UNRESOLVED until a run.
+[[hook]]
+name = "string lookup: keyboard prompts"
+kind = "delegate"
+function = 0x823A4780
+flag = "FM4_KEYBOARD_PROMPTS"
+bytes = 128
+sha256 = "570467fcd22637766ffb7b2feeeab3aa66cd83427bef295591ef5f45b4bd5922"
+handler = "PromptStringLookup"
+
+# A scene text element's update: sub_8233FAE8 (r3 ?, r4 = the element, r5 = its layout record; `mr r22,r3; mr r30,r4; mr r31,r5`; no
+# instruction up to 0x8233FE4C has r30 as its first operand, and its calls preserve it). Its text is a std::wstring at element + 132 (`addi r28,r30,132`): 16-byte inline buffer while
+# the capacity (+20 of the string, element + 152) is below 8, else a pointer at +132; the length at +16 (element + 148) (the assign
+# below: `lwz r11,20(r31); cmplwi r11,8; blt (inline)`, `stw r30,16(r31)`). It copies that text into the record (0x8233FB64..8C:
+# `addi r28,r30,132; addi r20,r31,28; ... bl 0x822fa000`) and lays the text out again only while byte element + 281 is set (0x8233FE4C
+# `lbz r11,281(r30); cmplwi r11,0; beq +624`, cleared at 0x823400BC `stb r19,281(r30)`). Every path from the entry reaches 0x8233FE4C
+# (forward branches only, to 8233FE18 / 8233FE48, and one backward strlen loop 8233FB94..A0). The reference hooks 0x8233FE4C itself
+# (midasm, host/config/rexglue/analysis/main-xex.toml:238-244; game_hooks.cpp:279-285 the offsets): our hooks are whole functions, so
+# the handler runs at the entry, before the original (so before the copy at 0x8233FB8C; README "Entry instead of the mid-function hook").
+[[hook]]
+name = "text element update: keyboard prompts"
+kind = "delegate"
+function = 0x8233FAE8
+flag = "FM4_KEYBOARD_PROMPTS"
+bytes = 1648
+sha256 = "8cd0acc95b17c12c5e01236214376748cd7a88cb1f3dbca58425759ff0b40ab8"
+handler = "PromptTextElementUpdate"
+
+# The wide string's assign (string, text, length): sub_82360E98 `mr r31,r3; mr r28,r4; mr r30,r5; bl 0x82362cc0`, then on one
+# branch sub_822FA000 (string, string, offset, length) and on the other sub_822F9F40 (string, length, 0), a copy of 2 x length bytes
+# (sub_8275FDF0), `stw r30,16(r31)` (the length) and a 0 terminator. The scene text setup calls it right after the GetText below
+# (0x8234FDA8..BC: `bl 0x822db0d8` with the text in r3, its result as r5; `addi r11,r31,132; mr r4,r28; mr r3,r11; bl 0x82360e98`). Reference: guest-addresses.toml:15-16 kTextAssign.
+[[symbol]]
+name = "kTextAssign"
+address = 0x82360E98
+bytes = 200
+sha256 = "0c176aa90cee7f2f5822f1a280ff10f88ab4880212c89a8ee89f11f6015b531f"
+
+# The scene text setup sub_8234FB80 (`lwz r31,0(r4)`: the element, kept in r31 throughout): it makes the element's string id with
+# MakeLocString (0x8234FD40 bl 0x822b1ae8) and its copy (0x8234FD4C bl 0x82971220), then calls its GetText through the vtable
+# (0x8234FD94 `lwz r11,20(r11)`, 0x8234FDA0 bctrl; the translation sets ctx.lr = 0x8234FDA4) and assigns the result to element + 132
+# (above). So a lookup whose return address is kTextSetup + kTextSetupGetTextReturn builds a scene text element, and its r31 (the
+# caller's, unchanged at the lookup's entry) is the element. Reference: guest-addresses.toml:17-19 kTextSetupGetTextReturn 0x8234FDA4,
+# game_hooks.cpp:1532-1536. The offset form follows kMainViewSetup + kAspectForCamera.
+[[symbol]]
+name = "kTextSetup"
+address = 0x8234FB80
+bytes = 1208
+sha256 = "af4f51c17802d28c587b7657217616f17240509902ee383d68e058e61f35d4b6"
+[[value]]
+name = "kTextSetupGetTextReturn"
+value = 548
+# A scene text element's fields (above): its std::wstring, the string's length and capacity, and the "lay out again" byte.
+[[value]]
+name = "kTextElementString"
+value = 132
+[[value]]
+name = "kTextElementLength"
+value = 148
+[[value]]
+name = "kTextElementCapacity"
+value = 152
+[[value]]
+name = "kTextElementLayout"
+value = 281
+
+# The render scenario settings of the GRAPHICS menu (SCENERY SHADOWS, REFLECTION UPDATES, MIRROR, SOFT PARTICLES, CROWDS, BLOOM, LEVEL OF
+# DETAIL; runtime/game/render_scenario.h and .cpp). The mechanism is FM4 Static Recomp 0.3.2's (BSD-3; host/src/game_hooks.cpp:354-503
+# value tables, :633-698 ApplyRenderScenarioSettings; host/config/rexglue/guest-addresses.toml:22-26), which runs the identical default.xex
+# (its fingerprints of 0x824360D8 and 0x82436078 in host/config/rexglue/releases/rev1.toml are the first 16 hex digits of our SHA-256 of
+# the same bytes); every number below was re-read here from our image (game/survey/image.bin) and translation (ppc/).
+# The render scenario manager (CDynamicRenderSettings) is held by the word at 0x82DC3750 (`lis rX,-32036; lwz r3,14160(rX)` before each
+# accessor call, e.g. in the scenario push sub_82450DE0 below and before both calls of the CrowdLoad accessor in ppc_recomp.70; 0 in the
+# image, set at renderer init). Each control's accessor (r3 = the manager, r4 = the scenario index from sub_82335E98) has one shape:
+# `lwz r11,96(r3)` (100 for ids 32..63); `rlwinm. r11,r11,32-id,31,31` (`clrlwi. r11,r11,31` for id 32): the override bit; set ->
+# `lis r11,-32042; addi r11,r11,-24592` (the offset table at 0x82D59FF0, initialized data: ids 0..35 -> 44, 52, 60, ...);
+# `lwz r11,4*id(r11); add r11,r11,r3; lbz/lwz/lfs ...,64(r11)`: the override value at manager + 64 + offset[id]; clear -> the stack of
+# scenario files (file + 36: their mask; file + offset + 4: their value), then the defaults at manager + 456 + offset. No function that
+# uses the offset table or the manager pointer stores to the mask words (static search of ppc/: the only stw ...,96/100 there are stack
+# stores), so the override layer is ours; the plan still keeps every bit it does not own. Static reading (2026-11-25): VERIFIED for the
+# ids, offsets, widths and the mask. The control names are the reference's and agree with the image (OBSERVED: the RTTI
+# CDynamicRenderControlBool<0x21> etc. and the value widths of ids 25..35 follow the names' order in .rdata: CrowdDrawShadows 25 bool,
+# CrowdSpriteDistScale 26 float, ParticleRateScale 28 float, EnvMapFrequencyScale 29 float, MaxCarsInMirror 30 int, HalfRateMirror 31,
+# HalfRateBloom 32, SoftParticles 33 (the template's 0x21), SkipShadowMapUnlessCockpit 34 bool, ExposureShiftScale 35 float). What each
+# setting looks like on screen is the reference's description: HYPOTHESIS here until a run.
+#
+# The tick: the main loop sub_822F7A00 runs `bl 0x822dc8e8; li r4,5; bl 0x822a23e8` at the head of every iteration (loop head loc_822F7B88,
+# its back edge `b 0x822f7b88` near the end), a few instructions before the reference's Fm4MainLoopSession point (0x822F7C30, the same
+# straight path). sub_822A23E8 has that one caller (return address 0x822F7BB4 = kMainLoop + 436). By its instructions: r4 & 15 < 6
+# indexes a table of six 556-byte entries at 0x82D9B7C0 (`lis r10,-32038; addi r10,r10,-18496; mulli r11,r11,556`); when the entry's
+# bytes 552 and 553 are set it calls sub_82AA0FF0 with the entry and, on 0, clears byte 553 and calls sub_82A9FE68 (r3, r4). What it
+# is: HYPOTHESIS, heap upkeep (0x82D9B7C0 + 284 is the track resource heap kResourceHeap above; both callees sit beside that heap
+# class's functions). The hook does not depend on it: it writes the override layer before the call, then makes the call unchanged.
+[[hook]]
+name = "render scenario: the main loop's tick"
+kind = "delegate"
+function = 0x822A23E8
+flag = "FM4_RENDER_SCENARIO"
+# mflr; bl 0x8276048c; stwu r1,-112(r1); mr r29,r3; mr r30,r4; clrlwi. r11,r4,28; ... mulli r11,r11,556; ... bl 0x82aa0ff0; ... bl 0x82a9fe68
+bytes = 128
+sha256 = "3eff5e8db751810c37db616164a12e6bc14463fd32f79d6764095efd0b148f81"
+handler = "RenderScenarioTick"
+
+# Depth of field: the reference's Fm4DepthOfFieldOption (host/config/rexglue/analysis/main-xex.toml:45-51, a mid-asm hook at 0x824360D8
+# zeroing r4; host/src/game_hooks.cpp:895-900) is the entry of a whole 24-byte function here: lwz r11,2760(r3); addi r3,r11,8;
+# lwz r11,8(r11); lwz r11,132(r11); mtctr r11; bctr: the renderer's depth-of-field switch (renderer, enable) forwarded to its device's
+# vtable +132. The showroom passes the enablehomespacedof option, scene changes 0 or 1 (the reference's reading, not re-checked here).
+# The hook passes 0 while DEPTH OF FIELD is OFF.
+[[hook]]
+name = "depth of field switch"
+kind = "delegate"
+function = 0x824360D8
+flag = "FM4_DEPTH_OF_FIELD_HOOK"
+bytes = 24
+sha256 = "797c0ed40b91b0691fda9178810025773d8cecc75d0571148ed197ef16e6a81d"
+handler = "DepthOfFieldSwitch"
+
+[[symbol]]
+name = "kMainLoop"
+address = 0x822F7A00
+bytes = 3256
+sha256 = "0550b71e09bd287dbb6968686e17a909c97bfb894c4bbd21359cf729b3874d7c"
+[[value]]
+name = "kMainLoopTick"
+value = 436
+[[value]]
+name = "kScenarioManagerPointer"
+value = 0x82DC3750
+[[value]]
+name = "kScenarioControlOffsets"
+value = 0x82D59FF0
+[[value]]
+name = "kScenarioOverrideValues"
+value = 64
+[[value]]
+name = "kScenarioOverrideMask"
+value = 96
+# The control ids (the reference's host/src/game_hooks.cpp:381-399 enum; each re-read from its accessor below: mask bit and table index).
+[[value]]
+name = "kScenarioCarLodThresholds"
+value = 7
+[[value]]
+name = "kScenarioCarFocusLodMinMax"
+value = 8
+[[value]]
+name = "kScenarioCarLodTransDist"
+value = 10
+[[value]]
+name = "kScenarioCarKeepLod0"
+value = 11
+[[value]]
+name = "kScenarioCarForceNoLod0"
+value = 12
+[[value]]
+name = "kScenarioCarMinWheelLod"
+value = 13
+[[value]]
+name = "kScenarioCollidablesInMirror"
+value = 18
+[[value]]
+name = "kScenarioCollidableShadows"
+value = 19
+[[value]]
+name = "kScenarioCrowdLoad"
+value = 20
+[[value]]
+name = "kScenarioEnvMapFrequencyScale"
+value = 29
+[[value]]
+name = "kScenarioMaxCarsInMirror"
+value = 30
+[[value]]
+name = "kScenarioHalfRateMirror"
+value = 31
+[[value]]
+name = "kScenarioHalfRateBloom"
+value = 32
+[[value]]
+name = "kScenarioSoftParticles"
+value = 33
+
+# Evidence anchors: the functions whose bytes hold the numbers above (never called; a different image refuses to build). The scenario push
+# (this, settings file): `lis r29,-32036; lwz r3,14160(r29)` (the manager pointer), the file pushed with sub_828E7340, then the UI tiling
+# (id 2, sub_8244EA68) to the screen manager.
+[[symbol]]
+name = "kScenarioPush"
+address = 0x82450DE0
+bytes = 180
+sha256 = "09000af8cfee3f511d44c6d9f472e0a709dc5658bb19e9f7f4b753627d21ab16"
+# The accessors (mask word and bit, override load): id 7 (+96, rlwinm 25: 3 words at +64/68/72), id 8 (rlwinm 24: 2 words), id 10
+# (rlwinm 22: 3 words), id 11 (rlwinm 21: lbz), id 12 (rlwinm 20: lbz), id 13 (rlwinm 19: lwz), id 18 (rlwinm 14: lbz), id 19 (rlwinm 13:
+# lbz), id 20 (rlwinm 12: lbz), id 29 (rlwinm 3: lfs), id 30 (rlwinm 2: lwz), id 31 (rlwinm 1: lbz), id 32 (+100, clrlwi 31: lbz), id 33
+# (+100, rlwinm 31: lbz); each loads table entry 4 x id.
+[[symbol]]
+name = "kGetCarLodThresholds"
+address = 0x82910BB0
+bytes = 252
+sha256 = "db4cd4cf8536990c20c9db6797d491774d74c72e71cbaedabe729880a56ae6f4"
+[[symbol]]
+name = "kGetCarFocusLodMinMax"
+address = 0x822C1DE0
+bytes = 224
+sha256 = "01671d898a45ac321173ea0dd8083ecb83ee929ac1dea0a6bbff115bfa0f7d14"
+[[symbol]]
+name = "kGetCarLodTransDist"
+address = 0x822FF2E8
+bytes = 252
+sha256 = "23a2171c4645ed3a08873ded6f3c362d0acadb80000008c27283a9a5b338311a"
+[[symbol]]
+name = "kGetCarKeepLod0"
+address = 0x823C1BB8
+bytes = 192
+sha256 = "566c06f33eed462da904ee42ee6dbd9989c95623f1346b9b7afba6ff9430de57"
+[[symbol]]
+name = "kGetCarForceNoLod0"
+address = 0x823C1C78
+bytes = 192
+sha256 = "f45a4d95516cf28190d48d6f89edb86b374816df578f9e454c54a1f8923727ca"
+[[symbol]]
+name = "kGetCarMinWheelLod"
+address = 0x82948218
+bytes = 192
+sha256 = "62925a6886aeef55ad8f7625f88b6fc0f7bff8ebb812843bc548c559615c9925"
+[[symbol]]
+name = "kGetCollidablesInMirror"
+address = 0x822EE828
+bytes = 192
+sha256 = "dd0f65b8420880d9b40ab5ad134de89da7871e584473aefe37294f6f27679d90"
+[[symbol]]
+name = "kGetCollidableShadows"
+address = 0x822C54B8
+bytes = 192
+sha256 = "d1b6e982e11f6c08b9179e18cef026969638476178f7835057f3295ceaab148b"
+[[symbol]]
+name = "kGetCrowdLoad"
+address = 0x82561D28
+bytes = 192
+sha256 = "617766039487e15be65f072738c1611b471e824a7f177c99d251768580d021f9"
+[[symbol]]
+name = "kGetEnvMapFrequencyScale"
+address = 0x822BA1C0
+bytes = 200
+sha256 = "c256cb0a97c2efa8863d90f4e036c1cfd4fa99eb693a14138d12c567ae6d5044"
+[[symbol]]
+name = "kGetMaxCarsInMirror"
+address = 0x82910CB0
+bytes = 192
+sha256 = "2968eaa96518722726040a7ee329b63261c3b6e98b1faf3776a3d864edb6b204"
+[[symbol]]
+name = "kGetHalfRateMirror"
+address = 0x826CE3C0
+bytes = 192
+sha256 = "63961d9e738e64afd2f103ddc6b603b95dcc9b506d68bc221a119f2b8d304569"
+[[symbol]]
+name = "kGetHalfRateBloom"
+address = 0x8244EB28
+bytes = 192
+sha256 = "e67fc14ab6a02a3bad437cb8425c3a39a1e977f6f53e24cfbbac0536ed3d3177"
+[[symbol]]
+name = "kGetSoftParticles"
+address = 0x82CEA0F8
+bytes = 192
+sha256 = "0adac2a48ea6646a21ad5331a61796ae54e24e414b38ca16a9f3bf29cb0e79f8"

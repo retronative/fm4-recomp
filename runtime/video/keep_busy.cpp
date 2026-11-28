@@ -21,11 +21,12 @@ namespace {
 
 // One fixed, bounded piece of work: kGroups x kGroups workgroups of 8x8 invocations, each a loop of kIterations steps, one store.
 constexpr uint32_t kIterations = 32, kLocal = 8;
+constexpr uint32_t kMaxDepth = 4;  // FM4_GPU_KEEP_BUSY_DEPTH: submissions kept queued (1: submit, then wait, as first built)
 
 struct Unit
 {
     bool asked = false, ready = false;
-    uint32_t groups = 64, cycleSeconds = 0;
+    uint32_t groups = 64, cycleSeconds = 0, depth = 1;
     uint64_t fenceTimeoutNs = 0;  // the renderer guard's bound
     bool (*rendererIdle)() = nullptr;  // FM4_GPU_KEEP_BUSY_GATED=1: submit only while the renderer has nothing in flight
     bool interactive = false;          // FM4_GPU_KEEP_BUSY_QOS=interactive (default: utility)
@@ -33,8 +34,8 @@ struct Unit
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
-    VkCommandBuffer commands = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBuffer commands[kMaxDepth] = {};  // one per queued submission, each with its own fence and buffer region
+    VkFence fences[kMaxDepth] = {};
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
@@ -81,45 +82,65 @@ bool GpuStopPresent() { return !unit.stopPath.empty() && ::access(unit.stopPath.
 void Work()
 {
     pthread_set_qos_class_self_np(unit.interactive ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_UTILITY, 0);  // utility: below the game's threads
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &unit.commands;
-    uint32_t sinceStopCheck = 0;
-    while (!quit.load())
-    {
-        if (!on.load())
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            continue;
-        }
-        if (unit.rendererIdle != nullptr && !unit.rendererIdle())  // gated: the game's own work has the GPU to itself
-        {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-            continue;
-        }
-        if (sinceStopCheck++ % 256 == 0 && GpuStopPresent())  // every GPU entry point honours GPU_STOP
-        {
-            std::fprintf(stderr, "[keepbusy] GPU_STOP is present: no further keep-busy work\n");
-            return;
-        }
-        // The command buffer was recorded once and is submitted again only after its last submission completed (the wait below).
-        if (vkResetFences(unit.device, 1, &unit.fence) != VK_SUCCESS || vkQueueSubmit(unit.queue, 1, &submit, unit.fence) != VK_SUCCESS)
-        {
-            std::fprintf(stderr, "[keepbusy] a submission was refused: no further keep-busy work\n");
-            return;
-        }
-        if (vkWaitForFences(unit.device, 1, &unit.fence, VK_TRUE, unit.fenceTimeoutNs) != VK_SUCCESS)
+    bool inFlight[kMaxDepth] = {};
+    // Waits for submission `i` if it is in flight (bounded); false when its completion is unknown (GPU_STOP written).
+    const auto retire = [&](uint32_t i) {
+        if (!inFlight[i])
+            return true;
+        if (vkWaitForFences(unit.device, 1, &unit.fences[i], VK_TRUE, unit.fenceTimeoutNs) != VK_SUCCESS)
         {
             stranded = true;  // completion unknown: nothing of this unit is destroyed, and the run's stop flag is written
             std::string error;
             if (!WriteGpuStop(unit.stopPath.c_str(), "fm4recomp keep-busy experiment (FM4_GPU_KEEP_BUSY): a fence did not signal within the fence bound; completion unknown", error))
                 std::fprintf(stderr, "[keepbusy] GPU_STOP NOT WRITTEN: %s\n", error.c_str());
             std::fprintf(stderr, "[keepbusy] a fence did not signal within the fence bound: GPU_STOP written, no further keep-busy work\n");
+            return false;
+        }
+        inFlight[i] = false;
+        submissions++;
+        return true;
+    };
+    const auto retireAll = [&] {
+        for (uint32_t i = 0; i < unit.depth; i++)
+            if (!retire(i))
+                return false;
+        return true;
+    };
+    uint32_t sinceStopCheck = 0, next = 0;
+    while (!quit.load())
+    {
+        // Off, or gated while the game's own work is in flight: what is queued completes, nothing new is submitted.
+        if (!on.load() || (unit.rendererIdle != nullptr && !unit.rendererIdle()))
+        {
+            if (!retireAll())
+                return;
+            std::this_thread::sleep_for(on.load() ? std::chrono::microseconds(100) : std::chrono::microseconds(1000));
+            continue;
+        }
+        if (sinceStopCheck++ % 256 == 0 && GpuStopPresent())  // every GPU entry point honours GPU_STOP
+        {
+            std::fprintf(stderr, "[keepbusy] GPU_STOP is present: no further keep-busy work\n");
+            retireAll();
             return;
         }
-        submissions++;
+        // The oldest of the `depth` submissions: waited for, then submitted again (so up to `depth` stay queued).
+        const uint32_t i = next;
+        next = (next + 1) % unit.depth;
+        if (!retire(i))
+            return;
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &unit.commands[i];
+        if (vkResetFences(unit.device, 1, &unit.fences[i]) != VK_SUCCESS || vkQueueSubmit(unit.queue, 1, &submit, unit.fences[i]) != VK_SUCCESS)
+        {
+            std::fprintf(stderr, "[keepbusy] a submission was refused: no further keep-busy work\n");
+            retireAll();
+            return;
+        }
+        inFlight[i] = true;
     }
+    retireAll();  // the thread ends with nothing in flight (or with GPU_STOP written)
 }
 
 }  // namespace
@@ -145,6 +166,16 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
             return;
         }
         unit.groups = uint32_t(n);
+    }
+    if (const char* v = std::getenv("FM4_GPU_KEEP_BUSY_DEPTH"))
+    {
+        const long n = std::strtol(v, nullptr, 10);
+        if (n < 1 || n > long(kMaxDepth))
+        {
+            std::fprintf(stderr, "[keepbusy] FM4_GPU_KEEP_BUSY_DEPTH must be 1..%u: the experiment stays off\n", kMaxDepth);
+            return;
+        }
+        unit.depth = uint32_t(n);
     }
     if (const char* v = std::getenv("FM4_GPU_KEEP_BUSY_CYCLE"))
     {
@@ -202,7 +233,7 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
     const VkDeviceSize bytes = VkDeviceSize(unit.groups) * kLocal * unit.groups * kLocal * 4;
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = bytes;
+    bufferInfo.size = bytes * unit.depth;  // a region of `bytes` per queued submission
     bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
@@ -218,10 +249,10 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
     shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shaderInfo.codeSize = spirv.size() * 4;
     shaderInfo.pCode = spirv.data();
-    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+    const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, unit.depth};
     VkDescriptorPoolCreateInfo descriptorInfo{};
     descriptorInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptorInfo.maxSets = 1;
+    descriptorInfo.maxSets = unit.depth;
     descriptorInfo.poolSizeCount = 1;
     descriptorInfo.pPoolSizes = &size;
     VkCommandPoolCreateInfo poolInfo{};
@@ -230,7 +261,8 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     VkShaderModule module = VK_NULL_HANDLE;
-    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSet sets[kMaxDepth] = {};
+    VkDescriptorSetLayout layouts[kMaxDepth] = {};
     bool ok = vkCreateBuffer(unit.device, &bufferInfo, nullptr, &unit.buffer) == VK_SUCCESS;
     if (ok)
     {
@@ -247,8 +279,9 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
          vkCreatePipelineLayout(unit.device, &layoutInfo, nullptr, &unit.layout) == VK_SUCCESS &&
          vkCreateShaderModule(unit.device, &shaderInfo, nullptr, &module) == VK_SUCCESS &&
          vkCreateDescriptorPool(unit.device, &descriptorInfo, nullptr, &unit.descriptors) == VK_SUCCESS &&
-         vkCreateCommandPool(unit.device, &poolInfo, nullptr, &unit.pool) == VK_SUCCESS &&
-         vkCreateFence(unit.device, &fenceInfo, nullptr, &unit.fence) == VK_SUCCESS;
+         vkCreateCommandPool(unit.device, &poolInfo, nullptr, &unit.pool) == VK_SUCCESS;
+    for (uint32_t i = 0; ok && i < unit.depth; i++)
+        ok = vkCreateFence(unit.device, &fenceInfo, nullptr, &unit.fences[i]) == VK_SUCCESS;
     if (ok)
     {
         VkComputePipelineCreateInfo pipeline{};
@@ -261,39 +294,44 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
         VkDescriptorSetAllocateInfo allocateSet{};
         allocateSet.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         allocateSet.descriptorPool = unit.descriptors;
-        allocateSet.descriptorSetCount = 1;
-        allocateSet.pSetLayouts = &unit.setLayout;
+        for (uint32_t i = 0; i < unit.depth; i++)
+            layouts[i] = unit.setLayout;
+        allocateSet.descriptorSetCount = unit.depth;
+        allocateSet.pSetLayouts = layouts;
         VkCommandBufferAllocateInfo allocateCommands{};
         allocateCommands.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocateCommands.commandPool = unit.pool;
         allocateCommands.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocateCommands.commandBufferCount = 1;
+        allocateCommands.commandBufferCount = unit.depth;
         ok = vkCreateComputePipelines(unit.device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &unit.pipeline) == VK_SUCCESS &&
-             vkAllocateDescriptorSets(unit.device, &allocateSet, &set) == VK_SUCCESS &&
-             vkAllocateCommandBuffers(unit.device, &allocateCommands, &unit.commands) == VK_SUCCESS;
+             vkAllocateDescriptorSets(unit.device, &allocateSet, sets) == VK_SUCCESS &&
+             vkAllocateCommandBuffers(unit.device, &allocateCommands, unit.commands) == VK_SUCCESS;
     }
     if (module != VK_NULL_HANDLE)
         vkDestroyShaderModule(unit.device, module, nullptr);
     if (ok)
     {
-        const VkDescriptorBufferInfo whole{unit.buffer, 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet write{};
-        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = set;
-        write.dstBinding = 0;
-        write.descriptorCount = 1;
-        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        write.pBufferInfo = &whole;
-        vkUpdateDescriptorSets(unit.device, 1, &write, 0, nullptr);
-        VkCommandBufferBeginInfo begin{};  // recorded once, before any submission; submitted again only after completion
-        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        ok = vkBeginCommandBuffer(unit.commands, &begin) == VK_SUCCESS;
-        if (ok)
+        for (uint32_t i = 0; ok && i < unit.depth; i++)
         {
-            vkCmdBindPipeline(unit.commands, VK_PIPELINE_BIND_POINT_COMPUTE, unit.pipeline);
-            vkCmdBindDescriptorSets(unit.commands, VK_PIPELINE_BIND_POINT_COMPUTE, unit.layout, 0, 1, &set, 0, nullptr);
-            vkCmdDispatch(unit.commands, unit.groups, unit.groups, 1);
-            ok = vkEndCommandBuffer(unit.commands) == VK_SUCCESS;
+            const VkDescriptorBufferInfo region{unit.buffer, bytes * i, bytes};
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = sets[i];
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            write.pBufferInfo = &region;
+            vkUpdateDescriptorSets(unit.device, 1, &write, 0, nullptr);
+            VkCommandBufferBeginInfo begin{};  // recorded once, before any submission; submitted again only after completion
+            begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            ok = vkBeginCommandBuffer(unit.commands[i], &begin) == VK_SUCCESS;
+            if (ok)
+            {
+                vkCmdBindPipeline(unit.commands[i], VK_PIPELINE_BIND_POINT_COMPUTE, unit.pipeline);
+                vkCmdBindDescriptorSets(unit.commands[i], VK_PIPELINE_BIND_POINT_COMPUTE, unit.layout, 0, 1, &sets[i], 0, nullptr);
+                vkCmdDispatch(unit.commands[i], unit.groups, unit.groups, 1);
+                ok = vkEndCommandBuffer(unit.commands[i]) == VK_SUCCESS;
+            }
         }
     }
     if (!ok)
@@ -306,8 +344,8 @@ void Initialize(const VulkanDevice& renderer, SpirvCompiler& compiler, const cha
     on = unit.cycleSeconds == 0;  // with a cycle the first window is OFF (OnSwap)
     unit.worker = std::thread(Work);
     std::fprintf(stderr, "[keepbusy] GPU keep-busy experiment on (FM4_GPU_KEEP_BUSY=1): a second device submits one compute dispatch of %ux%u workgroups "
-                         "(%u-step loop, %llu-byte buffer) after another, each waited for (%llu ms bound, GPU_STOP on a miss)%s%s; %s\n",
-                 unit.groups, unit.groups, kIterations, (unsigned long long)bytes, (unsigned long long)(fenceTimeoutNs / 1000000),
+                         "(%u-step loop, %llu-byte buffer) after another, %u kept queued, each waited for (%llu ms bound, GPU_STOP on a miss)%s%s; %s\n",
+                 unit.groups, unit.groups, kIterations, (unsigned long long)bytes, unit.depth, (unsigned long long)(fenceTimeoutNs / 1000000),
                  unit.rendererIdle != nullptr ? ", only while the renderer has nothing in flight (FM4_GPU_KEEP_BUSY_GATED=1)" : "",
                  unit.interactive ? ", interactive quality of service" : "",
                  unit.cycleSeconds == 0 ? "always" : ("alternating OFF/ON every " + std::to_string(unit.cycleSeconds) + " s from the first swap, OFF first").c_str());
@@ -353,7 +391,8 @@ bool Shutdown()
     vkDestroyPipelineLayout(unit.device, unit.layout, nullptr);
     vkDestroyDescriptorSetLayout(unit.device, unit.setLayout, nullptr);
     vkDestroyDescriptorPool(unit.device, unit.descriptors, nullptr);
-    vkDestroyFence(unit.device, unit.fence, nullptr);
+    for (uint32_t i = 0; i < unit.depth; i++)
+        vkDestroyFence(unit.device, unit.fences[i], nullptr);
     vkDestroyCommandPool(unit.device, unit.pool, nullptr);
     vkDestroyBuffer(unit.device, unit.buffer, nullptr);
     vkFreeMemory(unit.device, unit.memory, nullptr);

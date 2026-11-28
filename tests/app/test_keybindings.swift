@@ -93,7 +93,7 @@ enum KeyBindingsTest {
     let missing = d.serialized().replacingOccurrences(of: "brake = S\n", with: "")
     if case .failure(let error) = KeyBindings.parse(missing) { expect(error.message == "no key for 'brake'", "CONTROL: an action not named at all is invalid") }
     else { expect(false, "CONTROL: an action not named at all is invalid") }
-    expect(d.summary() == "W throttle, S brake, A/D steer, Space = A, Delete ⌫ = B, arrows = D-pad" &&
+    expect(d.summary() == "W throttle, S brake, A/D steer, Space = A, Backspace ⌫ = B, arrows = D-pad" &&
              swapped.summary().hasPrefix("S throttle, W brake,") && freed.summary().contains("J = A"),
            "summary: the launcher's Controls text follows the bindings")
 

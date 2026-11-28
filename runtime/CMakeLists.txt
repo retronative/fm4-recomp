@@ -17,6 +17,7 @@ target_include_directories(fm4recomp PRIVATE ${PROJECT_SOURCE_DIR}/tools/XenonRe
 # SDL3 for the audible audio sink only (audio_sdl.cpp); the runtime tests build kernel/ without it.
 find_package(SDL3 REQUIRED CONFIG)
 target_link_libraries(fm4recomp PRIVATE fm4_ppc SDL3::SDL3 objc "-framework AppKit")  # objc + AppKit: controls_panel_sdl.cpp's focus hand-over
+target_link_libraries(fm4recomp PRIVATE "-framework CoreText" "-framework CoreGraphics")  # video/keycap_text_mac.cpp (FM4_KEYCAP_ICONS)
 # FFmpeg for XMA (xma_ffmpeg.cpp only): the pinned, LGPL, xmaframes-only build of scripts/build_ffmpeg_xma.sh
 # (it checks the licence; the runtime checks the linked library again at start-up).
 # FM4_LGPL_SHARED (the release build, as in ReCarbon): the LGPL parts are libraries of their own, never inside a program, so

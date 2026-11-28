@@ -123,6 +123,20 @@ void PollLiveInput()
     int keyCount = 0;
     const bool* k = SDL_GetKeyboardState(&keyCount);
     const Keys keys = KeysFromState(*ActiveKeyBindings(), k, size_t(keyCount));
+//     const Keys keys = KeysFromState(*ActiveKeyBindings(), k, size_t(keyCount));
+// i.e. before Merge, the InputGate and the synthetic X pulse / Command-comma START, so only the player's own input counts.
+// `pad` is the raw pad (LiveState{} when no pad is open).
+
+    // FM4 Recomp (keyboard prompts, input_live.h LastDevice): the game's button prompts follow the device used last.
+    // (Names apart from the function's later `now`, its SDL clock.)
+    {
+        static LastDevice lastDevice;
+        const InputDevice previous = lastDevice.Current();
+        const InputDevice used = lastDevice.Update(PadInUse(pad), KeysInUse(keys), gamepad != nullptr);
+        if (used != previous)
+            std::fprintf(stderr, "[input] prompts: %s\n", used == InputDevice::Keyboard ? "keyboard keys" : "pad buttons");
+        SetKeyboardLastUsed(used == InputDevice::Keyboard);
+    }
     // FM4 Recomp (kernel/controls_screen.h, controls_menu.h): an idle pad while the host screen is up or the in-game KEYBOARD
     // CONTROLS submenu waits for a key or asks a question (the pad's A and B answer it); after it, held buttons stay hidden until
     // released. Each change the submenu makes sends the game one X press (~100 ms down, then up) so its screen redraws on the game's
@@ -307,7 +321,12 @@ void RunWindowLoop()
             }
             // Anywhere else (the menus): the Settings panel (--controls-panel: Graphics, and the keys), over the paused game.
             else if (runtime::controls::Screen* controls = runtime::controls::Service(); controls != nullptr && IsControlsShortcut(event))
-                controls->RequestOpen("Command-comma");
+            {
+                if (runtime::settings::InGameMenuShown())  // its previews are not saved: the panel's close would apply the file over them
+                    std::fprintf(stderr, "[input] Command-comma: the Settings panel does not open while the in-game GRAPHICS menu is shown\n");
+                else
+                    controls->RequestOpen("Command-comma");
+            }
             if (IsQuitShortcut(event))
                 CloseStop("Command-Q");
             if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)  // the in-game submenu's key, when it waits for one
@@ -331,6 +350,7 @@ void RunWindowLoop()
                 std::fprintf(stderr, "[graphics] Settings closed: RESOLUTION %s (%s), EDGE SMOOTHING %s (%s)\n", runtime::settings::kResolutions[saved.resolution].label,
                              resolution ? "asked for now" : "at the next start", runtime::settings::kSmoothings[saved.smoothing].label, smoothing ? "now" : "at the next start");
                 SetHdrPreference(saved.hdr != 0);
+                runtime::settings::PublishRender(saved);  // FM4 Recomp (render scenario settings): at the game's next main-loop tick
                 if (runtime::settings::ExtendedOffered())
                     runtime::view::Global().SetPreference(saved.extended != 0);  // Extended View: from the next frame
                 const HdrOutput now = HdrOutputNow();

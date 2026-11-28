@@ -7,6 +7,36 @@ All notable changes to FM4 Recomp are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-28
+
+[Release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.4.0).
+
+FM4 Recomp's own engine again, in place of the fm4-static-recomp engine that 0.3.0 to 0.3.1 shipped, with that engine's speed
+technique and the features players liked most in 0.3.1.
+
+### Added
+
+- More graphics settings in the GRAPHICS menu and in the Settings panel's new Effects tab: Scenery Shadows, Reflection Updates,
+  Mirror, Soft Particles, Crowds, Bloom, Level of Detail, Depth of Field, Motion Blur and Car Dirt. Each starts at the game's own value; a choice is
+  previewed at once and saved with A (B discards it).
+- Keyboard prompts: after you press a key, the game's on-screen instructions name your keys ("Press SPACE to start"); after you
+  use a gamepad, its buttons again. The button icons become keycaps of your keys (A, B, X, Y, BACK, START, the D-pad, the
+  triggers and RB). Connecting a controller switches them to its buttons at once, disconnecting it back to the keys, and with no
+  controller the game starts with the keys.
+- Careers played in 0.3.1 are brought over the first time you play: the game uses the newest copy of each saved game,
+  and the copy it replaces is kept in a saves-replaced folder beside your saves. A 0.3.0-only player opens 0.3.1 once first.
+- Shader warm-up: after Disc 1 setup, FM4 Recomp can play ten Quick Races hidden and muted (about 45 minutes; Skip stops it at
+  any time) so the game's shaders are ready before you race, and the first races no longer pause while they are prepared. It runs
+  on a separate profile and never touches your saves. Start it again later from the launcher's Warm Up Shaders button.
+
+### Changed
+
+- The Mac's delete key is named Backspace in key bindings, menus and prompts.
+- Faster: the GPU no longer waits for the game at each of its sync points (the technique of the fm4-static-recomp engine). On an
+  Apple M5 Mac at QHD, in automated runs without a window and with the frame rate unlocked, a parked race scene rendered 14 to 24 %
+  more frames per second than the same build without it, in back-to-back pairs. With the usual 60 Hz pacing, races stay at up to
+  30 frames per second; the headroom shows as fewer slow frames.
+
 ## [0.3.1] - 2026-11-25
 
 [Download the Apple silicon app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) · [Release notes and checksums](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).

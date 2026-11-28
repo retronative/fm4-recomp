@@ -39,10 +39,10 @@ bool SaveBindings(const std::string& path, const input::KeyBindings& bindings, s
 // Removes `path` (absent already: fine); false with `error`.
 bool ResetBindings(const std::string& path, std::string& error);
 
-// The game's style: upper case, ASCII (FM4's menu font). "STEER LEFT"; "DELETE" for SDL's "Backspace", "UP ARROW" for "Up".
+// The game's style: upper case, ASCII (FM4's menu font). "STEER LEFT"; "BACKSPACE" for SDL's "Backspace" (a Mac keyboard's delete key), "UP ARROW" for "Up".
 const char* ActionLabel(size_t action);
 std::string KeyLabel(uint16_t scancode);
-std::string KeysLabel(const std::vector<uint16_t>& keys);  // "DELETE / ESC"
+std::string KeysLabel(const std::vector<uint16_t>& keys);  // "BACKSPACE / ESC"
 
 class Menu
 {

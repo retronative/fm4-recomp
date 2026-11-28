@@ -81,6 +81,60 @@ inline LiveState Merge(const LiveState& pad, const LiveState& keys)
     return s;
 }
 
+// FM4 Recomp (keyboard prompts, runtime/game/prompt_text.cpp): the device the player used last, so the game's button prompts name
+// keyboard keys after a key press and pad buttons after a pad input. Until any input: the pad (the game's own prompts).
+// A device "is used" on the poll where its state goes from neutral to non-neutral (an edge, not a level), so a pad whose stick or
+// trigger rests a little off centre, or a key still held, never takes the prompts back on its own. When both devices start in the
+// same poll the device stays as it was.
+// Neutral: XInput's documented dead zones (XInput.h, Microsoft XInput "Getting Started" and XINPUT_GAMEPAD docs):
+// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE 7849, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE 8689, XINPUT_GAMEPAD_TRIGGER_THRESHOLD 30; a value
+// beyond them (|axis| > zone, trigger > threshold) is input. Per axis (a square zone), not the stick's magnitude: simpler, and the
+// zone only decides "is the pad being used".
+constexpr int kLeftThumbDeadzone = 7849, kRightThumbDeadzone = 8689, kTriggerThreshold = 30;
+
+inline bool PadInUse(const LiveState& p)
+{
+    const auto beyond = [](int16_t axis, int zone) { return (axis < 0 ? -int(axis) : int(axis)) > zone; };
+    return p.buttons != 0 || p.leftTrigger > kTriggerThreshold || p.rightTrigger > kTriggerThreshold || beyond(p.leftX, kLeftThumbDeadzone) ||
+           beyond(p.leftY, kLeftThumbDeadzone) || beyond(p.rightX, kRightThumbDeadzone) || beyond(p.rightY, kRightThumbDeadzone);
+}
+
+inline bool KeysInUse(const Keys& k)
+{
+    return k.up || k.down || k.left || k.right || k.w || k.a || k.s || k.d || k.enter || k.backspace || k.space || k.tab || k.x || k.y ||
+           k.q || k.e || k.c;
+}
+
+enum class InputDevice : uint8_t { Pad, Keyboard };
+
+// FM4 Recomp (as 0.3.x): a pad connecting makes it the device, the pad disconnecting makes the keyboard the
+// device, and a start with no pad starts on the keyboard; otherwise the device whose input starts alone (an edge) takes over.
+class LastDevice
+{
+public:
+    InputDevice Update(bool padInUse, bool keysInUse, bool padConnected = true)
+    {
+        if (!seen_ || padConnected != connected_)
+            device_ = padConnected ? InputDevice::Pad : InputDevice::Keyboard;
+        seen_ = true, connected_ = padConnected;
+        const bool padStarts = padInUse && !padWas_, keysStart = keysInUse && !keysWere_;
+        padWas_ = padInUse, keysWere_ = keysInUse;
+        if (padStarts != keysStart)
+            device_ = keysStart ? InputDevice::Keyboard : InputDevice::Pad;
+        return device_;
+    }
+    InputDevice Current() const { return device_; }
+
+private:
+    InputDevice device_ = InputDevice::Pad;
+    bool padWas_ = false, keysWere_ = false, seen_ = false, connected_ = false;
+};
+
+// FM4 Recomp (keyboard prompts): the window loop's LastDevice for guest threads (imports_input.cpp; an atomic).
+// FM4_DIAG_PROMPTS_KEYBOARD=1 (kernel/diag_prompts.h) makes it true from the start, for a scripted offscreen run.
+void SetKeyboardLastUsed(bool keyboard);
+bool KeyboardLastUsed();
+
 // While a host screen has the input (the Keyboard Controls screen, controls_screen.h) the game sees an idle pad; after it closes,
 // each button still held stays hidden until released, so the press that closed the screen does not reach the game. Adapted from
 // ReCarbon runtime/hid/input.cpp:731-745 at 66401ea (SpeedBreaker runtime, GPL-3.0-or-later). FM4 Recomp changes: a pure class

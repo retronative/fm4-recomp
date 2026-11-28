@@ -21,7 +21,7 @@ enum Theme {
 
 @MainActor
 final class SetupModel: ObservableObject {
-  enum Page: String, CaseIterable { case welcome, prerequisites, disc, disc2, installing, failed, launcher, repair }
+  enum Page: String, CaseIterable { case welcome, prerequisites, disc, disc2, installing, warmUp, failed, launcher, repair }
 
   let paths: Paths
   @Published var page: Page
@@ -56,7 +56,7 @@ final class SetupModel: ObservableObject {
   private var keyMonitor: Any?
   // Graphics (GraphicsSettings.swift; the panel's second tab, ControlsPanel.swift): the saved choice, why the saved file was refused
   // (720p is shown then), the choice the running game started with (the panel only), and the last save's result.
-  enum SettingsTab { case keyboard, graphics }
+  enum SettingsTab { case keyboard, graphics, effects }  // FM4 Recomp: effects, the render scenario settings (GraphicsView.swift EffectsPage)
   @Published var settingsTab = SettingsTab.keyboard
   @Published var graphics: GraphicsSettings
   @Published var graphicsProblem: String?
@@ -68,6 +68,9 @@ final class SetupModel: ObservableObject {
   var displayHdr: Bool?  // whether the screen can show HDR (nil: not known, e.g. a headless render)
   var hdrLive = false    // the running game takes an HDR change when this panel closes (FM4_GRAPHICS_LIVE=1); otherwise at its next start
   var extendedOffered = false  // Extended View has a row here (FM4_EXTENDED_VIEW_OFFERED=1; not in 0.2.0)
+  var renderOffered = false  // FM4 Recomp: the Effects tab (FM4_RENDER_SCENARIO=1: the running game applies its settings)
+  var dofOffered = false     // its Depth of Field row (FM4_DEPTH_OF_FIELD_HOOK=1)
+  var overridesOffered = false  // its Motion Blur and Car Dirt rows (FM4_SHADER_OVERRIDES=1)
   var hdrRunning: HdrStatus?  // the running game's last word on its output (hdr_status); nil: none
   // Why the game cannot start as set up (LaunchDecision.swift .repair), shown on the Repair page.
   @Published var repairReason = ""
@@ -157,7 +160,7 @@ final class SetupModel: ObservableObject {
     if status == 0 && installingDisc2 && hasDisc2 {
       page = .launcher
     } else if status == 0 && !installingDisc2 && state(paths) == .ready {
-      page = hasDisc2 ? .launcher : .disc2  // Disc 2 is optional: its page offers Skip
+      startWarmUp()  // then Disc 2, which is optional (its page offers Skip)
     } else {
       failure = log.last(where: { $0.hasPrefix("setup:") }) ?? (status == 6 || status == 15 ? "Setup was cancelled." : "Setup stopped (status \(status)).")
       page = .failed
@@ -165,6 +168,30 @@ final class SetupModel: ObservableObject {
   }
 
   func cancelSetup() { process?.terminate() }
+
+  // FM4 Recomp (shader warm-up): play.sh --warm-up after Disc 1's setup, or from the launcher (after a resolution change). The game
+  // plays a scripted route, hidden and muted, into the player's shader cache; Skip stops it and keeps what it compiled. Its outcome
+  // never fails setup: the game plays without it (with short pauses the first time new scenery appears).
+  @Published var warmUpFromLauncher = false
+  func startWarmUp(fromLauncher: Bool = false) {
+    refreshGpuStop()
+    guard gpuStop == nil, !playing, process == nil else { return }
+    warmUpFromLauncher = fromLauncher
+    page = .warmUp
+    progress = 0
+    stage = "Starting the game"
+    log = []
+    process = runKitScript(paths, "play.sh", ["--warm-up"], line: { text in
+      Task { @MainActor in self.consumeSetupLine(text) }
+    }, done: { status in
+      Task { @MainActor in
+        self.process = nil
+        self.refreshGpuStop()
+        self.lastSession = status == 0 ? "shaders warmed up." : "the shader warm-up stopped early; the shaders compiled so far are kept."
+        self.page = self.warmUpFromLauncher || self.hasDisc2 ? .launcher : .disc2
+      }
+    })
+  }
 
   // The panel never keeps the focus: after a file or folder dialog the game is active again (its keyboard and gamepad input).
   func returnFocus() {
@@ -341,6 +368,13 @@ final class SetupModel: ObservableObject {
     save(new)
   }
 
+  // FM4 Recomp (render scenario settings): one change on the Effects tab, saved at once like the others.
+  func setRender(_ change: (inout GraphicsSettings) -> Void) {
+    var new = graphics
+    change(&new)
+    save(new)
+  }
+
   private func save(_ new: GraphicsSettings) {
     do {
       try new.write(to: paths.graphicsFile)
@@ -379,6 +413,9 @@ final class SetupModel: ObservableObject {
     case .installing:
       progress = 0.42
       stage = "Copying the game files from your disc"
+    case .warmUp:
+      progress = 0.32
+      stage = "Warming up shaders: race 4 of 10"
     case .failed:
       failure = "setup: default.xex is not the file this build needs: another disc version?"
     case .launcher:
@@ -405,6 +442,7 @@ struct RootView: View {
         case .disc: DiscPage(model: model, which: .one)
         case .disc2: DiscPage(model: model, which: .two)
         case .installing: InstallingPage(model: model)
+        case .warmUp: WarmUpPage(model: model)
         case .failed: FailedPage(model: model)
         case .launcher: LauncherPage(model: model)
         case .repair: RepairPage(model: model)
@@ -429,7 +467,7 @@ struct Header: View {
         Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: .fit)
           .frame(height: model.page == .launcher ? 150 : 96)
       }
-      if model.page != .launcher && model.page != .repair && !model.panel { StepIndicator(page: model.page, disc2: model.installingDisc2) }
+      if model.page != .launcher && model.page != .repair && !model.panel && !(model.page == .warmUp && model.warmUpFromLauncher) { StepIndicator(page: model.page, disc2: model.installingDisc2) }
     }
     .padding(.top, 34)
     .padding(.bottom, 18)
@@ -700,6 +738,30 @@ struct InstallingPage: View {
   }
 }
 
+struct WarmUpPage: View {
+  @ObservedObject var model: SetupModel
+  @State private var details = false
+  var body: some View {
+    VStack(alignment: .leading, spacing: 16) {
+      Text("Warming up shaders").font(.system(size: 22, weight: .bold))
+      Card {
+        HStack {
+          Text(model.stage).font(.system(size: 13.5, weight: .medium))
+          Spacer()
+          Text("\(Int(model.progress * 100)) %").font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+        }
+        ProgressBar(value: model.progress)
+        Text("The game plays ten short races by itself, hidden and muted, so the graphics it needs are prepared before you play: no pauses when new scenery first appears. About 45 minutes; your saves are not touched. Skip at any time: what is done so far is kept. If you change the rendering resolution later, warm up again from the launcher.")
+          .font(.system(size: 12)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+      }
+      DisclosureGroup(isExpanded: $details) { LogView(lines: model.log) } label: {
+        Text("Details").font(.system(size: 12.5)).foregroundStyle(Theme.secondary)
+      }
+      HStack { Spacer(); SecondaryButton(title: "Skip") { model.cancelSetup() } }
+    }
+  }
+}
+
 struct ProgressBar: View {
   let value: Double
   var body: some View {
@@ -799,6 +861,7 @@ struct LauncherPage: View {
         SecondaryButton(title: "Logs") { model.openLogs() }
         SecondaryButton(title: "Read Me & Known Issues") { NSWorkspace.shared.open(model.paths.readme) }
         if !model.hasDisc2 && !model.playing { SecondaryButton(title: "Add Disc 2…") { model.page = .disc2 } }
+        if !model.playing && model.gpuStop == nil { SecondaryButton(title: "Warm Up Shaders…") { model.startWarmUp(fromLauncher: true) } }
         Spacer()
         Text("Beta · your saves are kept in your Library").font(.system(size: 11)).foregroundStyle(Theme.secondary)
       }

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: BSD-3-Clause AND GPL-3.0-or-later
+# The shader warm-up races (scripts/alpha/warmup/make_route.py): fm4-static-recomp warm-up.ps1's list (Copyright (c) 2026, i2kiselev,
+# BSD-3-Clause; LICENSES/FM4-Static-Recomp-BSD-3-Clause.txt). Columns: number, manufacturer (Abarth 1), car (from 0), environment (from 0), label.
+1	5	2	0	Aston Martin DBR1 at Bernese Alps
+2	12	1	9	Cadillac CTS-V at Le Mans
+3	13	18	1	Chevrolet Corvette Z06 at Camino Viejo de Montserrat
+4	21	14	24	Ferrari F430 at Tsukuba
+5	21	17	6	Ferrari 599 GTB Fiorano at Indianapolis
+6	21	20	15	Ferrari 599 GTO at Rally di Positano
+7	23	7	25	Ford Mustang Mach 1 at Twin Ring Motegi
+8	40	9	21	Lotus Evora Type 124 at Sunset Peninsula
+9	50	4	23	Nissan Versa SL at Top Gear Test Track
+10	57	7	13	Pontiac GTO at Nurburgring GP

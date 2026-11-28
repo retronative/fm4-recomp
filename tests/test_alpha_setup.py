@@ -645,5 +645,116 @@ class PlayDefaults(unittest.TestCase):
         self.assertNotIn("FM4_VERTEX_CACHE_MB", s)
 
 
+# A stand-in for the game in play.sh --warm-up: a binary named fm4recomp (play.sh stops it with pkill -x), recording its arguments,
+# environment and user data in FAKE_ARGS, then logging (stderr = game.log) the input script's lines for FAKE_MODE=complete (title,
+# each @scene list, the route's last event) and waiting for a signal.
+FAKE_GAME_C = r"""
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char** argv) {
+  FILE* f = fopen(getenv("FAKE_ARGS"), "w");
+  const char* user = "";
+  for (int i = 1; i < argc; i++) { fprintf(f, "%s\n", argv[i]); if (!strcmp(argv[i], "--user-data") && i + 1 < argc) user = argv[i + 1]; }
+  char profile[4096];
+  snprintf(profile, sizeof profile, "%s/content/1/00000001/ForzaProfile.xcontent", user);
+  fprintf(f, "ENV FM4_INPUT_SCRIPT=%s\nENV FM4_INPUT_LIVE=%s\nPROFILE %s\n", getenv("FM4_INPUT_SCRIPT") ? getenv("FM4_INPUT_SCRIPT") : "-",
+          getenv("FM4_INPUT_LIVE") ? getenv("FM4_INPUT_LIVE") : "-", access(profile, R_OK) == 0 ? "yes" : "no");
+  fclose(f);
+  if (!strcmp(getenv("FAKE_MODE"), "complete")) {
+    fprintf(stderr, "[input] title accepted at vblank 1801: the script's @title section (2 events) runs from here\n");
+    for (int k = 1; k <= 2; k++) { sleep(1); fprintf(stderr, "[input] @scene race 1 list %d of 2 (2 events) starts at vblank %d\n", k, 1000 * k); }
+    fprintf(stderr, "[input] event 9 at scene vblank 500: released\n");
+  }
+  for (;;) pause();
+}
+"""
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+ROUTE = "# test route\n0 A\n10\n@title\n0\n@scene race 1\n0 A\n10\n@scene race 1\n0\n500\n"
+
+
+class WarmUp(Base):
+    """play.sh --warm-up in a scratch kit with a fake game: the throwaway profile copy, the arguments (offscreen, muted, the route, no
+    keyboard bindings), progress lines, the stop at the route's end (exit 0) and the stop on TERM (Skip: exit 1); the player's user
+    data untouched, the throwaway removed."""
+
+    def setUp(self):
+        super().setUp()
+        self.disc1()
+        kit = self.k.kit
+        write_exec(os.path.join(kit, "play.sh"), read(os.path.join(ALPHA, "play.sh")))
+        for f in ("lib/libvulkan.1.dylib", "lib/libMoltenVK.dylib", "vulkan/icd.d/MoltenVK_icd.json"):
+            os.makedirs(os.path.dirname(os.path.join(kit, f)), exist_ok=True)
+            open(os.path.join(kit, f), "w").close()
+        os.makedirs(os.path.join(kit, "warmup", "profile", "content", "1", "00000001"))
+        open(os.path.join(kit, "warmup", "profile", "content", "1", "00000001", "ForzaProfile.xcontent"), "w").close()
+        with open(os.path.join(kit, "warmup", "route.txt"), "w") as f:
+            f.write(ROUTE)
+        src = os.path.join(self.tmp, "fake_game.c")
+        with open(src, "w") as f:
+            f.write(FAKE_GAME_C)
+        subprocess.run(["/usr/bin/cc", "-o", os.path.join(kit, "bin", "fm4recomp"), src], check=True)
+        with open(os.path.join(self.k.home, "keybindings.conf"), "w") as f:
+            f.write("throttle = J\n")
+        self.player = os.path.join(self.k.home, "data", "user-data")
+        with open(os.path.join(self.player, "save"), "w") as f:
+            f.write("the player's save\n")
+        self.args = os.path.join(self.tmp, "args.txt")
+
+    def start(self, mode):
+        if subprocess.run(["pgrep", "-x", "fm4recomp"], capture_output=True).returncode == 0:
+            self.skipTest("a game named fm4recomp is running on this Mac (play.sh would refuse, and its pkill would reach it)")
+        env = self.k.env(FAKE_ARGS=self.args, FAKE_MODE=mode, FM4_INPUT_LIVE="1")
+        return subprocess.Popen([BASH, os.path.join(self.k.kit, "play.sh"), "--warm-up", "5"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, start_new_session=True)
+
+    def checkCommon(self):
+        args = read(self.args).splitlines()
+        self.assertEqual(args[args.index("--user-data") + 1], os.path.join(self.k.home, "data", "warm-up", "user-data"))
+        self.assertEqual(args[args.index("--renderer") + 1], "present")
+        self.assertEqual(args[args.index("--audio") + 1], "mute")
+        self.assertNotIn("--keybindings", args)                                       # CONTROL: the player has a keybindings.conf
+        self.assertNotIn("--controls-panel", args)
+        self.assertIn("ENV FM4_INPUT_SCRIPT=" + os.path.join(self.k.kit, "warmup", "route.txt"), args)
+        self.assertIn("ENV FM4_INPUT_LIVE=-", args)                                   # CONTROL: set in the caller's environment
+        self.assertIn("PROFILE yes", args)                                            # the prepared profile's copy
+        self.assertFalse(os.path.exists(os.path.join(self.k.home, "data", "warm-up")))  # the throwaway is removed
+        self.assertEqual(read(os.path.join(self.player, "save")), "the player's save\n")
+        self.assertEqual(os.listdir(self.player), ["save"])
+
+    def test_complete(self):
+        p = self.start("complete")
+        out, _ = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 0, out)
+        progress = [l for l in out.splitlines() if l.startswith("progress ")]
+        self.assertEqual(progress, ["progress 0 Starting the game", "progress 2 Warming up shaders: race 1 of 2",
+                                    "progress 52 Warming up shaders: race 2 of 2", "progress 100 Shaders warmed up"], out)
+        self.assertIn("play: warm-up complete", out)
+        self.checkCommon()
+
+    def test_skip(self):
+        p = self.start("skip")
+        deadline = time.time() + 60
+        while not os.path.exists(self.args) and time.time() < deadline:
+            time.sleep(0.2)
+        time.sleep(1)
+        held = subprocess.run(["pgrep", "-f", "caffeinate -i -w %d" % p.pid], capture_output=True).returncode == 0
+        self.assertTrue(held, "no idle-sleep assertion for play.sh's lifetime")  # muted: nothing else keeps the Mac awake
+        p.send_signal(signal.SIGTERM)                                                 # the app's Skip: TERM to play.sh only
+        out, _ = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("the warm-up stopped before the route's end", out)
+        self.assertNotIn("progress 100", out)
+        self.assertNotEqual(subprocess.run(["pgrep", "-x", "fm4recomp"], capture_output=True).returncode, 0)  # the game stopped too
+        self.checkCommon()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

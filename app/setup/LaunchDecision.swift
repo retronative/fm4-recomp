@@ -62,6 +62,5 @@ func quitsAfterAutoSession(scriptStatus: Int32, gameEnded: String?) -> Bool {
 // play.sh's game-ended line for a normal end (closed, quit, or the session limit): the app leaves the screen at once (no Dock icon,
 // no menu bar) while play.sh finishes its GPU checks, then quits (or comes back with the launcher if they found something).
 func gameEndedNormally(_ line: String) -> Bool {
-  line == "play: the game ended (exit 0): ShiftGlue closed normally" ||
-    line.hasPrefix("play: the game ended (exit 14)") || line.hasPrefix("play: the game ended (exit 124)")
+  line.hasPrefix("play: the game ended (exit 14)") || line.hasPrefix("play: the game ended (exit 124)")
 }

@@ -103,9 +103,6 @@ enum LaunchDecisionTest {
     // app; a game stop (e.g. 9), a play.sh failure (3: GPU hang evidence) or no "game ended" line shows the launcher.
     let closed = "play: the game ended (exit 14): [stop 14] the window was closed by the user (SDL_EVENT_WINDOW_CLOSE_REQUESTED)"
     expect(quitsAfterAutoSession(scriptStatus: 0, gameEnded: closed), "auto session: window closed: the app quits")
-    let engineClosed = "play: the game ended (exit 0): ShiftGlue closed normally"
-    expect(quitsAfterAutoSession(scriptStatus: 0, gameEnded: engineClosed), "the active engine closed normally: the launcher quits")
-    expect(!quitsAfterAutoSession(scriptStatus: 3, gameEnded: engineClosed), "a failed post-session check still shows the launcher")
     expect(quitsAfterAutoSession(scriptStatus: 0, gameEnded: "play: the game ended (exit 124): no stop line"), "auto session: session limit: the app quits")
     expect(!quitsAfterAutoSession(scriptStatus: 0, gameEnded: "play: the game ended (exit 9): [stop 9] user data: ..."), "CONTROL: auto session: a game stop shows the launcher")
     expect(!quitsAfterAutoSession(scriptStatus: 3, gameEnded: closed), "CONTROL: auto session: GPU hang evidence shows the launcher")

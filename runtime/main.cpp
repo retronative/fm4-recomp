@@ -376,7 +376,9 @@ int main(int argc, char** argv)
                                                    runtime::video::GuestMemoryGpuAsked() ? runtime::video::HonourGpuReadGuard : nullptr,
                                                    runtime::video::GuestMemoryGpuAsked() ? runtime::video::BeforeCpWrite : nullptr,
                                                    // FM4 Recomp (M9, FM4_OCCLUSION_QUERIES): ZpassDone answers 0 unless the renderer counts
-                                                   runtime::video::ZpassDone, runtime::video::ZpdCount};
+                                                   runtime::video::ZpassDone, runtime::video::ZpdCount,
+                                                   // FM4 Recomp (FM4_NO_DRAIN, not guest-exact): only when on
+                                                   runtime::video::NoDrain() ? runtime::video::CpuVisible : nullptr};
     if (runtime::video::Initialize(video))
     {
         if (video.mode == runtime::video::Mode::SelfCheck)

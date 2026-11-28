@@ -74,7 +74,7 @@ func keyName(forKeyCode code: UInt16) -> String? { macKeyNames[Int(code)] }
 // How a Mac keyboard labels the key (the file keeps SDL's name).
 func keyLabel(_ name: String) -> String {
   switch name {
-  case "Backspace": return "Delete ⌫"
+  case "Backspace": return "Backspace ⌫"
   case "Delete": return "Forward Delete ⌦"
   case "Escape": return "Esc"
   case "Up": return "↑"

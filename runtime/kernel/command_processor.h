@@ -76,6 +76,10 @@ struct RendererHooks
     // land (the deferred queue) or now when nothing is open. Both nullable together.
     uint32_t (*zpassDone)(uint32_t physical) = nullptr;  // null (the default): not counted, the fixed report
     uint32_t (*zpdCount)(uint32_t token) = nullptr;
+    // FM4 Recomp (opt-in FM4_NO_DRAIN=1, not guest-exact; renderer.h NoDrain): non-null only when on. Stream stores and interrupts then
+    // land when reached (never queued), after this call (the renderer writes back a resolve that starts a new capture run); WAIT_UNTIL's
+    // idle request is not honoured; a memory wait on a word nothing pending writes polls without a sync.
+    void (*cpuVisible)() = nullptr;
 };
 // FM4 Recomp (FM4_GUEST_MEMORY_GPU): whether the calling thread is the command processor's (async-signal-safe: pthread_self).
 bool OnCommandProcessorThread();

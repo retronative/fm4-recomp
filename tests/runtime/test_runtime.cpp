@@ -1056,8 +1056,8 @@ int main(int, char** argv)
             two.keys[9] = {42, 41};  // B on Backspace and Escape: giving Escape to A leaves B its Backspace
             const controls::Change esc = controls::ChangeAssigning(two, 41, 8);
             Expect(esc.from == 9 && esc.fromGets == std::vector<uint16_t>{42}, "controls menu: an action keeps its other keys");
-            Expect(controls::KeyLabel(42) == "DELETE" && controls::KeyLabel(82) == "UP ARROW" && controls::KeyLabel(26) == "W" &&
-                       controls::KeyLabel(44) == "SPACE" && controls::KeyLabel(224) == "LEFT CONTROL" && controls::KeysLabel({42, 41}) == "DELETE / ESC" &&
+            Expect(controls::KeyLabel(42) == "BACKSPACE" && controls::KeyLabel(82) == "UP ARROW" && controls::KeyLabel(26) == "W" &&
+                       controls::KeyLabel(44) == "SPACE" && controls::KeyLabel(224) == "LEFT CONTROL" && controls::KeysLabel({42, 41}) == "BACKSPACE / ESC" &&
                        std::string(controls::ActionLabel(0)) == "STEER LEFT" && std::string(controls::ActionLabel(8)) == "A (CONFIRM)",
                    "controls menu: labels in the game's style (upper case; Mac names for Backspace, the arrows, Ctrl)");
             input::KeyBindings parsed;
@@ -1076,7 +1076,7 @@ int main(int, char** argv)
             const bool refused = menu.CurrentMode() == Mode::WaitingForKey && menu.Prompt().rfind("THAT KEY CANNOT BE USED", 0) == 0;
             menu.Key(22);
             const bool asked = menu.CurrentMode() == Mode::ConfirmReplace &&
-                               menu.Prompt() == "S IS USED BY BRAKE. A (SPACE): REPLACE (BRAKE WILL USE W). B (DELETE): CANCEL." &&
+                               menu.Prompt() == "S IS USED BY BRAKE. A (SPACE): REPLACE (BRAKE WILL USE W). B (BACKSPACE): CANCEL." &&
                                access(file.c_str(), F_OK) != 0;
             const bool cancelled = menu.Cancel() && menu.CurrentMode() == Mode::Browse && !menu.OwnsInput() && !menu.Cancel() &&
                                    access(file.c_str(), F_OK) != 0 && !menu.Changed();
@@ -1098,10 +1098,10 @@ int main(int, char** argv)
             // ReCarbon's keys (settings_menu.cpp at 66401ea: Y clears :456-460, X restores the row :461-463, Esc cancels a wait
             // :1329-1333): CAMERA cleared -> "camera = none" in the file, read back as no key; X on CAMERA -> C again; X on THROTTLE
             // after S went to BRAKE... here: THROTTLE given K, X -> W back with no question (W is free); BRAKE given W first, then X on
-            // THROTTLE asks (W is BRAKE's). The browse prompt names each button's key (A SPACE, Y LEFT CONTROL, X LEFT SHIFT, B DELETE).
+            // THROTTLE asks (W is BRAKE's). The browse prompt names each button's key (A SPACE, Y LEFT CONTROL, X LEFT SHIFT, B BACKSPACE).
             std::remove(file.c_str());
             controls::Menu edit(d, file);
-            const bool hint = edit.Prompt() == "A (SPACE): SET KEY   Y (LEFT CONTROL): CLEAR   X (LEFT SHIFT): DEFAULT   B (DELETE): BACK. THE "
+            const bool hint = edit.Prompt() == "A (SPACE): SET KEY   Y (LEFT CONTROL): CLEAR   X (LEFT SHIFT): DEFAULT   B (BACKSPACE): BACK. THE "
                                                "CONTROLLER LAYOUT IS FIXED.";
             edit.Clear(16);
             std::ifstream cleared(file);
@@ -1201,8 +1201,10 @@ int main(int, char** argv)
             Expect(round && offAccepted && refused,
                    "graphics menu: every choice round-trips; off, comments and spaces accepted; other spellings, settings and repeats refused "
                    "with the app's messages, the result untouched");
-            // The menu on a file: none -> FULL HD, STANDARD; RESOLUTION to QHD (2) and EDGE SMOOTHING to STRONG (3) are saved at once; a
-            // second menu reads them; out of range and unchanged values change nothing; the default of EDGE SMOOTHING is STANDARD.
+            // The menu (kernel/graphics_menu.h), from the menu's rules (2026-11-23): what the running game shows is taken when GRAPHICS
+            // opens; a change is a preview the game takes at once where it can and nothing is written; A saves (the new baseline); X
+            // previews the defaults; B (Discard) drops what is not saved and sets every moved setting back to the entry. A fake running
+            // game: `game` is what it shows, `refuse` the (row, value) it cannot take now, `calls` every applyLive in order.
             const std::string dir = std::string(argv[0]).substr(0, std::string(argv[0]).rfind('/'));
             const std::string file = dir + "/menu graphics.conf";
             std::remove(file.c_str());
@@ -1210,87 +1212,140 @@ int main(int, char** argv)
                 std::ifstream in(file, std::ios::binary);
                 return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
             };
-            settings::Menu menu(file);
-            const bool fresh = menu.Current() == settings::Graphics{} && menu.Notice().empty() && access(file.c_str(), F_OK) != 0 &&
+            const auto exists = [](const std::string& path) { return access(path.c_str(), F_OK) == 0; };
+            settings::Graphics game;
+            std::vector<std::pair<size_t, size_t>> refuse, calls;
+            const auto field = [](settings::Graphics& g, size_t row) -> size_t& { return settings::Menu::Field(g, row); };
+            const auto apply = [&](size_t row, size_t value) {
+                calls.push_back({row, value});
+                for (const auto& r : refuse)
+                    if (r.first == row && r.second == value)
+                        return false;
+                field(game, row) = value;
+                return true;
+            };
+            using Calls = std::vector<std::pair<size_t, size_t>>;
+            settings::SetHdrStatus({});
+            settings::SetExtendedOffered(false);
+            settings::SetRenderOffered(false), settings::SetDofOffered(false);  // FM4 Recomp: the render scenario rows hidden until their block
+            game = {};
+            settings::Menu menu(file, game, apply);
+            const bool fresh = menu.Current() == settings::Graphics{} && menu.Saved() == settings::Graphics{} && menu.Entry() == settings::Graphics{} &&
+                               menu.Notice().empty() && !menu.Dirty() && !exists(file) &&
                                std::string(settings::Menu::Label(0)) == "RESOLUTION" && std::string(settings::Menu::Label(1)) == "EDGE SMOOTHING" &&
-                               settings::Menu::Count(0) == 4 && settings::Menu::Count(1) == 4 && settings::Menu::Count(2) == 2 && settings::Menu::Count(3) == 2 && settings::Menu::Count(4) == 0 &&
+                               settings::Menu::Count(0) == 4 && settings::Menu::Count(1) == 4 && settings::Menu::Count(2) == 2 && settings::Menu::Count(3) == 2 && settings::Menu::Count(settings::Menu::kRows) == 0 &&
                                std::string(settings::Menu::ValueLabel(0, 1)) == "FULL HD" && std::string(settings::Menu::ValueLabel(1, 2)) == "STANDARD";
-            const bool qhd = menu.Set(0, 2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n" &&
-                             menu.Notice() == "RESOLUTION QHD SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS.";
-            const bool strong = menu.Set(1, 3) && text() == header + "internal_resolution = qhd\nanti_aliasing = strong\n" && menu.Value(0) == 2 && menu.Value(1) == 3;
-            const bool nothing = !menu.Set(0, 4) && !menu.Set(1, 3) && !menu.Set(2, 0) && text() == header + "internal_resolution = qhd\nanti_aliasing = strong\n";
-            const settings::Menu again(file);
-            const bool reread = again.Current() == settings::Graphics{2, 3};
-            const bool back = menu.Default(1) && !menu.Default(1) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n" && menu.Default(0) && menu.Value(0) == 1 && access((file + ".writing").c_str(), F_OK) != 0;
-            // An invalid file is the defaults (as play.sh starts), and the next change replaces it; a folder that does not exist: not
-            // saved, the value kept, and the line says so.
+            // Repeated edits of all three: each previewed at once (the game shows it), nothing written; out of range and unchanged: nothing.
+            const bool r1 = menu.Set(0, 2) && game.resolution == 2 && menu.Notice() == "RESOLUTION QHD: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD." && menu.Dirty();
+            const bool r2 = menu.Set(0, 3) && game.resolution == 3 && menu.Set(0, 0) && game.resolution == 0 && menu.Set(1, 3) && game.smoothing == 3 &&
+                            menu.Set(1, 0) && game.smoothing == 0 && menu.Set(2, 1) && game.hdr == 1 && menu.Notice() == "HDR AUTO: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD.";
+            const bool r3 = !menu.Set(0, 4) && !menu.Set(1, 0) && !menu.Set(2, 2) && menu.Current() == settings::Graphics{0, 0, 1} && !exists(file) &&
+                            calls == Calls{{0, 2}, {0, 3}, {0, 0}, {1, 3}, {1, 0}, {2, 1}};
+            Expect(fresh && r1 && r2 && r3,
+                   "graphics menu: no file is FULL HD, STANDARD, HDR OFF; repeated edits of resolution, smoothing and HDR are previewed at once in order and never "
+                   "written; out of range and unchanged values change nothing");
+            // B: back to the entry (each moved row once, in row order), the rows show the saved settings, the file still absent.
+            calls.clear();
+            const bool discarded = menu.Discard() && game == settings::Graphics{} && menu.InEffect() == settings::Graphics{} && menu.Current() == settings::Graphics{} &&
+                                   !menu.Dirty() && menu.Failures().empty() && menu.Notice().empty() && !exists(file) && calls == Calls{{0, 1}, {1, 2}, {2, 0}};
+            calls.clear();
+            const bool nothingBack = menu.Discard() && calls.empty();
+            Expect(discarded && nothingBack, "graphics menu B: every moved setting goes back to the entry (resolution, smoothing, HDR), nothing written; again: nothing asked");
+            // A: saved, read back by a new menu (a relaunch); the saved state is the new baseline: a later B returns to it, not to before.
+            const bool a1 = menu.Set(0, 0) && menu.Set(1, 1) && menu.Set(2, 1) && menu.Confirm() && menu.Notice() == "SAVED." && !menu.Dirty() &&
+                            text() == header + "internal_resolution = 720p\nanti_aliasing = soft\nhdr = auto\n" && !exists(file + ".writing");
+            const bool relaunch = settings::Menu(file).Current() == settings::Graphics{0, 1, 1} && settings::Menu(file, settings::Graphics{}).Saved() == settings::Graphics{0, 1, 1};
+            calls.clear();
+            const bool baseline = menu.Set(0, 2) && menu.Discard() && game == settings::Graphics{0, 1, 1} && calls == Calls{{0, 2}, {0, 0}} &&
+                                  text() == header + "internal_resolution = 720p\nanti_aliasing = soft\nhdr = auto\n";
+            const bool nothingToSave = !menu.Confirm() && menu.Notice().empty() && text() == header + "internal_resolution = 720p\nanti_aliasing = soft\nhdr = auto\n";
+            Expect(a1 && relaunch && baseline && nothingToSave,
+                   "graphics menu A: what the rows show is saved and read back after a relaunch; a later B returns to what A saved; nothing to save: no write");
+            // X then B: from saved QHD, STRONG, HDR AUTO the defaults are previewed (not written); twice: already the defaults; B: back.
+            game = {2, 3, 1};
+            Expect(settings::Save(file, {2, 3, 1}, e1), "graphics menu: the X test's saved file");
+            settings::Menu x(file, game, apply);
+            const std::string before = text();
+            calls.clear();
+            const bool xPreview = x.Defaults() && x.Current() == settings::Graphics{} && game == settings::Graphics{} && text() == before &&
+                                  x.Notice() == "DEFAULTS: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD." && calls == Calls{{0, 1}, {1, 2}, {2, 0}} && x.Dirty();
+            const bool xAgain = !x.Defaults() && x.Notice() == "THESE ARE THE DEFAULTS.";
+            const bool xBack = x.Discard() && game == settings::Graphics{2, 3, 1} && x.Current() == settings::Graphics{2, 3, 1} && text() == before && !x.Dirty();
+            const bool xSave = x.Defaults() && x.Confirm() && text() == header + "internal_resolution = fhd\nanti_aliasing = on\n" && game == settings::Graphics{};
+            Expect(xPreview && xAgain && xBack && xSave, "graphics menu X then B: the defaults are previewed, not written; B brings back the saved settings; X then A saves the defaults");
+            // A save that fails: the reason, the rows and the preview kept; B still rolls back.
+            game = {};
+            settings::Menu nowhere(dir + "/no such folder/graphics.conf", game, apply);
+            const bool notSaved = nowhere.Set(0, 2) && !nowhere.Confirm() && nowhere.Notice().rfind("NOT SAVED: CANNOT WRITE ", 0) == 0 &&
+                                  nowhere.Notice().find(". B: DISCARD.") != std::string::npos && nowhere.Value(0) == 2 && game.resolution == 2 && nowhere.Dirty() &&
+                                  nowhere.Discard() && game.resolution == 1;
+            // Something in the way of the temporary file (a folder): not saved, and the folder is not removed (not the menu's).
+            const std::string blocked = dir + "/blocked/graphics.conf";
+            std::filesystem::create_directories(blocked + ".writing");
+            settings::Menu blocker(blocked, game, apply);
+            const bool keptInTheWay = blocker.Set(0, 2) && !blocker.Confirm() && blocker.Notice().rfind("NOT SAVED: CANNOT WRITE ", 0) == 0 &&
+                                      std::filesystem::is_directory(blocked + ".writing") && !exists(blocked) && blocker.Discard();
+            // A rollback the game refuses (it cannot go back to FULL HD now): Discard says so and names the row with what stays; the
+            // other rows still go back; the rows show the saved settings.
+            game = {};
+            refuse = {{0, 1}};
+            settings::Menu stuck(dir + "/no such folder/graphics.conf", game, apply);
+            const bool rollbackRefused = stuck.Set(0, 2) && stuck.Set(1, 3) && !stuck.Discard() && stuck.Failures() == "RESOLUTION QHD" && game == settings::Graphics{2, 2, 0} &&
+                                 stuck.InEffect() == settings::Graphics{2, 2, 0} && stuck.Current() == settings::Graphics{};
+            // A value the game cannot take now: not previewed, A saves it for the next start and says which row waits.
+            game = {};
+            refuse = {{0, 3}};
+            std::remove(file.c_str());
+            settings::Menu later(file, game, apply);
+            const bool nextStart = later.Set(0, 3) && game.resolution == 1 && later.Notice() == "RESOLUTION 4K: NOT SAVED. A: SAVE (IT APPLIES THE NEXT TIME THE GAME STARTS). B: DISCARD." &&
+                                   later.Confirm() && later.Notice() == "SAVED. RESTART REQUIRED: RESOLUTION APPLIES THE NEXT TIME THE GAME STARTS." &&
+                                   text() == header + "internal_resolution = 4k\nanti_aliasing = on\n";
+            refuse.clear();
+            // The entry is what the game shows, which can differ from the file (a value waiting for the next start): choosing the value
+            // in effect asks nothing; B has nothing to set back.
+            game = {};
+            calls.clear();
+            settings::Menu waiting(file, game, apply);
+            const bool inEffect = waiting.Current() == settings::Graphics{3, 2, 0} && waiting.Entry() == settings::Graphics{} && waiting.Set(0, 1) && calls.empty() &&
+                                  waiting.Notice() == "RESOLUTION FULL HD: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD." && waiting.Discard() && calls.empty() &&
+                                  waiting.Current() == settings::Graphics{3, 2, 0};
+            // An invalid file: the defaults (as play.sh starts), replaced by the next save.
             { std::ofstream bad(file, std::ios::binary); bad << "internal_resolution = 8k\n"; }
             std::string why;
             const bool invalidFile = settings::Load(file, why) == settings::Graphics{} && why == "graphics.conf line 1: unknown resolution '8k' (720p, fhd, qhd or 4k)";
-            settings::Menu over(file);
-            const bool replaced = over.Current() == settings::Graphics{} && over.Set(1, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = soft\n";
-            settings::Menu nowhere(dir + "/no such folder/graphics.conf");
-            const bool notSaved = !nowhere.Set(0, 2) && nowhere.Value(0) == 1 && nowhere.Notice().rfind("NOT SAVED: CANNOT WRITE ", 0) == 0;
-            Expect(fresh && qhd && strong && nothing && reread && back && invalidFile && replaced && notSaved,
-                   "graphics menu: no file is FULL HD and STANDARD; each change is saved at once and read back; nothing else changes the file; "
-                   "an invalid file is replaced by the next change; a failed save keeps the value and says so");
-            // A change the running game takes at once (applyLive answers true for EDGE SMOOTHING only): the line says so; the other
-            // row, and a menu without the callback (above), say it applies at the next start. The callback is asked only after a save.
+            settings::Menu over(file, settings::Graphics{}, apply);
+            const bool replaced = over.Current() == settings::Graphics{} && over.Set(1, 1) && over.Confirm() && text() == header + "internal_resolution = fhd\nanti_aliasing = soft\n";
+            Expect(notSaved && keptInTheWay && rollbackRefused && nextStart && inEffect && invalidFile && replaced,
+                   "graphics menu: a failed save keeps the edits and says why, B still rolls back, and leaves alone a folder in its temporary file's way; a refused rollback is named and the rest goes back; a value the "
+                   "game cannot take now waits for the next start once saved; the entry is what the game shows; an invalid file is replaced by the next save");
+            // HDR (row 2; graphics.conf `hdr = auto`): OFF by default and then not written. What is active is the running game's to say:
+            // the preview line and the row's description follow the published status.
             std::remove(file.c_str());
-            size_t asked = 0, askedRow = 9, askedValue = 9;
-            settings::Menu live(file, [&](size_t row, size_t value) { asked++, askedRow = row, askedValue = value; return row == settings::Menu::kSmoothingRow; });
-            const bool appliedNow = live.Set(1, 3) && live.Notice() == "EDGE SMOOTHING STRONG APPLIED AND SAVED." && asked == 1 && askedRow == 1 && askedValue == 3 &&
-                                    text() == header + "internal_resolution = fhd\nanti_aliasing = strong\n";
-            const bool nextStart = live.Set(0, 2) && live.Notice() == "RESOLUTION QHD SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." && asked == 2 && !live.Set(0, 2) && asked == 2;
-            settings::Menu liveNowhere(dir + "/no such folder/graphics.conf", [&](size_t, size_t) { asked++; return true; });
-            const bool notAsked = !liveNowhere.Set(1, 0) && asked == 2;
-            Expect(appliedNow && nextStart && notAsked,
-                   "graphics menu: a change the running game takes is APPLIED AND SAVED; another applies at the next start; nothing is applied unless saved");
-            // HDR (row 2; graphics.conf `hdr = auto`): the preference, OFF by default and then not written (the file is what it was
-            // before the setting existed); AUTO is saved at once as the third line, kept by other changes and read back; X's default is
-            // OFF. What is active is not the file's: the line after a change and the row's description say it from the running
-            // game's status (HDR ACTIVE, or SDR ACTIVE with the reason); without a running game's answer the line asks for a restart.
-            std::remove(file.c_str());
-            settings::SetHdrStatus({});
-            settings::Menu hdr(file, [&](size_t row, size_t) { return row == settings::Menu::kSmoothingRow; });
-            const bool hdrRow = settings::Menu::kRows == 4 && std::string(settings::Menu::Label(2)) == "HDR" && hdr.Value(2) == 0 &&
+            const bool hdrRow = settings::Menu::kRows == 14 && std::string(settings::Menu::Label(2)) == "HDR" &&
                                 std::string(settings::Menu::ValueLabel(2, 0)) == "OFF" && std::string(settings::Menu::ValueLabel(2, 1)) == "AUTO" &&
                                 std::string(settings::Menu::ValueLabel(2, 2)).empty() && settings::Serialize({1, 2, 1}) == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
                                 settings::Serialize({1, 2, 0}) == header + "internal_resolution = fhd\nanti_aliasing = on\n";
             const std::string plain = settings::Menu::Description(2);
-            const bool hdrAuto = hdr.Set(2, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
-                                 hdr.Notice() == "HDR AUTO SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." && !hdr.Set(2, 1) && !hdr.Set(2, 2);
-            const bool hdrKept = hdr.Set(0, 2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\n" &&
-                                 settings::Menu(file).Current() == settings::Graphics{2, 2, 1};
-            const bool hdrOff = hdr.Default(2) && !hdr.Default(2) && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n";
             settings::Graphics parsed;
             std::string h1, h2, h3;
             const bool hdrParse = settings::Parse("hdr = auto\n", parsed, h1) && parsed == settings::Graphics{1, 2, 1} && settings::Parse("hdr=off\r\n", parsed, h1) &&
                                   parsed == settings::Graphics{} && !settings::Parse("hdr = on\n", parsed, h1) && h1 == "line 1: unknown hdr 'on' (off or auto)" &&
                                   !settings::Parse("hdr = AUTO\n", parsed, h2) && h2 == "line 1: unknown hdr 'AUTO' (off or auto)" &&
                                   !settings::Parse("hdr = auto\nhdr = off\n", parsed, h3) && h3 == "line 2: hdr is set twice";
-            Expect(hdrRow && hdrAuto && hdrKept && hdrOff && hdrParse && plain.find("AUTO USES HDR ONLY WHERE THE DISPLAY SUPPORTS IT") != std::string::npos &&
-                       plain.find("NOW:") == std::string::npos,
-                   "graphics menu HDR: a third row, OFF by default and not written; AUTO is the file's third line, kept by other changes and read back; its "
-                   "default is OFF; hdr parses off and auto only (CONTROL: on, AUTO, twice)");
-            // The running game's answer: the callback takes the preference and publishes what is active; the line and the description
-            // follow that status, never the preference alone.
-            std::remove(file.c_str());
+            Expect(hdrRow && hdrParse && plain.find("AUTO USES HDR ONLY WHERE THE DISPLAY SUPPORTS IT") != std::string::npos && plain.find("NOW:") == std::string::npos,
+                   "graphics menu HDR: a third row, OFF by default and not written; AUTO is the file's third line; hdr parses off and auto only (CONTROL: on, AUTO, twice)");
             settings::HdrStatus next;
-            settings::Menu liveHdr(file, [&](size_t row, size_t) { if (row == settings::Menu::kHdrRow) settings::SetHdrStatus(next); return true; });
+            game = {};
+            settings::Menu liveHdr(file, game, [&](size_t row, size_t value) { if (row == settings::Menu::kHdrRow) settings::SetHdrStatus(next); return apply(row, value); });
             next = {true, true, ""};
-            const bool active = liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. HDR ACTIVE." &&
+            const bool active = liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO: PREVIEW, NOT SAVED. HDR ACTIVE. A: SAVE. B: DISCARD." &&
                                 std::string(settings::Menu::Description(2)).find("NOW: HDR ACTIVE.") != std::string::npos;
-            next = {true, false, "HDR is off"};
-            const bool off = liveHdr.Set(2, 0) && liveHdr.Notice() == "HDR OFF SAVED. SDR ACTIVE: HDR IS OFF." && text() == header + "internal_resolution = fhd\nanti_aliasing = on\n";
             next = {true, false, "this display does not support HDR"};
-            const bool noDisplay = liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. SDR ACTIVE: THIS DISPLAY DOES NOT SUPPORT HDR." &&
-                                   text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n" &&
+            const bool noDisplay = liveHdr.Set(2, 0) && liveHdr.Set(2, 1) &&
+                                   liveHdr.Notice() == "HDR AUTO: PREVIEW, NOT SAVED. SDR ACTIVE: THIS DISPLAY DOES NOT SUPPORT HDR. A: SAVE. B: DISCARD." &&
                                    std::string(settings::Menu::Description(2)).find("NOW: SDR ACTIVE: THIS DISPLAY DOES NOT SUPPORT HDR.") != std::string::npos;
-            next = {true, false, "HDR is not available on this system"};
-            const bool noSystem = liveHdr.Set(2, 0) && liveHdr.Set(2, 1) && liveHdr.Notice() == "HDR AUTO SAVED. SDR ACTIVE: HDR IS NOT AVAILABLE ON THIS SYSTEM.";
-            const bool otherRows = liveHdr.Set(1, 3) && liveHdr.Notice() == "EDGE SMOOTHING STRONG APPLIED AND SAVED.";
-            // The status file's text (the Settings panel reads it) and the published change.
+            next = {true, false, "HDR is off"};
+            const bool hdrBack = liveHdr.Discard() && game.hdr == 0 && settings::GetHdrStatus() == settings::HdrStatus{true, false, "HDR is off"} && !exists(file);
             const bool statusText = settings::HdrStatusText({true, true, ""}) == "active = hdr\n" &&
                                     settings::HdrStatusText({true, false, "this display does not support HDR"}) == "active = sdr\nreason = this display does not support HDR\n" &&
                                     settings::HdrStatusText({}).empty() && settings::HdrStatusLine({}).empty();
@@ -1298,39 +1353,87 @@ int main(int, char** argv)
             const bool published = settings::PublishHdrStatus({true, true, ""}) && !settings::PublishHdrStatus({true, true, ""}) &&
                                    settings::PublishHdrStatus({true, false, "HDR is off"}) && settings::GetHdrStatus() == settings::HdrStatus{true, false, "HDR is off"};
             settings::SetHdrStatus({});
-            // EXTENDED VIEW (row 3; graphics.conf `extended_view = on`): OFF by default and not written; ON is a line after hdr; a
-            // run that takes it says APPLIED AND SAVED, one without its hook RESTART REQUIRED; X's default is OFF.
+            // EXTENDED VIEW (row 3; `extended_view = on`): a fourth row only when offered; X leaves it alone when it is not offered.
             std::remove(file.c_str());
             settings::SetExtendedOffered(false);
-            const bool hidden = settings::Menu::Rows() == 3;  // not offered (0.2.0): three rows; the file's line still parses and is kept
+            const bool hidden = settings::Menu::Rows() == 3;
+            game = {2, 2, 0, 1};
+            Expect(settings::Save(file, game, e1), "graphics menu: the EXTENDED VIEW test's saved file");
+            settings::Menu narrow(file, game, apply);
+            const bool keptByX = narrow.Defaults() && narrow.Current() == settings::Graphics{1, 2, 0, 1} && game.extended == 1;
             settings::SetExtendedOffered(true);
             const bool shown = settings::Menu::Rows() == 4;
-            bool armed = true;
-            size_t viewAsked = 0;
-            settings::Menu wide(file, [&](size_t row, size_t) { viewAsked += row == settings::Menu::kExtendedRow ? 1 : 0; return armed; });
-            const bool viewRow = std::string(settings::Menu::Label(3)) == "EXTENDED VIEW" && wide.Value(3) == 0 && std::string(settings::Menu::ValueLabel(3, 0)) == "OFF" &&
+            game = {2, 2, 0, 1};
+            settings::Menu wide(file, game, apply);
+            const bool viewRow = std::string(settings::Menu::Label(3)) == "EXTENDED VIEW" && std::string(settings::Menu::ValueLabel(3, 0)) == "OFF" &&
                                  std::string(settings::Menu::ValueLabel(3, 1)) == "ON" && std::string(settings::Menu::Description(3)).find("NOT 16:9") != std::string::npos;
-            const bool viewOn = wide.Set(3, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nextended_view = on\n" &&
-                                wide.Notice() == "EXTENDED VIEW ON APPLIED AND SAVED." && viewAsked == 1 && !wide.Set(3, 1) && !wide.Set(3, 2);
-            next = {true, false, "HDR is off"};
-            const bool viewWithHdr = wide.Set(2, 1) && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\nextended_view = on\n" &&
-                                     settings::Menu(file).Current() == settings::Graphics{1, 2, 1, 1};
-            armed = false;
-            const bool viewOff = wide.Default(3) && wide.Notice() == "EXTENDED VIEW OFF SAVED. RESTART REQUIRED: IT APPLIES THE NEXT TIME THE GAME STARTS." &&
-                                 text() == header + "internal_resolution = fhd\nanti_aliasing = on\nhdr = auto\n";
+            const bool viewX = wide.Defaults() && wide.Current() == settings::Graphics{} && game.extended == 0 && wide.Discard() && game.extended == 1;
+            const bool viewSave = wide.Set(3, 0) && wide.Confirm() && text() == header + "internal_resolution = qhd\nanti_aliasing = on\n" &&
+                                  wide.Set(3, 1) && wide.Set(2, 1) && wide.Confirm() && text() == header + "internal_resolution = qhd\nanti_aliasing = on\nhdr = auto\nextended_view = on\n";
             settings::Graphics view;
             std::string v1, v2;
             const bool viewParse = settings::Parse("extended_view = on\n", view, v1) && view == settings::Graphics{1, 2, 0, 1} &&
                                    !settings::Parse("extended_view = wide\n", view, v1) && v1 == "line 1: unknown extended_view 'wide' (off or on)" &&
                                    !settings::Parse("extended_view = on\nextended_view = on\n", view, v2) && v2 == "line 2: extended_view is set twice";
-            settings::SetHdrStatus({});
             settings::SetExtendedOffered(false);
-            Expect(hidden && shown && viewRow && viewOn && viewWithHdr && viewOff && viewParse,
-                   "graphics menu EXTENDED VIEW: a fourth row only when offered (three rows otherwise), OFF by default and not written; ON is saved after hdr and read back; applied at once when the "
-                   "run can, otherwise at the next start (CONTROL: wide, twice)");
-            Expect(active && off && noDisplay && noSystem && otherRows && statusText && published,
-                   "graphics menu HDR state: the line after a change and the description say HDR ACTIVE or SDR ACTIVE with the reason (off, the display, "
-                   "the system) from the running game's status, whatever the preference; the status text; a status is published once per change");
+            Expect(hidden && keptByX && shown && viewRow && viewX && viewSave && viewParse,
+                   "graphics menu EXTENDED VIEW: a fourth row only when offered (X leaves it alone otherwise), previewed, rolled back and saved after hdr like the others "
+                   "(CONTROL: wide, twice)");
+            // FM4 Recomp (render scenario settings): rows 4..11 (graphics_menu.h). Hidden unless offered; shown, they follow the rows
+            // offered before them (positions mapped by RowAt: EXTENDED VIEW hidden leaves no gap). They preview, roll back, save and
+            // take X like the others; the file names each only when it is not the game's own, in row order after extended_view;
+            // DEPTH OF FIELD's own value is ON (written: `off`). Expected texts and call orders by hand from those rules.
+            std::remove(file.c_str());
+            settings::SetExtendedOffered(false), settings::SetRenderOffered(true), settings::SetDofOffered(false);
+            const bool renderRows = settings::Menu::Rows() == 10 && settings::Menu::RowAt(2) == settings::Menu::kHdrRow &&
+                                    settings::Menu::RowAt(3) == settings::Menu::kShadowsRow && settings::Menu::RowAt(9) == settings::Menu::kDetailRow &&
+                                    settings::Menu::RowAt(10) == settings::Menu::kRows;  // 3 + 7 rows: no EXTENDED VIEW, no DEPTH OF FIELD
+            settings::SetDofOffered(true), settings::SetExtendedOffered(true);
+            const bool allRows = settings::Menu::Rows() == 12 && settings::Menu::RowAt(3) == settings::Menu::kExtendedRow &&
+                                 settings::Menu::RowAt(11) == settings::Menu::kDofRow && std::string(settings::Menu::Label(4)) == "SCENERY SHADOWS" &&
+                                 std::string(settings::Menu::Label(11)) == "DEPTH OF FIELD" && settings::Menu::Count(5) == 3 &&
+                                 std::string(settings::Menu::ValueLabel(5, 1)) == "EVERY RACE" && std::string(settings::Menu::ValueLabel(11, 0)) == "ON" &&
+                                 settings::Menu::IsRender(4) && settings::Menu::IsRender(11) && !settings::Menu::IsRender(3) &&
+                                 settings::Menu::DefaultValue(11) == 0 && settings::Menu::DefaultValue(0) == settings::kDefaultResolution;
+            // FM4_SHADER_OVERRIDES: MOTION BLUR and CAR DIRT after DEPTH OF FIELD (12 + 2 rows), render rows (applied live), ON first.
+            settings::SetOverridesOffered(true);
+            const bool overrideRows = settings::Menu::Rows() == 14 && settings::Menu::RowAt(12) == settings::Menu::kMotionBlurRow &&
+                                      settings::Menu::RowAt(13) == settings::Menu::kCarDirtRow && std::string(settings::Menu::Label(12)) == "MOTION BLUR" &&
+                                      std::string(settings::Menu::Label(13)) == "CAR DIRT" && std::string(settings::Menu::ValueLabel(13, 1)) == "OFF" &&
+                                      settings::Menu::IsRender(13) && settings::Menu::DefaultValue(12) == 0;
+            settings::SetOverridesOffered(false);
+            game = {};
+            calls.clear(), refuse.clear();
+            settings::Menu fx(file, game, apply);
+            // Previews: each taken by the game at once, nothing written.
+            const bool fxPreview = fx.Set(4, 1) && fx.Notice() == "SCENERY SHADOWS ON: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD." && fx.Set(5, 2) && fx.Set(11, 1) &&
+                                   calls == Calls{{4, 1}, {5, 2}, {11, 1}} && game.shadows == 1 && game.reflections == 2 && game.dof == 1 && !exists(file) && fx.Dirty();
+            // B: rolled back in row order, the rows show the saved (default) values, still nothing written.
+            const bool fxDiscard = fx.Discard() && calls == Calls{{4, 1}, {5, 2}, {11, 1}, {4, 0}, {5, 0}, {11, 0}} && game == settings::Graphics{} &&
+                                   fx.Current() == settings::Graphics{} && !exists(file) && !fx.Dirty();
+            // A: saved in row order; then X previews every render row back to the game's own, and B returns to what A saved.
+            const bool fxSave = fx.Set(4, 1) && fx.Set(10, 2) && fx.Set(11, 1) && fx.Confirm() && fx.Notice() == "SAVED." &&
+                                text() == header + "internal_resolution = fhd\nanti_aliasing = on\nscenery_shadows = on\nlevel_of_detail = ultra\ndepth_of_field = off\n";
+            calls.clear();
+            const bool fxDefaults = fx.Defaults() && calls == Calls{{4, 0}, {10, 0}, {11, 0}} && game == settings::Graphics{} &&
+                                    fx.Notice() == "DEFAULTS: PREVIEW, NOT SAVED. A: SAVE. B: DISCARD." && fx.Discard() && game.shadows == 1 && game.detail == 2 &&
+                                    game.dof == 1 && text() == header + "internal_resolution = fhd\nanti_aliasing = on\nscenery_shadows = on\nlevel_of_detail = ultra\ndepth_of_field = off\n";
+            settings::Graphics every, expected;
+            std::string pe1, pe2, pe3;
+            expected.mirror = 1, expected.particles = 1, expected.crowds = 1, expected.bloom = 1, expected.reflections = 1;
+            const bool renderParse = settings::Parse("mirror = full\nsoft_particles = on\ncrowds = every_race\nbloom = full_rate\nreflection_updates = every_race\n", every, pe1) &&
+                                     every == expected && settings::Serialize(expected) == header + "internal_resolution = fhd\nanti_aliasing = on\nreflection_updates = every_race\n"
+                                                                                                 "mirror = full\nsoft_particles = on\ncrowds = every_race\nbloom = full_rate\n" &&
+                                     !settings::Parse("mirror = on\n", every, pe1) && pe1 == "line 1: unknown mirror 'on' (console or full)" &&
+                                     !settings::Parse("reflection_updates = twice\n", every, pe2) && pe2 == "line 1: unknown reflection_updates 'twice' (console, every_race or double)" &&
+                                     !settings::Parse("crowds = every_race\ncrowds = console\n", every, pe3) && pe3 == "line 2: crowds is set twice";
+            settings::SetRenderOffered(false), settings::SetDofOffered(false), settings::SetExtendedOffered(false);
+            Expect(renderRows && allRows && overrideRows && fxPreview && fxDiscard && fxSave && fxDefaults && renderParse,
+                   "graphics menu render scenario rows: hidden unless offered, mapped by position; previewed at once, rolled back by B, saved by A only when "
+                   "not the game's own and in row order, reset by X; parsed back (CONTROL: a wrong spelling, a repeat)");
+            Expect(active && noDisplay && hdrBack && statusText && published,
+                   "graphics menu HDR state: the preview line and the description say HDR ACTIVE or SDR ACTIVE with the reason from the running game's status; B "
+                   "publishes the restored state; the status text; a status is published once per change");
             std::remove(file.c_str());
         }
         // The scripted gamepad (kernel/input_script.h; FM4_INPUT_SCRIPT). Without a script (this process never loads one)
@@ -1439,6 +1542,40 @@ int main(int, char** argv)
             Expect(tParsed && tA.buttons == 0x1000 && !tRace && tFirst && !tAgain && tR.buttons == 0x0008 && tR.event == 2 && tOff.buttons == 0 &&
                        tOff.event == 3 && !raceScript.TitleAccepted(10) && tBoth,
                    "input script @title: the second list counts from the title's acceptance; @race and @title are exclusive");
+            // FM4 Recomp (shader warm-up): "100 A / 110 / @scene menu 3 / 10 B / 20 / @scene race 2 / 0 RT / 50". Indices (hand): first
+            // list 0-1, no @race list (its "nothing yet" 2), chain 0 from 3 (B 3, released 4, nothing yet 5), chain 1 from 6 (RT 6, 50: 7).
+            // Not armed before 110 (the first list's last event); menu swaps at 110, a race swap at 111 (the row restarts), 112, 113,
+            // 114: the third in a row starts chain 0 at 114 (B at 124, released at 134). Chain 1 is armed at 134: race swaps at 134, 135
+            // start it at 135 (RT at 135, released at 185). Nothing after the last list.
+            input::Script scened;
+            const bool sParsed = input::ParseScript("100 A\n110\n@scene menu 3\n10 B\n20\n@scene race 2\n0 RT\n50\n", scened, error) &&
+                                 scened.events.size() == 2 && !scened.hasRace && scened.chain.size() == 2 && scened.chain[0].swaps == 3 &&
+                                 scened.chain[0].scene == input::Scene::Menu && scened.chain[1].scene == input::Scene::Race && scened.chain[1].events.size() == 2;
+            input::Poller sp(scened);
+            const bool early = sp.Swap(50, false);
+            const bool s110 = sp.Swap(110, false), s111 = sp.Swap(111, true), s112 = sp.Swap(112, false), s113 = sp.Swap(113, false), s114 = sp.Swap(114, false);
+            const input::Report sWait = sp.Poll(120), sB = sp.Poll(124), sOff = sp.Poll(134);
+            const bool r130 = sp.Swap(130, true), r134 = sp.Swap(134, true), r135 = sp.Swap(135, true);
+            const input::Report sRT = sp.Poll(135), sEnd = sp.Poll(185);
+            const bool after = sp.Swap(200, true) || sp.Swap(201, false);
+            Expect(sParsed && !early && !s110 && !s111 && !s112 && !s113 && s114 && sWait.event == 5 && sWait.buttons == 0 && sB.event == 3 &&
+                       sB.buttons == 0x2000 && sOff.event == 4 && sOff.buttons == 0 && !r130 && !r134 && r135 && sp.stage() == 2 && sRT.event == 6 &&
+                       sRT.rightTrigger == 0xFF && sEnd.event == 7 && sEnd.rightTrigger == 0 && !after,
+                   "input script @scene: each list armed after the previous one's last event, started by N swaps in a row of its scene");
+            // After a @race list: armed only once the race started and its last event passed (race at 100, last event +10).
+            input::Script both;
+            const bool bParsed = input::ParseScript("@race\n0 RT\n10\n@scene menu 1\n0 A\n", both, error) && both.hasRace && both.chain.size() == 1;
+            input::Poller bp(both);
+            const bool b5 = bp.Swap(5, false);
+            bp.RaceStarted(100);
+            const bool b105 = bp.Swap(105, false), b110 = bp.Swap(110, false);
+            const input::Report bA = bp.Poll(110);
+            const bool se1 = !input::ParseScript("@scene fast 3\n", bad, error) && error.starts_with("line 1: @scene needs");
+            const bool se2 = !input::ParseScript("@scene menu 0\n", bad, error) && !input::ParseScript("@scene menu\n", bad, error) &&
+                             !input::ParseScript("@scene menu 2 x\n", bad, error);
+            const bool se3 = !input::ParseScript("@scene race 2\n@race\n", bad, error) && error.starts_with("line 2: @race or @title after");
+            Expect(bParsed && !b5 && !b105 && b110 && bA.buttons == 0x1000 && bA.event == 3 && se1 && se2 && se3,
+                   "input script @scene after @race: armed after the race list; CONTROL: a bad kind, count or word, @race after @scene, refused");
         }
         {
             // The imports with a script, in a child (the parent never loads one). The vblank counter stays 0 here (no

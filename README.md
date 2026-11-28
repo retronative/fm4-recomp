@@ -1,7 +1,7 @@
 # FM4 Recomp
 
 A static recompilation of *Forza Motorsport 4* (Xbox 360, USA disc, title ID 4D530910) to native
-arm64 macOS. The 0.3.1 Mac app uses the FM4 Static Recomp host and the ShiftGlue SDK.
+arm64 macOS, built on [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
 
 > [!IMPORTANT]
 > FM4 Recomp is an unofficial fan project, not affiliated with, endorsed by or sponsored by
@@ -12,11 +12,16 @@ arm64 macOS. The 0.3.1 Mac app uses the FM4 Static Recomp host and the ShiftGlue
 
 ## Status
 
-**FM4 Recomp 0.3.1** is available for Apple silicon Macs running macOS 26 or later. Download the [Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg), follow [Getting started](docs/getting-started.md), or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
-
-Version 0.3.1 restores the production profile and imports compatible 0.2.0 careers and missing 0.3.0 playtest settings. If you played both versions, see the [upgrade guide](docs/getting-started.md#updating-from-a-previous-version) for the save-selection order.
-
-The game supports Extended View for wider and taller screens and an in-race Graphics menu with fullscreen and windowed modes, 720p through 4K rendering, MSAA, HDR and eight track and camera effects. New profiles start at Full HD. Spatial FSR 1 enlarges the image automatically when needed. Press **⌘,** to open settings and **Save & Apply** to confirm your choices.
+**[FM4 Recomp 0.4.0](https://github.com/retronative/fm4-recomp/releases/tag/v0.4.0) is available** for Apple silicon Macs (macOS 26 or later): a
+public beta on FM4 Recomp's own engine again, after 0.3.0 and 0.3.1 shipped the fm4-static-recomp
+engine. It plays the game in a window with sound, from the title screen through the menus into a
+race, with a gamepad or the keyboard, from your own Disc 1 (Disc 2 is optional). New in 0.4.0: a
+faster GPU path, the 0.3.x graphics effects (Scenery Shadows, Reflection Updates, Mirror, Soft
+Particles, Crowds, Bloom, Level of Detail, Depth of Field, Motion Blur, Car Dirt), keyboard prompts
+with keycap icons, an optional shader warm-up after setup, and 0.3.x careers brought over. It is still
+a beta: the frame rate in races is below 60 frames per second. To install it, follow
+[Getting started](docs/getting-started.md); the
+[release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.4.0) list its known issues.
 
 Changes by release are in [CHANGELOG.md](CHANGELOG.md). The public status of each milestone, the
 beta's contents and its known issues are in [docs/status.md](docs/status.md). See also
@@ -35,9 +40,16 @@ own disc. Its program contains code translated by machine from the game's execut
 
 ## Building from source
 
-Browse the [0.3.1 Mac launcher](app/setup/), [career migration](scripts/alpha/migrate-career.swift) and [playtest profile import](scripts/alpha/migrate-playtest-profile.sh). The [0.3.0 engine source](ports/v0.3.0/README.md) supplies the [Graphics menu](ports/v0.3.0/host/src/ui/graphics_page.cpp) and [renderer](ports/v0.3.0/sdk/src/ui/vulkan/vulkan_presenter.cpp) in this release.
+```sh
+scripts/setup_tools.sh                                    # pinned tools into tools/
+scripts/extract_game.sh <dir with your ISOs> <out dir>    # unpack your discs outside the repo
+mkdir -p game && ln -sfn <out dir>/disc1 game/files
+```
 
-For a full rebuild, use the [versioned source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256). The included README identifies the exact source revisions, launcher changes, decoder dependencies and commands. Regenerating the game's code requires the supported disc. The [contributor guide](CONTRIBUTING.md) describes the tooling in this repository.
+The remaining steps and the rules for changes are in [CONTRIBUTING.md](CONTRIBUTING.md). Saves of
+a development build are stored in `game/user-data/` and use a fixed, built-in compatibility key
+(the console's own key is unknown). Compatibility with real Xbox 360 saves is **unverified**:
+saves made here are expected to load only here.
 
 ## Contributing and security
 

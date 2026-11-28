@@ -83,10 +83,21 @@ bool SetPostAaLive(const char* spelling);
 // the next swaps, when nothing is in flight, or refuses it with one "[renderer] resolution: ... is refused" line (the device cannot
 // make something at that size, or the renderer was not idle for 120 swaps) and the resolution stays. So a caller that shows the
 // setting reads InternalResNow() afterwards: it changes only when the switch was made; InternalResPending() says a request is waiting.
-bool RequestInternalRes(const char* spelling);
+// `purpose` (optional, a string literal such as "GRAPHICS rollback"): when this request is served, one more line names it and says
+// whether the change was made or refused, and what is in effect then.
+bool RequestInternalRes(const char* spelling, const char* purpose = nullptr);
 // The internal resolution in effect, as "720p", "fhd", "qhd" or "4k". Any thread.
 const char* InternalResNow();
 bool InternalResPending();
+// What the resolution will be once a waiting request is served (InternalResNow without one). Any thread.
+const char* InternalResTarget();
+// The edge smoothing at the next presented swap, as graphics.conf spells it ("off", "soft", "on", "strong"). Any thread.
+const char* PostAaNow();
+// The HDR preference (SetHdrPreference): true for Auto. Any thread.
+bool HdrPreferenceNow();
+// FM4 Recomp (M9): the GRAPHICS submenu's Y: Preview (kernel/menu_preview.h): from the next swap, the pause blur copies the picture
+// instead and the menus are drawn only in the help bar's corner; off: every draw as the game asks. Any thread.
+void SetMenuPreview(bool on);
 // FM4 Recomp (M9, FM4_HDR; hdr_output.h): the display's current headroom (1: none), from the window's thread at each present; the
 // next swap's pass expands the picture's highlights into it. Changes are logged (the first 20).
 void SetHdrHeadroom(float headroom);
@@ -144,6 +155,10 @@ void BeforeCpWrite(uint32_t physical, uint32_t bytes);
 // waiting, then their deferred stores land in queue order (never an interrupt; never a store a later part's read guards).
 bool AsyncRetireOn();
 void ReapRetired();
+// FM4 Recomp (opt-in FM4_NO_DRAIN=1, not guest-exact; renderer.cpp NoDrain): stream stores and interrupts land when the command processor
+// reaches them; CpuVisible (command_processor.h RendererHooks::cpuVisible) first writes back a resolve that starts a new capture run.
+bool NoDrain();
+void CpuVisible();
 bool WorkOpen();  // FM4_DEFER_FENCES: the slot holds recorded work not yet submitted  // a GPU write or deferred store over the range waits for the open slot  // opcode: the PM4 type-3 packet (counted per packet in the swap timing line)
 
 // Window mode, main thread only (window_sdl.cpp RunWindowLoop; defined in window_present.cpp). Waits up to `waitNs` for

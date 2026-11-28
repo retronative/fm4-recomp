@@ -46,6 +46,9 @@ enum ControlsPanel {
     model.hdrAtStart = startedHdr == "on" || startedHdr == "1"
     model.hdrLive = ProcessInfo.processInfo.environment["FM4_GRAPHICS_LIVE"] == "1"
     model.extendedOffered = ProcessInfo.processInfo.environment["FM4_EXTENDED_VIEW_OFFERED"] == "1"
+    model.renderOffered = ProcessInfo.processInfo.environment["FM4_RENDER_SCENARIO"] == "1"  // FM4 Recomp: the Effects tab
+    model.dofOffered = ProcessInfo.processInfo.environment["FM4_DEPTH_OF_FIELD_HOOK"] == "1"
+    model.overridesOffered = ProcessInfo.processInfo.environment["FM4_SHADER_OVERRIDES"] == "1"
     model.hdrRunning = (try? String(contentsOf: Paths.standard().hdrStatusFile, encoding: .utf8)).flatMap(HdrStatus.parse)
     // The screen's most headroom above standard white (1: a standard-range display), as the game reads it (runtime/video/window_sdl.cpp).
     model.displayHdr = NSScreen.main.map { $0.maximumPotentialExtendedDynamicRangeColorComponentValue > 1.01 }
@@ -82,7 +85,11 @@ struct ControlsRoot: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
       SettingsTabs(model: model)
-      if model.settingsTab == .keyboard { ControlsPage(model: model) } else { GraphicsPage(model: model) }
+      switch model.settingsTab {
+      case .keyboard: ControlsPage(model: model)
+      case .graphics: GraphicsPage(model: model)
+      case .effects: EffectsPage(model: model)  // FM4 Recomp (render scenario settings)
+      }
     }
       .padding(.horizontal, 36).padding(.top, 30).padding(.bottom, 20)
       .frame(width: 720, height: 790, alignment: .top)

@@ -22,7 +22,7 @@
 # "setup: ..." lines on stderr explain each step and failure.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-ROOT="${FM4_RECOMP_HOME:-$HOME/Library/Application Support/FM4 Recomp}"
+ROOT="${FM4_RECOMP_HOME:-$HERE}"
 source "$HERE/locations.sh"
 RESULT=""
 EXTRACTOR=""

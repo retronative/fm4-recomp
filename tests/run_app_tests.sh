@@ -6,7 +6,7 @@
 # (tests/app/test_keybindings.swift over app/setup/KeyBindings.swift), the graphics settings' file
 # (tests/app/test_graphics_settings.swift over app/setup/GraphicsSettings.swift), and what opening the app does: setup, repair, blocked or play
 # (tests/app/test_launch_decision.swift over app/setup/Core.swift, KeyBindings.swift and LaunchDecision.swift). No window, no SwiftUI; the compiler
-# flags match the launcher. The profile checks use temporary homes, save packages and disc markers.
+# flags are scripts/release/make_app.sh's. A passing run removes its work directory.
 #
 #   tests/run_app_tests.sh
 set -euo pipefail
@@ -14,22 +14,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 "$ROOT/scripts/preflight.sh" >/dev/null
 OUT="$ROOT/build/tests/app"
 mkdir -p "$OUT"
-swiftc=(/usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-cache-path "$OUT/modules")
-perl -e 'alarm 300; exec @ARGV' "${swiftc[@]}" -module-name KeyBindingsTest \
+perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-name KeyBindingsTest \
   "$ROOT/app/setup/KeyBindings.swift" "$ROOT/tests/app/test_keybindings.swift" -o "$OUT/test_keybindings"
-perl -e 'alarm 300; exec @ARGV' "${swiftc[@]}" -module-name LaunchDecisionTest \
+perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-name LaunchDecisionTest \
   "$ROOT/app/setup/Core.swift" "$ROOT/app/setup/KeyBindings.swift" "$ROOT/app/setup/LaunchDecision.swift" "$ROOT/tests/app/test_launch_decision.swift" -o "$OUT/test_launch_decision"
-perl -e 'alarm 300; exec @ARGV' "${swiftc[@]}" -module-name GraphicsSettingsTest \
+perl -e 'alarm 300; exec @ARGV' /usr/bin/xcrun swiftc -swift-version 5 -target arm64-apple-macos26.0 -parse-as-library -module-name GraphicsSettingsTest \
   "$ROOT/app/setup/GraphicsSettings.swift" "$ROOT/tests/app/test_graphics_settings.swift" -o "$OUT/test_graphics_settings"
-perl -e 'alarm 300; exec @ARGV' "${swiftc[@]}" -module-name ProfileSetupTest \
-  "$ROOT/app/setup/Core.swift" "$ROOT/app/setup/ProfileSetup.swift" "$ROOT/tests/app/test_profile_setup.swift" -o "$OUT/test_profile_setup"
 status=0
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_graphics_settings" || status=$?
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_keybindings" || status=$?
 perl -e 'alarm 60; exec @ARGV' "$OUT/test_launch_decision" || status=$?
-perl -e 'alarm 60; exec @ARGV' "$OUT/test_profile_setup" || status=$?
-/bin/bash "$ROOT/tests/test_production_profile.sh" || status=$?
-python3 "$ROOT/tests/test_migrate_career.py" || status=$?
-python3 "$ROOT/tests/test_migrate_playtest_profile.py" || status=$?
+# The import of 0.3.x saved games (scripts/alpha/migrate-from-0.3.swift) on synthetic user-data folders.
+/opt/homebrew/bin/python3 -B -I "$ROOT/tests/test_migrate_from_03.py" || status=$?
 if [ "$status" = 0 ] && [ -z "${KEEP_WORK:-}" ]; then rm -r "$OUT"; fi
 exit $status

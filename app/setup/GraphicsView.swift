@@ -5,6 +5,8 @@
 // second tab of the panel the game opens on Command-comma (ControlsPanel.swift). A choice is saved at once to
 // $FM4_RECOMP_HOME/graphics.conf; the running game takes it when the panel closes (FM4_GRAPHICS_LIVE=1, runtime/video/window_sdl.cpp),
 // and play.sh reads the file at every start.
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp host/src/ui/graphics_page.cpp at 367bbea9: the Effects
+// tab's texts, adapted from its render scenario rows' descriptions). FM4 Recomp changes: shortened, the panel's style.
 
 import SwiftUI
 
@@ -15,6 +17,7 @@ struct SettingsTabs: View {
     HStack(spacing: 6) {
       tab("Keyboard", .keyboard)
       tab("Graphics", .graphics)
+      if model.renderOffered { tab("Effects", .effects) }  // FM4 Recomp (render scenario settings)
       Spacer()
     }
   }
@@ -255,5 +258,87 @@ struct ExtendedViewRow: View {
         .contentShape(Rectangle())
     }
     .buttonStyle(.plain)
+  }
+}
+
+// FM4 Recomp (render scenario settings; runtime/game/render_scenario.h): the game's own effects, each a row of choices, the first
+// the game's own (the default). The texts follow FM4 Static Recomp 0.3.2's Graphics page (host/src/ui/graphics_page.cpp kRows).
+// A choice is saved at once; the running game takes it when the panel closes, from its next frame; several show from the next race.
+struct EffectsPage: View {
+  @ObservedObject var model: SetupModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      VStack(alignment: .leading, spacing: 3) {
+        Text("Effects").font(.system(size: 22, weight: .bold))
+        Text("The game's own effects, beyond what the console shows in races. Console is the game as on the console.")
+          .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+      }
+      VStack(spacing: 0) {
+        EffectRow(title: "Scenery shadows", detail: "Shadows of cones, barriers and other scenery in races, which the game draws only in replays and photo mode. Experimental: a shadow may flicker near the edge of the screen.",
+                  choices: [("Off", false), ("On", true)], value: model.graphics.sceneryShadows) { v in model.setRender { $0.sceneryShadows = v } }
+        EffectRow(title: "Reflection updates", detail: "How often car reflections are redrawn. The console freezes them in 16-car races and split screen; Every Race redraws them there too; Double redraws twice as many faces each frame.",
+                  choices: ReflectionUpdates.allCases.map { ($0.label, $0) }, value: model.graphics.reflections) { v in model.setRender { $0.reflections = v } }
+        EffectRow(title: "Mirror", detail: "Full draws the mirror every frame with up to 16 cars and the cones and barriers, where the console halves its rate and draws 6 cars (12- and 16-car races).",
+                  choices: [("Console", false), ("Full", true)], value: model.graphics.fullMirror) { v in model.setRender { $0.fullMirror = v } }
+        EffectRow(title: "Soft particles", detail: "Smoke and dust fade where they meet the ground and cars instead of cutting into them, as in replays and photo mode.",
+                  choices: [("Off", false), ("On", true)], value: model.graphics.softParticles) { v in model.setRender { $0.softParticles = v } }
+        EffectRow(title: "Crowds", detail: "Every Race adds the crowds the console leaves out of 1- and 16-car races. Uses more game memory.",
+                  choices: [("Console", false), ("Every Race", true)], value: model.graphics.crowdsEveryRace) { v in model.setRender { $0.crowdsEveryRace = v } }
+        EffectRow(title: "Bloom", detail: "Full Rate updates the glow every frame, where the console skips every second one (16-car races).",
+                  choices: [("Console", false), ("Full Rate", true)], value: model.graphics.fullRateBloom) { v in model.setRender { $0.fullRateBloom = v } }
+        EffectRow(title: "Level of detail", detail: "How far cars keep their detailed models. Ultra also keeps the best model for your car, at more game memory per car.",
+                  choices: LevelOfDetail.allCases.map { ($0.label, $0) }, value: model.graphics.detail) { v in model.setRender { $0.detail = v } }
+        if model.dofOffered {
+          EffectRow(title: "Depth of field", detail: "Blurs what is out of focus in the showroom, pre-race and replay cameras and photo mode.",
+                    choices: [("On", true), ("Off", false)], value: model.graphics.depthOfField) { v in model.setRender { $0.depthOfField = v } }
+        }
+        if model.overridesOffered {
+          EffectRow(title: "Motion blur", detail: "The speed streaks of the road surface. Off keeps the road's grain still.",
+                    choices: [("On", true), ("Off", false)], value: model.graphics.motionBlur) { v in model.setRender { $0.motionBlur = v } }
+          EffectRow(title: "Car dirt", detail: "The dirt that builds up on cars during a race. Off keeps them clean.",
+                    choices: [("On", true), ("Off", false)], value: model.graphics.carDirt) { v in model.setRender { $0.carDirt = v } }
+        }
+      }
+      .background(RoundedRectangle(cornerRadius: 12).fill(Theme.card))
+      .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.line))
+      Text(model.graphicsNotice.isEmpty ? "A choice is saved at once and applies when you close Settings; several show from the next race." : model.graphicsNotice)
+        .font(.system(size: 12)).foregroundStyle(model.graphicsNotice.isEmpty ? Theme.secondary : Theme.red).fixedSize(horizontal: false, vertical: true)
+      Spacer(minLength: 0)
+      HStack {
+        Spacer()
+        PrimaryButton(title: "Done") { model.endCapture(); model.leaveControls() }
+      }
+    }
+  }
+}
+
+// One effect: its name, its choices (the first marked default) and what it does.
+struct EffectRow<Value: Equatable>: View {
+  let title: String
+  let detail: String
+  let choices: [(String, Value)]
+  let value: Value
+  let choose: (Value) -> Void
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      HStack(spacing: 6) {
+        Text(title).font(.system(size: 14, weight: .semibold)).frame(width: 150, alignment: .leading)
+        ForEach(Array(choices.enumerated()), id: \.offset) { index, choice in
+          let selected = choice.1 == value
+          Button { choose(choice.1) } label: {
+            Text(choice.0 + (index == 0 ? " (default)" : "")).font(.system(size: 12, weight: .semibold)).padding(.horizontal, 10).padding(.vertical, 4)
+              .background(RoundedRectangle(cornerRadius: 6).fill(selected ? Theme.red.opacity(0.9) : Theme.line))
+              .foregroundStyle(selected ? Color.white : Theme.secondary)
+              .contentShape(Rectangle())
+          }
+          .buttonStyle(.plain)
+        }
+        Spacer(minLength: 0)
+      }
+      Text(detail).font(.system(size: 11.5)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+    .padding(.horizontal, 14).padding(.vertical, 9)
   }
 }

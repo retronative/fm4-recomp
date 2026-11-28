@@ -102,7 +102,7 @@ std::string KeyLabel(uint16_t scancode)
     if (name == nullptr)
         return "?";
     static const struct { const char* sdl; const char* label; } kMac[] = {
-        {"Backspace", "DELETE"}, {"Delete", "FORWARD DELETE"}, {"Escape", "ESC"}, {"Up", "UP ARROW"}, {"Down", "DOWN ARROW"},
+        {"Backspace", "BACKSPACE"}, {"Delete", "FORWARD DELETE"}, {"Escape", "ESC"}, {"Up", "UP ARROW"}, {"Down", "DOWN ARROW"},
         {"Left", "LEFT ARROW"}, {"Right", "RIGHT ARROW"}, {"Left Ctrl", "LEFT CONTROL"}, {"Right Ctrl", "RIGHT CONTROL"}};
     for (const auto& m : kMac)
         if (std::strcmp(name, m.sdl) == 0)

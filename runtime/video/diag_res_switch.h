@@ -62,4 +62,26 @@ inline const char* ResCycleAt(uint64_t swap)
     return cycle.list[size_t((swap / cycle.window - 1) % cycle.list.size())].c_str();
 }
 
+// FM4_DIAG_RES_REFUSE=<res> (diagnostic, opt-in, off by default; FM4_INTERNAL_RES's spellings): every switch to that resolution is
+// refused when it is served, through the path a real refusal takes (the device cannot make something at that size, or the
+// renderer was never idle), so a bounded run can exercise what follows a refused switch, e.g. a GRAPHICS rollback that cannot be made.
+inline bool ResRefused(uint32_t halves)
+{
+    static const uint32_t refused = [] {
+        const char* v = std::getenv("FM4_DIAG_RES_REFUSE");
+        uint32_t h = 0;
+        std::string error;
+        if (v == nullptr || *v == '\0')
+            return 0u;
+        if (!scale::ParseInternalRes(v, h, error))
+        {
+            std::fprintf(stderr, "[diag res] FM4_DIAG_RES_REFUSE '%s' is not a resolution (720p, fhd, qhd, 4k): off\n", v);
+            return 0u;
+        }
+        std::fprintf(stderr, "[diag res] on (FM4_DIAG_RES_REFUSE=%s): every switch to it is refused (DIAGNOSTIC)\n", v);
+        return h;
+    }();
+    return refused != 0 && halves == refused;
+}
+
 }  // namespace runtime::video::diag

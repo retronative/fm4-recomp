@@ -17,6 +17,7 @@
 #include "rumble.h"  // FM4 Recomp: controller rumble
 #include "key_bindings.h"  // FM4 Recomp: --keybindings
 #include "av_latency.h"  // FM4 Recomp: FM4_DIAG_AV_LATENCY (diagnostic)
+#include "diag_prompts.h"  // FM4 Recomp: FM4_DIAG_PROMPTS_KEYBOARD (diagnostic)
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -95,7 +96,25 @@ namespace {
 std::atomic<bool> raceScene{false};
 }  // namespace
 
-void NoteSwapDraws(uint64_t draws) { raceScene.store(draws >= 1000, std::memory_order_relaxed); }
+void NoteSwapDraws(uint64_t draws)
+{
+    const bool race = draws >= 1000;
+    const bool was = raceScene.exchange(race, std::memory_order_relaxed);
+    std::lock_guard guard(lock);
+    if (poller == nullptr)
+        return;
+    const uint64_t vblank = runtime::gpu::VblankCount();
+    if (race != was)  // FM4 Recomp (shader warm-up): where the route's @scene lists can start, in a scripted run's log
+        std::fprintf(stderr, "[input] scene: %s from vblank %llu\n", race ? "race" : "menu", (unsigned long long)vblank);
+    if (poller->Swap(vblank, race))
+    {
+        const size_t k = poller->stage() - 1;
+        const auto& section = poller->script().chain[k];
+        std::fprintf(stderr, "[input] @scene %s %u list %zu of %zu (%zu events) starts at vblank %llu\n", section.scene == runtime::input::Scene::Race ? "race" : "menu",
+                     section.swaps, k + 1, poller->script().chain.size(), section.events.size(), (unsigned long long)vblank);
+        logged = poller->ChainFirstIndex(k) - 1;
+    }
+}
 bool InRaceScene() { return raceScene.load(std::memory_order_relaxed); }
 
 void NotifyTitleAccepted(uint64_t vblank)
@@ -123,6 +142,16 @@ bool LiveEnabled()
 }
 
 uint64_t APresses() { return aPresses.load(std::memory_order_relaxed); }
+
+// FM4 Recomp (keyboard prompts): written by the window loop (PollLiveInput), read by the string hooks on guest threads.
+namespace {
+std::atomic<bool> keyboardLastUsed{false};
+}
+
+void SetKeyboardLastUsed(bool keyboard) { keyboardLastUsed.store(keyboard, std::memory_order_relaxed); }
+
+bool KeyboardLastUsed() { return runtime::diag::PromptsKeyboard() || keyboardLastUsed.load(std::memory_order_relaxed); }
+
 
 RumbleRequest GameRumble() { return RumbleFromGuestWord(gameRumble.load(std::memory_order_relaxed)); }
 
@@ -199,11 +228,21 @@ GUEST_IMPORT(XamInputGetState, "REFERENCE_DERIVED: Xenia xam_input.cc:94-121; a 
         for (; logged < report.event; logged++)
         {
             const size_t next = size_t(logged + 1), first = script.events.size();
-            if (next >= first + script.race.size())
+            const runtime::input::Event* e = nullptr;
+            const char* where = "";
+            if (poller->stage() > 0)  // FM4 Recomp (shader warm-up): the running @scene list's events
+            {
+                const auto& section = script.chain[poller->stage() - 1];
+                const long at = logged + 1 - poller->ChainFirstIndex(poller->stage() - 1);
+                if (at >= 0 && size_t(at) < section.events.size())
+                    e = &section.events[size_t(at)], where = "scene ";
+            }
+            else if (next < first + script.race.size())
+                e = next < first ? &script.events[next] : &script.race[next - first], where = next < first ? "" : "race ";
+            if (e == nullptr)
                 continue;
-            const runtime::input::Event& e = next < first ? script.events[next] : script.race[next - first];
-            const std::string held = runtime::input::Describe(e.buttons, e.leftTrigger, e.rightTrigger);
-            std::fprintf(stderr, "[input] event %ld at %svblank %llu: %s\n", logged + 1, next < first ? "" : "race ", (unsigned long long)e.vblank,
+            const std::string held = runtime::input::Describe(e->buttons, e->leftTrigger, e->rightTrigger);
+            std::fprintf(stderr, "[input] event %ld at %svblank %llu: %s\n", logged + 1, where, (unsigned long long)e->vblank,
                          held.empty() ? "released" : held.c_str());
         }
         runtime::Store32(base, state, report.packet);

@@ -43,12 +43,26 @@ struct Event
 // FM4 Recomp (M7 stability harness): `@title` instead anchors the second list on the title screen's acceptance (the game's storage
 // device prompt, XamShowDeviceSelectorUI: Poller::TitleAccepted), so the menu route keeps its timing whatever the boot time; the first
 // list can then press A repeatedly until the title takes it. One anchor a script.
+// FM4 Recomp (shader warm-up, a long route in one launch): `@scene race N` or `@scene menu N` lines, any number, after the lists above,
+// each start a list of their own (Script::chain) whose vblanks count from its start: it is armed once the list before it has started
+// and passed its last event, and starts at the Nth swap in a row (Poller::Swap) that is a race scene (1,000 draws or more) or a menu
+// (fewer), N >= 1. So each part of the route waits for the screen it is written for, whatever the load times. Nothing is held from a
+// list's last event until the next list's first one but that last event's buttons (end a list with a release).
+enum class Scene : uint8_t { Race, Menu };
+struct Section
+{
+    Scene scene = Scene::Menu;
+    uint32_t swaps = 1;          // swaps in a row that start it
+    std::vector<Event> events;   // vblanks relative to its start
+};
+
 struct Script
 {
     std::vector<Event> events;  // in vblank order
     std::vector<Event> race;    // in vblank order, relative to the anchor (the race start, or the title's acceptance with `@title`)
     bool hasRace = false;       // a second list is present
     bool anchorTitle = false;   // it is anchored on the title (`@title`), not the race start (`@race`)
+    std::vector<Section> chain;  // `@scene` lists, in order, after the lists above
 };
 
 // Parses `text`; false with `error` ("line N: ...") on a malformed line, an unknown name or a vblank not above the
@@ -83,6 +97,12 @@ public:
     bool RaceStarted(uint64_t vblank);
     // The title screen took input at `vblank` (the first call counts; false unless the script's second list is `@title`).
     bool TitleAccepted(uint64_t vblank);
+    // A swap at `vblank` (`race`: 1,000 draws or more): true when it starts the next `@scene` list (then stage() is its index + 1).
+    bool Swap(uint64_t vblank, bool race);
+    // 0 before any `@scene` list has started, else the started list's index in chain + 1.
+    size_t stage() const { return stage_; }
+    // The index Poll reports for the first event of chain[k] (events, race, then each chain list in order).
+    long ChainFirstIndex(size_t k) const;
 
 private:
     Script script_;
@@ -90,6 +110,10 @@ private:
     uint64_t raceStart_ = 0;
     uint32_t packet_ = 0;  // 0: never polled
     long event_ = -1;
+    size_t stage_ = 0;        // `@scene` lists started
+    uint64_t stageStart_ = 0; // the vblank the current one started at
+    uint32_t inRow_ = 0;      // swaps in a row of the next one's scene since it was armed
+    bool Armed(uint64_t vblank) const;
 };
 
 // FM4 Recomp: Poller::RaceStarted on the loaded script, if any (imports_input.cpp; logged once). Any thread.

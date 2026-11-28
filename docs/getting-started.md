@@ -1,12 +1,16 @@
 ---
 title: Getting started
-description: How to install FM4 Recomp 0.3.1 on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
+description: How to install FM4 Recomp 0.4.0 on an Apple silicon Mac and play Forza Motorsport 4 natively, from your own disc.
 order: 1
 ---
 
 # Getting started
 
-**FM4 Recomp 0.3.1** is the public beta released on 25 November 2026. [Download the Mac app](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) or read the [release notes](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1).
+> [!NOTE]
+> **FM4 Recomp 0.4.0** is available: a public beta on FM4 Recomp's own engine again, faster than
+> 0.2.0, with the 0.3.x graphics settings and keyboard prompts. Download `FM4-Recomp-0.4.0.dmg` from the
+> [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.4.0), which also has the release
+> notes. See [Status and releases](status.md) for its known issues.
 
 ## What you will need
 
@@ -16,102 +20,116 @@ order: 1
   Disc), as a disc image you made from your own disc. Other versions are refused. See
   [Compatibility](compatibility.md).
 - **About 9 GB of free disk space** for the game data.
-- **A gamepad or the keyboard.** On-screen prompts follow the input device you use.
+- **Optional: your Disc 2** (the Content Install Disc) as a disc image: about 3.2 GB for its files
+  and about 3 GB more when the game installs its content. Disc 1 alone still plays.
+- **A gamepad or the keyboard.** A gamepad that SDL recognises on macOS, in the Xbox layout.
 
-The app includes its runtime, graphics and audio libraries. Homebrew and Xcode are only needed for development.
+FM4 Recomp is an unofficial fan project and never ships any game data: no disc files, artwork,
+audio, tracks or cars (what the app does contain: the [legal notice](LEGAL.md)). Nothing else is
+needed: the app includes everything it runs. No Homebrew, Xcode or developer tools.
 
 ## Install
 
-1. [Download FM4-Recomp-0.3.1.dmg](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1.dmg.sha256). In Terminal, open the folder containing both and run `shasum -a 256 -c FM4-Recomp-0.3.1.dmg.sha256`. A matching download reports `OK`.
-2. Open the DMG, drag **FM4 Recomp** into **Applications**, and open the app from there.
-3. The app is ad hoc signed and has not been notarised by Apple. If macOS blocks the first launch and you have verified the download, use **System Settings → Privacy & Security → Open Anyway** for FM4 Recomp.
-4. For a fresh installation, choose a storage location and select the supported USA Disc 1 image when the setup window asks. Allow about 9 GB for the extracted game data. Keep any external drive containing the data connected when playing.
-5. Choose **Play**. If the app opens Repair on a later launch, first check that your game data drive is mounted.
+1. **Download the DMG.** Get `FM4-Recomp-0.4.0.dmg` and `FM4-Recomp-0.4.0.dmg.sha256` from the
+   [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.4.0). To check the download, run
+   `shasum -a 256 -c FM4-Recomp-0.4.0.dmg.sha256` in Terminal, in the folder with both files. It must report `OK`.
+2. **Move the app to Applications.** Open the disk image and drag **FM4 Recomp** onto **Applications**. Open it from
+   Applications.
+3. **Allow the first launch.** The beta is ad hoc signed and **not notarised**: Apple has not checked it,
+   so macOS may refuse to open it the first time. Opening it anyway is your own decision to make
+   an exception for this app; do it only for a download whose checksum matches. Open **System
+   Settings → Privacy & Security**, choose **Open Anyway** for FM4 Recomp, and open it again.
+4. **Choose your Disc 1 image.** FM4 Recomp checks your Mac, then asks where to keep the game data and
+   your saves: your Library by default, or any folder, an external SSD included (keep that drive
+   connected to play). Choose your Disc 1 image or drop it on the window. Setup copies and checks
+   the game files, which takes a few minutes; your disc image is only read, and every file is
+   checked against the version this build was made for.
+5. **Play.** Press **Play**. Once set up, opening FM4 Recomp starts the game directly. If the game
+   data is missing (moved, deleted, or on a drive that is not connected), the app opens Repair
+   instead.
+
+After Disc 1 setup, FM4 Recomp offers to **warm up the shaders**: it plays ten Quick Races hidden and
+muted, about 45 minutes, so the first races no longer pause while the game prepares its shaders. It
+uses a separate profile and never touches your saves. **Skip** stops it at any time; **Warm Up
+Shaders** in the app's window runs it later.
+
+Pressing A skips the long welcome video before the first race. The original game cannot skip it;
+FM4 Recomp adds that.
 
 ### Updating from a previous version
 
-Quit the earlier app, connect any external drive used for game data or saves, then replace the app in **Applications** and choose **Play**. Version 0.3.1 uses the production profile folder again. It keeps your recorded storage locations and can adopt the recorded Disc 1 setup from 0.3.0 when the production profile has no setup.
-
-On first launch, the app checks for a career in this order.
-
-1. An existing native career in the configured production save folder takes priority.
-2. If that career is missing, the launcher imports compatible saved-game packages from the earlier public 0.2.0 layout.
-3. If a career is still missing, the launcher looks in the 0.3.0 or performance playtest profile. It also copies missing settings from that profile.
-
-If you played both versions, the careers stay separate. The launcher keeps the other career at its original location. If you see a different career than expected, quit before starting a new career and keep both profiles. The old 0.3.0 account is under `~/Library/Application Support/FM4 Recomp ShiftGlue Playtest/shiftglue/user/`. Your 0.2.0 saved-game packages remain under `content/1/00000001/` in the configured save folder. Back up the whole save tree, including its headers, before moving it. If the launcher reports an unavailable folder, reconnect the drive and try again.
+Quit the earlier app, connect any external drive with your game data or saves, replace the app in
+**Applications** and open it. Your storage locations and game data are kept. The career you played in
+0.3.1 comes back the first time you play: FM4 Recomp uses the newest copy of each saved game and keeps
+the copy it replaces in a `saves-replaced` folder beside your saves. If you only ever used 0.3.0, open
+0.3.1 once first: it moves the 0.3.0 career and setup to where this version finds them. A 0.2.0
+installation needs nothing: its saves are already in this version's layout.
 
 ## Disc 2
 
-Disc 1 is sufficient to play. Disc 2 installation on the 0.3.1 engine has not been verified. If you already installed optional content under 0.2.0, keep that installation.
+Disc 2 is optional. If you choose to install it in the game, FM4 Recomp's Disc 2 panel opens over
+the game's "Insert Disc 2" screen: drop or choose your Disc 2 image and where its files go, and
+watch the progress (Cancel and Try Again are there). The panel closes once Disc 2 is ready, and
+the game then shows its own "Install Additional Content" screen; confirm with A.
 
 ## Controls
 
-| Action | Default keyboard input |
+![8BitDo Ultimate 2 Wireless controller showing the FM4 controls and default keyboard equivalents.](../.website/public/brand/fm4-controller-guide.svg)
+
+| Gamepad (Xbox layout) | Keyboard (default) |
 |---|---|
-| Throttle / brake | W / S |
-| Steer | A / D |
-| Handbrake / clutch | Space / Shift |
-| Gear up / down | E / Q |
-| Change camera / rewind | Tab / R |
-| Look around / look straight back | Arrow keys / C |
-| Pause a race | Esc |
-| Move in menus | Arrow keys or W, A, S, D |
-| Select / back in menus | Enter or Space / Esc or Backspace |
-| Gamepad X / Y in menus | X / Y |
-| Menu tabs | Q / E |
-| Show or hide the FPS counter | F3 |
-| Toggle fullscreen | Option+Return or F11 |
+| Left stick: steer | A / D |
+| Right trigger: throttle | W |
+| Left trigger: brake | S |
+| A / B / X / Y | Space / Backspace / Left Shift / Left Control |
+| D-pad | Arrow keys |
+| Start / Back | Return / Tab |
+| LB / RB | Q / E |
+| Right stick click: camera | C |
 
-On a controller, use the D-pad in menus, A to select and B to go back. In a race use the left stick to steer and the triggers for the pedals. Open **Pause → GRAPHICS** or press **⌘,** to reach the **Graphics**, **Keyboard**, **Mouse** and **Gameplay** tabs.
+The keyboard keys are changed in the game: choose **KEYBOARD CONTROLS** in the Pause menu (Start,
+or **Command-comma (⌘,)** during a race) or on the Pre-Race screen. Changes are saved at once and
+apply in every later session. The gamepad layout is fixed. The game's on-screen instructions follow
+the device you used last: after a key press they name your keys and show keycaps in place of the
+gamepad's buttons.
 
-### Graphics settings
-
-Open **Pause → GRAPHICS** during a single-player race, or press **Command-comma (⌘,)**. On a controller, press **Up** from the first setting to reach the tabs. **Left** and **Right** switch tabs there. Press **Down** or **A** to enter the selected tab. In the settings list, **Up** and **Down** select a row and **Left** and **Right** change its value.
-
-Press **Y (Save & Apply)** to use your choices. Browsing resolutions keeps the current picture on screen. The **Changing resolution…** indicator waits for a new frame at the requested size. The Graphics page stays open so you can choose when to resume.
-
-| Setting | What it changes |
-| --- | --- |
-| Display Mode | Switch between fullscreen and a window. |
-| Resolution | Choose the game's render size. The choices are 720p, 1080p (Full HD), 1440p (QHD) and 4K (2160p). A new profile starts at Full HD. You can choose 4K even on a smaller screen. |
-| MSAA | Smooths the edges of 3D objects. Game uses 2× in races and 4× in the showroom. Off, 2× and 4× set both. Takes effect in the next scene. |
-| HDR | Auto uses HDR on a compatible display. Off uses standard brightness. |
-| Extended View | Matches the camera to the window shape. A wider window shows more at the sides and a taller window shows more above and below. |
-| Scenery Shadows | Adds shadows for trackside cones and barriers during races. These can flicker near the edge of the screen. |
-| Reflection Updates | Controls how often reflections on cars refresh. Console follows the original game. Every Race also updates them in 16-car and split-screen races. Double updates twice as many reflection faces per frame. |
-| Mirror | Full refreshes the rear-view mirror every frame and can show up to 16 cars. Console shows up to six at half rate in 12- and 16-car races. |
-| Soft Particles | Softens the edge of smoke and dust where they touch cars or the road. |
-| Crowds | Every Race adds spectators to solo and 16-car races and uses more memory. Console follows the original game's race settings. |
-| Motion Blur | Blurs the road surface as the car gains speed. |
-| Depth of Field | Blurs areas outside the camera's focus in the showroom, pre-race sequences, replays and Photo Mode. Takes effect from the next screen. |
-| Car Dirt | Shows dirt accumulating on the car during a race. |
-
-**Automatic upscaling.** When the rendered picture is smaller than the area it fills in the game window, spatial FSR 1 enlarges it. At matching sizes the picture passes through at its rendered size. A larger rendered picture is scaled down. The comparison uses the visible game area in display pixels and excludes black bars. MSAA remains available at every resolution.
-
-A new profile uses Full HD, Standard edge smoothing and HDR Auto. HDR and Extended View can be used together in fullscreen.
+The **GRAPHICS** menu (Pause menu or Pre-Race screen) and the Settings panel's **Effects** tab hold the
+resolution, edge smoothing, HDR and the effects: Scenery Shadows, Reflection Updates, Mirror, Soft
+Particles, Crowds, Bloom, Level of Detail, Depth of Field, Motion Blur and Car Dirt. A choice is
+previewed at once and saved with A (B discards it).
 
 ## Sessions and GPU safeguards
 
-The launcher runs one session at a time and checks system diagnostics for a GPU hang or restart. If it creates `GPU_STOP` in the profile folder, read it before playing again. A session log can contain local paths. Review the text before sharing a bug report, and omit game files and captures.
+FM4 Recomp is early software that drives the GPU hard, so every session runs with safeguards that
+are always on:
 
-The default profile is `~/Library/Application Support/FM4 Recomp/`. Use Finder’s **Go → Go to Folder** to open it.
+- One session at a time, with a time limit, ending when you close the game window.
+- After each session the system log and crash reports are searched for a GPU hang or restart. On
+  any evidence FM4 Recomp writes a `GPU_STOP` file in `~/Library/Application Support/FM4 Recomp`
+  and refuses to start again until you have read it and deleted it yourself.
+- **Debug mode** runs the game with the Vulkan validation layer and Metal API validation, and
+  stops at the first validation message. It is much slower and meant for reports.
 
-| Inside the profile | Contents |
-|---|---|
-| `data/user-data/` | Default save folder. A custom or external save folder is recorded as `user_data_root` in `locations.conf`. |
-| `config/graphics.toml` | Graphics settings |
-| `logs/` | Session logs |
+Session logs are kept in `~/Library/Application Support/FM4 Recomp/logs/`. A session's folder
+holds the game's log (it contains folder paths on your Mac), captured frames of the game, the
+microcode of any shader the build refused, and an excerpt of the macOS system log for the session,
+which can include other apps' Metal messages. Nothing is sent anywhere. When you report a problem,
+send the text log only, after looking through it; never attach captured frames.
 
 ## Known issues
 
-Frame rate and memory depend on resolution, track and Mac. Choosing 4K can substantially increase memory use. See [Status and releases](status.md#known-issues) for current limitations.
+This is a beta. The main known issues are on the [Status and releases](status.md#known-issues)
+page: a low frame rate, a stutter and an abrupt start before a race, and features that stop the
+game with a named message.
 
 ## Uninstall
 
-Quit the app and move it from Applications to the Bin. Keep the profile and disc data if you intend to reinstall. Back up your saves before removing a profile or an external data folder. The production and old playtest folders can contain different careers.
+Quit FM4 Recomp, move it from Applications to the Bin, and delete
+`~/Library/Application Support/FM4 Recomp` (and the folders you chose in setup, if you chose
+others). That removes the game data, your saves and the session logs. Your disc images are never
+changed.
 
 ## Building from source
 
-Browse the [0.3.1 launcher and save migration on GitHub](https://github.com/retronative/fm4-recomp/tree/v0.3.1/scripts/alpha) or the [game host and renderer used by this release](https://github.com/retronative/fm4-recomp/tree/v0.3.1/ports/v0.3.0).
-
-Download the [0.3.1 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256). Its README identifies the upstream host and SDK revisions, the local changes and the steps to regenerate the game code from your own supported disc. See also [Third-party notices](../THIRD_PARTY_NOTICES.md).
+Developers build FM4 Recomp from this repository with their own discs: see
+[CONTRIBUTING.md](../CONTRIBUTING.md).

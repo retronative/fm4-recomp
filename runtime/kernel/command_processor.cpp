@@ -9,6 +9,7 @@
 #include "graphics.h"
 #include "cp_trace.h"
 #include "diag_zpd.h"
+#include "diag_idle.h"  // FM4 Recomp: FM4_DIAG_IGNORE_IDLE (diagnostic)
 #include "imports.h"
 #include "virtual_memory.h"
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <pthread.h>
@@ -137,7 +139,23 @@ struct DeferredStore { uint32_t address, value; bool interrupt = false; uint32_t
 std::vector<DeferredStore> deferredStores;
 uint8_t* deferredBase = nullptr;
 StorePartition storeParts;  // FM4 Recomp (FM4_ASYNC_RETIRE; deferred_store_parts.h): the submission part each queued entry follows
+// FM4 Recomp (FM4_DIAG_IDLE_CENSUS=1, diagnostic; diag_idle.h): the newest queued store, and the idle-asked interrupts queued and
+// not yet raised (oldest first). Command-processor thread only.
+struct CensusStore { uint32_t opcode = 0, address = 0; uint64_t index = 0, draw = 0; bool any = false; };
+struct CensusIrq { uint64_t swap, draw, ns, parts; bool logged; };
+CensusStore censusLastStore;
+std::deque<CensusIrq> censusIrqs;
+uint32_t censusOpcode = 0;  // the type-3 packet being executed
+uint64_t censusDraws = 0, censusParts = 0;
+uint32_t censusLines = 0;
+constexpr uint32_t kCensusLines = 3000;
+void CensusQueued(uint32_t address)  // before storeParts.Queued(): `index` is the entry's own count
+{
+    if (runtime::diag::IdleCensus())
+        censusLastStore = {censusOpcode, address, storeParts.QueuedCount(), censusDraws, true};
+}
 std::atomic<uint64_t> cpIdleNs{0}, selfWaits{0}, immediateWaits{0}, memWaits{0}, syncedWaits{0}, memWaitNs{0}, immediateInterrupts{0}, graceSyncs{0};
+std::atomic<uint64_t> earlyInterrupts{0}, earlyOverStores{0}, earlyIdle{0};  // FM4_DIAG_EARLY_IRQ (diagnostic)
 // FM4 Recomp (FM4_DIAG_MEMWAIT=1, diagnostic): each memory WAIT_REG_MEM that is not satisfied at once, on every 50th swap (at
 // most 4,000 lines): its word, reference, the value before and after the sync, what was pending, and where the time went.
 bool MemWaitDiag()
@@ -225,10 +243,19 @@ void RaiseInterrupts(uint32_t mask)
             RequestInterrupt(1, true, renderer && renderer->honourGpuReadGuard ? HonourGpuReadGuard : nullptr);
 }
 
+bool NoDrain() { return renderer && renderer->cpuVisible; }  // FM4_NO_DRAIN (RendererHooks::cpuVisible)
+
 void CpStore(uint8_t* base, uint32_t address, uint32_t value)
 {
+    if (NoDrain())  // FM4_NO_DRAIN (not guest-exact): lands now, after a new capture run's resolve
+    {
+        renderer->cpuVisible();
+        StoreGpu(base, address, value);
+        return;
+    }
     if (!deferredStores.empty() || (renderer && renderer->deferStore && renderer->deferStore(address & ~3u)))
     {
+        CensusQueued(address);  // FM4_DIAG_IDLE_CENSUS (diagnostic)
         deferredStores.push_back({address, value}), deferredBase = base, storeParts.Queued();
         return;
     }
@@ -240,8 +267,15 @@ void CpStore(uint8_t* base, uint32_t address, uint32_t value)
 uint32_t ZpdValue(uint32_t token) { return __builtin_bswap32(renderer->zpdCount(token)); }
 void CpStoreZpd(uint8_t* base, uint32_t address, uint32_t token)
 {
+    if (NoDrain())  // FM4_NO_DRAIN (not guest-exact): lands now with the address's newest known count (renderer.cpp ZpdCount)
+    {
+        renderer->cpuVisible();
+        StoreGpu(base, address, ZpdValue(token));
+        return;
+    }
     if (!deferredStores.empty() || (renderer->deferStore && renderer->deferStore(address & ~3u)))
     {
+        CensusQueued(address);  // FM4_DIAG_IDLE_CENSUS (diagnostic)
         deferredStores.push_back({address, 0, false, token}), deferredBase = base, storeParts.Queued();
         return;
     }
@@ -363,6 +397,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             continue;
         }
         const uint32_t opcode = (packet >> 8) & 0x7F;
+        censusOpcode = opcode;  // FM4_DIAG_IDLE_CENSUS (diagnostic): the packet a queued store comes from
         uint32_t remaining = count;
         auto next = [&] {
             if (remaining == 0)
@@ -430,7 +465,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 CpWriteRegister(base, reg::kVgtDmaSize, next());
             }
             TraceDraw(base, state.draws, opcode, vizQueryToken);
-            state.draws++;  // counted; drawn only with a renderer (M4 unit 8)
+            state.draws++, censusDraws++;  // counted; drawn only with a renderer (M4 unit 8)
             if (renderer)
                 renderer->draw(base, opcode, vizQueryToken);
             break;
@@ -439,8 +474,15 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
         {
             const uint32_t mask = next();
             // FM4 Recomp (FM4_DEFER_FENCES): raised when the work before it completes, in order behind the queued stores.
-            const bool idle = idleAsked;
+            const bool idle = idleAsked && !runtime::diag::IgnoreIdle();  // FM4_DIAG_IGNORE_IDLE (diagnostic, diag_idle.h)
             idleAsked = false;
+            if (NoDrain())  // FM4_NO_DRAIN (not guest-exact): raised now, after the stores before it (they landed when reached)
+            {
+                renderer->cpuVisible();
+                immediateInterrupts++;
+                RaiseInterrupts(mask);
+                break;
+            }
             static std::atomic<uint32_t> irqLines{0};
             if (MemWaitDiag() && state.swaps % 50 == 0 && irqLines.fetch_add(1) < 2000)
             {
@@ -453,6 +495,18 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                              (unsigned long long)(packetsSeen - waitUntilAt), deferredStores.size(),
                              renderer && renderer->workOpen && renderer->workOpen() ? 1 : 0, history);
             }
+            if (renderer && renderer->workOpen && runtime::diag::EarlyIrq() && (!deferredStores.empty() || renderer->workOpen()))
+            {
+                earlyInterrupts++, earlyOverStores += deferredStores.empty() ? 0 : 1, earlyIdle += idle ? 1 : 0;  // FM4_DIAG_EARLY_IRQ
+                if (earlyInterrupts % 1000 == 0)
+                    std::fprintf(stderr, "[diag idle] swap %llu: early interrupts %llu, %llu with stores queued, %llu after a 3D-idle request; memory "
+                                         "waits %llu, %llu synced (%llu after the grace)\n", (unsigned long long)state.swaps,
+                                 (unsigned long long)earlyInterrupts.load(), (unsigned long long)earlyOverStores.load(), (unsigned long long)earlyIdle.load(),
+                                 (unsigned long long)memWaits.load(), (unsigned long long)syncedWaits.load(), (unsigned long long)graceSyncs.load());
+                immediateInterrupts++;
+                RaiseInterrupts(mask);
+                break;
+            }
             if (renderer && renderer->workOpen && deferredStores.empty() && !idle && ImmediateInterruptsOn())
             {
                 immediateInterrupts++;
@@ -461,9 +515,32 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             }
             if (renderer && renderer->workOpen && (!deferredStores.empty() || renderer->workOpen()))
             {
+                if (runtime::diag::IdleCensus())  // FM4_DIAG_IDLE_CENSUS (diagnostic): every queued interrupt has a record (raised in order)
+                {
+                    const bool log = idle && state.swaps % 25 == 0 && censusLines < kCensusLines;
+                    if (log)
+                    {
+                        censusLines++;
+                        uint32_t stores = 0, irqs = 0;
+                        for (const DeferredStore& d : deferredStores)
+                            (d.interrupt ? irqs : stores)++;
+                        const CensusStore& s = censusLastStore;
+                        const bool queued = s.any && s.index >= storeParts.QueuedCount() - deferredStores.size();
+                        std::fprintf(stderr, "[idle census] swap %llu irq queued: mask %X; queue %zu (stores %u, interrupts %u), open-part entries %llu; "
+                                             "newest store: %s op %02X at %08X, %s, %llu draw(s) since\n",
+                                     (unsigned long long)state.swaps, mask, deferredStores.size(), stores, irqs,
+                                     (unsigned long long)(storeParts.QueuedCount() - std::max(storeParts.OpenFrom(), storeParts.QueuedCount() - deferredStores.size())),
+                                     queued ? "queued" : "landed", s.opcode, s.address,
+                                     !queued ? "-" : s.index >= storeParts.OpenFrom() ? "OPEN part" : "submitted part",
+                                     (unsigned long long)(censusDraws - s.draw));
+                    }
+                    censusIrqs.push_back({state.swaps, censusDraws, NowNs(), censusParts, log});
+                }
                 deferredStores.push_back({0, mask, true}), deferredBase = base, storeParts.Queued();
                 break;
             }
+            if (runtime::diag::IdleCensus() && idle && state.swaps % 25 == 0 && censusLines < kCensusLines)
+                censusLines++, std::fprintf(stderr, "[idle census] swap %llu irq raised at once: mask %X, nothing open or queued\n", (unsigned long long)state.swaps, mask);
             SyncBefore(opcode);
             RaiseInterrupts(mask);
             break;
@@ -542,10 +619,14 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             const size_t queuedAtEntry = deferredStores.size();
             const bool overlapAtEntry = (info & 0x10) && renderer && renderer->pendingAt && renderer->pendingAt(poll & ~3u, 4);
             // FM4 Recomp (FM4_IMMEDIATE_INTERRUPTS): a word only the CPU writes gets the grace period before the sync.
-            const bool cpuWord = (info & 0x10) && ImmediateInterruptsOn() && renderer && renderer->pendingAt && !overlapAtEntry && deferredStores.empty();
-            if ((info & 0x10) && !cpuWord)
+            // FM4_DIAG_EARLY_IRQ (diagnostic): also with stores queued (pendingAt covers their words: DeferStore marks them written).
+            const bool cpuWord = (info & 0x10) && (ImmediateInterruptsOn() || runtime::diag::EarlyIrq()) && renderer && renderer->pendingAt &&
+                                 !overlapAtEntry && (deferredStores.empty() || runtime::diag::EarlyIrq());
+            // FM4_NO_DRAIN (not guest-exact): a word nothing pending writes is the guest CPU's to write; polled without a sync.
+            const bool noSync = (info & 0x10) && NoDrain() && !overlapAtEntry;
+            if ((info & 0x10) && !cpuWord && !noSync)
                 SyncBefore(opcode);
-            bool synced = !cpuWord;
+            bool synced = !cpuWord || noSync;
             const uint64_t syncNs = (info & 0x10) ? NowNs() - waitStart : 0;
             const uint32_t afterSync = (info & 0x10) ? LoadGpu(base, poll) : 0;
             const uint64_t pollStart = NowNs();
@@ -580,7 +661,7 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
                 // FM4 Recomp (FM4_DEFER_FENCES): the queued stores and interrupts may be what the guest CPU needs before it writes what
                 // this waits for (observed: an INTERRUPT queued, then a wait for the CPU to clear 08D4D002, stop 7 after
                 // 10 s). Submit and retire the open work, which applies them, before waiting (ReCarbon command_processor.cpp:745-750).
-                if (!deferredStores.empty() && renderer && renderer->ringIdle)
+                if (!deferredStores.empty() && renderer && renderer->ringIdle && synced)  // FM4_DIAG_EARLY_IRQ: not inside the grace (unchanged otherwise: a cpuWord wait had nothing queued)
                 {
                     renderer->ringIdle();
                     idleFlushes++;
@@ -608,6 +689,17 @@ void Execute(uint8_t* base, uint32_t start, uint32_t size, uint32_t from, uint32
             {
                 const uint64_t totalNs = NowNs() - waitStart;
                 memWaits++, memWaitNs += totalNs, syncedWaits += synced ? 1 : 0;
+                if (runtime::diag::IdleCensus() && synced && !censusIrqs.empty() && censusIrqs.front().logged && censusLines < kCensusLines)
+                {
+                    bool queuedWord = false;  // FM4_DIAG_IDLE_CENSUS (diagnostic): does a queued store write the polled word?
+                    for (const DeferredStore& d : deferredStores)
+                        queuedWord = queuedWord || (!d.interrupt && (d.address & ~3u) == (poll & ~3u));
+                    censusLines++;
+                    std::fprintf(stderr, "[idle census] swap %llu memwait with an idle irq queued: word %08X (%s), entry %08X final %08X, "
+                                         "%.3f ms, %u idle flush(es), queue now %zu\n",
+                                 (unsigned long long)state.swaps, poll, queuedWord ? "a queued store writes it" : "no queued store writes it",
+                                 entryValue, LoadGpu(base, poll), totalNs / 1e6, idleFlushes, deferredStores.size());
+                }
                 if (synced && DrainDiag())  // FM4_DIAG_DRAIN (diagnostic): the wait's span, for the renderer's drain lines
                     syncedWaitSpans[syncedWaitNext++ % kSyncedWaitSpans] = {waitStart, waitStart + totalNs};
                 static std::atomic<uint32_t> lines{0};
@@ -822,10 +914,21 @@ void ApplyDeferredStores()
         if (!d.interrupt)
             StoreGpu(deferredBase, d.address, d.zpd ? ZpdValue(d.zpd) : d.value);
         else
+        {
             RaiseInterrupts(d.value);
+            if (runtime::diag::IdleCensus() && !censusIrqs.empty())  // FM4_DIAG_IDLE_CENSUS (diagnostic); interrupts are raised in order
+            {
+                const CensusIrq c = censusIrqs.front();
+                censusIrqs.pop_front();
+                if (c.logged && censusLines < kCensusLines)
+                    censusLines++, std::fprintf(stderr, "[idle census] swap %llu irq raised by the full drain: %.3f ms after it was queued, %llu draw(s) and "
+                                                        "%llu part(s) later\n", (unsigned long long)c.swap, (NowNs() - c.ns) / 1e6,
+                                                (unsigned long long)(censusDraws - c.draw), (unsigned long long)(censusParts - c.parts));
+            }
+        }
 }
 bool DeferredStoresPending() { return !deferredStores.empty(); }
-void MarkDeferredStoresPart(uint64_t serial) { storeParts.Submitted(serial); }
+void MarkDeferredStoresPart(uint64_t serial) { storeParts.Submitted(serial), censusParts++; }
 size_t ApplyDeferredStoresThrough(uint64_t serial, bool (*canStore)(uint32_t physical))
 {
     return ApplyStoresThrough(deferredStores, storeParts, serial, [&](const DeferredStore& d) { return canStore == nullptr || canStore(d.address & 0x1FFFFFFCu); },
@@ -939,6 +1042,11 @@ void ReportCommandProcessor()
     for (uint32_t i = 0; i < 16 && i < ringState.lastCount; i++)
         std::fprintf(stderr, " %08X", ringState.lastHeaders[(ringState.lastCount - 1 - i) % 16]);
     std::fprintf(stderr, "\n");
+    if (runtime::diag::EarlyIrq())
+        std::fprintf(stderr, "[diag idle] early interrupts %llu: %llu with stores queued, %llu after a 3D-idle request; memory waits %llu, %llu synced "
+                             "(%llu after the grace)\n", (unsigned long long)earlyInterrupts.load(), (unsigned long long)earlyOverStores.load(),
+                     (unsigned long long)earlyIdle.load(), (unsigned long long)memWaits.load(), (unsigned long long)syncedWaits.load(),
+                     (unsigned long long)graceSyncs.load());
 }
 
 }  // namespace runtime::gpu

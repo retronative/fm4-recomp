@@ -50,6 +50,9 @@ public:
         return !parts_.empty() && parts_.front().serial <= serial;
     }
     size_t Parts() const { return parts_.size(); }
+    // Diagnostic (FM4_DIAG_IDLE_CENSUS): entries counted so far, and the count from which entries belong to the open part (P2).
+    uint64_t QueuedCount() const { return queued_; }
+    uint64_t OpenFrom() const { return parts_.empty() ? taken_ : parts_.back().end; }
 
 private:
     struct Part { uint64_t serial, end; };  // end: the queue count after its last entry

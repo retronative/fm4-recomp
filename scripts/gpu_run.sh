@@ -188,6 +188,16 @@ if [ -n "${GPU_RUN_VALIDATION_OFF:-}" ]; then
 fi
 if [ "$RENDERER" != headless ] && [ "$VALIDATION" = off ]; then
   ICD=/opt/homebrew/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json
+  # GPU_RUN_ICD=<manifest> (timing comparisons only, with GPU_RUN_VALIDATION_OFF): another MoltenVK, e.g. a reference port's bundled
+  # build, named in the evidence with its library's hash.
+  if [ -n "${GPU_RUN_ICD:-}" ]; then
+    ICD=$GPU_RUN_ICD
+    LIB=$(sed -n 's/.*"library_path": *"\([^"]*\)".*/\1/p' "$ICD")
+    case "$LIB" in /*) ;; *) LIB="$(cd "$(dirname "$ICD")" && cd "$(dirname "$LIB")" && pwd)/$(basename "$LIB")" ;; esac
+    [ -f "$LIB" ] || { echo "gpu_run: GPU_RUN_ICD's library $LIB is missing" >&2; exit 1; }
+    echo "gpu_run: GPU_RUN_ICD $ICD -> $LIB" | tee -a "$OUT/binary.sha256"
+    shasum -a 256 "$LIB" | tee -a "$OUT/binary.sha256"
+  fi
   [ -f "$ICD" ] || { echo "gpu_run: the MoltenVK ICD $ICD is missing" >&2; exit 1; }
   export VK_DRIVER_FILES="$ICD" VK_LOADER_DEBUG=layer
   # FM4 Recomp: normal windowed gameplay runs without Vulkan or Metal API validation:

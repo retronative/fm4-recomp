@@ -18,9 +18,16 @@
 // Technique: SpeedBreaker runtime/game/quick_race_cops.cpp (fe04285, GPL-3.0-or-later): game rows made with the game's own calls.
 //
 // FM4 Recomp: the GRAPHICS submenu (the Pause menu's GRAPHICS row; kernel/graphics_menu.h is its logic and its file) is shown the
-// same way, in the same option screen: OpenGraphics; two rows whose values are the game's own spinners (left and right change one;
-// the list's "a value changed" event reads the rows' options, title_symbols.h kItemValue, and saves at once), X restores the focused
-// row's default, B is the game's Back. It never owns the input. One submenu at a time: `shown` says which one `screen` is.
+// same way, in the same option screen: OpenGraphics; rows whose values are the game's own spinners (left and right change one;
+// the list's "a value changed" event reads the rows' options, title_symbols.h kItemValue). What the running game shows is taken
+// when GRAPHICS opens; a change is a preview, nothing is saved until A (OK), which saves and returns to the menu that opened it as
+// its Back does; X previews the defaults; B (BACK, or DISCARD CHANGES while something is not saved) discards and brings the
+// resolution, edge smoothing and HDR back to what they were at the entry, then returns. The screen closing any other way discards
+// too. It never owns the input. One submenu at a time: `shown` says which one `screen` is.
+// FM4 Recomp (render scenario settings): GRAPHICS shows only the rows the run offers (graphics_menu.h Shown), so a list position is
+// mapped to its row with Menu::RowAt. A render scenario row previews and rolls back like the others: applyLive publishes the value
+// to the running game (PublishRenderValue), which applies it at its next main-loop tick (render_scenario.cpp); the entry snapshot
+// takes those rows from what the game applies now (RenderNow).
 #include "title_symbols.h"
 #include "kernel/controls_menu.h"
 #include "kernel/graphics_menu.h"
@@ -48,8 +55,15 @@ std::atomic<Submenu> pending{Submenu::None};  // the next option screen built is
 std::atomic<uint32_t> screen{0};    // the option screen showing it, 0 if none
 Submenu shown = Submenu::None;      // game thread only: the submenu `screen` shows
 std::optional<settings::Menu> graphics;  // game thread only: GRAPHICS while it is shown
+uint64_t graphicsOpenedNs = 0;      // game thread only: when GRAPHICS opened (its opener's A is not an OK)
+bool graphicsDirtyShown = false;    // game thread only: the help bar's B says DISCARD CHANGES
+bool rollingBack = false;           // game thread only: applyLive is setting the entry's values back
+std::atomic<bool> pendingFromPause{false};  // the submenu `pending` names was opened from the Pause menu (not the Pre-Race screen)
+bool previewOffered = false;        // game thread only: GRAPHICS shown from the Pause menu offers Y: PREVIEW (a paused scene behind it)
+bool previewing = false;            // game thread only: Y: Preview is on (renderer.h SetMenuPreview)
 std::atomic<bool> freeing{false};   // our own call of the teardown (old rows), not the screen closing
 uint32_t focusRow = 0;              // game thread only
+constexpr uint64_t kGraphicsSettleNs = 350'000'000;  // an A this soon after GRAPHICS opened is its opener's (controls_menu.h kOpenSettleNs)
 
 std::string BindingsPath()
 {
@@ -279,6 +293,46 @@ void BuildRows(PPCContext& ctx, uint8_t* base, uint32_t self)
     ShowRows(f, self, collection);
 }
 
+uint64_t SteadyNs()
+{
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// "FULL HD, STANDARD, HDR OFF" (and EXTENDED VIEW when it is offered; FM4 Recomp: then each render scenario row shown, as
+// "SCENERY SHADOWS ON"), for the log.
+std::string Describe(const settings::Graphics& g)
+{
+    std::string text = std::string(settings::kResolutions[g.resolution].label) + ", " + settings::kSmoothings[g.smoothing].label + ", HDR " + settings::kHdrs[g.hdr].label;
+    if (settings::ExtendedOffered())
+        text += std::string(", EXTENDED VIEW ") + settings::kExtendeds[g.extended].label;
+    for (size_t row = settings::Menu::kShadowsRow; row < settings::Menu::kRows; row++)
+        if (settings::Menu::Shown(row))
+            text += std::string(", ") + settings::Menu::Label(row) + " " + settings::Menu::ValueLabel(row, settings::Menu::Field(g, row));
+    return text;
+}
+
+// What the running game shows now (the entry snapshot): the renderer's resolution (a request still waiting counts as made), edge
+// smoothing and HDR preference, and Extended View's preference; FM4 Recomp: the render scenario rows as the game applies them
+// (RenderNow). A value the tables do not name: the default (never expected).
+settings::Graphics GraphicsInEffect()
+{
+    const auto index = [](const settings::Option* options, size_t count, const char* file, size_t fallback) {
+        for (size_t i = 0; i < count; i++)
+            if (file != nullptr && std::string(file) == options[i].file)
+                return i;
+        return fallback;
+    };
+    settings::Graphics g;
+    g.resolution = index(settings::kResolutions, settings::kResolutionCount, runtime::video::InternalResTarget(), settings::kDefaultResolution);
+    g.smoothing = index(settings::kSmoothings, settings::kSmoothingCount, runtime::video::PostAaNow(), settings::kDefaultSmoothing);
+    g.hdr = runtime::video::HdrPreferenceNow() ? 1 : 0;
+    g.extended = runtime::view::Global().Preference() ? 1 : 0;
+    const settings::Graphics render = settings::RenderNow();
+    for (size_t row = settings::Menu::kShadowsRow; row < settings::Menu::kRows; row++)
+        settings::Menu::Field(g, row) = settings::Menu::Field(render, row);
+    return g;
+}
+
 // The GRAPHICS rows: each value is one of the row's options, in the file's order.
 // The running game's HDR state (renderer.h HdrOutputNow) into the menu's status and the Settings panel's file.
 void PublishHdr()
@@ -291,10 +345,11 @@ void BuildGraphicsRows(PPCContext& ctx, uint8_t* base, uint32_t self)
 {
     Frame f(ctx, base);
     const uint32_t collection = NewCollection(f);
-    for (uint32_t row = 0; row < settings::Menu::Rows(); row++)
+    for (uint32_t position = 0; position < settings::Menu::Rows(); position++)
     {
+        const size_t row = settings::Menu::RowAt(position);
         uint32_t source = 0;
-        const uint32_t item = NewRow(f, row, settings::Menu::Label(row), settings::Menu::Description(row), source);
+        const uint32_t item = NewRow(f, position, settings::Menu::Label(row), settings::Menu::Description(row), source);
         for (uint32_t value = 0; value < settings::Menu::Count(row); value++)
             AddOption(f, source, value, settings::Menu::ValueLabel(row, value));
         AddRow(f, collection, item, source, uint32_t(graphics->Value(row)));
@@ -302,18 +357,93 @@ void BuildGraphicsRows(PPCContext& ctx, uint8_t* base, uint32_t self)
     ShowRows(f, self, collection);
 }
 
-// GRAPHICS: the rows' spinners as the player left them are the new values (saved at once, graphics_menu.h); then the rows show
-// what is saved (a value that could not be saved goes back) and the line under the list says so.
+void HelpButton(Frame& f, uint32_t bar, uint32_t slot, const char* label)
+{
+    const uint32_t mark = f.Mark();
+    const uint32_t made = f.String(label), copy = f.Alloc(4);
+    f.ctx.r3.u64 = copy, f.ctx.r4.u64 = made;
+    f.Call(kStringCopy);
+    f.ctx.r3.u64 = bar, f.ctx.r4.u64 = slot, f.ctx.r5.u64 = copy;
+    f.Call(kHelpAdd);
+    f.Release(copy);
+    f.Release(made);
+    f.Reset(mark);
+}
+
+uint32_t HelpBarOf(Frame& f, uint32_t self)
+{
+    f.ctx.r3.u64 = kHelpBarName;
+    f.Call(kNameHash);
+    f.ctx.r4.u64 = f.ctx.r3.u64, f.ctx.r3.u64 = self;
+    f.Call(kComponent);
+    return f.ctx.r3.u32;
+}
+
+// GRAPHICS: B's label in the help bar (BACK, or DISCARD CHANGES while something is not saved).
+void BackHint(Frame& f, uint32_t self, const char* label)
+{
+    const uint32_t bar = HelpBarOf(f, self);
+    if (bar == 0)
+        return;
+    f.ctx.r3.u64 = bar, f.ctx.r4.u64 = 1;
+    f.Call(kHelpRemove);
+    HelpButton(f, bar, 1, label);
+    const uint32_t binding = bar + kListBinding;
+    f.ctx.r3.u64 = binding;
+    f.Call(f.VFunction(binding, kBindingRefresh));
+}
+
+// GRAPHICS, Y: Preview: the help bar holds only B: BACK TO GRAPHICS while it is on (the renderer draws the menus only in the help
+// bar's corner, kernel/menu_preview.h); then A OK, X DEFAULT, Y PREVIEW and B as before.
+void PreviewHint(Frame& f, uint32_t self, bool on)
+{
+    const uint32_t bar = HelpBarOf(f, self);
+    if (bar == 0)
+        return;
+    for (const uint32_t slot : {0u, 2u, 3u, 1u})
+    {
+        f.ctx.r3.u64 = bar, f.ctx.r4.u64 = slot;
+        f.Call(kHelpRemove);
+    }
+    if (on)
+        HelpButton(f, bar, 1, "BACK TO GRAPHICS");
+    else
+    {
+        HelpButton(f, bar, 0, "OK");
+        HelpButton(f, bar, 2, "DEFAULT");
+        HelpButton(f, bar, 3, "PREVIEW");
+        HelpButton(f, bar, 1, graphicsDirtyShown ? "DISCARD CHANGES" : "BACK");
+    }
+    const uint32_t binding = bar + kListBinding;
+    f.ctx.r3.u64 = binding;
+    f.Call(f.VFunction(binding, kBindingRefresh));
+}
+
+void SetPreview(PPCContext& ctx, uint8_t* base, uint32_t self, bool on, const char* how)
+{
+    previewing = on;
+    runtime::video::SetMenuPreview(on);
+    {
+        Frame f(ctx, base);
+        PreviewHint(f, self, on);
+    }
+    std::fprintf(stderr, "[graphics] GRAPHICS preview %s (%s): rows %s (%s), focused row %u; saved %s\n", on ? "on" : "off", how, Describe(graphics->Current()).c_str(),
+                 graphics->Dirty() ? "not saved" : "as saved", unsigned(focusRow), Describe(graphics->Saved()).c_str());
+}
+
+// GRAPHICS: the rows' spinners as the player left them are the new values (previewed, not saved; graphics_menu.h); then the rows
+// show what the menu holds and the line under the list says what happened.
 void ApplyGraphics(PPCContext& ctx, uint8_t* base, uint32_t self, bool readRows)
 {
     Frame f(ctx, base);
     const uint32_t collection = PPC_LOAD_U32(self + kHudCollection);
     const uint32_t begin = PPC_LOAD_U32(collection + kCollectionItems), end = PPC_LOAD_U32(collection + kCollectionItems + 4);
-    for (uint32_t at = begin, row = 0; at < end && row < settings::Menu::Rows(); at += 4, row++)
+    for (uint32_t at = begin, position = 0; at < end && position < settings::Menu::Rows(); at += 4, position++)
     {
+        const size_t row = settings::Menu::RowAt(position);
         const uint32_t item = PPC_LOAD_U32(at);
         if (readRows && graphics->Set(row, PPC_LOAD_U32(item + kItemValue)))
-            std::fprintf(stderr, "[graphics] GRAPHICS: %s %s: %s\n", settings::Menu::Label(row), settings::Menu::ValueLabel(row, graphics->Value(row)),
+            std::fprintf(stderr, "[graphics] GRAPHICS: %s %s previewed: %s\n", settings::Menu::Label(row), settings::Menu::ValueLabel(row, graphics->Value(row)),
                          graphics->Notice().c_str());
         f.ctx.r3.u64 = item, f.ctx.r4.u64 = graphics->Value(row), f.ctx.r5.u64 = 0;
         f.Call(f.VFunction(item, kItemSetValue));
@@ -324,6 +454,31 @@ void ApplyGraphics(PPCContext& ctx, uint8_t* base, uint32_t self, bool readRows)
     if (!graphics->Notice().empty())
         SetText(f, self + kHudDescription, graphics->Notice());
     PPC_STORE_U8(self + kHudChanged, 0);
+    if (graphics->Dirty() != graphicsDirtyShown)
+    {
+        graphicsDirtyShown = graphics->Dirty();
+        BackHint(f, self, graphicsDirtyShown ? "DISCARD CHANGES" : "BACK");
+    }
+}
+
+// GRAPHICS is leaving (B, A, or the screen closing): what is not saved is discarded and the running game set back to the entry.
+void DiscardGraphics(const char* how)
+{
+    rollingBack = true;
+    const bool moved = !(graphics->InEffect() == graphics->Entry()), unsaved = !(graphics->Current() == graphics->Saved());
+    // The resolution is asked for here and switched (or refused) by the renderer at a later swap (renderer.h RequestInternalRes):
+    // its own "GRAPHICS rollback" line says which; these lines must not claim it.
+    const bool resolutionAsked = graphics->InEffect().resolution != graphics->Entry().resolution;
+    const bool restored = graphics->Discard();
+    rollingBack = false;
+    const char* asked = resolutionAsked ? " (the resolution asked for: the renderer's GRAPHICS rollback line says whether it was made)" : "";
+    if (moved || unsaved)
+        std::fprintf(stderr, "[graphics] GRAPHICS %s: changes discarded; %s%s%s%s\n", how,
+                     restored ? "set back to " : "NOT RESTORED: ", restored ? Describe(graphics->Entry()).c_str() : graphics->Failures().c_str(),
+                     restored ? "" : " (stays until the next start; the saved settings apply then)", restored ? asked : "");
+    if (moved)
+        PublishHdr();
+    std::fprintf(stderr, "[graphics] GRAPHICS closed (%s): saved %s; set %s%s\n", how, Describe(graphics->Saved()).c_str(), Describe(graphics->InEffect()).c_str(), asked);
 }
 
 void CloseSession()
@@ -345,6 +500,7 @@ void Open(PPCContext& ctx, uint8_t* base, uint32_t opener, uint32_t infoHidden, 
     if (which == Submenu::Keyboard ? BindingsPath().empty() || controls::KeyboardMenu().IsOpen() : !settings::Available() || screen.load() != 0)
         return;
     pending = which;
+    pendingFromPause = infoHidden == kPauseInfoHidden;
     Frame f(ctx, base);
     f.Call(kScreenManager);
     const uint32_t manager = f.ctx.r3.u32;
@@ -388,16 +544,11 @@ void OpenGraphicsPreRace(PPCContext& ctx, uint8_t* base)
 
 namespace {
 
-// The help bar: A SET KEY, X DEFAULT, Y CLEAR, B BACK (the HUD screen's SAVE, DISCARD, RESET DEFAULT removed); GRAPHICS: X DEFAULT,
-// B BACK (left and right change a value).
+// The help bar (the HUD screen's SAVE, DISCARD, RESET DEFAULT removed).
 void HelpBar(PPCContext& ctx, uint8_t* base, uint32_t self)
 {
     Frame f(ctx, base);
-    f.ctx.r3.u64 = kHelpBarName;
-    f.Call(kNameHash);
-    f.ctx.r4.u64 = f.ctx.r3.u64, f.ctx.r3.u64 = self;
-    f.Call(kComponent);
-    const uint32_t bar = f.ctx.r3.u32;
+    const uint32_t bar = HelpBarOf(f, self);
     if (bar == 0)
         return;
     for (const uint32_t slot : {3u, 1u, 0u})
@@ -405,21 +556,15 @@ void HelpBar(PPCContext& ctx, uint8_t* base, uint32_t self)
         f.ctx.r3.u64 = bar, f.ctx.r4.u64 = slot;
         f.Call(kHelpRemove);
     }
-    static const struct { uint32_t slot; const char* label; bool graphics; } kButtons[] = {
-        {0, "SET KEY", false}, {2, "DEFAULT", true}, {3, "CLEAR", false}, {1, "BACK", true}};
+    // KEYBOARD CONTROLS: A SET KEY, X DEFAULT, Y CLEAR, B BACK. GRAPHICS: A OK, X DEFAULT, Y PREVIEW (from the Pause menu), B BACK
+    // (DISCARD CHANGES once edited).
+    static const struct { uint32_t slot; const char* keyboard; const char* graphics; } kButtons[] = {
+        {0, "SET KEY", "OK"}, {2, "DEFAULT", "DEFAULT"}, {3, "CLEAR", "PREVIEW"}, {1, "BACK", "BACK"}};
     for (const auto& b : kButtons)
     {
-        if (shown == Submenu::Graphics && !b.graphics)
-            continue;
-        const uint32_t mark = f.Mark();
-        const uint32_t made = f.String(b.label), copy = f.Alloc(4);
-        f.ctx.r3.u64 = copy, f.ctx.r4.u64 = made;
-        f.Call(kStringCopy);
-        f.ctx.r3.u64 = bar, f.ctx.r4.u64 = b.slot, f.ctx.r5.u64 = copy;
-        f.Call(kHelpAdd);
-        f.Release(copy);
-        f.Release(made);
-        f.Reset(mark);
+        const char* label = shown == Submenu::Graphics ? (b.slot == 3 && !previewOffered ? nullptr : b.graphics) : b.keyboard;
+        if (label != nullptr)
+            HelpButton(f, bar, b.slot, shown == Submenu::Graphics && b.slot == 1 && graphicsDirtyShown ? "DISCARD CHANGES" : label);
     }
     const uint32_t binding = bar + kListBinding;
     f.ctx.r3.u64 = binding;
@@ -439,7 +584,7 @@ void KeyboardHudBind(PPCContext& ctx, uint8_t* base, PPCFunc* original)
     screen = self, shown = which, focusRow = 0;
     if (which == Submenu::Graphics)
     {
-        graphics.emplace(settings::GraphicsPath(), [](size_t row, size_t value) {
+        graphics.emplace(settings::GraphicsPath(), GraphicsInEffect(), [](size_t row, size_t value) {
             if (row == settings::Menu::kHdrRow)  // the HDR preference, from the next presented swap; then what is active now
             {
                 runtime::video::SetHdrPreference(value != 0);
@@ -452,17 +597,22 @@ void KeyboardHudBind(PPCContext& ctx, uint8_t* base, PPCFunc* original)
                 runtime::view::Global().SetPreference(value != 0);
                 return armed;
             }
+            if (settings::Menu::IsRender(row))  // FM4 Recomp (render scenario settings): the running game takes it at its next tick
+            {
+                settings::PublishRenderValue(row, value);
+                return true;
+            }
             if (row == settings::Menu::kResolutionRow)  // FM4 Recomp (live resolution): asked for now, made at the next frame boundary the renderer finds safe
-                return runtime::video::RequestInternalRes(settings::kResolutions[value].file);
+                return runtime::video::RequestInternalRes(settings::kResolutions[value].file, rollingBack ? "GRAPHICS rollback" : "GRAPHICS preview");
             return row == settings::Menu::kSmoothingRow && runtime::video::SetPostAaLive(settings::kSmoothings[value].file);
         });
         PublishHdr();  // what is active now, for the HDR row's description
+        graphicsOpenedNs = SteadyNs(), graphicsDirtyShown = false;
+        previewOffered = pendingFromPause.load(), previewing = false;
+        settings::SetInGameMenuShown(true);
         BuildGraphicsRows(ctx, base, self);
-        std::fprintf(stderr, "[graphics] GRAPHICS shown: %s, %s, HDR %s%s%s (%s); %s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
-                     settings::Menu::ValueLabel(1, graphics->Value(1)), settings::Menu::ValueLabel(2, graphics->Value(2)),
-                     settings::ExtendedOffered() ? ", EXTENDED VIEW " : "", settings::ExtendedOffered() ? settings::Menu::ValueLabel(3, graphics->Value(3)) : "",
-                     settings::GraphicsPath().c_str(),
-                     settings::HdrStatusLine(settings::GetHdrStatus()).c_str());
+        std::fprintf(stderr, "[graphics] GRAPHICS shown: saved %s (%s); in effect %s; %s\n", Describe(graphics->Saved()).c_str(), settings::GraphicsPath().c_str(),
+                     Describe(graphics->Entry()).c_str(), settings::HdrStatusLine(settings::GetHdrStatus()).c_str());
         return;
     }
     controls::KeyboardMenu().Open(*runtime::input::ActiveKeyBindings(), BindingsPath(),
@@ -492,7 +642,19 @@ void KeyboardHudList(PPCContext& ctx, uint8_t* base, PPCFunc* original)
     const uint32_t self = ctx.r3.u32;
     if (self == screen.load() && ctx.r4.u32 == 1)
     {
-        if (ctx.r5.u32 == PPC_LOAD_U32(self + kHudList) + kListSender)
+        if (previewing)  // Y: Preview takes no input (KeyboardHudInput): an event here came another way; the rows stay as they were
+        {
+            std::fprintf(stderr, "[graphics] GRAPHICS preview: a list event (row %u) while on: %s\n", unsigned(ctx.r6.u32),
+                         ctx.r5.u32 == PPC_LOAD_U32(self + kHudList) + kListSender ? "the focus moved" : "a value change, undone");
+            if (ctx.r5.u32 == PPC_LOAD_U32(self + kHudList) + kListSender)
+                focusRow = ctx.r6.u32;
+            else
+            {
+                ApplyGraphics(ctx, base, self, false);
+                return;
+            }
+        }
+        else if (ctx.r5.u32 == PPC_LOAD_U32(self + kHudList) + kListSender)
             focusRow = ctx.r6.u32;
         else if (shown == Submenu::Graphics)
         {
@@ -532,25 +694,64 @@ void KeyboardHudInput(PPCContext& ctx, uint8_t* base, PPCFunc* original)
     }
     if (shown == Submenu::Graphics)
     {
-        // GRAPHICS: B is the game's Back (nothing to ask: each change was saved as it was made); X the focused row's default; A and
-        // Y do nothing (the HUD screen's save and reset are not this submenu's).
+        // GRAPHICS: B discards and is the game's Back; A saves and closes the screen as that Back does (the HUD screen's own A
+        // would save our rows as HUD options); X previews the defaults; Y (from the Pause menu) turns Preview on: the paused scene
+        // without the menus and the blur, the edits shown, nothing saved or discarded. In Preview only B is taken, back to GRAPHICS
+        // as it was; nothing reaches the game's screen (its list keeps the focused row and the values).
+        if (previewing)
+        {
+            if (code == kInputB)
+                SetPreview(ctx, base, self, false, "by B");
+            return;
+        }
+        if (code == kInputY)
+        {
+            if (previewOffered)
+                SetPreview(ctx, base, self, true, "by Y");
+            return;
+        }
         if (code == kInputB)
         {
-            std::fprintf(stderr, "[graphics] GRAPHICS closed: %s, %s, HDR %s%s%s\n", settings::Menu::ValueLabel(0, graphics->Value(0)),
-                         settings::Menu::ValueLabel(1, graphics->Value(1)), settings::Menu::ValueLabel(2, graphics->Value(2)),
-                         settings::ExtendedOffered() ? ", EXTENDED VIEW " : "", settings::ExtendedOffered() ? settings::Menu::ValueLabel(3, graphics->Value(3)) : "");
+            DiscardGraphics("by B");
             screen = 0, shown = Submenu::None;
-            graphics.reset();
+            graphics.reset(), settings::SetInGameMenuShown(false);
             PPC_STORE_U8(self + kHudChanged, 0);
             original(ctx, base);
         }
+        else if (code == kInputA && SteadyNs() < graphicsOpenedNs + kGraphicsSettleNs)
+            ;  // the A that opened GRAPHICS, delivered to it
+        else if (code == kInputA)
+        {
+            const bool saved = graphics->Confirm();
+            if (!saved && graphics->Current() == graphics->Saved())
+                std::fprintf(stderr, "[graphics] GRAPHICS: OK, nothing to save\n");
+            else if (saved)
+                std::fprintf(stderr, "[graphics] GRAPHICS: OK, saved %s: %s\n", Describe(graphics->Saved()).c_str(), graphics->Notice().c_str());
+            else
+            {
+                std::fprintf(stderr, "[graphics] GRAPHICS: OK, NOT saved: %s\n", graphics->Notice().c_str());
+                ApplyGraphics(ctx, base, self, false);  // stays: the reason under the list; B discards
+                return;
+            }
+            DiscardGraphics("by A");  // nothing left to discard after a save; logs the state it leaves
+            screen = 0, shown = Submenu::None;
+            graphics.reset(), settings::SetInGameMenuShown(false);
+            PPC_STORE_U8(self + kHudChanged, 0);
+            Frame f(ctx, base);
+            f.Call(kScreenManager);
+            const uint32_t manager = f.ctx.r3.u32;
+            f.ctx.r3.u64 = manager, f.ctx.r4.u64 = PPC_LOAD_U32(self + kScreenOwner);
+            f.Call(f.VFunction(manager, kManagerClose));
+            f.ctx.r3.u64 = self, f.ctx.r4.u64 = PPC_LOAD_U32(kBackEvent);
+            f.Call(f.VFunction(self, kScreenEvent));
+        }
         else if (code == kInputX)
         {
-            if (focusRow < settings::Menu::Rows() && graphics->Default(focusRow))
-                std::fprintf(stderr, "[graphics] GRAPHICS: %s back to its default, saved\n", settings::Menu::Label(focusRow));
+            if (graphics->Defaults())
+                std::fprintf(stderr, "[graphics] GRAPHICS: defaults previewed: %s\n", graphics->Notice().c_str());
             ApplyGraphics(ctx, base, self, false);
         }
-        else if (code != kInputA && code != kInputY)
+        else
             original(ctx, base);
         return;
     }
@@ -601,8 +802,12 @@ void KeyboardHudTeardown(PPCContext& ctx, uint8_t* base, PPCFunc* original)
 {
     if (!freeing && ctx.r3.u32 == screen.load())
     {
+        if (previewing)
+            previewing = false, runtime::video::SetMenuPreview(false), std::fprintf(stderr, "[graphics] GRAPHICS preview off (by the screen closing)\n");
+        if (graphics)
+            DiscardGraphics("by the screen closing");
         screen = 0, shown = Submenu::None;
-        graphics.reset();
+        graphics.reset(), settings::SetInGameMenuShown(false);
         if (controls::KeyboardMenu().IsOpen())
             CloseSession();
     }

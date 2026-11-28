@@ -45,6 +45,7 @@
 #include "diag_res_switch.h"  // FM4 Recomp (M9 diagnostic): FM4_DIAG_RES_CYCLE
 #include "diag_draw_list.h"  // FM4 Recomp (M9 diagnostic): FM4_DIAG_DRAW_LIST
 #include "kernel/extended_view.h"  // FM4 Recomp (M9): Extended View
+#include "kernel/menu_preview.h"   // FM4 Recomp (M9): the GRAPHICS submenu's Y: Preview
 #include "zpd_report.h"  // FM4 Recomp (M9): FM4_OCCLUSION_QUERIES
 #include "keep_busy.h"  // FM4 Recomp (M9 experiment): FM4_GPU_KEEP_BUSY
 #include "gpu_guard.h"
@@ -59,6 +60,9 @@
 #include "diag_blend.h"  // FM4 Recomp: FM4_DIAG_BLEND_LOG / FM4_DIAG_PS_SKIP (diagnostic)
 #include "diag_slow_submit.h"  // FM4 Recomp: FM4_DIAG_SLOW_SUBMIT (diagnostic)
 #include "diag_drain.h"  // FM4 Recomp: FM4_DIAG_DRAIN (diagnostic)
+#include "capture_runs.h"  // FM4 Recomp: FM4_NO_DRAIN
+#include "shader_overrides.h"  // FM4 Recomp: FM4_SHADER_OVERRIDES (MOTION BLUR, CAR DIRT)
+#include "graphics_menu.h"  // FM4 Recomp: FM4_SHADER_OVERRIDES reads the settings in effect
 #include "diag_cp_delay.h"  // FM4 Recomp: FM4_DIAG_CP_DELAY_NS (diagnostic)
 #include "diag_compile.h"  // FM4 Recomp: compile time beside a long swap (diagnostic)
 #include "texture_dump.h"
@@ -94,6 +98,7 @@
 #include <thread>
 #include <algorithm>
 #include <map>
+#include <deque>
 #include <unordered_map>
 #include <vector>
 
@@ -101,6 +106,11 @@
 void SetStopQuiesce(void (*quiesce)(), void (*signalReport)());
 
 namespace runtime::video {
+// FM4 Recomp (FM4_NO_DRAIN): the occlusion-query unit settles END counts after each harvest (ZpdSettle, below ZpdCount).
+uint32_t ZpdExactCount(uint32_t token);
+void ZpdSettle();
+bool NoDrain();
+
 namespace {
 
 constexpr uint32_t kDisplayWidth = 1280, kDisplayHeight = 720;  // the accepted video mode (imports_video.cpp)
@@ -203,7 +213,7 @@ struct Slot
 struct ZpdUnit
 {
     static constexpr uint32_t kQueries = 256;  // a command buffer's segments; draws past them are not counted (named once)
-    struct End { uint32_t token = 0; uint32_t address = 0; uint64_t s0 = 0, s1 = 0; bool known = false; uint32_t count = 0; };
+    struct End { uint32_t token = 0; uint32_t address = 0; uint64_t s0 = 0, s1 = 0; bool known = false; uint32_t count = 0; bool settling = false; uint32_t stale = 0; };
     static constexpr uint32_t kEnds = 256;     // pending END reports (FM4: two a frame)
     bool on = false;
     int32_t query = -1;                 // the active segment's query in zpdSlot's pool, or -1
@@ -218,6 +228,13 @@ struct ZpdUnit
     uint64_t zpds = 0, begins = 0, endReports = 0, segments = 0, draws = 0, countedOnly = 0, untested = 0, unmatched = 0, dropped = 0, overflow = 0,
              unavailable = 0, lost = 0, stored = 0, nonZero = 0, lastCount = 0, maxCount = 0;
     long logLines = 0;                  // FM4_DIAG_ZPD_QUERY_LOG=<lines>: each BEGIN, counted draw, segment and END
+    // FM4 Recomp (FM4_NO_DRAIN, ShiftGlue's model: vulkan/command_processor.cpp EndGuestOcclusionQuery writes the last completed result
+    // for the report's address at record time): the ENDs whose counts are not known yet (in token order), the segments harvested so
+    // far (ids below harvestedBelow; parts retire in order), and each report address's newest known count.
+    std::deque<uint32_t> settling;
+    uint64_t harvestedBelow = 1;
+    std::unordered_map<uint32_t, uint32_t> latest;
+    uint64_t staleStored = 0;
 } zpdUnit;
 __attribute__((format(printf, 1, 2))) void ZpdLog(const char* format, ...)
 {
@@ -275,10 +292,12 @@ void ZpdHarvest(uint32_t s)
         zpdUnit.unavailable += available ? 0 : 1;
         const uint64_t guest = zpd::Normalize(raw, g.num, g.den);
         zpdUnit.results->Put(g.id, guest, raw);
+        zpdUnit.harvestedBelow = std::max(zpdUnit.harvestedBelow, g.id + 1);  // FM4_NO_DRAIN (ZpdSettle)
         ZpdLog("segment %llu: %s%llu host samples x %u/%u = %llu", (unsigned long long)g.id, available ? "" : "not available, ", (unsigned long long)raw, g.num,
                g.den, (unsigned long long)guest);
     }
     slot.zpdSegments.clear();
+    ZpdSettle();
 }
 VkImage display = VK_NULL_HANDLE;
 VkDeviceMemory displayMemory = VK_NULL_HANDLE;
@@ -355,6 +374,7 @@ Transient readback;  // persistent: read on the CPU only after the slot's comple
 // stays. Without a request nothing here runs: a run at one scale is as it was.
 std::atomic<uint32_t> resRequested{0};  // the scale asked for, in halves (render_scale.h); 0: none
 uint32_t resAttempts = 0;               // swaps at which the pending request found the renderer not idle (command processor's thread)
+std::atomic<const char*> resPurpose{nullptr};  // RequestInternalRes's purpose for the latched request (a literal), or null
 bool resClearsCarried = false;          // the EDRAM unit holds pending clears a switch kept aside (dropped at the next swap)
 uint64_t resSwitches = 0, resRefusals = 0;
 constexpr uint32_t kResAttempts = 120;  // then the request is refused (two seconds of swaps at 60 a second)
@@ -393,9 +413,9 @@ uint64_t constantsReusedSinceSwap = 0;  // FM4_FETCH_UNCHECKED: draws by vertex 
 // cause, and the texture binds (hash, untile, staging) on the CPU.
 // FM4 Recomp (M7, vertex reuse across submissions): VertexCache, a flush because no chunk of the vertex cache could be recycled.
 // FM4 Recomp (M7, guest memory for the GPU): WriteWatch, a submit and retire a store waited for (gpu_read_guard.h G5).
-enum class FlushCause : uint32_t { Resolve, Ring, Swap, Consumer, Sync, NextResolve, Idle, VertexCache, WriteWatch, Count };
+enum class FlushCause : uint32_t { Resolve, Ring, Swap, Consumer, Sync, NextResolve, Idle, VertexCache, WriteWatch, NewCapture, Count };
 constexpr const char* kFlushCauseNames[] = {"resolve", "ring", "swap", "resolve consumer", "CPU sync", "next resolve", "ring idle", "vertex cache",
-                                            "write watch"};
+                                            "write watch", "new capture"};  // new capture: FM4_NO_DRAIN (CpuVisible)
 static_assert(std::size(kFlushCauseNames) == size_t(FlushCause::Count));
 uint64_t syncFlushesByPacketSinceSwap[128] = {};
 // FM4 Recomp: what the draws ask of the slot's ring per swap (the ring check's `need`): texture staging, vertex windows, host
@@ -819,6 +839,12 @@ uint64_t currentSwap = 0;  // the last swap Present saw (diagnostics)
 // none), set at each swap for the draws that follow it, and how many of its draws were narrowed.
 float extendedFrameFactor = 1.0f;
 uint64_t extendedNarrowedSinceSwap = 0;
+// FM4 Recomp (M9, the GRAPHICS submenu's Y: Preview; kernel/menu_preview.h): asked for by the game thread (SetMenuPreview), latched at
+// each swap for the frame that follows (the command processor's thread): while on, the pause blur is left out and the menus are drawn
+// only in the help bar's corner (the blur's tap offsets zeroed: a copy). Without it nothing here changes a draw.
+std::atomic<bool> menuPreviewWanted{false};
+bool frameMenuPreview = false;
+uint64_t previewSwaps = 0, previewSwapsWithoutBlur = 0, previewBlurThisFrame = 0, previewBlurFlattened = 0, previewMenuSkipped = 0, previewClipped = 0;
 float hdrHudGain = 1.0f;  // FM4_HDR: the HUD draws' colour gain for the frames from the last swap (1: none; hdr_output.h HudGain)
 float extendedShownFactor = 1.0f;  // the frame being presented: its stretch, given to the presenter while it is not presenting
 
@@ -2154,6 +2180,53 @@ void ReapRetired()
 }
 bool AsyncRetireOn() { return retireBackend.has_value(); }
 
+// FM4 Recomp (opt-in FM4_NO_DRAIN=1; capture_runs.h, ShiftGlue's command-processor model):
+// the command stream's stores and interrupts reach the guest CPU when the command processor reaches them, not when the GPU finishes
+// the work before them; WAIT_UNTIL's 3D-idle request is not honoured, and a memory wait on a word nothing pending writes polls
+// without a sync. Only a resolve that is not a steady capture (capture_runs.h) is waited for (CpuVisible) before the next store
+// or interrupt; steady ones land when their part retires, so the guest CPU may read the previous frame's capture of a range. NOT guest-exact. Needs FM4_DEFER_FENCES=1 and FM4_ASYNC_RETIRE=1. With FM4_OCCLUSION_QUERIES=1 an END report gets its
+// address's newest known count (ZpdCount), as ShiftGlue.
+bool NoDrain()
+{
+    static const bool on = [] {
+        const char* v = std::getenv("FM4_NO_DRAIN");
+        const bool asked = v != nullptr && v[0] == '1' && v[1] == '\0';
+        const bool enabled = asked && DeferFences() && AsyncRetire();
+        if (asked)
+            std::fprintf(stderr, enabled ? "[gpu] no drain on (FM4_NO_DRAIN=1, not guest-exact): stream stores and interrupts land when reached; only a resolve "
+                                           "that is not a steady capture is waited for\n"
+                                         : "[gpu] FM4_NO_DRAIN=1 ignored: it needs FM4_DEFER_FENCES=1 and FM4_ASYNC_RETIRE=1\n");
+        return enabled;
+    }();
+    return on;
+}
+
+namespace {
+CaptureRuns captureRuns;               // FM4_NO_DRAIN
+uint64_t newCaptureSerial = 0;         // the newest part that recorded a resolve to wait for, not known to be retired (0: none)
+uint64_t newCaptureWaitsSinceSwap = 0, newCaptureStartsSinceSwap = 0;
+}  // namespace
+
+// The EDRAM unit's observer of each recorded resolve: the texture unit's mark (guest_writes.h), and with FM4_NO_DRAIN the run check.
+void ResolveRecorded(uint32_t physical, uint32_t bytes)
+{
+    MarkGuestWritten(physical, bytes);
+    if (NoDrain() && captureRuns.Resolve(physical, bytes, currentSwap))
+        newCaptureSerial = currentPartSerial, newCaptureStartsSinceSwap++;
+}
+
+// FM4_NO_DRAIN (command_processor.h RendererHooks::cpuVisible): before a stream store or an interrupt reaches the guest CPU, a run-start
+// resolve recorded before it is written back: the slot is drained when that resolve's part has not retired yet. At a packet boundary.
+void CpuVisible()
+{
+    if (newCaptureSerial == 0)
+        return;
+    const uint64_t oldestUnretired = !slots[0].open ? UINT64_MAX : submitted.empty() ? currentPartSerial : submittedSerials.front();
+    if (newCaptureSerial >= oldestUnretired)
+        FlushSlot(0, FlushCause::NewCapture), newCaptureWaitsSinceSwap++;
+    newCaptureSerial = 0;
+}
+
 namespace {
 
 // FM4 Recomp (M9, FM4_POST_AA): everything but the source image (CreateResources). A refusal is named and every swap is presented
@@ -3255,7 +3328,7 @@ bool SetPostAaLive(const char* spelling)
 }
 
 // FM4 Recomp (M9, live resolution, step 2; renderer.h). Only latches the request: Present serves it (ServeResolutionRequest).
-bool RequestInternalRes(const char* spelling)
+bool RequestInternalRes(const char* spelling, const char* purpose)
 {
     uint32_t halves = 0;
     std::string error;
@@ -3276,6 +3349,7 @@ bool RequestInternalRes(const char* spelling)
     }();
     if (!live)
         return false;
+    resPurpose.store(purpose, std::memory_order_relaxed);
     const uint32_t before = resRequested.exchange(halves, std::memory_order_relaxed);
     if (before != halves && halves != runtime::video::scale::InternalHalvesQuiet())
         std::fprintf(stderr, "[renderer] resolution: %s asked for (now %s): at the next swap with nothing in flight\n", runtime::video::scale::HalvesSpelling(halves),
@@ -3283,6 +3357,19 @@ bool RequestInternalRes(const char* spelling)
     return true;
 }
 const char* InternalResNow() { return runtime::video::scale::HalvesSpelling(runtime::video::scale::InternalHalvesQuiet()); }
+const char* InternalResTarget()
+{
+    const uint32_t asked = resRequested.load(std::memory_order_relaxed);
+    return asked != 0 ? runtime::video::scale::HalvesSpelling(asked) : InternalResNow();
+}
+const char* PostAaNow()
+{
+    static const char* const kSpellings[] = {"off", "soft", "on", "strong"};
+    const int level = postAaLevel.load();
+    return kSpellings[level >= 0 && level <= 3 ? level : 0];
+}
+bool HdrPreferenceNow() { return hdrWanted.load(); }
+void SetMenuPreview(bool on) { menuPreviewWanted.store(on, std::memory_order_relaxed); }
 bool InternalResPending()
 {
     const uint32_t asked = resRequested.load(std::memory_order_relaxed);
@@ -3425,7 +3512,7 @@ bool Initialize(const Options& o)
         if (o.guestBase == nullptr)
             Stop(StopCode::Setup, "renderer: present mode needs the writable guest base (Options::guestBase)");
         std::string edramError;
-        const EdramHooks* hooks = InitializeEdramVk(dev, *compiler, o.guestBase, MarkGuestWritten, edramError);
+        const EdramHooks* hooks = InitializeEdramVk(dev, *compiler, o.guestBase, ResolveRecorded, edramError);  // MarkGuestWritten (+ FM4_NO_DRAIN)
         if (hooks == nullptr)
             Stop(StopCode::Setup, "renderer: EDRAM unit: %s", edramError.c_str());
         SetEdramHooks(hooks);
@@ -3788,14 +3875,23 @@ void ServeResolutionRequest(uint64_t swap, bool windowed)
     const uint32_t now = sc::InternalHalves();
     // A newer request (another thread, meanwhile) stays latched: only the one served is cleared.
     const auto done = [&] { resRequested.compare_exchange_strong(want, 0, std::memory_order_relaxed), resAttempts = 0; };
+    // The purpose of the request served (renderer.h), said once with its outcome.
+    const auto outcome = [&](const char* what) {
+        if (const char* purpose = resPurpose.exchange(nullptr, std::memory_order_relaxed))
+            std::fprintf(stderr, "[renderer] resolution: %s to %s %s at swap %llu; now %s\n", purpose, sc::HalvesSpelling(want), what, (unsigned long long)swap,
+                         sc::HalvesSpelling(sc::InternalHalvesQuiet()));
+    };
     if (want == 0 || want == now)
-        return done();
+        return outcome("already in effect"), done();
     const auto refuse = [&](const char* reason) {
         resRefusals++;
         std::fprintf(stderr, "[renderer] resolution: the change to %s at swap %llu is refused (%s); it stays %s (refusal %llu)\n", sc::HalvesSpelling(want),
                      (unsigned long long)swap, reason, sc::HalvesSpelling(now), (unsigned long long)resRefusals);
+        outcome("refused");
         done();
     };
+    if (runtime::video::diag::ResRefused(want))  // FM4_DIAG_RES_REFUSE (diagnostic): a refusal on purpose, the path a real one takes
+        return refuse("FM4_DIAG_RES_REFUSE (DIAGNOSTIC)");
     // The safe point. The frame's parts were retired by Present's FlushSlot; an earlier swap's present part (FM4_ASYNC_RETIRE) here.
     if (retireBackend)
         RetireParts(UINT64_MAX, true);
@@ -3818,7 +3914,7 @@ void ServeResolutionRequest(uint64_t swap, bool windowed)
     }
     std::string why;
     if (SwitchResolution(swap, now, want, windowed, why))
-        done();
+        outcome("made"), done();
     else
         refuse(why.c_str());
 }
@@ -3828,6 +3924,25 @@ void ServeResolutionRequest(uint64_t swap, bool windowed)
 void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, uint32_t width, uint32_t height, uint64_t swap)
 {
     currentSwap = swap;
+    {  // FM4 Recomp (M9, Y: Preview; kernel/menu_preview.h): the frame that ends here, then the latch for the next one
+        if (frameMenuPreview)
+            previewSwaps++, previewSwapsWithoutBlur += previewBlurThisFrame == 0 ? 1 : 0;
+        previewBlurThisFrame = 0;
+        const bool want = menuPreviewWanted.load(std::memory_order_relaxed);
+        if (want && !frameMenuPreview)
+        {
+            previewSwaps = previewSwapsWithoutBlur = previewBlurFlattened = previewMenuSkipped = previewClipped = 0;
+            std::fprintf(stderr, "[renderer] menu preview on from swap %llu: the pause blur made a copy, the menus drawn only in the help bar's corner\n",
+                         (unsigned long long)swap);
+        }
+        else if (!want && frameMenuPreview)
+            std::fprintf(stderr, "[renderer] menu preview off at swap %llu: %llu frame(s); pause blur passes flattened %llu (frames without one: %llu%s); "
+                                 "menu draws left out %llu, clipped to the corner %llu\n",
+                         (unsigned long long)swap, (unsigned long long)previewSwaps, (unsigned long long)previewBlurFlattened, (unsigned long long)previewSwapsWithoutBlur,
+                         previewSwaps != 0 && previewSwapsWithoutBlur == previewSwaps ? ": NO PAUSE BLUR SEEN, the blur is not the one menu_preview.h knows" : "",
+                         (unsigned long long)previewMenuSkipped, (unsigned long long)previewClipped);
+        frameMenuPreview = want;
+    }
     {  // FM4 Recomp (M9, Extended View; kernel/extended_view.h): the factor for the frames from here, latched between frames
         static const float forced = [] {  // FM4_DIAG_ASPECT_FACTOR (diagnostic): a factor without a window, 1..2
             const char* v = std::getenv("FM4_DIAG_ASPECT_FACTOR");
@@ -3909,6 +4024,9 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                          (unsigned long long)z.overflow);
             z.zpds = z.begins = z.endReports = z.stored = z.nonZero = z.draws = z.countedOnly = z.segments = z.maxCount = 0;
             z.unmatched = z.dropped = z.lost = z.unavailable = 0;
+            if (NoDrain())  // FM4_NO_DRAIN: ENDs answered with their address's newest known count, ENDs still settling, addresses known
+                std::fprintf(stderr, "[zpd] no drain: %llu END word(s) stored with the newest known count, %zu END(s) settling, %zu address(es) known\n",
+                             (unsigned long long)z.staleStored, z.settling.size(), z.latest.size()), z.staleStored = 0;
         }
     }
     runtime::video::keepbusy::OnSwap(swap);  // FM4_GPU_KEEP_BUSY_CYCLE: the experiment's OFF/ON switches
@@ -4438,6 +4556,12 @@ void Present(const uint8_t* base, const uint32_t fetch[6], uint32_t physical, ui
                          w.jobNs / 1e6, (unsigned long long)reapedPartsSinceSwap, (unsigned long long)earlyStoresSinceSwap, (unsigned long long)asyncPresentsSinceSwap);
             reapedPartsSinceSwap = earlyStoresSinceSwap = asyncPresentsSinceSwap = 0;
         }
+        if (NoDrain())  // FM4_NO_DRAIN: the run-start resolves and the drains they cost (the drain's time is in the timing line's "new capture")
+        {
+            std::fprintf(stderr, "[gpu] swap %llu no drain: %llu resolve(s) to wait for, %llu drain(s) for them\n", (unsigned long long)swap,
+                         (unsigned long long)newCaptureStartsSinceSwap, (unsigned long long)newCaptureWaitsSinceSwap);
+            newCaptureStartsSinceSwap = newCaptureWaitsSinceSwap = 0;
+        }
         if (drain::Enabled())  // FM4_DIAG_DRAIN (diagnostic): this swap's drains
             drain::Swap(swap, drawsSinceSwap);
         gpuBusyNsSinceSwap = gpuTimedSinceSwap = passesSinceSwap = 0;
@@ -4723,6 +4847,30 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     DiagBlendLog(draw, key, runtime::gpu::VblankCount());  // FM4_DIAG_BLEND_LOG (diagnostic, diag_blend.h): nothing unless set
     if (DiagSkipDraw(ps->hash, draw))                       // FM4_DIAG_PS_SKIP (diagnostic, diag_blend.h): nothing unless set
         return;
+    // FM4 Recomp (M9, Y: Preview; kernel/menu_preview.h): only while the GRAPHICS submenu's preview is on, before anything is recorded.
+    const runtime::preview::Action previewAction =
+        runtime::preview::Classify(frameMenuPreview, ps->hash, overlay, d.scissor.x, d.scissor.y, d.scissor.width, d.scissor.height);
+    if (previewAction == runtime::preview::Action::Skip)
+    {
+        previewMenuSkipped++;
+        return;
+    }
+    if (previewAction == runtime::preview::Action::Flatten)  // the blur pass as a copy: its tap offsets zeroed in this draw's constants
+    {
+        if (d.aluConstants.size() != 2048 || d.psConstantWords < runtime::preview::kBlurOffsetEndWord)
+            Stop(StopCode::Unimplemented, "renderer: draw %llu: the pause blur's pixel constants (%u words) do not hold c0-c7: Y: Preview cannot flatten it",
+                 (unsigned long long)draw, unsigned(d.psConstantWords));
+        uint32_t* psWords = d.aluConstants.data() + 1024;
+        if (previewBlurFlattened == 0)
+        {
+            float c0[4];
+            std::memcpy(c0, psWords, sizeof c0);
+            std::fprintf(stderr, "[renderer] menu preview: the pause blur ps_%016llx flattened (c1-c7 zeroed); its weights c0 = %g %g %g %g\n",
+                         (unsigned long long)ps->hash, double(c0[0]), double(c0[1]), double(c0[2]), double(c0[3]));
+        }
+        runtime::preview::FlattenBlur(psWords);
+        previewBlurFlattened++, previewBlurThisFrame++;
+    }
     DescriptorPlan plan;
     RequireDraw(draw, PlanDescriptors(*vs, *ps, samplerLimits, plan));
     key.samplerLayout = plan.layoutKey;  // the pipeline layout is the pair's (PipelineCache::Get refuses a key without it)
@@ -5136,6 +5284,23 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // Invariant (each stage): the block at lastConstants.<stage>At holds FillConstants(previous draw, stage) in the range the shader
     // reads: a filled block is this draw's; a reused one equals this draw's by the comparison; lastConstants takes this draw's words
     // whenever a stage was filled (the alu swap below), and is already equal when both were reused.
+    // FM4 Recomp (opt-in FM4_SHADER_OVERRIDES=1; shader_overrides.h): MOTION BLUR / CAR DIRT off change this draw's pixel constants
+    // before the reuse comparison, so a reused block holds the same overridden words.
+    if (settings::OverridesOffered())
+    {
+        static uint64_t readAt = UINT64_MAX;  // the settings in effect, read once a swap (RenderNow takes a lock)
+        static settings::Graphics now;
+        if (readAt != currentSwap)
+            now = settings::RenderNow(), readAt = currentSwap;
+        if ((now.motionBlur == 1 || now.carDirt == 1) &&
+            overrides::Apply(ps->hash, now.motionBlur == 1, now.carDirt == 1, d.aluConstants.data(), d.aluConstants.size(), d.psConstantWords))
+        {
+            static bool named = false;
+            if (!named)
+                named = true, std::fprintf(stderr, "[gpu] shader overrides: first draw changed (ps_%016llx; motion blur %s, car dirt %s)\n",
+                                           (unsigned long long)ps->hash, now.motionBlur == 1 ? "off" : "on", now.carDirt == 1 ? "off" : "on");
+        }
+    }
     bool reuseVs = false, reusePs = false;
     if (!ConstantsPerStage())
         reuseVs = reusePs = haveLastConstants && d.aluConstants.size() == 2048 && lastConstants.alu.size() == 2048 &&
@@ -5295,6 +5460,8 @@ void Draw(const uint8_t* base, uint32_t opcode, uint32_t vizQueryToken)
     // and row) and takes the pinned variant chosen above with the two stretches; a draw in a viewport of its own (the track map)
     // is moved and narrowed about the frame's centre; scissors follow the same rule.
     uint32_t scissorX = d.scissor.x, scissorWidth = d.scissor.width, scissorY = d.scissor.y, scissorHeight = scissorBottom - d.scissor.y;
+    if (previewAction == runtime::preview::Action::Clip)  // Y: Preview: a menu draw over the help bar's corner, there only
+        runtime::preview::ClipToHint(scissorX, scissorY, scissorWidth, scissorHeight), previewClipped++;
     if (extendedFrameFactor != 1.0f && d.target.colorFormat == runtime::view::kFinalColourFormat && d.target.pitch == runtime::view::kFrameWidth)
     {
         static float centreX = 0.0f, centreY = 0.0f;  // the frame in this target, from its last whole-frame draw (the scene's copy at least)
@@ -5774,6 +5941,48 @@ uint32_t ZpassDone(uint32_t physical)
 // The count of the END `token` (RendererHooks::zpdCount): called when the report's store lands, after every part recorded before
 // the END has retired (their segments are in the ring; ZpdHarvest). A segment the ring no longer holds counts 0 and is tallied.
 uint32_t ZpdCount(uint32_t token)
+{
+    // FM4 Recomp (FM4_NO_DRAIN, not guest-exact): the report lands when reached, with the newest known count of its address (0 before
+    // the first); this END's own count becomes known once its segments are harvested (ZpdSettle) and answers the next END there.
+    if (NoDrain())
+    {
+        ZpdUnit::End& end = zpdUnit.ends[token % ZpdUnit::kEnds];
+        if (end.token != token)
+            return zpdUnit.lost++, 0;
+        zpdUnit.staleStored++;
+        if (end.settling)  // the report's second word: the count its first word got
+            return end.stale;
+        // Read before settling: ZpdSettle may insert into `latest` (an iterator would not survive a rehash) and may make this END's
+        // own count the address's newest.
+        const auto it = zpdUnit.latest.find(end.address);
+        end.stale = it != zpdUnit.latest.end() ? it->second : 0;
+        end.settling = true, zpdUnit.settling.push_back(token);
+        ZpdSettle();  // an END with no segment is known at once
+        return end.stale;
+    }
+    return ZpdExactCount(token);
+}
+
+// FM4_NO_DRAIN: the ENDs whose segments have all been harvested, in order, become their address's newest known count.
+void ZpdSettle()
+{
+    while (!zpdUnit.settling.empty())
+    {
+        const uint32_t token = zpdUnit.settling.front();
+        const ZpdUnit::End& end = zpdUnit.ends[token % ZpdUnit::kEnds];
+        if (end.token != token)  // overwritten by a newer END (kEnds behind): its count is lost
+        {
+            zpdUnit.lost++, zpdUnit.settling.pop_front();
+            continue;
+        }
+        if (end.s1 > end.s0 && end.s1 > zpdUnit.harvestedBelow)
+            break;
+        zpdUnit.latest[end.address] = ZpdExactCount(token);
+        zpdUnit.settling.pop_front();
+    }
+}
+
+uint32_t ZpdExactCount(uint32_t token)
 {
     ZpdUnit::End& end = zpdUnit.ends[token % ZpdUnit::kEnds];
     if (end.token != token)

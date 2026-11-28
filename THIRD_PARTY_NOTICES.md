@@ -1,18 +1,5 @@
 # Third-party notices
 
-## FM4 Recomp 0.3.1 for macOS
-
-The 0.3.1 app ships the FM4 Static Recomp and ShiftGlue engine alongside FM4 Recomp's macOS launcher, disc setup and validation tools. The actual app includes its version-specific notice in `Contents/Resources/kit/licenses/THIRD_PARTY_NOTICES.md` with the component licences and replacement instructions.
-
-- **Game host and SDK.** The host comes from [FM4 Static Recomp](https://github.com/i2kiselev/fm4-static-recomp), including its Pinyon Shift attribution. [ShiftGlue SDK](https://github.com/i2kiselev/shiftglue-sdk) includes work by Tom Clay, i2kiselev and Xenia contributors under BSD terms. The graphics engine includes adapted GPL-3.0-or-later anti-aliasing and HDR shader code from SpeedBreaker and ReCarbon.
-- **Audio and compression.** The engine loads the replaceable `libavcodec.58.dylib` and `libavutil.56.dylib` (FFmpeg contributors) and `libshiftglue_lzx.dylib` (libmspack, Stuart Caie and contributors). The disc setup helper uses a separate `libfm4_lzx.dylib`. LGPL terms and notices accompany the matching sources. The engine and setup LZX libraries are different builds.
-- **Graphics, input and tools.** The kit contains MoltenVK, Vulkan loaders and validation tools, SDL and other SDK dependencies, the AMD FidelityFX Vulkan library, the XenonRecomp-derived disc setup code and extract-xiso. The app's full notice identifies the shipped files, upstream revisions, authors and individual terms.
-- **Corresponding source.** Download the [0.3.1 source archive](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz) and its [SHA-256 checksum](https://github.com/retronative/fm4-recomp/releases/download/v0.3.1/FM4-Recomp-0.3.1-source.tar.xz.sha256). Its README documents the pinned source and macOS changes, how to build compatible replacement libraries and how to sign the modified app. The [release page](https://github.com/retronative/fm4-recomp/releases/tag/v0.3.1) contains the DMG and source checksums.
-
-## Earlier public releases (0.2.0 and 0.1.0)
-
-The following inventory and source filenames describe those versions and their original renderer.
-
 FM4 Recomp is licensed under GPL-3.0-or-later ([COPYING](COPYING), [NOTICE](NOTICE)). This file lists the third-party code
 that FM4 Recomp contains or ships, with its copyright holders, licence, the shipped file that contains it, and where its
 licence text is.
@@ -33,6 +20,8 @@ licence text is.
 | **TinySHA1** (as modified for Xenia; XenonRecomp's `thirdparty/TinySHA1`) | Copyright (c) 2012-22 Saurav Mohapatra | ISC | `bin/fm4recomp` (`runtime/kernel/stfs.cpp`, the STFS hash tree), `bin/xexsurvey`; included from XenonRecomp's tree, not copied into this repository | [LICENSES/TinySHA1-ISC.txt](LICENSES/TinySHA1-ISC.txt) |
 | **SIMDe** (`a532a12ca9bbdc5e6547eb602e6256b71a5377d4`; XenonRecomp's `thirdparty/simde`) | Copyright (c) 2017 Evan Nemerson | MIT | `bin/fm4recomp` (header-only; the translated code uses it through `ppc_context.h`) | [LICENSES/SIMDe-MIT.txt](LICENSES/SIMDe-MIT.txt) |
 | **tiny-AES-c** (`23856752fbd139da0b8ca6e471a13d5bcc99a08d`; XenonRecomp's `thirdparty/tiny-AES-c`) | Public domain (no copyright claimed) | Unlicense | `bin/xexsurvey` | [LICENSES/tiny-AES-c-Unlicense.txt](LICENSES/tiny-AES-c-Unlicense.txt) |
+| **ShiftGlue SDK** (`d16189ff0488`, a ReXGlue SDK fork) | Copyright (c) 2026, Tom Clay; Copyright (c) 2026, i2kiselev | BSD-3-Clause | `bin/fm4recomp`: `runtime/video/capture_runs.h` (the run-start rule of `src/graphics/fm4_resolve_readbacks.cpp`, adapted; opt-in `FM4_NO_DRAIN`) | [LICENSES/ShiftGlue-SDK-BSD-3-Clause.txt](LICENSES/ShiftGlue-SDK-BSD-3-Clause.txt) |
+| **FM4 Static Recomp** (fm4-engine 0.3.2 host, `367bbea`) | Copyright (c) 2026, i2kiselev | BSD-3-Clause | `bin/fm4recomp`: `runtime/kernel/keyboard_prompts.h` and `runtime/game/prompt_text.cpp` (the keyboard wording of the game's button prompts), `runtime/game/render_scenario.h` and `.cpp` (the render scenario settings and Depth of Field), `runtime/video/shader_overrides.h` (Motion Blur and Car Dirt), `runtime/video/keycap.h` and `.cpp` (the keycap prompt icons), `runtime/kernel/graphics_menu.cpp` (the settings' labels and descriptions), adapted; the app (`FM4 Recomp.app/Contents/MacOS`): `app/setup/GraphicsView.swift` (the Effects tab's texts), adapted; `warmup/route.txt`, made by `scripts/alpha/warmup/make_route.py` from `races.tsv` (the shader warm-up's Quick Race route, after `warm-up.ps1`), adapted | [LICENSES/FM4-Static-Recomp-BSD-3-Clause.txt](LICENSES/FM4-Static-Recomp-BSD-3-Clause.txt) |
 
 ## Code from other GPL-3.0-or-later projects
 
@@ -42,7 +31,7 @@ its header, with the source file and FM4 Recomp's changes.
 | Project | Copyright | Licence | Where |
 |---|---|---|---|
 | Earlier FM4 runtime code | Copyright (C) 2026 ForzaRecomp contributors | GPL-3.0-or-later | `bin/fm4recomp`: much of `runtime/kernel/`, `runtime/gpu/`, `runtime/shader/` and the runtime's entry files; `recomp/indirect.h`; `bin/fm4_validation_control` |
-| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h`, `render_scale.h`, `post_aa.h`, `zpd_report.h`, `hdr_output.h` and `runtime/kernel/input_live.h`, `rumble.h`, `extended_view.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
+| Shared runtime code and **SpeedBreaker** | Copyright (C) 2026 SpeedBreaker / ReCarbon contributors | GPL-3.0-or-later | `bin/fm4recomp`: `runtime/video/pipeline_cache_header.h`, and parts of `async_retire.h`, `gpu_read_guard.h`, `draw_record.h` and `runtime/kernel/input_live.h`; `bin/xexsurvey` (`survey/xexsurvey.cpp`); `survey/xexinfo.py` and the tool setup scripts |
 | **reFrozen** | Copyright (C) 2026 reFrozen contributors | GPL-3.0-or-later | The release scripts `scripts/release/make_app.sh` and `make_dmg.py` (not in the app) |
 
 ## Programs shipped beside FM4 Recomp
@@ -80,7 +69,7 @@ This product includes software developed by in &lt;in@fishtank.com&gt;.
 
 ## Source code
 
-FM4 Recomp 0.2.0 is built from the tag `v0.2.0` of <https://github.com/retronative/fm4-recomp>. That tree holds the
+FM4 Recomp 0.4.0 is built from the tag `v0.4.0` of <https://github.com/retronative/fm4-recomp>. That tree holds the
 complete source of FM4 Recomp and its build and release scripts: FM4 Recomp's own source for a release is the repository at
 that release's tag. `scripts/setup_tools.sh` there names the exact source of XenonRecomp (`ddd128bcca99`, with our patches in
 `patches/xenonrecomp/`), and `scripts/release/build_runtime_deps.sh` the sources of the libraries in `lib/`.
@@ -97,9 +86,10 @@ LGPL-2.1. They are not compiled into FM4 Recomp's programs: they are three separ
 decoder) load by name (`@rpath/<file>`) when they start.
 
 **Source offer.** With every binary release, FM4 Recomp publishes the complete source of these parts, at the versions in that
-release, on the same GitHub Release page as the binary, for as long as the binary is offered there: for 0.2.0,
-`FM4-Recomp-0.2.0-third-party-source.tar.xz`, with its SHA-256 in
-`FM4-Recomp-0.2.0-third-party-source.tar.xz.sha256`. It holds FFmpeg 7.1.1
+release, on the same GitHub Release page as the binary, for as long as the binary is offered there: for 0.4.0,
+`FM4-Recomp-0.4.0-third-party-source.tar.xz`, with its SHA-256 in
+`FM4-Recomp-0.4.0-third-party-source.tar.xz.sha256`. Earlier releases
+keep their own notices and source archives at their tags and on their release pages. It holds FFmpeg 7.1.1
 (`https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz`, SHA-256 in `scripts/setup_tools.sh`), the patch and
 the repository's `scripts/build_ffmpeg_xma.sh` with the options listed in `third-party/ffmpeg/build-info.txt`;
 libmspack at XenonRecomp's pinned revision `305907723a4e7ab2018e58040059ffb5e77db837`; the source of the other libraries that
