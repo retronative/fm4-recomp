@@ -6,7 +6,7 @@
 # key must name the expected IDS_ entry in the expected table, and its text is written to a TSV (table, key, name, text) for
 # tests/run_keyboard_prompt_tests.sh <tsv> and for review. Game text: write the TSV under research/, never commit it.
 #
-# The .str format (LSB2) as the reference's test reads it (fm4-engine 0.3.2 host/tests/string_tables_test.cpp:41-75, BSD-3; facts
+# The .str format (LSB2) as the reference's test reads it (FM4 Static Recomp 0.3.x host/tests/string_tables_test.cpp:41-75, BSD-3; facts
 # only): "LSB2" at 0; at +0x0C the texts' chunk offset: [size u32][count u32], then (u16 key, u32 character offset) x count and a
 # sentinel entry, then a UTF-16BE pool (a text runs to a 0 character); at +0x18 the names' chunk offset: [size][count],
 # (u16 key, u16 index, u32 byte offset) x count, then an ASCII pool. Big-endian throughout.

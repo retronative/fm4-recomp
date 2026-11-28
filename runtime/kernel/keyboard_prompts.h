@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// Adapted from fm4-engine 0.3.2 host/src/input/prompt_strings.cpp (FM4 Recomp 0.3.1's "prompts follow the input device"):
+// Adapted from FM4 Static Recomp 0.3.x host/src/input/prompt_strings.cpp (FM4 Recomp 0.3.1's "prompts follow the input device"):
 //
 //   Copyright (c) 2026, i2kiselev
 //   BSD 3-Clause License. Redistribution and use in source and binary forms, with or without modification, are permitted provided

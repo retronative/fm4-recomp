@@ -6,7 +6,7 @@
 menu positions after fm4-static-recomp's warm-up.ps1 (Copyright (c) 2026, i2kiselev, BSD-3-Clause): Free Play > Quick Race; per race:
 manufacturer, car, showroom, assists, environment, track, GO RACE, START RACE, the accelerator held with the race cameras cycled,
 pause > QUIT RACE, confirm, the post-race menu, CONTINUE (track select); then B, B back to car select (B again to the manufacturers
-when the make changes). Our changes: open-loop vblank delays within a section (from research runs wu_warm1 and all10_qhd), each race
+when the make changes). Our changes: open-loop vblank delays within a section (measured in our test runs), each race
 section started by the race scene after the load (@scene race; the track select after CONTINUE comes within ~200 vblanks, and some
 track selects draw like a race, so the next race's menus follow CONTINUE in the same section); the route's last event marks its end.
 usage: make_route.py <races.tsv> [race number ...] > route.txt (scripts/release/bundle_kit.sh writes the kit's warmup/route.txt)"""

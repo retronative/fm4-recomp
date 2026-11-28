@@ -2,7 +2,7 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // Some text inputs below (the shapes of FM4's phrases, e.g. "x PRESS THE BACK BUTTON y", "NUMBER OF PERFECT DRAFT SCORES", the key
-// constants) are taken from fm4-engine 0.3.2 host/tests/prompt_strings_test.cpp (Copyright (c) 2026, i2kiselev, BSD 3-Clause
+// constants) are taken from FM4 Static Recomp 0.3.x host/tests/prompt_strings_test.cpp (Copyright (c) 2026, i2kiselev, BSD 3-Clause
 // License; full notice in runtime/kernel/keyboard_prompts.h). The expected outputs are ours, derived as below for our key set.
 //
 // Keyboard prompts, CPU only: kernel/keyboard_prompts.h (the keyboard wording of the prompt strings) and input_live.h LastDevice

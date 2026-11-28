@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
-// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.2 host at 367bbea9, src/game_hooks.cpp: ApplyRenderScenarioSettings,
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.x host, src/game_hooks.cpp: ApplyRenderScenarioSettings,
 // called every main-loop tick from its Fm4MainLoopSession / Fm4PresentInterval hooks, and Fm4DepthOfFieldOption). FM4 Recomp changes:
 // whole-function delegate hooks instead of mid-function hooks (our generator has no mid-function kind), the plan in render_scenario.h,
 // FM4's numbers from config/title_hooks.toml (title_symbols.h), the settings from graphics.conf (kernel/graphics_menu.h RenderNow).

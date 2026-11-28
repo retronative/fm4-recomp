@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// Adapted from fm4-engine 0.3.2 host/src/game_hooks.cpp:253-296 and 1471-1592 (Fm4GraphicsOptionText's prompt part,
+// Adapted from FM4 Static Recomp 0.3.x host/src/game_hooks.cpp:253-296 and 1471-1592 (Fm4GraphicsOptionText's prompt part,
 // Fm4TextElementUpdate, GuestText), Copyright (c) 2026, i2kiselev, BSD 3-Clause License; its full notice is in
 // runtime/kernel/keyboard_prompts.h.
 //
@@ -16,7 +16,7 @@
 //     game's SetText does. An element that no longer shows the text it was given has been reused: it is forgotten.
 // FM4 Recomp changes from the reference: delegates instead of midasm hooks (the lookup's original is called directly, no nested
 // call guard; the element's rewrite runs at the update's entry, before the update copies the text, not at the reference's hook point after
-// the copy: drafts README "Entry instead of the mid-function hook"); guest copies from the kernel arena (kernel/arena.h) instead of the system heap; no string
+// the copy: a delegate at the function entry instead of a mid-function hook); guest copies from the kernel arena (kernel/arena.h) instead of the system heap; no string
 // log; the key labels from our bindings (key_bindings.h, controls_menu.h KeyLabel).
 #include "title_symbols.h"
 #include "kernel/arena.h"

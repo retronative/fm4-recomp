@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
 //
-// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.2 host at 367bbea, src/car_dirt.cpp: which pixel shaders
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.x host, src/car_dirt.cpp: which pixel shaders
 // and constants, ComposePixelShaderConstantOverride). FM4 Recomp changes: the shaders by our hash (runtime/kernel/shader_hash.h,
 // FNV-1a-64 of the microcode), mapped from the SDK's XXH3-64 of the same microcode over every shader of the disc (Media/Shaders and
 // the .fxobj inside every zip) and a race's loaded shaders (2026-11-26: 31 of 31 dirt shaders, the road

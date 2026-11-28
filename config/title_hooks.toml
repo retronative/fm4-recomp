@@ -546,7 +546,7 @@ name = "kFovForRecord"
 value = 756
 
 # Keyboard prompts (runtime/game/prompt_text.cpp, kernel/keyboard_prompts.h; FM4 Recomp 0.3.1's "prompts follow the input device",
-# fm4-engine 0.3.2 host/, BSD-3): while the keyboard was the device used last (input_live.h LastDevice), FM4's English strings that
+# FM4 Static Recomp 0.3.x host/, BSD-3): while the keyboard was the device used last (input_live.h LastDevice), FM4's English strings that
 # name pad buttons in prose name the bound keys instead ("Press A to start the game." -> "Press SPACE to start").
 # sub_823A4780 (r3 = string table, r4 = 16-bit key) -> r3 = the UTF-16BE text: `mr r31,r3; mr r3,r4; cmplwi r31,0; beq; lwz r11,12(r31);
 # ...; bl 0x823a4800 (the key's entry); lwz r10,2(r3); lwz r11,8(r31); rlwinm r10,r10,1,0,30; add r3,r10,r11` (pool + 2 x offset), or

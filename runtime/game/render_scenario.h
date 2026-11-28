@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 FM4 Recomp contributors
-// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.2 host at 367bbea9, src/game_hooks.cpp, ApplyRenderScenarioSettings
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp 0.3.x host, src/game_hooks.cpp, ApplyRenderScenarioSettings
 // and the value tables above it). FM4 Recomp changes: the guest writes split into a pure plan (this header, tested on a synthetic
 // layout) and a thin writer (render_scenario.cpp); the control ids and offsets come from config/title_hooks.toml, not from code;
 // the settings arrive as a struct instead of cvars; no diagnostic omit list or LOD threshold override.

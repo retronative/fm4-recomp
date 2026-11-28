@@ -5,7 +5,7 @@
 // second tab of the panel the game opens on Command-comma (ControlsPanel.swift). A choice is saved at once to
 // $FM4_RECOMP_HOME/graphics.conf; the running game takes it when the panel closes (FM4_GRAPHICS_LIVE=1, runtime/video/window_sdl.cpp),
 // and play.sh reads the file at every start.
-// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp host/src/ui/graphics_page.cpp at 367bbea9: the Effects
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp host/src/ui/graphics_page.cpp: the Effects
 // tab's texts, adapted from its render scenario rows' descriptions). FM4 Recomp changes: shortened, the panel's style.
 
 import SwiftUI

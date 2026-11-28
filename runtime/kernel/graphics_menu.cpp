@@ -2,7 +2,7 @@
 // Copyright (C) 2026 FM4 Recomp contributors
 //
 // The in-game GRAPHICS submenu's logic (graphics_menu.h). Tested by tests/runtime/test_runtime.cpp.
-// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp host/src/ui/graphics_page.cpp at 367bbea9: the render
+// Portions copyright (c) 2026, i2kiselev (BSD 3-Clause; FM4 Static Recomp host/src/ui/graphics_page.cpp: the render
 // scenario rows' labels and descriptions, kSceneryShadows ... kDepthOfField and kRows). FM4 Recomp changes: the game's upper case,
 // shortened, with when each change shows; the file keys are ours.
 #include "graphics_menu.h"
