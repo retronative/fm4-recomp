@@ -62,7 +62,8 @@ Quit the earlier app, connect any external drive with your game data or saves, r
 **Applications** and open it. Your storage locations and game data are kept. The career you played in
 0.3.1 comes back the first time you play: FM4 Recomp uses the newest copy of each saved game and keeps
 the copy it replaces in a `saves-replaced` folder beside your saves. If you only ever used 0.3.0, open
-0.3.1 once first: it moves the 0.3.0 career and setup to where this version finds them. A 0.2.0
+0.3.1 once first: when its save folder has no career yet, it brings the 0.3.0 career and setup to where
+this version finds them (see the [0.3.1 upgrade guide](https://github.com/retronative/fm4-recomp/blob/v0.3.1/docs/getting-started.md#updating-from-a-previous-version)). A 0.2.0
 installation needs nothing: its saves are already in this version's layout.
 
 ## Disc 2

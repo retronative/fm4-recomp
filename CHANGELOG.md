@@ -24,7 +24,7 @@ technique and the features players liked most in 0.3.1.
   triggers and RB). Connecting a controller switches them to its buttons at once, disconnecting it back to the keys, and with no
   controller the game starts with the keys.
 - Careers played in 0.3.1 are brought over the first time you play: the game uses the newest copy of each saved game,
-  and the copy it replaces is kept in a saves-replaced folder beside your saves. A 0.3.0-only player opens 0.3.1 once first.
+  and the copy it replaces is kept in a saves-replaced folder beside your saves. A 0.3.0-only career: open 0.3.1 once first, which brings it over when its save folder has no career yet (its [upgrade guide](https://github.com/retronative/fm4-recomp/blob/v0.3.1/docs/getting-started.md#updating-from-a-previous-version)).
 - Shader warm-up: after Disc 1 setup, FM4 Recomp can play ten Quick Races hidden and muted (about 45 minutes; Skip stops it at
   any time) so the game's shaders are ready before you race, and the first races no longer pause while they are prepared. It runs
   on a separate profile and never touches your saves. Start it again later from the launcher's Warm Up Shaders button.
